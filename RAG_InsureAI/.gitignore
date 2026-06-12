@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# ChromaDB (vector store data - can be rebuilt)
+app/chroma_db/
+
+# Temp / uploads
+app/video/
+
+# Environment
+.env
+
+# Docker volumes (managed by Docker)
+*.log
+
+# Claude Code internal files
+.claude/

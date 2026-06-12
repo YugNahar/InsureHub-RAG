@@ -1,0 +1,34 @@
+services:
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_api
+    command: uvicorn api:app --host 0.0.0.0 --port 8502 --reload
+    ports:
+      - "8502:8502"
+    shm_size: '2gb'
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 2G
+    environment:
+      - VLLM_HOST=http://123.253.124.14:7000
+      - VLLM_MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ
+      - EMBED_MODEL=BAAI/bge-base-en-v1.5
+    volumes:
+      - ./app:/app
+      - upload_data:/tmp/uploads
+      - whisper_cache:/root/.cache/whisper
+      - chroma_data:/app/chroma_db
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  upload_data:
+  whisper_cache:
+  chroma_data:
+  hf_cache:
