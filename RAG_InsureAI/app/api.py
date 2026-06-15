@@ -26,12 +26,12 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import aiohttp
 import re
 from bs4 import BeautifulSoup
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,23 +45,234 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
+_MAX_HISTORY_TURNS = 3  # keep last 3 exchanges to stay within token limit
+_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d.", name, raw, default)
+        return default
+
+
+_ASK_TIMEOUT_SECONDS = _int_env("ASK_TIMEOUT_SECONDS", 150)
+
+_STATE_DIR = os.getenv("API_STATE_DIR", os.path.join(os.path.dirname(__file__), "state"))
+_CONVERSATIONS_PATH = os.path.join(_STATE_DIR, "conversations.json")
+_AGENT_SESSIONS_PATH = os.path.join(_STATE_DIR, "conversation_agent_sessions.json")
+_JOBS_PATH = os.path.join(_STATE_DIR, "jobs.json")
+_STATE_LOCK = threading.RLock()       # for sync background threads only
+_ASYNC_STATE_LOCK: asyncio.Lock | None = None  # for async endpoint handlers
+
+
+def _get_async_lock() -> asyncio.Lock:
+    global _ASYNC_STATE_LOCK
+    if _ASYNC_STATE_LOCK is None:
+        _ASYNC_STATE_LOCK = asyncio.Lock()
+    return _ASYNC_STATE_LOCK
+
+
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8501",
+    "http://localhost:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8501",
+    "http://127.0.0.1:8080",
+]
+
+
+def _csv_env(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "")
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    return values or default
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as state_file:
+            _json.dump(data, state_file, ensure_ascii=False)
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _load_json_state(path: str, label: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as state_file:
+            payload = _json.load(state_file)
+        if not isinstance(payload, dict):
+            raise ValueError("state root must be an object")
+        return payload
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Could not load %s state from %s: %s", label, path, exc)
+        return {}
+
+
+def _normalize_history(raw_turns: object) -> list[dict]:
+    if not isinstance(raw_turns, list):
+        return []
+    history = []
+    for turn in raw_turns:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role", ""))
+        content = str(turn.get("content", ""))
+        if role in {"user", "assistant"}:
+            history.append({"role": role, "content": content})
+    return history[-_MAX_HISTORY_TURNS * 2 :]
+
+
+def _load_conversations() -> dict[str, list[dict]]:
+    payload = _load_json_state(_CONVERSATIONS_PATH, "conversation")
+    return {
+        str(session_id): history
+        for session_id, turns in payload.items()
+        if (history := _normalize_history(turns))
+    }
+
+
+def _load_agent_sessions() -> dict[str, dict]:
+    payload = _load_json_state(_AGENT_SESSIONS_PATH, "conversation agent")
+    return {
+        str(session_id): dict(session)
+        for session_id, session in payload.items()
+        if isinstance(session, dict)
+    }
+
+
+def _normalize_job(raw_job: object) -> dict | None:
+    if not isinstance(raw_job, dict):
+        return None
+    try:
+        chunks = int(raw_job.get("chunks", 0) or 0)
+    except (TypeError, ValueError):
+        chunks = 0
+    try:
+        timestamp = float(raw_job.get("_ts", time.time()) or time.time())
+    except (TypeError, ValueError):
+        timestamp = time.time()
+
+    status = str(raw_job.get("status", "error"))
+    job = {
+        "status": status,
+        "filename": str(raw_job.get("filename", "")),
+        "chunks": chunks,
+        "_ts": timestamp,
+    }
+    if raw_job.get("error"):
+        job["error"] = str(raw_job["error"])
+    if status in {"queued", "processing"}:
+        job["status"] = "error"
+        job["error"] = "Server restarted before this background job finished. Please retry the upload."
+        job["_ts"] = time.time()
+    return job
+
+
+def _load_jobs() -> dict[str, dict]:
+    payload = _load_json_state(_JOBS_PATH, "job")
+    jobs = {}
+    changed = False
+    for job_id, raw_job in payload.items():
+        job = _normalize_job(raw_job)
+        if job is None:
+            changed = True
+            continue
+        if isinstance(raw_job, dict) and raw_job.get("status") in {"queued", "processing"}:
+            changed = True
+        jobs[str(job_id)] = job
+    if changed:
+        try:
+            _atomic_write_json(_JOBS_PATH, jobs)
+        except OSError as exc:
+            logger.warning("Could not persist normalized job state: %s", exc)
+    return jobs
+
 
 # Conversation memory: session_id -> list of {"role": "user/assistant", "content": "..."}
-_conversations: dict[str, list[dict]] = {}
-_MAX_HISTORY_TURNS = 3  # keep last 3 exchanges to stay within token limit
+_conversations: dict[str, list[dict]] = _load_conversations()
+_agent_sessions: dict[str, dict] = _load_agent_sessions()
+_jobs: dict[str, dict] = _load_jobs()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    asyncio.create_task(_get_whisper())
-    yield
+def _persist_conversations_locked() -> None:
+    _atomic_write_json(_CONVERSATIONS_PATH, _conversations)
 
 
-app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc", lifespan=lifespan)
+def _persist_agent_sessions_locked() -> None:
+    _atomic_write_json(_AGENT_SESSIONS_PATH, _agent_sessions)
+
+
+def _persist_jobs_locked() -> None:
+    _atomic_write_json(_JOBS_PATH, _jobs)
+
+
+def _get_conversation_history(session_id: str) -> list[dict]:
+    with _STATE_LOCK:
+        return [dict(turn) for turn in _conversations.get(session_id, [])]
+
+
+async def _save_conversation_history(session_id: str, history: list[dict]) -> None:
+    async with _get_async_lock():
+        _conversations[session_id] = history[-_MAX_HISTORY_TURNS * 2 :]
+        _persist_conversations_locked()
+
+
+async def _delete_conversation_history(session_id: str) -> None:
+    async with _get_async_lock():
+        if session_id in _conversations:
+            del _conversations[session_id]
+            _persist_conversations_locked()
+
+
+async def _save_agent_sessions(sessions: dict[str, dict]) -> None:
+    async with _get_async_lock():
+        _agent_sessions.clear()
+        _agent_sessions.update({str(key): dict(value) for key, value in sessions.items()})
+        _persist_agent_sessions_locked()
+
+
+async def _delete_agent_session(session_id: str) -> None:
+    async with _get_async_lock():
+        if session_id in _agent_sessions:
+            del _agent_sessions[session_id]
+            _persist_agent_sessions_locked()
+
+
+def _set_job(job_id: str, job: dict) -> None:
+    with _STATE_LOCK:
+        _jobs[job_id] = job
+        _persist_jobs_locked()
+
+
+def _get_job(job_id: str) -> dict | None:
+    with _STATE_LOCK:
+        job = _jobs.get(job_id)
+        return dict(job) if job else None
+
+
+app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_csv_env("CORS_ALLOW_ORIGINS", _DEFAULT_CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -71,7 +282,6 @@ from rag import RAGPipeline
 
 _pipeline: RAGPipeline | None = None
 
-_jobs: dict[str, dict] = {}
 _ingest_semaphore: asyncio.Semaphore | None = None
 
 
@@ -98,9 +308,12 @@ def _job_state(status: str, filename: str, chunks: int = 0, error: str | None = 
 
 def _prune_jobs() -> None:
     cutoff = time.time() - _JOB_TTL
-    stale = [jid for jid, j in _jobs.items() if j.get("_ts", 0) < cutoff]
-    for jid in stale:
-        del _jobs[jid]
+    with _STATE_LOCK:
+        stale = [jid for jid, j in _jobs.items() if j.get("_ts", 0) < cutoff]
+        for jid in stale:
+            del _jobs[jid]
+        if stale:
+            _persist_jobs_locked()
     if stale:
         logger.info("Pruned %d stale jobs from _jobs cache.", len(stale))
 
@@ -138,6 +351,49 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     return len(chunks)
 
 
+def _file_too_large_detail(filename: str, size: int) -> str:
+    max_mb = MAX_FILE_SIZE_BYTES / (1024 * 1024)
+    size_mb = size / (1024 * 1024)
+    return f"File '{filename}' is too large ({size_mb:.1f} MB). Maximum allowed: {max_mb:.0f} MB."
+
+
+async def _save_upload_to_temp(file: UploadFile, suffix: str, filename: str) -> str:
+    tmp_path = None
+    bytes_read = 0
+    try:
+        size_header = file.headers.get("content-length")
+        if size_header:
+            try:
+                reported_size = int(size_header)
+            except ValueError:
+                reported_size = 0
+            if reported_size > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=_file_too_large_detail(filename, reported_size),
+                )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            while True:
+                chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > MAX_FILE_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=_file_too_large_detail(filename, bytes_read),
+                    )
+                tmp.write(chunk)
+        return tmp_path
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    finally:
+        await file.close()
+
+
 class AskRequest(BaseModel):
     question: str
     session_id: str = "default"  # optional — frontend can omit it
@@ -151,7 +407,13 @@ class URLRequest(BaseModel):
 # MultiSourceRAG, VideoStore, WebpageStore
 # ══════════════════════════════════════════════════════════════════════════════
 from multi_source_rag import MultiSourceRAG
-from document_loader import load_url_advanced, is_youtube_url, _load_youtube
+from document_loader import (
+    ALLOWED_EXTENSIONS,
+    FileValidationError,
+    MAX_FILE_SIZE_BYTES,
+    _get_whisper_model,
+    load_url_advanced,
+)
 from rag import SectionChunker
 
 _multi_rag: MultiSourceRAG | None = None
@@ -197,9 +459,11 @@ async def upload_video(req: URLRequest):
         chunks = _chunk_transcript(transcript_text, url, title)
         multi.add_video_chunks(url, chunks)
         return {"status": "success", "url": url, "chunks": len(chunks)}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Video upload failed")
-        raise HTTPException(status_code=500, detail=f"Video ingestion failed: {exc}")
+        raise HTTPException(status_code=500, detail="Video ingestion failed unexpectedly.") from exc
 
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
@@ -222,9 +486,11 @@ async def upload_webpage(req: URLRequest):
             chunk.metadata["source_url"] = url
         multi.add_webpage_chunks(url, chunks)
         return {"status": "success", "url": url, "chunks": len(chunks)}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Webpage upload failed")
-        raise HTTPException(status_code=500, detail=f"Webpage ingestion failed: {exc}")
+        raise HTTPException(status_code=500, detail="Webpage ingestion failed unexpectedly.") from exc
 
 
 # ── List videos ──────────────────────────────────────────────────────────────
@@ -273,6 +539,7 @@ def _get_conversation_agent() -> ConversationAgent:
     global _conversation_agent
     if _conversation_agent is None:
         _conversation_agent = ConversationAgent(_get_pipeline()._vector_store, _get_multi_rag())
+        _conversation_agent.restore_sessions(_agent_sessions)
     return _conversation_agent
 
 
@@ -289,14 +556,18 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     # Retrieve or create conversation history for this session
-    history_list = _conversations.get(req.session_id, [])
+    history_list = _get_conversation_history(req.session_id)
     history_str = ""
     for turn in history_list[-_MAX_HISTORY_TURNS * 2 :]:
         history_str += f"{turn['role'].capitalize()}: {turn['content']}\n"
 
     agent = _get_conversation_agent()
     try:
-        result, is_complete = await agent.process_message(req.session_id, req.question, history_str)
+        result, is_complete = await asyncio.wait_for(
+            agent.process_message(req.session_id, req.question, history_str),
+            timeout=_ASK_TIMEOUT_SECONDS,
+        )
+        await _save_agent_sessions(agent.export_sessions())
 
         answer = result.get("message", "")
         options = result.get("options", [])  # list of {id, label, description, recommended}
@@ -304,7 +575,7 @@ async def ask(req: AskRequest):
         # Update conversation memory
         history_list.append({"role": "user", "content": req.question})
         history_list.append({"role": "assistant", "content": answer})
-        _conversations[req.session_id] = history_list[-_MAX_HISTORY_TURNS * 2 :]
+        await _save_conversation_history(req.session_id, history_list)
 
         return {
             "answer": answer,
@@ -312,9 +583,19 @@ async def ask(req: AskRequest):
             "sources": [],
             "conversation_continues": not is_complete,
         }
+    except asyncio.TimeoutError:
+        logger.warning("Conversational ask timed out after %ds", _ASK_TIMEOUT_SECONDS)
+        raise HTTPException(status_code=504, detail="The AI model server is taking too long to respond. Please try again in a moment.")
+    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        logger.warning("Conversational ask failed due to upstream model error: %s", exc)
+        status_code, detail = _describe_llm_failure(exc)
+        raise HTTPException(status_code=status_code, detail=detail) from exc
     except Exception as exc:
         logger.exception("Conversational ask failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="The backend could not generate an answer due to an unexpected internal error.",
+        ) from exc
 
 
 @app.post("/conversation/reset/{session_id}")
@@ -322,19 +603,19 @@ async def reset_conversation(session_id: str):
     """Reset the conversational agent's state for a session (clears pending questions)."""
     agent = _get_conversation_agent()
     agent.reset_session(session_id)
+    await _delete_agent_session(session_id)
     # Also clear the stored conversation history if desired
-    if session_id in _conversations:
-        del _conversations[session_id]
+    await _delete_conversation_history(session_id)
     return {"status": "reset"}
 
 
 @app.delete("/conversation/{session_id}")
 async def clear_conversation(session_id: str):
     """Clear conversation history (legacy endpoint)."""
-    if session_id in _conversations:
-        del _conversations[session_id]
+    await _delete_conversation_history(session_id)
     # Also reset agent state
     _get_conversation_agent().reset_session(session_id)
+    await _delete_agent_session(session_id)
     return {"status": "cleared"}
 
 
@@ -361,7 +642,10 @@ async def ask_documents_only(req: AskRequest):
         raise HTTPException(status_code=status_code, detail=detail) from exc
     except Exception as exc:
         logger.exception("Ask failed unexpectedly")
-        raise HTTPException(status_code=500, detail=f"The backend failed while generating the answer: {exc}") from exc
+        raise HTTPException(
+            status_code=500,
+            detail="The backend could not generate an answer due to an unexpected internal error.",
+        ) from exc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -373,27 +657,26 @@ async def ask_documents_only(req: AskRequest):
 async def upload(file: UploadFile = File(...)):
     _prune_jobs()
     suffix = os.path.splitext(file.filename or "")[1].lower()
-    supported = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".csv", ".txt", ".eml"}
+    supported = ALLOWED_EXTENSIONS
     if suffix not in supported:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
-    content = await file.read()
-    filename = file.filename
+    filename = file.filename or f"upload{suffix}"
+    tmp_path = await _save_upload_to_temp(file, suffix, filename)
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = _job_state("queued", filename)
+    _set_job(job_id, _job_state("queued", filename))
 
     async def _process():
-        tmp_path = None
         try:
             async with _get_ingest_semaphore():
-                _jobs[job_id] = _job_state("processing", filename)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(content)
-                    tmp_path = tmp.name
+                _set_job(job_id, _job_state("processing", filename))
                 chunks = await asyncio.to_thread(_ingest_file, tmp_path, filename)
-                _jobs[job_id] = _job_state("done", filename, chunks=chunks)
+                _set_job(job_id, _job_state("done", filename, chunks=chunks))
                 logger.info("Ingested %s — %d chunks", filename, chunks)
+        except FileValidationError as exc:
+            _set_job(job_id, _job_state("error", filename, error=str(exc)))
+            logger.warning("File validation failed for %s: %s", filename, exc)
         except Exception as exc:
-            _jobs[job_id] = _job_state("error", filename, error=str(exc))
+            _set_job(job_id, _job_state("error", filename, error="Document ingestion failed unexpectedly."))
             logger.exception("Ingest failed for %s", filename)
         finally:
             if tmp_path and os.path.exists(tmp_path):
@@ -405,7 +688,7 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/upload/{job_id}")
 async def upload_status(job_id: str):
-    job = _jobs.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
@@ -419,16 +702,16 @@ async def ingest_url(req: URLRequest):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL — must start with http:// or https://")
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = _job_state("queued", url)
+    _set_job(job_id, _job_state("queued", url))
 
     async def _process():
         try:
-            _jobs[job_id] = _job_state("processing", url)
+            _set_job(job_id, _job_state("processing", url))
             chunks = await asyncio.to_thread(_get_pipeline().add_url, url)
-            _jobs[job_id] = _job_state("done", url, chunks=chunks)
+            _set_job(job_id, _job_state("done", url, chunks=chunks))
             logger.info("Ingested URL %s — %d chunks", url, chunks)
         except Exception as exc:
-            _jobs[job_id] = _job_state("error", url, error=str(exc))
+            _set_job(job_id, _job_state("error", url, error="URL ingestion failed unexpectedly."))
             logger.exception("URL ingest failed for %s", url)
 
     asyncio.create_task(_process())
@@ -471,14 +754,14 @@ async def ask_url(req: AskURLRequest):
             f"Text: {context}\n\n"
             f"Question: {question}\n\nAnswer:"
         )
-        from router import VLLM_HOST, VLLM_MODEL
+        from router import VLLM_API_KEY, VLLM_HOST, VLLM_MODEL
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage
 
         llm = ChatOpenAI(
             model=VLLM_MODEL,
             base_url=f"{VLLM_HOST}/v1",
-            api_key="EMPTY",
+            api_key=VLLM_API_KEY,
             temperature=0.3,
             max_tokens=200,
             timeout=25,
@@ -493,7 +776,7 @@ async def ask_url(req: AskURLRequest):
             yield f"data: {_json.dumps({'error': detail})}\n\n".encode()
         except Exception as exc:
             logger.exception("URL answer generation failed")
-            yield f"data: {_json.dumps({'error': f'Unexpected server error: {exc}'})}\n\n".encode()
+            yield f"data: {_json.dumps({'error': 'Unexpected server error.'})}\n\n".encode()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -512,7 +795,8 @@ async def ask_stream(req: AskRequest):
                 yield chunk
                 await asyncio.sleep(0.01)
         except Exception as exc:
-            yield f"Error: {exc}"
+            logger.exception("Streaming ask failed")
+            yield "Error: The backend could not generate an answer due to an unexpected internal error."
 
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -551,50 +835,15 @@ async def remove_doc(name: str):
     return {"removed": True, "filename": name}
 
 
-# ── Voice transcription (Whisper) – unchanged ────────────────────────────────
-_whisper_lib = None
-_whisper_model = None
-_whisper_lock = asyncio.Lock()
-
-
-def _import_whisper():
-    global _whisper_lib
-    if _whisper_lib is None:
-        try:
-            import whisper as _w
-
-            _whisper_lib = _w
-        except ImportError:
-            raise RuntimeError("openai-whisper is not installed. Run: pip install openai-whisper")
-
-
-def _load_whisper() -> None:
-    global _whisper_model
-    _import_whisper()
-    logger.info("Loading Whisper model (base)...")
-    _whisper_model = _whisper_lib.load_model("base")
-    logger.info("Whisper model loaded.")
-
-
-async def _get_whisper():
-    global _whisper_model
-    async with _whisper_lock:
-        if _whisper_model is None:
-            await asyncio.to_thread(_load_whisper)
-    return _whisper_model
-
-
+# ── Voice transcription (Whisper) ────────────────────────────────────────────
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
     suffix = os.path.splitext(file.filename or "recording.webm")[1].lower()
     if suffix not in {".webm", ".wav", ".mp3", ".m4a"}:
         raise HTTPException(status_code=400, detail="Unsupported audio format. Use webm, wav, mp3, or m4a.")
-    content = await file.read()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+    tmp_path = await _save_upload_to_temp(file, suffix, file.filename or f"recording{suffix}")
     try:
-        model = await _get_whisper()
+        model = await asyncio.to_thread(_get_whisper_model)
         result = await asyncio.to_thread(model.transcribe, tmp_path)
         text = result["text"].strip()
         if not text:

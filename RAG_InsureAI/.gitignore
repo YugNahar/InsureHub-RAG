@@ -6,6 +6,7 @@ __pycache__/
 
 # ChromaDB (vector store data - can be rebuilt)
 app/chroma_db/
+app/state/
 
 # Temp / uploads
 app/video/

@@ -3,7 +3,6 @@ Insurance RAG Pipeline — ChromaDB Vector Edition with HyDE, Hybrid Search, and
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -16,19 +15,14 @@ import pandas as pd
 import requests
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from document_loader import load_document, load_url, extract_urls
 from metadata_tagger import tag_document
-from validator import detect_conflict, validate_grounding, validate_calculation
-from calculator import compute_insurance_benefits
-from router import get_insurance_llm, get_general_llm, get_active_model_info, VLLM_HOST, VLLM_MODEL
+from validator import detect_conflict, validate_grounding
+from router import get_insurance_llm, get_general_llm, VLLM_HOST
 from prompt_template import (
-    SCENARIO_PROMPT,
-    INFORMATIONAL_PROMPT,
-    COMPARISON_PROMPT,
     GENERAL_PROMPT,
     RAG_PROMPT,
 )
@@ -91,35 +85,6 @@ def _detect_section(text: str) -> str:
     return best if scores[best] > 0 else "general"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INTENT DETECTION (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-_INTENT_MAP = [
-    (["hajj", "umrah", "pilgrimage", "mecca"], ["medical", "benefits", "eligibility", "definitions"]),
-    (["flight delay", "trip delay", "delay benefit", "hours delay", "departure delay", "delayed flight", "hours delayed"], ["flight_delay", "benefits"]),
-    (["medical", "hospital", "emergency treatment", "medical expense", "medical evacuation", "repatriation"], ["medical", "benefits"]),
-    (["baggage", "luggage", "personal effects", "baggage loss", "baggage delay", "lost baggage"], ["baggage", "benefits"]),
-    (["minimum age", "max age", "age limit", "how old", "entry age", "insured age", "age of insured"], ["eligibility", "definitions"]),
-    (["eligib", "who can", "qualify", "qualification", "insured person"], ["eligibility", "definitions"]),
-    (["exclusion", "not cover", "not included", "excluded", "except", "what is not", "not payable"], ["exclusions"]),
-    (["claim", "file claim", "how to claim", "claim procedure", "notification", "submit claim", "report"], ["claims", "general"]),
-    (["benefit", "coverage", "covered", "cover", "compensation", "limit", "reimburs", "payable", "sum insured"], ["benefits"]),
-    (["definition", "what is", "what does", "mean", "define", "covered trip", "what counts"], ["definitions", "benefits"]),
-    (["premium", "price", "cost", "rate", "how much does"], ["benefits", "general"]),
-    (["duration", "how long", "trip length", "maximum trip", "days allowed", "consecutive"], ["eligibility", "benefits", "general"]),
-    (["deductible", "excess", "self-insured", "out of pocket"], ["benefits", "definitions"]),
-]
-
-def _detect_intent(query: str) -> list[str]:
-    q = query.lower()
-    sections = []
-    for keywords, sec_list in _INTENT_MAP:
-        if any(_query_contains_term(q, kw) for kw in keywords):
-            for s in sec_list:
-                if s not in sections:
-                    sections.append(s)
-    return sections or ["benefits", "eligibility", "definitions", "exclusions", "claims", "general"]
-
-# ══════════════════════════════════════════════════════════════════════════════
 # DOCUMENT ROUTING (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 _DOCUMENT_ROUTING_MAP = [
@@ -129,27 +94,6 @@ _DOCUMENT_ROUTING_MAP = [
     (["liva"], "LIVA"),
     (["rak"], "RAK"),
 ]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PLAN TIER DETECTION (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-_PLAN_TIERS = {
-    "platinum": ["platinum", "plat"],
-    "gold": ["gold"],
-    "silver": ["silver"],
-    "prime": ["prime"],
-    "enhanced": ["enhanced"],
-    "basic": ["basic"],
-    "standard": ["standard"],
-    "comprehensive": ["comprehensive", "comp"],
-}
-
-def _detect_plan_tier(query: str) -> Optional[str]:
-    q = query.lower()
-    for tier, kws in _PLAN_TIERS.items():
-        if any(kw in q for kw in kws):
-            return tier
-    return None
 
 def _query_contains_term(query_lower: str, term: str) -> bool:
     q = re.sub(r"[_\-]", " ", query_lower)
@@ -200,183 +144,6 @@ def _extract_condition_hint(chunks: list[Document]) -> Optional[str]:
     return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REGEX EXTRACTION (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-_AGE_RE = re.compile(r'\b(\d+\s*(?:days?|years?|months?))\b', re.IGNORECASE)
-_MONEY_RE = re.compile(r'(?<!\d)((?:USD|US\$|\$|QAR|AED|SAR|OMR|BHD|KWD)\s*[\d,]+(?:\.\d+)?)(?!\d)', re.IGNORECASE)
-_PLAIN_AMOUNT_RE = re.compile(r'(?<![,\d\$])(\d{1,3}(?:,\d{3})+)(?!\d)')
-_DURATION_RE = re.compile(r'\b(\d+\s*(?:consecutive\s+)?days?)\b', re.IGNORECASE)
-_PERCENT_RE = re.compile(r'\b(\d+(?:\.\d+)?\s*%)\b')
-
-def _find_amounts(text: str) -> list[str]:
-    with_prefix = _MONEY_RE.findall(text)
-    if with_prefix:
-        return list(dict.fromkeys(with_prefix))
-    plain = _PLAIN_AMOUNT_RE.findall(text)
-    return list(dict.fromkeys(plain))
-
-def _try_regex_extract(query: str, chunks: list[Document]) -> Optional[str]:
-    combined = "\n".join(c.page_content for c in chunks)
-    q = query.lower()
-    if any(w in q for w in ["minimum age", "max age", "age limit", "how old", "entry age"]):
-        matches = list(dict.fromkeys(_AGE_RE.findall(combined)))
-        if matches:
-            return f"AGE VALUES FOUND IN POLICY: {', '.join(matches[:5])}"
-    if any(w in q for w in ["how much", "amount", "limit", "maximum", "coverage amount", "usd", "compensation", "benefit amount", "sum insured"]):
-        matches = _find_amounts(combined)
-        if matches:
-            return f"MONETARY AMOUNTS FOUND IN POLICY: {', '.join(matches[:8])}"
-    if any(w in q for w in ["how long", "duration", "maximum trip", "trip length", "days allowed"]):
-        matches = list(dict.fromkeys(_DURATION_RE.findall(combined)))
-        if matches:
-            return f"DURATION VALUES FOUND IN POLICY: {', '.join(matches[:5])}"
-    return None
-
-def _try_direct_answer(query: str, chunks: list[Document]) -> Optional[str]:
-    q = query.lower()
-    # Age queries
-    if any(w in q for w in ["minimum age", "max age", "age limit", "how old", "entry age", "minimum entry", "age of insured", "age requirement", "how young"]):
-        hits = []
-        for chunk in chunks:
-            sec = chunk.metadata.get("section", "")
-            if sec not in ("eligibility", "definitions", "general"):
-                continue
-            vals = list(dict.fromkeys(_AGE_RE.findall(chunk.page_content)))
-            if vals:
-                src = chunk.metadata.get("source", "Unknown")
-                page = chunk.metadata.get("page", "?")
-                for val in vals:
-                    for sent in re.split(r'[.\n]', chunk.page_content):
-                        if val.lower() in sent.lower() and len(sent.strip()) > 10:
-                            hits.append(f"- **{val}** — _{sent.strip()}_ [Source: {src}, Page {page}]")
-                            break
-                    else:
-                        hits.append(f"- **{val}** [Source: {src}, Page {page}]")
-        if hits:
-            return "**Age values found in policy documents:**\n\n" + "\n".join(hits[:8]) + "\n\n**Confidence:** High"
-    # Emergency Medical
-    if any(w in q for w in ["emergency medical", "medical coverage", "medical expenses", "medical and related", "medical benefit", "medical limit"]):
-        tier = _detect_plan_tier(query)
-        _TIER_COL = {"platinum": 0, "gold": 1, "silver": 2, "prime": 0, "enhanced": 1, "basic": 2}
-        col_idx = _TIER_COL.get(tier) if tier else None
-        _SKIP_KEYWORDS = ["personal accident", "accidental death", "permanent disability", "baggage", "luggage", "trip delay", "flight delay", "cancellation", "passport", "hijacking", "bail bond", "emergency family travel", "family travel", "emergency departure", "missed departure"]
-        _MED_PRIORITY = ["medical expenses", "medical expense", "medical and related"]
-        hits_primary = []
-        hits_secondary = []
-        for chunk in chunks:
-            text = chunk.page_content
-            src = chunk.metadata.get("source", "Unknown")
-            page = chunk.metadata.get("page", "?")
-            for line in text.split("\n"):
-                l_low = line.lower()
-                if not any(kw in l_low for kw in ["medical", "hospital"]):
-                    continue
-                if any(skip in l_low for skip in _SKIP_KEYWORDS):
-                    continue
-                vals = _find_amounts(line)
-                if not vals:
-                    continue
-                if col_idx is not None and len(vals) > col_idx:
-                    chosen = vals[col_idx]
-                    tier_label = ["Platinum", "Gold", "Silver"][col_idx]
-                    entry = f"- **{chosen}** ({tier_label}) — _{line.strip()}_ [Source: {src}, Page {page}]"
-                else:
-                    entry = f"- **{vals[0]}** — _{line.strip()}_ [Source: {src}, Page {page}]"
-                if any(kw in l_low for kw in _MED_PRIORITY):
-                    hits_primary.append(entry)
-                else:
-                    hits_secondary.append(entry)
-        hits = hits_primary + hits_secondary
-        if hits:
-            tier_note = f" ({tier.title()} plan)" if tier else ""
-            return f"**Emergency Medical coverage limits{tier_note}:**\n\n" + "\n".join(list(dict.fromkeys(hits))[:6]) + "\n\n**Confidence:** High"
-    # Monetary limits
-    if any(w in q for w in ["how much", "maximum amount", "coverage amount", "benefit amount", "sum insured", "limit for", "payout", "compensation amount", "maximum coverage", "medical coverage", "emergency medical coverage", "maximum emergency", "maximum medical", "what is the maximum", "coverage limit", "coverage under", "covered under"]):
-        tier = _detect_plan_tier(query)
-        hits_tier = []
-        hits_all = []
-        for chunk in chunks:
-            sec = chunk.metadata.get("section", "")
-            if sec not in ("benefits", "eligibility", "medical", "general", "flight_delay", "baggage"):
-                continue
-            text = chunk.page_content
-            vals = _find_amounts(text)
-            if not vals:
-                continue
-            src = chunk.metadata.get("source", "Unknown")
-            page = chunk.metadata.get("page", "?")
-            for val in vals[:6]:
-                for sent in re.split(r'[.\n]', text):
-                    s_norm = sent.replace(",", "").lower()
-                    v_norm = val.replace(",", "")
-                    if v_norm.lower() in s_norm and len(sent.strip()) > 10:
-                        entry = f"- **{val}** — _{sent.strip()}_ [Source: {src}, Page {page}]"
-                        if tier and tier in sent.lower():
-                            hits_tier.append(entry)
-                        else:
-                            hits_all.append(entry)
-                        break
-                else:
-                    hits_all.append(f"- **{val}** [Source: {src}, Page {page}]")
-        hits = hits_tier + hits_all
-        if hits:
-            tier_note = f" ({tier.title()} plan)" if tier else ""
-            return f"**Coverage amounts / limits found in policy documents{tier_note}:**\n\n" + "\n".join(hits[:8]) + "\n\n**Confidence:** High"
-    # Flight delay
-    if any(w in q for w in ["flight delay", "trip delay", "delay benefit", "hours delay", "departure delay", "delayed"]):
-        hits = []
-        for chunk in chunks:
-            text = chunk.page_content
-            t_low = text.lower()
-            if not any(kw in t_low for kw in ["delay", "departure", "hour"]):
-                continue
-            src = chunk.metadata.get("source", "Unknown")
-            page = chunk.metadata.get("page", "?")
-            hour_vals = re.findall(r'\b(\d+)\s*(?:consecutive\s+)?hours?\b', text, re.IGNORECASE)
-            money_vals = _find_amounts(text)
-            for sent in re.split(r'[.\n]', text):
-                s_low = sent.lower()
-                has_hour = any(str(h) in sent for h in hour_vals)
-                has_money = any(m.replace(",", "") in sent.replace(",", "") for m in money_vals)
-                if (has_hour or has_money) and len(sent.strip()) > 15:
-                    hits.append(f"- _{sent.strip()}_ [Source: {src}, Page {page}]")
-        if hits:
-            return "**Flight/Trip delay terms found in policy:**\n\n" + "\n".join(list(dict.fromkeys(hits))[:6]) + "\n\n**Confidence:** High"
-    # Hajj/Umrah
-    if any(w in q for w in ["hajj", "umrah", "pilgrimage"]):
-        hits = []
-        for chunk in chunks:
-            text = chunk.page_content
-            money_vals = _find_amounts(text)
-            if not money_vals:
-                continue
-            src = chunk.metadata.get("source", "Unknown")
-            page = chunk.metadata.get("page", "?")
-            for sent in re.split(r'[.\n]', text):
-                if any(m.replace(",", "") in sent.replace(",", "") for m in money_vals) and len(sent.strip()) > 15:
-                    hits.append(f"- _{sent.strip()}_ [Source: {src}, Page {page}]")
-        if hits:
-            return "**Coverage limits found for Hajj/Umrah:**\n\n" + "\n".join(list(dict.fromkeys(hits))[:8]) + "\n\n**Confidence:** High"
-    # Duration
-    if any(w in q for w in ["how long", "maximum trip", "trip duration", "days allowed", "trip length", "maximum days", "consecutive days"]):
-        hits = []
-        for chunk in chunks:
-            vals = list(dict.fromkeys(_DURATION_RE.findall(chunk.page_content)))
-            if vals:
-                src = chunk.metadata.get("source", "Unknown")
-                page = chunk.metadata.get("page", "?")
-                for val in vals[:4]:
-                    for sent in re.split(r'[.\n]', chunk.page_content):
-                        if val.lower() in sent.lower() and len(sent.strip()) > 10:
-                            hits.append(f"- **{val}** — _{sent.strip()}_ [Source: {src}, Page {page}]")
-                            break
-                    else:
-                        hits.append(f"- **{val}** [Source: {src}, Page {page}]")
-        if hits:
-            return "**Duration values found in policy documents:**\n\n" + "\n".join(hits[:8]) + "\n\n**Confidence:** High"
-    return None
-
-# ══════════════════════════════════════════════════════════════════════════════
 # KEYWORD EXTRACTION (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 _STOPWORDS = frozenset({
@@ -416,6 +183,27 @@ class SectionChunker:
 # ══════════════════════════════════════════════════════════════════════════════
 # CONTEXT BUILDER (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
+def _chunks_within_context_limit(chunks: list[Document], max_chars: int) -> list[Document]:
+    """Select complete chunks that fit the context budget."""
+    selected = []
+    used_chars = 0
+    for chunk in chunks:
+        source = chunk.metadata.get("source", "Unknown")
+        page = chunk.metadata.get("page", "?")
+        section = chunk.metadata.get("section", "general").title()
+        rendered_length = len(
+            f"[Section: {section} | Source: {source} | Page: {page}]\n{chunk.page_content}"
+        )
+        separator_length = 2 if selected else 0
+        if selected and used_chars + separator_length + rendered_length > max_chars:
+            continue
+        selected.append(chunk)
+        used_chars += separator_length + rendered_length
+        if used_chars >= max_chars:
+            break
+    return selected
+
+
 def _build_structured_context(chunks: list[Document], max_chars: int = MAX_CONTEXT_CHARS) -> str:
     parts = []
     for chunk in chunks:
@@ -433,10 +221,11 @@ def _sources_from_chunks(chunks: list[Document]) -> list[str]:
     for doc in chunks:
         src = doc.metadata.get("source", "Unknown")
         page = doc.metadata.get("page")
-        key = f"{src}_{page}"
+        key = (src, page)
         if key not in seen:
             seen.add(key)
-            result.append(f"{src} (page {page})" if page and page != "?" else src)
+            has_page = page not in (None, "", "?")
+            result.append(f"{src} (page {page})" if has_page else src)
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -580,14 +369,27 @@ class RAGPipeline:
 
     def get_document_tags(self, doc_name: str) -> dict:
         results = self._vector_store.collection.get(where={"source": doc_name}, limit=1, include=["metadatas"])
-        if results["metadatas"]:
+        if results.get("metadatas"):
             meta = results["metadatas"][0]
             return {"insurer": meta.get("insurer", "UNKNOWN"), "policy_type": meta.get("policy_type", "general")}
         return {"insurer": "UNKNOWN", "policy_type": "general"}
 
     def get_full_content(self, source: str) -> str:
-        results = self._vector_store.collection.get(where={"source": source}, include=["documents"])
-        return "\n\n".join(results["documents"])
+        results = self._vector_store.collection.get(
+            where={"source": source},
+            include=["documents", "metadatas"],
+        )
+        documents = results.get("documents") or []
+        metadatas = results.get("metadatas") or [{} for _ in documents]
+
+        def page_key(item: tuple[str, dict]) -> tuple[int, object]:
+            page = item[1].get("page")
+            if isinstance(page, (int, float)):
+                return (0, page)
+            return (1, str(page or ""))
+
+        ordered = sorted(zip(documents, metadatas), key=page_key)
+        return "\n\n".join(document for document, _ in ordered)
 
     def summarize_url(self, url: str) -> tuple[str, list[str]]:
         full_text = self.get_full_content(url)
@@ -607,6 +409,9 @@ class RAGPipeline:
 
     # ── Query entry point (backward compat) ────────────────────────────────
     def query(self, question: str, model: str, allowed_docs: Optional[list[str]] = None) -> tuple[str, list[str], Optional[pd.DataFrame]]:
+        question = question.strip()
+        if not question:
+            return "Question cannot be empty.", [], None
         if _is_all_docs_query(question) and allowed_docs:
             return self._extract_all_docs(question, model, allowed_docs)
         answer, sources = self._rag_query(question, model, allowed_docs=allowed_docs)
@@ -621,54 +426,83 @@ class RAGPipeline:
         )
         llm = get_insurance_llm(temperature=0.5)
         chain = hyde_prompt | llm | StrOutputParser()
+        executor = None
         try:
-            hypo = chain.invoke({"question": question})
+            import concurrent.futures
+
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(chain.invoke, {"question": question})
+            hypo = future.result(timeout=8)
+            logger.debug("HyDE expansion succeeded (%d chars).", len(hypo))
             return [question, hypo[:500]]
-        except Exception:
+        except concurrent.futures.TimeoutError:
+            logger.warning("HyDE timed out after 8s - using original query only.")
             return [question]
+        except Exception as exc:
+            logger.warning("HyDE expansion failed: %s - using original query only.", exc)
+            return [question]
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     def knowledge_query(self, question: str) -> tuple[str, bool, list[str]]:
+        question = question.strip()
+        if not question:
+            return "Question cannot be empty.", False, []
+
+        # URL questions do not depend on the document knowledge base.
+        urls = extract_urls(question)
+        if urls:
+            url = urls[0].rstrip(".,;:!?)]}")
+            q_lower = question.lower()
+            if any(p in q_lower for p in ["full text", "raw text"]):
+                full_text = self.get_full_content(url)
+                if not full_text.strip():
+                    docs = load_url(url)
+                    full_text = "\n\n".join(doc.page_content for doc in docs)
+                return full_text or "No content found for this URL.", False, [url]
+            docs = load_url(url)
+            if docs:
+                context = "\n\n".join(doc.page_content for doc in docs)
+                answer = self._summarize_with_citations(context, question)
+                return answer, False, [url]
+            return "No content found for this URL.", False, [url]
+
         if self._vector_store.count() == 0:
             return "EMPTY_KB", True, []
 
-        # ── URL handling (improved) ────────────────────────────────────────
-        urls = extract_urls(question)
-        if urls:
-            q_lower = question.lower()
-            if any(p in q_lower for p in ["full text", "raw text"]):
-                full_text = self.get_full_content(urls[0])
-                return full_text, False, [urls[0]]
-            # For summary, use the improved loader
-            from document_loader import load_url_advanced
-            docs = load_url_advanced(urls[0])
-            if docs:
-                context = docs[0].page_content
-                answer = self._summarize_with_citations(context, question)
-                return answer, False, [urls[0]]
-
         # ── Query expansion (HyDE) ─────────────────────────────────────────
+        routed_docs = _route_to_documents(question, self.list_documents())
+        filter_meta = self._source_filter(routed_docs)
         expanded_queries = self._expand_query(question)
         all_chunks = []
         for q in expanded_queries:
-            chunks = self._vector_store.search(q, top_k=6, use_hybrid=True, use_reranker=True)
+            chunks = self._vector_store.search(
+                q,
+                top_k=RERANK_K,
+                filter_metadata=filter_meta,
+                use_hybrid=True,
+                use_reranker=True,
+            )
             all_chunks.extend(chunks)
-        # deduplicate by content hash
-        seen = set()
-        unique_chunks = []
-        for c in all_chunks:
-            h = hash(c.page_content[:200])
-            if h not in seen:
-                seen.add(h)
-                unique_chunks.append(c)
-        chunks = unique_chunks[:12]
+        chunks = self._deduplicate_chunks(all_chunks)[:RETRIEVE_K]
 
         if not chunks:
             return "Not mentioned in documents.", False, []
 
+        chunks = _chunks_within_context_limit(chunks, MAX_CONTEXT_CHARS)
         sources = _sources_from_chunks(chunks)
 
         # ── Build context with forced citations ────────────────────────────
         context = _build_structured_context(chunks, max_chars=MAX_CONTEXT_CHARS)
+        condition_hint = _extract_condition_hint(chunks)
+        has_conflict, insurers = detect_conflict(chunks)
+        conflict_hint = ""
+        if has_conflict:
+            conflict_hint = (
+                "The context contains multiple insurers "
+                f"({', '.join(sorted(insurers))}). Keep each insurer's facts separate."
+            )
 
         citation_prompt = f"""You are an Insurance Policy Analyst. Answer based ONLY on the CONTEXT below.
 
@@ -678,6 +512,11 @@ RULES (strictly enforced):
 3. Do not invent any information. If you are unsure, say "Not mentioned in documents."
 4. Format your answer using markdown: headings, bullet points, bold for key numbers.
 5. If the question asks for a calculation, show step‑by‑step using only numbers from context.
+6. Do not combine limits or conditions from different insurers or policy documents.
+
+RETRIEVAL NOTES:
+{condition_hint or "No conditional-clause hint detected."}
+{conflict_hint or "No multi-insurer conflict detected."}
 
 CONTEXT:
 {context}
@@ -697,10 +536,46 @@ ANSWER (with citations):"""
         # Grounding validation
         grounded, missing = validate_grounding(answer, context)
         if not grounded and missing:
-            missing_values = ", ".join(str(m) for m in missing)
+            missing_values = ", ".join(sorted(str(m) for m in missing))
             answer += f"\n\n⚠️ Warning: These figures could not be verified in the source documents: {missing_values}. Please cross-check against the original policy document."
 
         return answer, False, sources
+
+    @staticmethod
+    def _source_filter(sources: Optional[list[str]]) -> Optional[dict]:
+        if not sources:
+            return None
+        unique_sources = list(dict.fromkeys(sources))
+        if len(unique_sources) == 1:
+            return {"source": unique_sources[0]}
+        return {"source": {"$in": unique_sources}}
+
+    @staticmethod
+    def _deduplicate_chunks(chunks: list[Document]) -> list[Document]:
+        unique: dict[tuple[str, object, str], Document] = {}
+        for chunk in chunks:
+            key = (
+                str(chunk.metadata.get("source", "Unknown")),
+                chunk.metadata.get("page"),
+                chunk.page_content,
+            )
+            existing = unique.get(key)
+            chunk_score = chunk.metadata.get("rerank_score", chunk.metadata.get("similarity", 0))
+            existing_score = (
+                existing.metadata.get("rerank_score", existing.metadata.get("similarity", 0))
+                if existing
+                else float("-inf")
+            )
+            if existing is None or chunk_score > existing_score:
+                unique[key] = chunk
+        return sorted(
+            unique.values(),
+            key=lambda chunk: chunk.metadata.get(
+                "rerank_score",
+                chunk.metadata.get("similarity", 0),
+            ),
+            reverse=True,
+        )
 
     def _summarize_with_citations(self, content: str, question: str) -> str:
         prompt = f"""Summarize the following web page content in a detailed, structured way (like Perplexity). Use headings, bullet points, and include all important facts (dates, numbers, names). Do not add external knowledge.
@@ -723,13 +598,11 @@ Detailed summary:"""
 
     def _rag_query(self, question: str, model: str, allowed_docs: Optional[list[str]] = None) -> tuple[str, list[str]]:
         llm = get_insurance_llm(temperature=0)
-        filter_meta = None
-        if allowed_docs:
-            if len(allowed_docs) == 1:
-                filter_meta = {"source": allowed_docs[0]}
-            else:
-                filter_meta = {"source": {"$in": allowed_docs}}
+        filter_meta = self._source_filter(allowed_docs)
         chunks = self._vector_store.search(question, top_k=5, filter_metadata=filter_meta)
+        if not chunks:
+            return "Not mentioned in documents.", []
+        chunks = _chunks_within_context_limit(chunks, MAX_CONTEXT_CHARS)
         context = _build_structured_context(chunks, max_chars=MAX_CONTEXT_CHARS)
         sources = _sources_from_chunks(chunks)
         response = llm.invoke(RAG_PROMPT.format(context=context, question=question))
@@ -760,8 +633,22 @@ Detailed summary:"""
         }
         rows = []
         for doc_name in doc_names:
-            results = self._vector_store.collection.get(where={"source": doc_name}, limit=50, include=["documents"])
-            raw_chunks = results["documents"]
+            results = self._vector_store.collection.get(
+                where={"source": doc_name},
+                limit=50,
+                include=["documents", "metadatas"],
+            )
+            documents = results.get("documents") or []
+            metadatas = results.get("metadatas") or [{} for _ in documents]
+
+            def page_key(item: tuple[str, dict]) -> tuple[int, object]:
+                page = item[1].get("page")
+                if isinstance(page, (int, float)):
+                    return (0, page)
+                return (1, str(page or ""))
+
+            pairs = sorted(zip(documents, metadatas), key=page_key)
+            raw_chunks = [document for document, _ in pairs]
             context = "\n\n".join(raw_chunks)[:6000]
             hints = "\n".join(f"- For {f}: {_FIELD_HINTS[f]}" for f in fields if f in _FIELD_HINTS)
             fields_str = ", ".join(f'"{f}"' for f in fields)
@@ -797,10 +684,12 @@ Detailed summary:"""
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
-        try:
-            m = re.search(r'\{[\s\S]*\}', raw)
-            if m:
-                return json.loads(m.group())
-        except Exception:
-            pass
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", raw):
+            try:
+                parsed, _ = decoder.raw_decode(raw[match.start():])
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
         return {}

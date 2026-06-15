@@ -385,6 +385,14 @@ class ConversationAgent:
         from multi_source_rag import _strip_model_preamble
         return _strip_model_preamble(response.content if hasattr(response, "content") else str(response))
 
+    def restore_sessions(self, sessions: dict[str, dict]) -> None:
+        """Restore persisted sessions on startup."""
+        self.sessions = {str(k): dict(v) for k, v in sessions.items() if isinstance(v, dict)}
+
+    def export_sessions(self) -> dict[str, dict]:
+        """Export sessions for persistence."""
+        return {str(k): dict(v) for k, v in self.sessions.items()}
+
     def reset_session(self, session_id: str) -> None:
         if session_id in self.sessions:
             del self.sessions[session_id]

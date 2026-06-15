@@ -11,6 +11,8 @@ import logging
 import re
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 import requests
 from langchain_core.documents import Document
@@ -18,6 +20,52 @@ from langchain_core.documents import Document
 logger = logging.getLogger(__name__)
 
 _MIN_TEXT_LENGTH = 200
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".docx", ".doc", ".txt", ".html", ".htm",
+    ".xlsx", ".xls", ".pptx", ".ppt", ".csv", ".eml",
+}
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
+
+
+class FileValidationError(ValueError):
+    """Raised when an uploaded file fails validation."""
+
+
+def validate_file(file_path: str, original_name: str) -> None:
+    """Validate a file before processing."""
+    ext = Path(original_name).suffix.lower()
+
+    if ext not in ALLOWED_EXTENSIONS:
+        allowed_types = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise FileValidationError(
+            f"File type '{ext}' is not supported. Allowed types: {allowed_types}"
+        )
+
+    size = os.path.getsize(file_path)
+    if size > MAX_FILE_SIZE_BYTES:
+        raise FileValidationError(
+            f"File '{original_name}' is too large "
+            f"({size / (1024 * 1024):.1f} MB). Maximum allowed: 50 MB."
+        )
+
+    magic_bytes = {
+        ".pdf": [(0, b"%PDF")],
+        ".docx": [(0, b"PK\x03\x04")],
+        ".xlsx": [(0, b"PK\x03\x04")],
+        ".pptx": [(0, b"PK\x03\x04")],
+    }
+    if ext in magic_bytes:
+        with open(file_path, "rb") as f:
+            header = f.read(8)
+        expected = magic_bytes[ext]
+        if not any(
+            header[offset : offset + len(signature)] == signature
+            for offset, signature in expected
+        ):
+            raise FileValidationError(
+                f"File '{original_name}' does not appear to be a valid {ext} file. "
+                "It may be corrupted or misnamed."
+            )
 
 # ── Unit normalisation ────────────────────────────────────────────────────────
 def _normalize_units(text: str) -> str:
@@ -85,7 +133,6 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
 
 def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
     """Download audio from YouTube and transcribe using Whisper."""
-    import whisper
     import yt_dlp
     
     temp_audio_path = None
@@ -136,19 +183,40 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
 
 # Global Whisper model
 _whisper_model = None
-_whisper_lock = None
+_whisper_last_used = 0.0
+_whisper_lock = threading.Lock()
+_WHISPER_TTL_SECONDS = 300
 
 def _get_whisper_model():
-    global _whisper_model, _whisper_lock
-    import asyncio
-    if _whisper_lock is None:
-        _whisper_lock = asyncio.Lock()
-    if _whisper_model is None:
-        import whisper
-        logger.info("Loading Whisper model (base) - first time may take a moment...")
-        _whisper_model = whisper.load_model("base")
-        logger.info("Whisper model loaded successfully.")
-    return _whisper_model
+    global _whisper_model, _whisper_last_used
+    with _whisper_lock:
+        _whisper_last_used = time.time()
+        if _whisper_model is None:
+            import whisper
+
+            logger.info("Loading Whisper model (base)...")
+            _whisper_model = whisper.load_model("base")
+            logger.info("Whisper model loaded.")
+            threading.Thread(target=_whisper_cleanup_loop, daemon=True).start()
+        return _whisper_model
+
+
+def _whisper_cleanup_loop():
+    """Unload Whisper from RAM after the idle TTL expires."""
+    global _whisper_model
+    while True:
+        time.sleep(60)
+        with _whisper_lock:
+            if (
+                _whisper_model is not None
+                and time.time() - _whisper_last_used > _WHISPER_TTL_SECONDS
+            ):
+                _whisper_model = None
+                logger.info(
+                    "Whisper model unloaded (idle > %ds).",
+                    _WHISPER_TTL_SECONDS,
+                )
+                break
 
 
 def _load_youtube(url: str) -> list[Document]:
@@ -176,11 +244,7 @@ def _load_generic_video(url: str) -> list[Document]:
     Download audio from any video URL (Vimeo, Dailymotion, etc.) using yt-dlp,
     transcribe with Whisper, and return Document.
     """
-    import whisper
     import yt_dlp
-    import tempfile
-    import os
-    import re
 
     temp_audio_path = None
     try:
@@ -351,6 +415,7 @@ def load_url(url: str) -> list[Document]:
 # MAIN DOCUMENT DISPATCHER (unchanged from original)
 # ══════════════════════════════════════════════════════════════════════════════
 def load_document(file_path: str, original_name: str) -> list[Document]:
+    validate_file(file_path, original_name)
     ext = Path(original_name).suffix.lower()
     try:
         if ext in (".txt", ".html", ".htm"):
