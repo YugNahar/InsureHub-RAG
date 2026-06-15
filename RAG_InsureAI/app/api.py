@@ -224,8 +224,8 @@ def _persist_jobs_locked() -> None:
     _atomic_write_json(_JOBS_PATH, _jobs)
 
 
-def _get_conversation_history(session_id: str) -> list[dict]:
-    with _STATE_LOCK:
+async def _get_conversation_history(session_id: str) -> list[dict]:
+    async with _get_async_lock():
         return [dict(turn) for turn in _conversations.get(session_id, [])]
 
 
@@ -256,19 +256,38 @@ async def _delete_agent_session(session_id: str) -> None:
             _persist_agent_sessions_locked()
 
 
-def _set_job(job_id: str, job: dict) -> None:
-    with _STATE_LOCK:
+async def _set_job(job_id: str, job: dict) -> None:
+    async with _get_async_lock():
         _jobs[job_id] = job
         _persist_jobs_locked()
 
 
-def _get_job(job_id: str) -> dict | None:
-    with _STATE_LOCK:
+async def _get_job(job_id: str) -> dict | None:
+    async with _get_async_lock():
         job = _jobs.get(job_id)
         return dict(job) if job else None
 
 
 app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc")
+
+
+@app.on_event("startup")
+async def _init_async_lock():
+    global _ASYNC_STATE_LOCK
+    _ASYNC_STATE_LOCK = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def _start_job_pruner():
+    """Periodically prune stale jobs from memory (every 5 minutes)."""
+    async def _prune_loop():
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            try:
+                await _prune_jobs()
+            except Exception:
+                logger.exception("Periodic job pruner failed")
+    app.state.job_pruner_task = asyncio.create_task(_prune_loop())
 
 app.add_middleware(
     CORSMiddleware,
@@ -306,9 +325,9 @@ def _job_state(status: str, filename: str, chunks: int = 0, error: str | None = 
     return job
 
 
-def _prune_jobs() -> None:
+async def _prune_jobs() -> None:
     cutoff = time.time() - _JOB_TTL
-    with _STATE_LOCK:
+    async with _get_async_lock():
         stale = [jid for jid, j in _jobs.items() if j.get("_ts", 0) < cutoff]
         for jid in stale:
             del _jobs[jid]
@@ -340,14 +359,17 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
 
     pipeline = _get_pipeline()
     raw_docs = load_document(tmp_path, filename)
-    chunks = pipeline._chunker.split_documents(raw_docs)
-    pipeline._vector_store.delete_by_source(filename)
+    chunks = pipeline.chunker.split_documents(raw_docs)
+    # Use a unique source key per upload so identical filenames don't collide.
+    upload_id = uuid.uuid4().hex[:12]
+    unique_source = f"{upload_id}_{filename}"
     preview = raw_docs[0].page_content[:600] if raw_docs else ""
     doc_tags = tag_document(filename, preview)
     for chunk in chunks:
-        chunk.metadata["source"] = filename
+        chunk.metadata["source"] = unique_source
+        chunk.metadata["filename"] = filename
         chunk.metadata.update(doc_tags)
-    pipeline._vector_store.add_documents(chunks)
+    pipeline.vector_store.add_documents(chunks)
     return len(chunks)
 
 
@@ -538,7 +560,7 @@ _conversation_agent: ConversationAgent | None = None
 def _get_conversation_agent() -> ConversationAgent:
     global _conversation_agent
     if _conversation_agent is None:
-        _conversation_agent = ConversationAgent(_get_pipeline()._vector_store, _get_multi_rag())
+        _conversation_agent = ConversationAgent(_get_pipeline().vector_store, _get_multi_rag())
         _conversation_agent.restore_sessions(_agent_sessions)
     return _conversation_agent
 
@@ -556,7 +578,7 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     # Retrieve or create conversation history for this session
-    history_list = _get_conversation_history(req.session_id)
+    history_list = await _get_conversation_history(req.session_id)
     history_str = ""
     for turn in history_list[-_MAX_HISTORY_TURNS * 2 :]:
         history_str += f"{turn['role'].capitalize()}: {turn['content']}\n"
@@ -631,7 +653,7 @@ async def ask_documents_only(req: AskRequest):
     try:
         answer, _, _ = await asyncio.wait_for(
             asyncio.to_thread(_get_pipeline().knowledge_query, req.question),
-            timeout=150,
+            timeout=_ASK_TIMEOUT_SECONDS,
         )
         return {"answer": answer}
     except asyncio.TimeoutError:
@@ -655,7 +677,7 @@ async def ask_documents_only(req: AskRequest):
 # ── Upload (async) ────────────────────────────────────────────────────────────
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    _prune_jobs()
+    await _prune_jobs()
     suffix = os.path.splitext(file.filename or "")[1].lower()
     supported = ALLOWED_EXTENSIONS
     if suffix not in supported:
@@ -663,20 +685,20 @@ async def upload(file: UploadFile = File(...)):
     filename = file.filename or f"upload{suffix}"
     tmp_path = await _save_upload_to_temp(file, suffix, filename)
     job_id = str(uuid.uuid4())
-    _set_job(job_id, _job_state("queued", filename))
+    await _set_job(job_id, _job_state("queued", filename))
 
     async def _process():
         try:
             async with _get_ingest_semaphore():
-                _set_job(job_id, _job_state("processing", filename))
+                await _set_job(job_id, _job_state("processing", filename))
                 chunks = await asyncio.to_thread(_ingest_file, tmp_path, filename)
-                _set_job(job_id, _job_state("done", filename, chunks=chunks))
+                await _set_job(job_id, _job_state("done", filename, chunks=chunks))
                 logger.info("Ingested %s — %d chunks", filename, chunks)
         except FileValidationError as exc:
-            _set_job(job_id, _job_state("error", filename, error=str(exc)))
+            await _set_job(job_id, _job_state("error", filename, error=str(exc)))
             logger.warning("File validation failed for %s: %s", filename, exc)
         except Exception as exc:
-            _set_job(job_id, _job_state("error", filename, error="Document ingestion failed unexpectedly."))
+            await _set_job(job_id, _job_state("error", filename, error="Document ingestion failed unexpectedly."))
             logger.exception("Ingest failed for %s", filename)
         finally:
             if tmp_path and os.path.exists(tmp_path):
@@ -688,7 +710,7 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/upload/{job_id}")
 async def upload_status(job_id: str):
-    job = _get_job(job_id)
+    job = await _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
@@ -697,21 +719,22 @@ async def upload_status(job_id: str):
 # ── Ingest URL (async) ────────────────────────────────────────────────────────
 @app.post("/ingest-url")
 async def ingest_url(req: URLRequest):
-    _prune_jobs()
+    await _prune_jobs()
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL — must start with http:// or https://")
     job_id = str(uuid.uuid4())
-    _set_job(job_id, _job_state("queued", url))
+    await _set_job(job_id, _job_state("queued", url))
 
     async def _process():
         try:
-            _set_job(job_id, _job_state("processing", url))
-            chunks = await asyncio.to_thread(_get_pipeline().add_url, url)
-            _set_job(job_id, _job_state("done", url, chunks=chunks))
-            logger.info("Ingested URL %s — %d chunks", url, chunks)
-        except Exception as exc:
-            _set_job(job_id, _job_state("error", url, error="URL ingestion failed unexpectedly."))
+            async with _get_ingest_semaphore():
+                await _set_job(job_id, _job_state("processing", url))
+                chunks = await asyncio.to_thread(_get_pipeline().add_url, url)
+                await _set_job(job_id, _job_state("done", url, chunks=chunks))
+                logger.info("Ingested URL %s — %d chunks", url, chunks)
+        except Exception:
+            await _set_job(job_id, _job_state("error", url, error="URL ingestion failed unexpectedly."))
             logger.exception("URL ingest failed for %s", url)
 
     asyncio.create_task(_process())
@@ -727,7 +750,8 @@ class AskURLRequest(BaseModel):
 async def fetch_url_text_async(url: str, max_chars: int = 1500) -> str:
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                resp.raise_for_status()
                 html = await resp.text()
         soup = BeautifulSoup(html, "lxml")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
@@ -790,10 +814,16 @@ async def ask_stream(req: AskRequest):
     async def generate():
         pipeline = _get_pipeline()
         try:
-            answer, _, _ = await asyncio.to_thread(pipeline.knowledge_query, req.question)
+            answer, _, _ = await asyncio.wait_for(
+                asyncio.to_thread(pipeline.knowledge_query, req.question),
+                timeout=_ASK_TIMEOUT_SECONDS,
+            )
             for chunk in [answer[i:i+30] for i in range(0, len(answer), 30)]:
                 yield chunk
                 await asyncio.sleep(0.01)
+        except asyncio.TimeoutError:
+            logger.warning("Streaming ask timed out after %ds", _ASK_TIMEOUT_SECONDS)
+            yield "Error: The AI model server is taking too long to respond. Please try again in a moment."
         except Exception as exc:
             logger.exception("Streaming ask failed")
             yield "Error: The backend could not generate an answer due to an unexpected internal error."
@@ -805,17 +835,17 @@ async def ask_stream(req: AskRequest):
 @app.get("/docs")
 async def list_docs():
     pipeline = _get_pipeline()
-    sources = pipeline.list_documents()
+    filenames = pipeline.vector_store.list_values("filename")
     counts = {}
     try:
-        all_meta = pipeline._vector_store.collection.get(include=["metadatas"])
+        all_meta = pipeline.vector_store.collection.get(include=["metadatas"])
         for meta in all_meta["metadatas"]:
-            src = meta.get("source")
-            if src:
-                counts[src] = counts.get(src, 0) + 1
+            fn = meta.get("filename")
+            if fn:
+                counts[fn] = counts.get(fn, 0) + 1
     except Exception:
         pass
-    documents = [f"{s} ({counts.get(s, 0)} chunks)" for s in sources]
+    documents = [f"{s} ({counts.get(s, 0)} chunks)" for s in filenames]
     return {"documents": documents}
 
 
@@ -828,10 +858,10 @@ async def clear_docs():
 @app.delete("/docs/{name:path}")
 async def remove_doc(name: str):
     pipeline = _get_pipeline()
-    sources_before = set(pipeline.list_documents())
-    await asyncio.to_thread(pipeline.remove_document, name)
-    if name not in sources_before:
+    filenames_before = set(pipeline.vector_store.list_values("filename"))
+    if name not in filenames_before:
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found.")
+    pipeline.vector_store.delete_by_field("filename", name)
     return {"removed": True, "filename": name}
 
 
@@ -863,4 +893,4 @@ async def transcribe_audio(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
     pipeline = _get_pipeline()
-    return {"status": "ok", "chunks": pipeline._vector_store.count()}
+    return {"status": "ok", "chunks": pipeline.vector_store.count()}

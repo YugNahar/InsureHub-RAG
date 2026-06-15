@@ -23,12 +23,12 @@ services:
       - ./app:/app
       - upload_data:/tmp/uploads
       - whisper_cache:/root/.cache/whisper
-      - chroma_data:/app/chroma_db
+      - turbovec_data:/app/turbovec_data
       - hf_cache:/root/.cache/huggingface
     restart: unless-stopped
 
 volumes:
   upload_data:
   whisper_cache:
-  chroma_data:
+  turbovec_data:
   hf_cache:

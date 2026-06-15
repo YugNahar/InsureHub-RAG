@@ -109,7 +109,7 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
             language_code = transcript.language_code
             logger.info(f"Using manual transcript in {language_code} for {video_id}")
             return transcript_text, {"source_type": "youtube_manual", "language": language_code}
-        except:
+        except Exception:
             pass
         try:
             transcript = transcript_list.find_generated_transcript()
@@ -117,7 +117,7 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
             language_code = transcript.language_code
             logger.info(f"Using auto-generated transcript in {language_code} for {video_id}")
             return transcript_text, {"source_type": "youtube_auto", "language": language_code}
-        except:
+        except Exception:
             pass
         for transcript in transcript_list:
             transcript_text = " ".join(entry["text"] for entry in transcript.fetch())

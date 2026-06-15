@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 .venv/
 
-# ChromaDB (vector store data - can be rebuilt)
+# Vector store data (can be rebuilt)
 app/chroma_db/
+app/turbovec_data/
 app/state/
 
 # Temp / uploads

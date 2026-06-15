@@ -13,11 +13,12 @@ User / Frontend
       ▼
 FastAPI (REST API — port 8502)
       │
-      ├── Document Ingestion → ChromaDB (Vector Store)
+      ├── Document Ingestion → TurboVec Index (Vector Store)
+      │                         └── 4-bit quantization, ~4GB RAM, no GPU
       │
       └── Query Pipeline
               ├── HyDE Query Expansion
-              ├── Hybrid Search (Dense + BM25)
+              ├── Hybrid Search (Dense via TurboVec + BM25)
               ├── Cross-Encoder Reranking
               └── vLLM (LLM Server — remote)
 ```
@@ -37,10 +38,11 @@ FastAPI (REST API — port 8502)
 ### Vector Store & Retrieval
 | Component | Detail |
 |---|---|
-| **ChromaDB** | Persistent local vector database storing document chunks |
+| **TurboVec (TurboQuantIndex)** | Ultra-fast ANN vector index with 4-bit quantization — ~4GB RAM instead of ~31GB. No GPU required. ARM-compatible. Air-gap safe. |
+| **IdMapIndex** | TurboVec wrapper for O(1) external ID mapping — enables stable document IDs through deletes |
 | **BAAI/bge-base-en-v1.5** | Sentence embedding model — converts text to vectors for semantic search |
 | **BM25 (rank-bm25)** | Keyword-based retrieval — complements dense search for exact term matching |
-| **Hybrid Search** | Merges dense (semantic) + BM25 (keyword) results for better recall |
+| **Hybrid Search** | Merges dense (TurboVec semantic) + BM25 (keyword) results for better recall |
 | **Cross-Encoder Reranker** | `BAAI/bge-reranker-base` — re-scores candidates to surface the most relevant chunks |
 
 ### Query Pipeline
@@ -83,7 +85,7 @@ FastAPI (REST API — port 8502)
 | Component | Detail |
 |---|---|
 | **Docker** | Entire app runs in a container |
-| **Docker Compose** | Orchestrates the API container with volumes for ChromaDB, Whisper cache, HuggingFace cache |
+| **Docker Compose** | Orchestrates the API container with volumes for TurboVec data, Whisper cache, HuggingFace cache |
 | **Python 3.11** | Base runtime |
 
 ---
@@ -91,8 +93,10 @@ FastAPI (REST API — port 8502)
 ## Key Design Decisions
 
 - **No cloud LLM dependency** — vLLM runs on a private GPU server; no data leaves your infrastructure to a third-party AI provider.
+- **TurboVec over ChromaDB** — switched to TurboQuantIndex for the dense ANN store. 4-bit quantization brings memory from ~31GB down to ~4GB, with no GPU required and full ARM compatibility. Ideal for air-gapped and privacy-sensitive deployments.
 - **Hybrid retrieval** — pure semantic search misses exact policy numbers and clause references; BM25 catches those.
 - **Reranking** — retrieval returns many candidates; the cross-encoder reranker picks the most relevant ones before sending to the LLM, reducing hallucination.
 - **Grounding check** — after the LLM answers, the system verifies that every number in the answer exists in the retrieved context. Unverified figures trigger a warning.
 - **TTL job cache** — background ingest jobs auto-expire after 1 hour to prevent memory leaks.
-- **Lifespan startup** — Whisper model is pre-loaded at startup so the first transcription request is instant.
+- **Split locking** — `asyncio.Lock` for async endpoint handlers, `threading.RLock` for background thread operations, preventing deadlocks in concurrent access.
+- **Lazy Whisper load** — Whisper model is loaded on the first transcription request only, keeping initial startup fast.

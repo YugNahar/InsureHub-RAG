@@ -1,5 +1,5 @@
 """
-Insurance RAG Pipeline — ChromaDB Vector Edition with HyDE, Hybrid Search, and Citation Enforcement.
+Insurance RAG Pipeline — TurboVec Vector Edition with HyDE, Hybrid Search, and Citation Enforcement.
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from typing import Optional
 
 import pandas as pd
@@ -321,12 +322,22 @@ def list_vllm_models() -> list[str]:
         return []
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAG PIPELINE — ChromaDB Vector Edition with HyDE, Hybrid Search, Citation
+# RAG PIPELINE — TurboVec Vector Edition with HyDE, Hybrid Search, Citation
 # ══════════════════════════════════════════════════════════════════════════════
 class RAGPipeline:
     def __init__(self):
         self._vector_store = ChromaVectorStore()
         self._chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
+
+    @property
+    def vector_store(self):
+        """Public accessor for the underlying vector store."""
+        return self._vector_store
+
+    @property
+    def chunker(self):
+        """Public accessor for the document chunker."""
+        return self._chunker
 
     # ── Document ingestion ─────────────────────────────────────────────────
     def add_document(self, uploaded_file) -> int:
@@ -337,11 +348,13 @@ class RAGPipeline:
         try:
             raw_docs = load_document(tmp_path, uploaded_file.name)
             chunks = self._chunker.split_documents(raw_docs)
-            self._vector_store.delete_by_source(uploaded_file.name)
+            upload_id = uuid.uuid4().hex[:12]
+            unique_source = f"{upload_id}_{uploaded_file.name}"
             preview = raw_docs[0].page_content[:600] if raw_docs else ""
             doc_tags = tag_document(uploaded_file.name, preview)
             for chunk in chunks:
-                chunk.metadata["source"] = uploaded_file.name
+                chunk.metadata["source"] = unique_source
+                chunk.metadata["filename"] = uploaded_file.name
                 chunk.metadata.update(doc_tags)
             self._vector_store.add_documents(chunks)
             return len(chunks)
@@ -351,24 +364,27 @@ class RAGPipeline:
     def add_url(self, url: str) -> int:
         docs = load_url(url)
         chunks = self._chunker.split_documents(docs)
-        self._vector_store.delete_by_source(url)
+        upload_id = uuid.uuid4().hex[:12]
+        unique_source = f"{upload_id}_{url[:40]}"
+        self._vector_store.delete_by_field("source_url", url)
         for chunk in chunks:
-            chunk.metadata["source"] = url
+            chunk.metadata["source"] = unique_source
+            chunk.metadata["source_url"] = url
         self._vector_store.add_documents(chunks)
         return len(chunks)
 
     # ── Document management ─────────────────────────────────────────────────
     def list_documents(self) -> list[str]:
-        return self._vector_store.list_sources()
+        return self._vector_store.list_values("filename")
 
     def clear_documents(self) -> None:
         self._vector_store.delete_all()
 
     def remove_document(self, doc_name: str) -> None:
-        self._vector_store.delete_by_source(doc_name)
+        self._vector_store.delete_by_field("filename", doc_name)
 
     def get_document_tags(self, doc_name: str) -> dict:
-        results = self._vector_store.collection.get(where={"source": doc_name}, limit=1, include=["metadatas"])
+        results = self._vector_store.collection.get(where={"filename": doc_name}, limit=1, include=["metadatas"])
         if results.get("metadatas"):
             meta = results["metadatas"][0]
             return {"insurer": meta.get("insurer", "UNKNOWN"), "policy_type": meta.get("policy_type", "general")}
@@ -376,7 +392,7 @@ class RAGPipeline:
 
     def get_full_content(self, source: str) -> str:
         results = self._vector_store.collection.get(
-            where={"source": source},
+            where={"filename": source},
             include=["documents", "metadatas"],
         )
         documents = results.get("documents") or []
@@ -634,7 +650,7 @@ Detailed summary:"""
         rows = []
         for doc_name in doc_names:
             results = self._vector_store.collection.get(
-                where={"source": doc_name},
+                where={"filename": doc_name},
                 limit=50,
                 include=["documents", "metadatas"],
             )

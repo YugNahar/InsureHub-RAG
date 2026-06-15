@@ -32,13 +32,27 @@ def detect_conflict(chunks) -> Tuple[bool, List[str]]:
 
 
 def validate_calculation(answer: str, context: str) -> Tuple[bool, str]:
-    """Check that any calculation result appears grounded."""
+    """Check that any calculation result appears grounded.
+    Normalizes numbers by parsing to float before comparing so that
+    '250.0' matches '250' and vice versa.
+    """
     calc_pattern = r'(?:=|\bresult:?\s*)(\d+(?:\.\d+)?)'
     matches = re.findall(calc_pattern, answer, re.IGNORECASE)
     if not matches:
         return True, ""
-    context_nums = extract_numerical_claims(context)
+    # Normalize context numbers to float for comparison
+    context_nums_raw = extract_numerical_claims(context)
+    context_nums = set()
+    for n in context_nums_raw:
+        try:
+            context_nums.add(str(float(n)))
+        except ValueError:
+            context_nums.add(n)
     for m in matches:
-        if m not in context_nums:
+        try:
+            normalized = str(float(m))
+        except ValueError:
+            normalized = m
+        if normalized not in context_nums:
             return False, f"Calculation result '{m}' not found in source context."
     return True, ""

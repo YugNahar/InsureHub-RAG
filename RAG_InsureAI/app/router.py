@@ -4,8 +4,11 @@ Router — LLM routing based on query type.
 import os
 from langchain_openai import ChatOpenAI
 
-VLLM_HOST  = os.environ["VLLM_HOST"]
-VLLM_MODEL = os.environ["VLLM_MODEL"]
+VLLM_HOST = os.getenv("VLLM_HOST")
+VLLM_MODEL = os.getenv("VLLM_MODEL")
+
+if not VLLM_HOST or not VLLM_MODEL:
+    raise RuntimeError("VLLM_HOST and VLLM_MODEL must be configured")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "EMPTY"
 
 def get_insurance_llm(temperature: float = 0) -> ChatOpenAI:

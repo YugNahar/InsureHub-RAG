@@ -230,7 +230,7 @@ Normal. The embedding and reranker models are loaded into memory on the first re
 **Getting "could not connect to model server" errors**
 The vLLM server is unreachable. Test with `curl http://<vllm-host>:7000/v1/models` and check that the host/port in `docker-compose.yml` is correct.
 
-**ChromaDB is empty after I restarted**
+**Knowledge base appears empty after a restart**
 If you ran `docker compose down -v`, that deletes the volumes including your document store. Use `docker compose down` (without `-v`) to preserve data between restarts.
 
 **Voice transcription isn't working**
@@ -244,7 +244,7 @@ All persistent data lives in Docker named volumes, not inside the container imag
 
 | What | Where it's stored |
 |------|------------------|
-| Uploaded documents (ChromaDB) | `chroma_data` volume |
+| Uploaded documents (TurboVec index + metadata) | `turbovec_data` volume |
 | Embedding + reranker models | `hf_cache` volume |
 | Whisper model | `whisper_cache` volume |
 | Temporary file uploads | `upload_data` volume |

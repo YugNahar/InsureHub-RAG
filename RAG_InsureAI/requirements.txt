@@ -7,13 +7,13 @@ langchain-text-splitters>=0.2.0
 openai>=1.0.0
 
 # ── Vector Store ──────────────────────────────────────────────────────────────
-chromadb>=0.5.0
+# TurboVec replaces ChromaDB — 4-bit quantization, no GPU, ARM-compatible
+turbovec>=0.1.0
 
 # ── Embeddings & Reranking ────────────────────────────────────────────────────
 sentence-transformers>=2.2.0
 numpy>=1.24.0
 rank-bm25>=0.2.2
-sentence-transformers>=2.2.0
 
 # ── Document Extraction ───────────────────────────────────────────────────────
 docling>=2.5.0
@@ -44,7 +44,7 @@ rapidfuzz>=3.0.0
 
 # ── Voice Transcription ───────────────────────────────────────────────────────
 openai-whisper>=20231117
-# ── YouTube Audio Download & Transcription ─────────────────────────────────────
+
+# ── YouTube Audio Download ────────────────────────────────────────────────────
 yt-dlp>=2024.12.0
-openai-whisper>=20231117
 ffmpeg-python>=0.2.0

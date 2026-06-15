@@ -166,7 +166,7 @@ class ConversationAgent:
             return "home", "Home"
         if any(w in q for w in ["accident", "disability", "personal"]):
             return "personal", "Personal"
-        return "unclear", None
+        return "unclear", "General"
 
     def _get_all_main_categories(self) -> List[dict]:
         """Return all main categories (no sub‑options)."""
@@ -209,7 +209,7 @@ class ConversationAgent:
         This prevents common words like "travel", "home", "car" from falsely
         triggering a document filter on general questions.
         """
-        all_sources = self.vector_store.list_sources() if self.vector_store else []
+        all_sources = self.vector_store.list_filenames() if hasattr(self.vector_store, "list_filenames") else (self.vector_store.list_sources() if self.vector_store else [])
         if not all_sources:
             return []
         q_lower = question.lower()
@@ -367,7 +367,10 @@ class ConversationAgent:
         policy_type = type_map.get(sub_option_label.lower().replace(" ", "_"), category_id)
         query = original_question or f"Tell me about {sub_option_label} insurance details, coverage, limits, exclusions."
         filter_meta = {"policy_type": policy_type}
-        chunks = self.vector_store.search(query, top_k=6, filter_metadata=filter_meta, use_hybrid=True, use_reranker=True)
+        chunks = await asyncio.to_thread(
+            self.vector_store.search,
+            query, top_k=6, filter_metadata=filter_meta, use_hybrid=True, use_reranker=True,
+        )
         if not chunks:
             return f"Thank you for your interest in {sub_option_label}. I couldn't find specific policy documents in the knowledge base. Please upload relevant insurance documents first."
 
