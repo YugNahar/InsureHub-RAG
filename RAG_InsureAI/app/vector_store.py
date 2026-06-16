@@ -54,12 +54,14 @@ class ChromaVectorStore:
     def delete_all(self):
         self._store.delete_all()
 
+    def list_values(self, field: str) -> List[str]:
+        return self._store.list_values(field)
+
     def list_sources(self) -> List[str]:
         return self._store.list_values("source")
 
     def list_filenames(self) -> List[str]:
         return self._store.list_values("filename")
-
     def count(self) -> int:
         return self._store.count()
 
