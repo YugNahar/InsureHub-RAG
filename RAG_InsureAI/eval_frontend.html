@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>InsureHub — RAG Evaluator</title>
+<style>
+  :root {
+    --bg: #f7f7f5;
+    --surface: #ffffff;
+    --surface2: #f2f1ef;
+    --border: rgba(0,0,0,0.1);
+    --border2: rgba(0,0,0,0.18);
+    --text: #1a1a18;
+    --text2: #6b6b65;
+    --text3: #9b9b95;
+    --accent: #1a6b4a;
+    --accent-bg: #e6f5ee;
+    --warn: #b45309;
+    --warn-bg: #fef3c7;
+    --danger: #991b1b;
+    --danger-bg: #fee2e2;
+    --info: #1e40af;
+    --info-bg: #dbeafe;
+    --radius: 10px;
+    --radius-sm: 6px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111110;
+      --surface: #1c1c1a;
+      --surface2: #242422;
+      --border: rgba(255,255,255,0.09);
+      --border2: rgba(255,255,255,0.16);
+      --text: #e8e8e2;
+      --text2: #9b9b95;
+      --text3: #6b6b65;
+      --accent: #4ade80;
+      --accent-bg: #052e16;
+      --warn: #fbbf24;
+      --warn-bg: #292114;
+      --danger: #f87171;
+      --danger-bg: #290a0a;
+      --info: #60a5fa;
+      --info-bg: #0c1a36;
+    }
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.6; min-height: 100vh; }
+  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+  /* Sidebar */
+  .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 0; display: flex; flex-direction: column; }
+  .sidebar-header { padding: 20px 20px 16px; border-bottom: 1px solid var(--border); }
+  .logo { font-size: 15px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
+  .logo span { color: var(--accent); }
+  .sidebar-section { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .sidebar-label { font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 10px; }
+  /* Upload zone */
+  .upload-zone { border: 1.5px dashed var(--border2); border-radius: var(--radius); padding: 20px 16px; text-align: center; cursor: pointer; background: var(--surface2); transition: border-color .15s, background .15s; }
+  .upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: var(--accent-bg); }
+  .upload-zone .icon { font-size: 24px; margin-bottom: 6px; }
+  .upload-zone p { font-size: 12px; color: var(--text2); }
+  .upload-zone strong { color: var(--text); font-size: 13px; }
+  #file-input { display: none; }
+  .file-pill { display: flex; align-items: center; gap: 8px; background: var(--accent-bg); border: 1px solid var(--accent); border-radius: var(--radius-sm); padding: 8px 10px; margin-top: 8px; display: none; }
+  .file-pill .name { font-size: 12px; font-weight: 500; color: var(--accent); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-pill .rm { cursor: pointer; color: var(--text3); font-size: 16px; line-height: 1; }
+  /* Doc list */
+  .doc-item { display: flex; align-items: center; gap: 6px; padding: 5px 0; font-size: 12px; }
+  .doc-item .src { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); }
+  .doc-item .del { color: var(--text3); cursor: pointer; font-size: 15px; }
+  .doc-item .del:hover { color: var(--danger); }
+  .doc-empty { font-size: 12px; color: var(--text3); padding: 4px 0; }
+  /* Config */
+  .config-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; color: var(--text2); }
+  .config-row select, .config-row input[type=number] { padding: 3px 6px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: 12px; font-family: var(--font); }
+  .toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text2); cursor: pointer; }
+  .toggle input { accent-color: var(--accent); cursor: pointer; }
+  /* API url */
+  .api-input { width: 100%; padding: 5px 8px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: 11px; font-family: var(--mono); }
+  /* Main area */
+  .main { display: flex; flex-direction: column; }
+  .topbar { display: flex; align-items: center; gap: 10px; padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .query-input { flex: 1; height: 38px; padding: 0 14px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-size: 14px; font-family: var(--font); }
+  .query-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(26,107,74,.12); }
+  .run-btn { height: 38px; padding: 0 20px; border-radius: var(--radius-sm); border: none; background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: opacity .15s; }
+  .run-btn:hover { opacity: .88; }
+  .run-btn:disabled { opacity: .4; cursor: not-allowed; }
+  /* Content */
+  .content { flex: 1; padding: 20px 24px; overflow-y: auto; }
+  /* Status bar */
+  .status-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 18px; font-size: 12px; color: var(--text2); }
+  .spinner { width: 14px; height: 14px; border: 2px solid var(--border2); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* Metric cards */
+  .metric-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .metric-card .label { font-size: 11px; color: var(--text3); margin-bottom: 4px; }
+  .metric-card .value { font-size: 24px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
+  .metric-card .sub { font-size: 11px; color: var(--text3); margin-top: 2px; }
+  /* Tabs */
+  .tab-bar { display: flex; gap: 2px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 16px; font-size: 13px; cursor: pointer; border: none; background: none; color: var(--text2); border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: var(--font); transition: color .12s; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--text); font-weight: 500; border-bottom-color: var(--accent); }
+  /* Cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 14px; }
+  .card-title { font-size: 12px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 12px; }
+  /* Meta grid */
+  .meta-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 20px; font-size: 13px; }
+  .meta-key { color: var(--text2); white-space: nowrap; }
+  .meta-val { font-weight: 500; }
+  /* Badges */
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+  .b-green { background: var(--accent-bg); color: var(--accent); }
+  .b-warn { background: var(--warn-bg); color: var(--warn); }
+  .b-danger { background: var(--danger-bg); color: var(--danger); }
+  .b-info { background: var(--info-bg); color: var(--info); }
+  .b-neutral { background: var(--surface2); color: var(--text2); border: 1px solid var(--border); }
+  /* Chunk card */
+  .chunk-card { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 10px; background: var(--surface); }
+  .chunk-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .chunk-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chunk-num { font-size: 12px; font-weight: 600; color: var(--text); }
+  .chunk-text { font-size: 13px; color: var(--text2); line-height: 1.65; font-family: var(--mono); background: var(--surface2); border-radius: var(--radius-sm); padding: 10px 12px; max-height: 100px; overflow: hidden; transition: max-height .3s; white-space: pre-wrap; word-break: break-word; }
+  .chunk-text.open { max-height: 600px; }
+  .chunk-toggle { font-size: 12px; color: var(--accent); cursor: pointer; background: none; border: none; font-family: var(--font); margin-top: 6px; }
+  /* Score bar */
+  .score-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .score-label { font-size: 11px; color: var(--text3); min-width: 110px; }
+  .score-track { flex: 1; height: 5px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+  .score-fill { height: 100%; border-radius: 3px; transition: width .45s ease; }
+  /* RAGAS table */
+  .ragas-table { width: 100%; border-collapse: collapse; }
+  .ragas-table th { text-align: left; font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: .06em; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .ragas-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
+  .ragas-table tr:last-child td { border-bottom: none; }
+  .score-pill { display: inline-flex; align-items: center; gap: 6px; }
+  /* Timing */
+  .timing-rows { margin-bottom: 14px; }
+  .timing-row { display: flex; justify-content: space-between; font-size: 13px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .timing-row:last-child { border-bottom: none; font-weight: 600; }
+  .timing-bar { height: 24px; border-radius: var(--radius-sm); overflow: hidden; display: flex; margin-top: 14px; }
+  .timing-seg { display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: rgba(255,255,255,.9); transition: width .5s ease; overflow: hidden; white-space: nowrap; }
+  .t-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
+  .t-leg-item { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text2); }
+  .t-leg-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  /* Answer */
+  .answer-box { font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+  .answer-box code { font-family: var(--mono); background: var(--surface2); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  /* Empty */
+  .empty { text-align: center; padding: 60px 20px; color: var(--text3); }
+  .empty .big { font-size: 36px; margin-bottom: 10px; }
+  .empty p { font-size: 14px; }
+  /* Conflict banner */
+  .conflict-banner { display: flex; align-items: center; gap: 10px; background: var(--warn-bg); border: 1px solid var(--warn); border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 14px; font-size: 13px; color: var(--warn); }
+  /* Per-chunk RAGAS list */
+  .ragas-chunk { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .ragas-chunk:last-child { border-bottom: none; }
+  .ragas-chunk .reason { font-size: 12px; color: var(--text3); margin-top: 2px; }
+  /* Spinner overlay */
+  #loading-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.3); backdrop-filter: blur(2px); z-index: 999; align-items: center; justify-content: center; }
+  #loading-overlay.show { display: flex; }
+  .loading-card { background: var(--surface); border-radius: var(--radius); padding: 28px 36px; text-align: center; border: 1px solid var(--border2); }
+  .loading-card .big-spin { width: 36px; height: 36px; border: 3px solid var(--border2); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 14px; }
+  .loading-card p { font-size: 13px; color: var(--text2); }
+  .loading-card strong { font-size: 15px; color: var(--text); display: block; margin-bottom: 4px; }
+  @media (max-width: 800px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+    .metric-row { grid-template-columns: repeat(2,1fr); }
+  }
+</style>
+</head>
+<body>
+
+<div id="loading-overlay">
+  <div class="loading-card">
+    <div class="big-spin"></div>
+    <strong>Evaluating…</strong>
+    <p id="loading-step">Retrieving chunks</p>
+  </div>
+</div>
+
+<div class="layout">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">Insure<span>Hub</span> <span style="font-weight:400;color:var(--text2)">/ RAG Eval</span></div>
+    </div>
+
+    <!-- Upload -->
+    <div class="sidebar-section">
+      <div class="sidebar-label">document</div>
+      <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <div class="icon">📄</div>
+        <strong>Drop file here</strong>
+        <p>PDF · DOCX · TXT</p>
+        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.text">
+      </div>
+      <div class="file-pill" id="file-pill">
+        <span class="name" id="pill-name"></span>
+        <span class="rm" onclick="clearFile()" title="Remove">✕</span>
+      </div>
+      <button class="run-btn" style="width:100%;margin-top:10px;font-size:12px;height:32px" id="upload-btn" onclick="uploadFile()" disabled>Upload & ingest</button>
+    </div>
+
+    <!-- Ingested docs -->
+    <div class="sidebar-section" style="flex:1;overflow-y:auto">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div class="sidebar-label" style="margin-bottom:0">knowledge base</div>
+        <span style="font-size:11px;color:var(--text3)" id="kb-count">0 chunks</span>
+      </div>
+      <div id="doc-list"><div class="doc-empty">No documents yet</div></div>
+    </div>
+
+    <!-- Config -->
+    <div class="sidebar-section">
+      <div class="sidebar-label">retrieval config</div>
+      <div class="config-row">
+        <span>Top-K chunks</span>
+        <input type="number" id="cfg-topk" value="5" min="1" max="20" style="width:52px">
+      </div>
+      <div class="config-row" style="margin-bottom:6px">
+        <label class="toggle"><input type="checkbox" id="cfg-hybrid" checked> Hybrid BM25</label>
+        <label class="toggle"><input type="checkbox" id="cfg-rerank" checked> Cross-encoder rerank</label>
+      </div>
+      <div class="config-row" style="margin-bottom:6px">
+        <label class="toggle"><input type="checkbox" id="cfg-answer" checked> Generate full answer</label>
+        <label class="toggle"><input type="checkbox" id="cfg-ragas" checked> Run RAGAS</label>
+      </div>
+    </div>
+
+    <!-- API -->
+    <div class="sidebar-section">
+      <div class="sidebar-label">backend url</div>
+      <input class="api-input" id="api-url" value="http://localhost:8001" />
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main">
+    <div class="topbar">
+      <input class="query-input" id="query-input" placeholder="Ask something about your documents…" />
+      <button class="run-btn" id="run-btn" onclick="runEval()" disabled>▶ Evaluate</button>
+    </div>
+
+    <div class="content" id="content">
+      <div class="empty" id="empty-state">
+        <div class="big">🔍</div>
+        <p>Upload a document and type a query to start evaluating your RAG pipeline.</p>
+      </div>
+      <div id="results" style="display:none"></div>
+    </div>
+  </main>
+
+</div>
+
+<script>
+const API = () => document.getElementById('api-url').value.replace(/\/$/, '');
+let selectedFile = null;
+
+// ── Drag & drop ───────────────────────────────────────────────────────────────
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); setFile(e.dataTransfer.files[0]); });
+document.getElementById('file-input').addEventListener('change', e => setFile(e.target.files[0]));
+
+function setFile(f) {
+  if (!f) return;
+  selectedFile = f;
+  document.getElementById('pill-name').textContent = f.name;
+  document.getElementById('file-pill').style.display = 'flex';
+  document.getElementById('upload-btn').disabled = false;
+}
+function clearFile() {
+  selectedFile = null;
+  document.getElementById('file-pill').style.display = 'none';
+  document.getElementById('file-input').value = '';
+  document.getElementById('upload-btn').disabled = true;
+}
+
+document.getElementById('query-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') runEval();
+});
+
+// ── Upload ────────────────────────────────────────────────────────────────────
+async function uploadFile() {
+  if (!selectedFile) return;
+  const btn = document.getElementById('upload-btn');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  const fd = new FormData();
+  fd.append('file', selectedFile);
+  try {
+    const res = await fetch(`${API()}/eval/upload`, { method: 'POST', body: fd });
+    if (!res.ok) { const err = await res.json(); alert('Upload error: ' + (err.detail || res.statusText)); return; }
+    const data = await res.json();
+    showToast(`✓ ${data.chunks_added} chunks ingested from ${data.filename}`);
+    clearFile();
+    loadDocList();
+    document.getElementById('run-btn').disabled = false;
+  } catch(e) {
+    alert('Network error — is the backend running at ' + API() + '?');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Upload & ingest';
+  }
+}
+
+// ── Doc list ──────────────────────────────────────────────────────────────────
+async function loadDocList() {
+  try {
+    const res = await fetch(`${API()}/eval/documents`);
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById('kb-count').textContent = data.total_chunks + ' chunks';
+    const list = document.getElementById('doc-list');
+    if (!data.sources.length) { list.innerHTML = '<div class="doc-empty">No documents yet</div>'; return; }
+    list.innerHTML = data.sources.map(s => `
+      <div class="doc-item">
+        <span>📃</span>
+        <span class="src" title="${s}">${s}</span>
+        <span class="del" onclick="deleteDoc('${encodeURIComponent(s)}')" title="Remove">✕</span>
+      </div>`).join('');
+    document.getElementById('run-btn').disabled = false;
+  } catch(e) {}
+}
+
+async function deleteDoc(enc) {
+  const src = decodeURIComponent(enc);
+  if (!confirm(`Remove "${src}" from the knowledge base?`)) return;
+  await fetch(`${API()}/eval/documents/${enc}`, { method: 'DELETE' });
+  loadDocList();
+}
+
+// ── Evaluate ──────────────────────────────────────────────────────────────────
+async function runEval() {
+  const query = document.getElementById('query-input').value.trim();
+  if (!query) { document.getElementById('query-input').focus(); return; }
+
+  showLoading('Retrieving chunks…');
+  const payload = {
+    query,
+    top_k: parseInt(document.getElementById('cfg-topk').value) || 5,
+    use_hybrid: document.getElementById('cfg-hybrid').checked,
+    use_reranker: document.getElementById('cfg-rerank').checked,
+    generate_answer: document.getElementById('cfg-answer').checked,
+    run_ragas: document.getElementById('cfg-ragas').checked,
+  };
+
+  setTimeout(() => setLoadingStep('Scoring with RAGAS…'), 1500);
+  setTimeout(() => setLoadingStep('Generating answer…'), 3000);
+
+  try {
+    const res = await fetch(`${API()}/eval/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      hideLoading();
+      alert('Eval error: ' + (err.detail || res.statusText));
+      return;
+    }
+    const data = await res.json();
+    hideLoading();
+    renderResults(data);
+  } catch(e) {
+    hideLoading();
+    alert('Network error — is the backend running at ' + API() + '?');
+  }
+}
+
+// ── Render results ────────────────────────────────────────────────────────────
+function renderResults(d) {
+  document.getElementById('empty-state').style.display = 'none';
+  const el = document.getElementById('results');
+  el.style.display = 'block';
+
+  const avgScore = d.chunks.reduce((a,c) => a + (c.rerank_score ?? c.similarity_score), 0) / (d.chunks.length || 1);
+  const metaFields = d.chunk_metadata[0] ? Object.keys(d.chunk_metadata[0]).length : 0;
+
+  el.innerHTML = `
+    <!-- Summary metrics -->
+    <div class="metric-row">
+      <div class="metric-card">
+        <div class="label">chunks retrieved</div>
+        <div class="value">${d.chunks.length}</div>
+        <div class="sub">of ${d.total_chunks_in_store} total</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">avg relevance</div>
+        <div class="value">${pct(avgScore)}%</div>
+        <div class="sub">${d.chunks[0]?.retrieval_method || 'n/a'}</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">total time</div>
+        <div class="value">${(d.timing.total_ms/1000).toFixed(2)}s</div>
+        <div class="sub">retrieval + LLM</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">metadata fields</div>
+        <div class="value">${metaFields}</div>
+        <div class="sub">per chunk</div>
+      </div>
+    </div>
+
+    ${d.has_conflict ? `<div class="conflict-banner">⚠️ Multi-insurer conflict detected: ${d.conflict_insurers.join(', ')} — answers may mix policy terms.</div>` : ''}
+
+    <!-- Tabs -->
+    <div class="tab-bar">
+      <button class="tab active" onclick="switchTab('metadata',this)">Metadata</button>
+      <button class="tab" onclick="switchTab('chunks',this)">Raw chunks</button>
+      <button class="tab" onclick="switchTab('ragas',this)">RAGAS scores</button>
+      <button class="tab" onclick="switchTab('answer',this)">Answer + timing</button>
+    </div>
+
+    <!-- TAB: Metadata -->
+    <div id="tab-metadata">
+      <div class="card">
+        <div class="card-title">document-level metadata</div>
+        <div class="meta-grid">
+          ${metaRows(d.doc_metadata)}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">chunk-level metadata (${d.chunk_metadata.length} chunks)</div>
+        ${d.chunk_metadata.map(m => `
+          <div style="margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+              <span style="font-size:12px;font-weight:600">Chunk #${m.chunk_index}</span>
+              <span class="badge b-neutral">${m.section}</span>
+              <span class="badge b-info">${m.insurer}</span>
+              <span class="badge b-neutral">${m.policy_type}</span>
+              ${scoreBadge(m.rerank_score ?? m.similarity_score)}
+            </div>
+            <div class="meta-grid" style="font-size:12px">
+              ${metaRows(m)}
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- TAB: Raw chunks -->
+    <div id="tab-chunks" style="display:none">
+      <p style="font-size:12px;color:var(--text3);margin-bottom:12px">Raw text retrieved from vector store — no LLM processing applied</p>
+      ${d.chunks.map((c,i) => chunkCard(c,i)).join('')}
+    </div>
+
+    <!-- TAB: RAGAS -->
+    <div id="tab-ragas" style="display:none">
+      ${d.ragas ? `
+      <div class="card">
+        <div class="card-title">ragas metrics — judged by ${d.ragas.judge_model}</div>
+        <table class="ragas-table">
+          <thead><tr><th>metric</th><th>score</th><th>bar</th><th>interpretation</th></tr></thead>
+          <tbody>
+            ${ragasRow('Faithfulness', d.ragas.faithfulness, 'Claims in the answer are supported by the context')}
+            ${ragasRow('Answer Relevancy', d.ragas.answer_relevancy, 'Answer directly addresses the query')}
+            ${ragasRow('Context Precision', d.ragas.context_precision, 'Retrieved chunks are relevant to the query')}
+            ${ragasRow('Context Recall', d.ragas.context_recall, 'Context covers all information needed to answer')}
+          </tbody>
+        </table>
+      </div>` : '<div class="card"><p style="color:var(--text3);font-size:13px">RAGAS scoring was disabled or failed.</p></div>'}
+      <div class="card" style="margin-top:0">
+        <div class="card-title">per-chunk relevance</div>
+        ${(d.ragas_per_chunk || []).map(r => `
+          <div class="ragas-chunk">
+            <div style="min-width:70px;font-size:12px;color:var(--text2)">chunk #${r.chunk_index}</div>
+            <div style="flex:1">
+              <div class="score-row" style="margin-top:0">
+                <div class="score-track"><div class="score-fill" style="width:${pct(r.relevance)}%;background:${fillColor(r.relevance)}"></div></div>
+                <span style="font-size:12px;font-weight:600;min-width:36px">${pct(r.relevance)}%</span>
+              </div>
+              ${r.reason ? `<div class="reason">${r.reason}</div>` : ''}
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- TAB: Answer + timing -->
+    <div id="tab-answer" style="display:none">
+      <div class="card">
+        <div class="card-title">generated answer</div>
+        <div class="answer-box">${esc(d.answer || '(answer generation was disabled)')}</div>
+        ${d.sources.length ? `<div style="margin-top:12px;font-size:12px;color:var(--text3)">Sources: ${d.sources.map(s=>`<span class="badge b-neutral">${s}</span>`).join(' ')}</div>` : ''}
+      </div>
+      <div class="card">
+        <div class="card-title">latency breakdown</div>
+        <div class="timing-rows">
+          ${timingRow('Retrieval (BM25 + dense + rerank)', d.timing.retrieval_ms)}
+          ${timingRow('LLM generation', d.timing.llm_ms)}
+          ${timingRow('RAGAS scoring', d.timing.ragas_ms)}
+          ${timingRow('Total', d.timing.total_ms)}
+        </div>
+        <div class="timing-bar">
+          ${timingBar(d.timing)}
+        </div>
+        <div class="t-legend">
+          <div class="t-leg-item"><div class="t-leg-dot" style="background:#1d9e75"></div>Retrieval</div>
+          <div class="t-leg-item"><div class="t-leg-dot" style="background:#1e40af"></div>LLM gen</div>
+          <div class="t-leg-item"><div class="t-leg-dot" style="background:#b45309"></div>RAGAS</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function switchTab(name, btn) {
+  ['metadata','chunks','ragas','answer'].forEach(t => {
+    const el = document.getElementById('tab-'+t);
+    if (el) el.style.display = t===name ? '' : 'none';
+  });
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function toggleChunk(i) {
+  const el = document.getElementById('ct-'+i);
+  const btn = document.getElementById('ct-btn-'+i);
+  const open = el.classList.toggle('open');
+  btn.textContent = open ? 'show less ↑' : 'show more ↓';
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function pct(v) { return Math.round((v||0)*100); }
+function fillColor(v) {
+  if (v >= 0.75) return '#1d9e75';
+  if (v >= 0.5) return '#b45309';
+  return '#991b1b';
+}
+function scoreBadge(v) {
+  const p = pct(v);
+  if (p >= 75) return `<span class="badge b-green">${p}%</span>`;
+  if (p >= 50) return `<span class="badge b-warn">${p}%</span>`;
+  return `<span class="badge b-danger">${p}%</span>`;
+}
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function metaRows(obj) {
+  return Object.entries(obj).map(([k,v]) => {
+    if (v === null || v === undefined || v === '') return '';
+    const val = Array.isArray(v) ? v.join(', ') : String(v);
+    return `<span class="meta-key">${k}</span><span class="meta-val">${esc(val.substring(0,120))}</span>`;
+  }).join('');
+}
+function chunkCard(c, i) {
+  const score = c.rerank_score ?? c.similarity_score;
+  return `<div class="chunk-card">
+    <div class="chunk-header">
+      <div class="chunk-left">
+        <span class="chunk-num">Chunk #${c.chunk_index}</span>
+        <span class="badge b-neutral">${c.section}</span>
+        <span class="badge b-neutral">${c.word_count} words</span>
+        <span class="badge b-neutral">${c.retrieval_method}</span>
+        ${c.metadata.has_conditions ? '<span class="badge b-warn">has conditions</span>' : ''}
+      </div>
+      ${scoreBadge(score)}
+    </div>
+    <div class="score-row">
+      <span class="score-label">similarity ${pct(c.similarity_score)}%</span>
+      <div class="score-track"><div class="score-fill" style="width:${pct(c.similarity_score)}%;background:${fillColor(c.similarity_score)}"></div></div>
+    </div>
+    ${c.rerank_score != null ? `<div class="score-row">
+      <span class="score-label">rerank ${pct(c.rerank_score)}%</span>
+      <div class="score-track"><div class="score-fill" style="width:${pct(c.rerank_score)}%;background:${fillColor(c.rerank_score)}"></div></div>
+    </div>` : ''}
+    <div class="chunk-text" id="ct-${i}">${esc(c.text)}</div>
+    <button class="chunk-toggle" id="ct-btn-${i}" onclick="toggleChunk(${i})">show more ↓</button>
+  </div>`;
+}
+function ragasRow(name, val, desc) {
+  return `<tr>
+    <td style="font-weight:500;white-space:nowrap">${name}</td>
+    <td>${scoreBadge(val)}</td>
+    <td style="min-width:120px">
+      <div class="score-track"><div class="score-fill" style="width:${pct(val)}%;background:${fillColor(val)}"></div></div>
+    </td>
+    <td style="color:var(--text2);font-size:12px">${desc}</td>
+  </tr>`;
+}
+function timingRow(label, ms) {
+  const v = ms >= 1000 ? (ms/1000).toFixed(2)+'s' : Math.round(ms)+'ms';
+  return `<div class="timing-row"><span style="color:var(--text2)">${label}</span><span>${v}</span></div>`;
+}
+function timingBar(t) {
+  const total = t.total_ms || 1;
+  const segs = [
+    ['#1d9e75', t.retrieval_ms, 'retr'],
+    ['#1e40af', t.llm_ms, 'llm'],
+    ['#b45309', t.ragas_ms, 'ragas'],
+  ];
+  return segs.map(([col, ms, label]) => {
+    const w = Math.round((ms/total)*100);
+    return `<div class="timing-seg" style="width:${w}%;background:${col}">${w>12?label:''}</div>`;
+  }).join('');
+}
+
+// ── Loading overlay ────────────────────────────────────────────────────────────
+function showLoading(msg) {
+  document.getElementById('loading-step').textContent = msg;
+  document.getElementById('loading-overlay').classList.add('show');
+}
+function setLoadingStep(msg) {
+  document.getElementById('loading-step').textContent = msg;
+}
+function hideLoading() {
+  document.getElementById('loading-overlay').classList.remove('show');
+}
+
+// ── Toast ──────────────────────────────────────────────────────────────────────
+function showToast(msg) {
+  const t = document.createElement('div');
+  t.style.cssText = 'position:fixed;bottom:20px;right:20px;background:var(--accent);color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:500;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,.3)';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────────
+loadDocList();
+setInterval(loadDocList, 15000);
+</script>
+</body>
+</html>
