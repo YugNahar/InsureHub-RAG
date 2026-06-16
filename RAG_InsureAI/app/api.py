@@ -288,6 +288,11 @@ async def _start_job_pruner():
             except Exception:
                 logger.exception("Periodic job pruner failed")
     app.state.job_pruner_task = asyncio.create_task(_prune_loop())
+@app.on_event("startup")
+async def _warmup_pipeline():
+    """Pre-load embedding model and vector store at startup so first request is fast."""
+    await asyncio.to_thread(_get_pipeline)
+    logger.info("Pipeline warmed up — embedding model loaded and ready.")
 
 app.add_middleware(
     CORSMiddleware,

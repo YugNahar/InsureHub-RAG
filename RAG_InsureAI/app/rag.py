@@ -498,10 +498,14 @@ class RAGPipeline:
                 top_k=RERANK_K,
                 filter_metadata=filter_meta,
                 use_hybrid=True,
-                use_reranker=True,
+                use_reranker=False,  # Don't apply citation-based reranking yet; we'll handle it in post-processing
             )
             all_chunks.extend(chunks)
-        chunks = self._deduplicate_chunks(all_chunks)[:RETRIEVE_K]
+        chunks = self._deduplicate_chunks(all_chunks)
+        chunks = self._vector_store._rerank(question, 
+            [(c.metadata.get('id',''), c.page_content, c.metadata, 0) for c in chunks], 
+            RETRIEVE_K)
+        chunks = [Document(page_content=t, metadata=m) for _, t, m, _ in chunks]
 
         if not chunks:
             return "Not mentioned in documents.", False, []
