@@ -1,0 +1,5 @@
+1. TurboVec replaces ChromaDB — vector_store.py, video_store.py, webpage_store.py all now delegate to turbovec_store.py (the new file). ChromaVectorStore is now just a thin wrapper that calls TurboVecStore internally.
+2. Race condition fixes in api.py — _get_job, _set_job, _prune_jobs, _get_conversation_history all changed from def (sync with threading.Lock) to async def (with asyncio.Lock). URL ingest also got the semaphore it was missing.
+3. Source key collision fix — uploads now get a uuid prefix so two files with the same name don't overwrite each other. filename metadata field added separately from source.
+4. validator.py float normalization — 250.0 now matches 250 in grounding checks.
+5. conversation_agent.py — blocking .search() call is now properly wrapped in asyncio.to_thread.
