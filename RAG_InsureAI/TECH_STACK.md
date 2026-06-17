@@ -62,7 +62,9 @@ FastAPI (REST API — port 8502)
 | **Uvicorn** | ASGI server running FastAPI |
 | **aiohttp** | Async HTTP client for URL fetching |
 | **Streaming** | `/ask-stream` and `/ask-url` stream answers token by token |
-| **Async Job Queue** | `/upload` and `/ingest-url` return a `job_id` immediately; status polled via `GET /upload/{job_id}` |
+| **Async Job Queue** | `/upload` and `/ingest-url` return a `job_id` immediately; status polled
+| **Auth Middleware** | `python-jose` JWT tokens + `passlib` bcrypt — `/auth/login` issues tokens, `require_auth` dependency guards protected endpoints |
+via `GET /upload/{job_id}` |
 
 ### Document Ingestion
 | Format | Library Used |
@@ -87,7 +89,7 @@ FastAPI (REST API — port 8502)
 | **Docker** | Entire app runs in a container |
 | **Docker Compose** | Orchestrates the API container with volumes for TurboVec data, Whisper cache, HuggingFace cache |
 | **Python 3.11** | Base runtime |
-
+| **Auth** | JWT-based login via `/auth` — protects upload and delete endpoints |
 ---
 
 ## Key Design Decisions
@@ -100,3 +102,4 @@ FastAPI (REST API — port 8502)
 - **TTL job cache** — background ingest jobs auto-expire after 1 hour to prevent memory leaks.
 - **Split locking** — `asyncio.Lock` for async endpoint handlers, `threading.RLock` for background thread operations, preventing deadlocks in concurrent access.
 - **Lazy Whisper load** — Whisper model is loaded on the first transcription request only, keeping initial startup fast.
+- **Protected admin endpoints** — upload, delete, and ingest endpoints require a JWT token. The public `/ask` endpoint remains open so the Layla chatbot works without login.

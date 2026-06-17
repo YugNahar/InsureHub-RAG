@@ -33,7 +33,8 @@ import aiohttp
 import re
 from bs4 import BeautifulSoup
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from auth import create_login_endpoint, require_auth
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import APIConnectionError, APIStatusError, APITimeoutError
@@ -269,6 +270,17 @@ async def _get_job(job_id: str) -> dict | None:
 
 
 app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc")
+create_login_endpoint(app)
+
+from fastapi.responses import FileResponse
+
+@app.get("/auth")
+async def auth_page():
+    return FileResponse("/app/auth.html")
+
+@app.get("/admin")
+async def admin_page():
+    return FileResponse("/app/admin.html")
 
 
 @app.on_event("startup")
@@ -470,7 +482,7 @@ def _chunk_transcript(transcript_text: str, url: str, title: str = "") -> list:
 
 # ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
-async def upload_video(req: URLRequest):
+async def upload_video(req: URLRequest, _=Depends(require_auth)):
     url = req.url.strip()
     multi = _get_multi_rag()
     if multi.video_exists(url):
@@ -495,7 +507,7 @@ async def upload_video(req: URLRequest):
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
 @app.post("/upload-webpage")
-async def upload_webpage(req: URLRequest):
+async def upload_webpage(req: URLRequest, _=Depends(require_auth)):
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL.")
@@ -681,7 +693,7 @@ async def ask_documents_only(req: AskRequest):
 
 # ── Upload (async) ────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), _=Depends(require_auth)):
     await _prune_jobs()
     suffix = os.path.splitext(file.filename or "")[1].lower()
     supported = ALLOWED_EXTENSIONS
