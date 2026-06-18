@@ -43,6 +43,14 @@ class WebpageVectorStore:
     def list_urls(self) -> List[str]:
         return self._store.list_values("source_url")
 
+    def get_metadata_summary(self, url: str) -> Dict[str, Any]:
+        """Return chunk count, policy_types, and sections stored for a URL.
+
+        Lets the eval API inspect what's been indexed for a given webpage
+        without having to scan all chunks manually.
+        """
+        return self._store.get_metadata_summary("source_url", url)
+
     def search(
         self,
         query: str,

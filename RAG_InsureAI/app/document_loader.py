@@ -1,675 +1,922 @@
 """
-Document loader: PDF, Word, Excel, PowerPoint, CSV, TXT, URLs, YouTube, and any video.
-YouTube handling now supports:
-  - Any language (English, Hindi, Arabic, etc.)
-  - Videos without subtitles (using Whisper AI transcription)
-  - Auto-detection of spoken language
+document_loader.py — Unified document loading for InsureHub RAG.
 
-Any video URL (Vimeo, Dailymotion, etc.) is also supported via yt-dlp + Whisper.
+Supported sources
+-----------------
+  PDFs          : PyMuPDF (fitz) with multi-page text extraction
+  DOCX          : python-docx
+  XLSX / CSV    : pandas
+  Images        : pytesseract OCR (optional)
+  Audio/Video   : OpenAI Whisper (optional, for local transcription)
+  YouTube URLs  : YouTubeTranscriptApi >= 0.6 + 800-word overlapping chunks
+  Web URLs      : requests + BeautifulSoup HTML → text
+                  Playwright fallback for JS-rendered (SPA) pages
+
+Public API
+----------
+  load_document(file_path, filename)  → list[Document]
+  load_url(url)                       → list[Document]
+  load_url_advanced(url, **kw)        → list[Document]
+  extract_urls(text)                  → list[str]
+  is_youtube_url(url)                 → bool
+  _load_youtube(url)                  → list[Document]  (also used by eval_api)
+  _get_whisper_model()                → whisper.Model | None
+
+Constants
+---------
+  ALLOWED_EXTENSIONS  : set of lowercase extensions the API accepts
+  MAX_FILE_SIZE_BYTES : 50 MB hard limit
+  FileValidationError : exception raised for invalid files
+
+Webpage cleaning improvements (v2)
+-----------------------------------
+  1. Playwright fallback  — fetches JS-rendered SPA pages that return empty
+                            HTML to plain requests.
+  2. Encoding detection   — uses chardet to decode non-UTF-8 pages correctly
+                            before handing the markup to BeautifulSoup.
+  3. Nav-link noise filter— drops lines shorter than 4 words that are almost
+                            always breadcrumbs / menu links / cookie banners.
+  4. Friendly HTTP errors — 403/429/5xx give an actionable message instead of
+                            a bare RuntimeError.
+  5. Duplicate-line dedup — consecutive identical lines (e.g. repeated headers
+                            rendered by JS frameworks) are collapsed to one.
 """
+from __future__ import annotations
+
 import logging
-import re
 import os
+import re
 import tempfile
-import threading
-import time
 from pathlib import Path
-import requests
-from langchain_core.documents import Document
+from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-_MIN_TEXT_LENGTH = 200
-ALLOWED_EXTENSIONS = {
-    ".pdf", ".docx", ".doc", ".txt", ".html", ".htm",
-    ".xlsx", ".xls", ".pptx", ".ppt", ".csv", ".eml",
+# ── LangChain document type ────────────────────────────────────────────────────
+try:
+    from langchain_core.documents import Document
+except ImportError:
+    from langchain.schema import Document  # type: ignore
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+ALLOWED_EXTENSIONS: set[str] = {
+    ".pdf", ".docx", ".doc", ".txt", ".csv", ".xlsx", ".xls",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp",
+    ".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm",
 }
-MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
+
+MAX_FILE_SIZE_BYTES: int = 50 * 1024 * 1024  # 50 MB
+_SAFE_TMP_ROOT = os.path.expanduser("~/.insurehub_tmp")
+os.makedirs(_SAFE_TMP_ROOT, exist_ok=True)
+
+# YouTube transcript chunk settings
+_YT_CHUNK_WORDS: int = 800
+_YT_CHUNK_OVERLAP_WORDS: int = 80
+
+# Minimum meaningful line length for webpage noise filtering (words)
+_MIN_LINE_WORDS: int = 4
+
+# If requests returns fewer than this many chars of body text, try Playwright
+_SPARSE_CONTENT_THRESHOLD: int = 300
 
 
 class FileValidationError(ValueError):
     """Raised when an uploaded file fails validation."""
 
 
-def validate_file(file_path: str, original_name: str) -> None:
-    """Validate a file before processing."""
-    ext = Path(original_name).suffix.lower()
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if ext not in ALLOWED_EXTENSIONS:
-        allowed_types = ", ".join(sorted(ALLOWED_EXTENSIONS))
-        raise FileValidationError(
-            f"File type '{ext}' is not supported. Allowed types: {allowed_types}"
-        )
-
-    size = os.path.getsize(file_path)
-    if size > MAX_FILE_SIZE_BYTES:
-        raise FileValidationError(
-            f"File '{original_name}' is too large "
-            f"({size / (1024 * 1024):.1f} MB). Maximum allowed: 50 MB."
-        )
-
-    magic_bytes = {
-        ".pdf": [(0, b"%PDF")],
-        ".docx": [(0, b"PK\x03\x04")],
-        ".xlsx": [(0, b"PK\x03\x04")],
-        ".pptx": [(0, b"PK\x03\x04")],
-    }
-    if ext in magic_bytes:
-        with open(file_path, "rb") as f:
-            header = f.read(8)
-        expected = magic_bytes[ext]
-        if not any(
-            header[offset : offset + len(signature)] == signature
-            for offset, signature in expected
-        ):
-            raise FileValidationError(
-                f"File '{original_name}' does not appear to be a valid {ext} file. "
-                "It may be corrupted or misnamed."
-            )
-
-# ── Unit normalisation ────────────────────────────────────────────────────────
-def _normalize_units(text: str) -> str:
-    text = re.sub(r'/\s*(\d+)\s*hr[s]?', r' per \1 hours', text, flags=re.IGNORECASE)
-    text = re.sub(r'/\s*hour[s]?\b',     ' per 1 hour',    text, flags=re.IGNORECASE)
-    text = re.sub(r'/\s*hr[s]?\b',       ' per 1 hour',    text, flags=re.IGNORECASE)
-    text = re.sub(r'/\s*day[s]?\b',      ' per 1 day',     text, flags=re.IGNORECASE)
-    text = re.sub(r'/\s*km\b',           ' per 1 km',      text, flags=re.IGNORECASE)
-    text = re.sub(r'/\s*night[s]?\b',    ' per 1 night',   text, flags=re.IGNORECASE)
-    return text
-
-# ── URL helpers ───────────────────────────────────────────────────────────────
 def extract_urls(text: str) -> list[str]:
-    return re.findall(r'https?://[^\s\'"<>]+', text)
+    """Extract all HTTP/HTTPS URLs from a string."""
+    pattern = r"https?://[^\s\"'<>)\]}\|\\]+"
+    return re.findall(pattern, text)
+
 
 def is_youtube_url(url: str) -> bool:
-    return bool(re.search(r'(youtube\.com/watch|youtu\.be/)', url))
-
-# ------------------------------------------------------------------------------
-# ADVANCED YOUTUBE TRANSCRIPT EXTRACTION (with Whisper fallback)
-# ------------------------------------------------------------------------------
-
-def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
-    """
-    Get transcript from YouTube video.
-    Returns: (transcript_text, metadata)
-    """
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
-    
-    match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
-    if not match:
-        return "Invalid YouTube URL format.", {"error": "invalid_url"}
-    video_id = match.group(1)
-    
+    """Return True if *url* is a YouTube video link."""
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            transcript = transcript_list.find_manually_created_transcript()
-            transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
-            language_code = transcript.language_code
-            logger.info(f"Using manual transcript in {language_code} for {video_id}")
-            return transcript_text, {"source_type": "youtube_manual", "language": language_code}
-        except Exception:
-            pass
-        try:
-            transcript = transcript_list.find_generated_transcript()
-            transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
-            language_code = transcript.language_code
-            logger.info(f"Using auto-generated transcript in {language_code} for {video_id}")
-            return transcript_text, {"source_type": "youtube_auto", "language": language_code}
-        except Exception:
-            pass
-        for transcript in transcript_list:
-            transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
-            logger.info(f"Using fallback transcript in {transcript.language_code} for {video_id}")
-            return transcript_text, {"source_type": "youtube_fallback", "language": transcript.language_code}
-    except (NoTranscriptFound, TranscriptsDisabled) as e:
-        logger.info(f"No transcript available for {video_id}, falling back to Whisper transcription.")
-        return _transcribe_youtube_audio(url, video_id)
-    except Exception as e:
-        logger.warning(f"Unexpected error getting transcript: {e}")
-        return _transcribe_youtube_audio(url, video_id)
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().lstrip("www.")
+        if host == "youtube.com":
+            return "watch" in parsed.path or "embed" in parsed.path or "shorts" in parsed.path
+        if host == "youtu.be":
+            return bool(parsed.path.strip("/"))
+        return False
+    except Exception:
+        return False
 
 
-def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
-    """Download audio from YouTube and transcribe using Whisper."""
-    import yt_dlp
-    
-    temp_audio_path = None
+def _extract_video_id(url: str) -> Optional[str]:
+    """Extract the YouTube video ID from any supported URL format."""
+    patterns = [
+        r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([A-Za-z0-9_-]{11})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _detect_encoding(raw_bytes: bytes) -> str:
+    """
+    Detect the character encoding of raw HTTP response bytes.
+    Falls back to utf-8 if chardet is not installed or detection fails.
+    """
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            temp_audio_path = tmp.name
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'outtmpl': temp_audio_path.replace('.mp3', ''),
-            'quiet': True,
-            'no_warnings': True,
-        }
-        logger.info(f"Downloading audio from {url}...")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        actual_path = temp_audio_path.replace('.mp3', '.mp3')
-        if not os.path.exists(actual_path):
-            import glob
-            mp3_files = glob.glob(temp_audio_path.replace('.mp3', '') + "*.mp3")
-            if mp3_files:
-                actual_path = mp3_files[0]
-            else:
-                raise Exception("Could not find downloaded audio file")
-        whisper_model = _get_whisper_model()
-        result = whisper_model.transcribe(actual_path, task="transcribe")
-        transcript_text = result["text"].strip()
-        detected_language = result["language"]
-        if not transcript_text:
-            raise Exception("Whisper returned empty transcript")
-        logger.info(f"Whisper transcription complete. Detected language: {detected_language}")
-        return transcript_text, {"source_type": "whisper_transcription", "language": detected_language}
-    except Exception as e:
-        logger.error(f"Whisper transcription failed: {e}")
-        return f"Could not transcribe audio: {str(e)}", {"error": str(e)}
-    finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            os.unlink(temp_audio_path)
-        for ext in ['.mp3', '.temp', '.part']:
-            path = temp_audio_path.replace('.mp3', '') + ext if temp_audio_path else None
-            if path and os.path.exists(path):
-                os.unlink(path)
+        import chardet
+        result = chardet.detect(raw_bytes[:10_000])
+        encoding = result.get("encoding") or "utf-8"
+        # chardet sometimes returns 'ascii' for utf-8 content — promote it
+        return "utf-8" if encoding.lower() == "ascii" else encoding
+    except ImportError:
+        return "utf-8"
 
 
-# Global Whisper model
+def _clean_webpage_text(raw_text: str) -> str:
+    """
+    Post-process plain text extracted from a web page:
+      1. Drop lines shorter than _MIN_LINE_WORDS words  (nav / breadcrumb noise)
+      2. Remove consecutive duplicate lines              (JS-framework repeated headers)
+      3. Collapse runs of 3+ blank lines into 2          (already done by caller, kept for safety)
+      4. Strip leading/trailing whitespace
+    """
+    lines = raw_text.splitlines()
+    cleaned: list[str] = []
+    prev_stripped = None
+    for line in lines:
+        stripped = line.strip()
+        # Keep blank lines (they preserve paragraph structure) but collapse dups
+        if not stripped:
+            if prev_stripped != "":
+                cleaned.append("")
+            prev_stripped = ""
+            continue
+        # Drop very short lines — almost always navigation / cookie / breadcrumb
+        if len(stripped.split()) < _MIN_LINE_WORDS:
+            continue
+        # Drop consecutive duplicate lines
+        if stripped == prev_stripped:
+            continue
+        cleaned.append(stripped)
+        prev_stripped = stripped
+
+    text = "\n".join(cleaned)
+    # Final whitespace collapse
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WHISPER (optional audio transcription)
+# ══════════════════════════════════════════════════════════════════════════════
 _whisper_model = None
-_whisper_last_used = 0.0
-_whisper_lock = threading.Lock()
-_WHISPER_TTL_SECONDS = 300
+_whisper_loaded = False
+
 
 def _get_whisper_model():
-    global _whisper_model, _whisper_last_used
-    with _whisper_lock:
-        _whisper_last_used = time.time()
-        if _whisper_model is None:
-            import whisper
-
-            logger.info("Loading Whisper model (base)...")
-            _whisper_model = whisper.load_model("base")
-            logger.info("Whisper model loaded.")
-            threading.Thread(target=_whisper_cleanup_loop, daemon=True).start()
+    """Lazy-load the Whisper 'base' model. Returns None if whisper is not installed."""
+    global _whisper_model, _whisper_loaded
+    if _whisper_loaded:
         return _whisper_model
+    _whisper_loaded = True
+    try:
+        import whisper
+        _whisper_model = whisper.load_model("base")
+        logger.info("[Whisper] Model 'base' loaded.")
+    except Exception as exc:
+        logger.warning("[Whisper] Not available: %s", exc)
+        _whisper_model = None
+    return _whisper_model
 
 
-def _whisper_cleanup_loop():
-    """Unload Whisper from RAM after the idle TTL expires."""
-    global _whisper_model
-    while True:
-        time.sleep(60)
-        with _whisper_lock:
-            if (
-                _whisper_model is not None
-                and time.time() - _whisper_last_used > _WHISPER_TTL_SECONDS
-            ):
-                _whisper_model = None
-                logger.info(
-                    "Whisper model unloaded (idle > %ds).",
-                    _WHISPER_TTL_SECONDS,
-                )
-                break
+# ══════════════════════════════════════════════════════════════════════════════
+# YOUTUBE LOADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _chunk_words(words: list[str], chunk_size: int, overlap: int) -> list[str]:
+    """
+    Split a word list into overlapping chunks.
+
+    Each chunk contains at most `chunk_size` words, with `overlap` words
+    from the previous chunk prepended for context continuity.
+    """
+    chunks: list[str] = []
+    start = 0
+    total = len(words)
+    while start < total:
+        end = min(start + chunk_size, total)
+        chunks.append(" ".join(words[start:end]))
+        if end >= total:
+            break
+        start = end - overlap
+    return chunks
 
 
 def _load_youtube(url: str) -> list[Document]:
-    """Main entry point for YouTube video processing."""
-    transcript_text, metadata = _get_youtube_transcript_with_whisper_fallback(url)
-    source_type = metadata.get("source_type", "unknown")
-    language = metadata.get("language", "unknown")
+    """
+    Load a YouTube video transcript and return overlapping text chunks
+    as LangChain Document objects.
+
+    Strategy
+    --------
+    1. Try YouTubeTranscriptApi (>= 0.6 API — uses .fetch() on a
+       FetchedTranscript object, not the old list_transcripts() pattern).
+    2. Fall back to Whisper audio transcription if the transcript API fails
+       (e.g., transcripts disabled for the video).
+
+    Each chunk carries metadata:
+      source       : original YouTube URL
+      video_id     : 11-character YouTube video ID
+      chunk_index  : 0-based chunk number
+      source_type  : "youtube_transcript" or "whisper"
+      doc_type     : "youtube"
+    """
+    video_id = _extract_video_id(url)
+    if not video_id:
+        raise ValueError(f"Could not extract video ID from URL: {url}")
+
+    full_text: Optional[str] = None
+    source_type = "youtube_transcript"
+
+    # ── Attempt 1: YouTubeTranscriptApi ───────────────────────────────────────
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+
+        try:
+            # Modern API (>= 0.6) uses instance method api.fetch(video_id)
+            api = YouTubeTranscriptApi()
+            fetched = api.fetch(video_id)
+            snippets = list(fetched)
+            full_text = " ".join(
+                s.text if hasattr(s, "text") else s.get("text", "")
+                for s in snippets
+            ).strip()
+        except (TypeError, AttributeError, ValueError) as sub_exc:
+            logger.info("[YouTube] Modern fetch API failed (%s) — falling back to get_transcript", sub_exc)
+            # Older API (< 0.6) or fallback to classmethod get_transcript
+            try:
+                raw = YouTubeTranscriptApi.get_transcript(video_id)
+                full_text = " ".join(s.get("text", "") for s in raw).strip()
+            except Exception:
+                raise sub_exc
+
+        if not full_text:
+            raise ValueError("Empty transcript returned by YouTubeTranscriptApi")
+
+        logger.info(
+            "[YouTube] Transcript loaded for %s (%d chars)", video_id, len(full_text)
+        )
+
+    except Exception as yt_exc:
+        logger.warning("[YouTube] Transcript API failed: %s — trying Whisper", yt_exc)
+
+        # ── Attempt 2: Whisper audio transcription ────────────────────────────
+        whisper_model = _get_whisper_model()
+        if whisper_model is None:
+            raise RuntimeError(
+                f"YouTube transcript unavailable for {url} and Whisper is not installed. "
+                "Install 'openai-whisper' or enable video transcripts."
+            ) from yt_exc
+
+        try:
+            import yt_dlp
+        except ImportError:
+            raise RuntimeError(
+                "yt-dlp is required for Whisper audio download. "
+                "Install it with: pip install yt-dlp"
+            ) from yt_exc
+
+        with tempfile.TemporaryDirectory(dir=_SAFE_TMP_ROOT) as tmp_dir:
+            # Use %(ext)s so yt-dlp fills in the actual extension
+            # instead of hardcoding .mp3 which may not exist before conversion
+            outtmpl = os.path.join(tmp_dir, "audio.%(ext)s")
+            ydl_opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "outtmpl": outtmpl,
+                "quiet": True,
+                "no_warnings": True,
+                # No FFmpeg postprocessor — Whisper reads m4a/webm natively
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                ext = info.get("ext", "m4a")
+
+            # Find the actual downloaded file
+            audio_path = os.path.join(tmp_dir, f"audio.{ext}")
+            if not os.path.exists(audio_path):
+                # fallback: grab whatever was downloaded
+                import glob
+                candidates = glob.glob(os.path.join(tmp_dir, "audio.*"))
+                if not candidates:
+                    raise RuntimeError("yt-dlp downloaded nothing — check the URL or your network.")
+                audio_path = candidates[0]
+
+            logger.info("[Whisper] Transcribing %s", audio_path)
+            result = whisper_model.transcribe(audio_path)
+            full_text = result.get("text", "").strip()
+            source_type = "whisper"
+            logger.info(
+                "[Whisper] Transcription complete for %s (%d chars)", video_id, len(full_text)
+            )
+
+    if not full_text:
+        raise ValueError(f"No transcript content found for: {url}")
+
+    # ── Chunk the transcript into overlapping word windows ────────────────────
+    words = full_text.split()
+    if not words:
+        raise ValueError(f"Transcript is blank for: {url}")
+
+    text_chunks = _chunk_words(words, _YT_CHUNK_WORDS, _YT_CHUNK_OVERLAP_WORDS)
+    logger.info(
+        "[YouTube] %d chunks created from %d words (chunk=%d, overlap=%d)",
+        len(text_chunks), len(words), _YT_CHUNK_WORDS, _YT_CHUNK_OVERLAP_WORDS,
+    )
+
+    docs: list[Document] = []
+    for idx, chunk_text in enumerate(text_chunks):
+        docs.append(Document(
+            page_content=chunk_text,
+            metadata={
+                "source": url,
+                "video_id": video_id,
+                "chunk_index": idx,
+                "source_type": source_type,
+                "doc_type": "youtube",
+                # These will be overwritten by eval_api.py / rag.py with
+                # LLM-classified values:
+                "section": "general",
+                "policy_type": "general",
+            },
+        ))
+
+    return docs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF LOADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
+    """
+    Load a PDF with per-page Documents.
+
+    Priority order (uses whatever is installed):
+      1. pypdf  — modern, pure-Python, actively maintained (pip install pypdf)
+      2. pdfplumber — good for complex layouts (pip install pdfplumber)
+
+    Raises RuntimeError if neither library is available.
+    """
+    # ── pypdf (preferred — installed as 'pypdf' v6+) ──────────────────────────
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        docs: list[Document] = []
+        reader = PdfReader(file_path)
+        total = len(reader.pages)
+        for page_num, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
+            if text:
+                docs.append(Document(
+                    page_content=text,
+                    metadata={
+                        "source": filename or file_path,
+                        "filename": filename or os.path.basename(file_path),
+                        "page": page_num + 1,
+                        "total_pages": total,
+                    },
+                ))
+        logger.info("[PDF/pypdf] Loaded %d pages from '%s'", len(docs), filename)
+        return docs
+
+    except ImportError:
+        logger.warning("[PDF] pypdf not available, trying pdfplumber")
+
+    # ── pdfplumber (fallback) ─────────────────────────────────────────────────
+    try:
+        import pdfplumber  # type: ignore
+
+        docs = []
+        with pdfplumber.open(file_path) as pdf:
+            total = len(pdf.pages)
+            for page_num, page in enumerate(pdf.pages):
+                text = (page.extract_text() or "").strip()
+                if text:
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={
+                            "source": filename or file_path,
+                            "filename": filename or os.path.basename(file_path),
+                            "page": page_num + 1,
+                            "total_pages": total,
+                        },
+                    ))
+        logger.info("[PDF/pdfplumber] Loaded %d pages from '%s'", len(docs), filename)
+        return docs
+
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "No PDF library installed. Run: pip install pypdf"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCX / TXT / CSV / XLSX LOADERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_docx(file_path: str, filename: str = "") -> list[Document]:
+    """Load a DOCX file using python-docx."""
+    try:
+        from docx import Document as DocxDocument  # type: ignore
+    except ImportError:
+        raise RuntimeError("python-docx is required: pip install python-docx")
+
+    doc = DocxDocument(file_path)
+    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    text = "\n\n".join(paragraphs)
+    if not text:
+        return []
     return [Document(
-        page_content=f"YouTube Video: {url}\nLanguage: {language}\nTranscript source: {source_type}\n\nTranscript:\n{transcript_text}",
+        page_content=text,
         metadata={
-            "source": url,
-            "type": "youtube",
-            "source_type": source_type,
-            "language": language,
-            "video_id": re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url).group(1) if re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url) else None,
+            "source": filename or file_path,
+            "filename": filename or os.path.basename(file_path),
+            "page": 1,
         },
     )]
 
 
-# ------------------------------------------------------------------------------
-# GENERIC VIDEO SUPPORT (any video URL)
-# ------------------------------------------------------------------------------
-def _load_generic_video(url: str) -> list[Document]:
+def _load_txt(file_path: str, filename: str = "") -> list[Document]:
+    """Load a plain text file."""
+    try:
+        with open(file_path, encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except Exception as exc:
+        raise RuntimeError(f"Could not read text file '{filename}': {exc}") from exc
+
+    if not text:
+        return []
+    return [Document(
+        page_content=text,
+        metadata={
+            "source": filename or file_path,
+            "filename": filename or os.path.basename(file_path),
+            "page": 1,
+        },
+    )]
+
+
+def _load_csv(file_path: str, filename: str = "") -> list[Document]:
+    """Load a CSV as a plain-text representation."""
+    try:
+        import pandas as pd
+        df = pd.read_csv(file_path)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse CSV '{filename}': {exc}") from exc
+
+    text = df.to_string(index=False)
+    if not text.strip():
+        return []
+    return [Document(
+        page_content=text,
+        metadata={
+            "source": filename or file_path,
+            "filename": filename or os.path.basename(file_path),
+            "page": 1,
+            "rows": len(df),
+            "columns": list(df.columns),
+        },
+    )]
+
+
+def _load_xlsx(file_path: str, filename: str = "") -> list[Document]:
+    """Load an XLSX file; each sheet becomes one Document."""
+    try:
+        import pandas as pd
+        sheets = pd.read_excel(file_path, sheet_name=None)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse Excel file '{filename}': {exc}") from exc
+
+    docs: list[Document] = []
+    for sheet_name, df in sheets.items():
+        text = df.to_string(index=False).strip()
+        if text:
+            docs.append(Document(
+                page_content=f"[Sheet: {sheet_name}]\n{text}",
+                metadata={
+                    "source": filename or file_path,
+                    "filename": filename or os.path.basename(file_path),
+                    "sheet": sheet_name,
+                    "page": 1,
+                },
+            ))
+    return docs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAGE LOADER (OCR)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_image(file_path: str, filename: str = "") -> list[Document]:
+    """OCR an image file using Tesseract via pytesseract."""
+    try:
+        from PIL import Image  # type: ignore
+        import pytesseract  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "Tesseract OCR requires Pillow + pytesseract: "
+            "pip install Pillow pytesseract"
+        )
+
+    image = Image.open(file_path)
+    text = pytesseract.image_to_string(image).strip()
+    if not text:
+        return []
+    return [Document(
+        page_content=text,
+        metadata={
+            "source": filename or file_path,
+            "filename": filename or os.path.basename(file_path),
+            "page": 1,
+            "source_type": "ocr",
+        },
+    )]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDIO / VIDEO LOADER (Whisper)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_audio(file_path: str, filename: str = "") -> list[Document]:
+    """Transcribe audio/video using local Whisper."""
+    model = _get_whisper_model()
+    if model is None:
+        raise RuntimeError(
+            "Whisper is required for audio files: pip install openai-whisper"
+        )
+
+    result = model.transcribe(file_path)
+    text = result.get("text", "").strip()
+    if not text:
+        return []
+    return [Document(
+        page_content=text,
+        metadata={
+            "source": filename or file_path,
+            "filename": filename or os.path.basename(file_path),
+            "page": 1,
+            "source_type": "whisper",
+        },
+    )]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEB PAGE LOADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_html_to_text(html: str) -> tuple[str, str]:
     """
-    Download audio from any video URL (Vimeo, Dailymotion, etc.) using yt-dlp,
-    transcribe with Whisper, and return Document.
+    Parse raw HTML into clean plain text and extract the page title.
+
+    Removes boilerplate tags, prefers <main>/<article>, filters noise lines,
+    and deduplicates consecutive identical lines.
+
+    Returns (clean_text, title).
     """
-    import yt_dlp
+    from bs4 import BeautifulSoup
 
-    temp_audio_path = None
+    soup = BeautifulSoup(html, "html.parser")
+
+    # ── Remove boilerplate tags ───────────────────────────────────────────────
+    for tag in soup(["script", "style", "nav", "footer", "header",
+                     "aside", "form", "noscript", "svg", "iframe",
+                     "button", "figure", "picture"]):
+        tag.decompose()
+
+    # ── Prefer semantic content containers ───────────────────────────────────
+    container = (
+        soup.find("main")
+        or soup.find("article")
+        or soup.find("section")
+        or soup.find("body")
+        or soup
+    )
+    raw_text = container.get_text(separator="\n", strip=True)
+
+    # ── Apply noise filters ───────────────────────────────────────────────────
+    clean_text = _clean_webpage_text(raw_text)
+
+    # ── Extract title ─────────────────────────────────────────────────────────
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    return clean_text, title
+
+
+def _fetch_with_requests(
+    url: str,
+    timeout: int,
+    user_agent: str,
+) -> tuple[str, int]:
+    """
+    Fetch a URL with requests and return (html_text, status_code).
+    Raises RuntimeError with a user-friendly message on HTTP errors.
+    """
+    import requests
+
+    headers = {"User-Agent": user_agent}
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            temp_audio_path = tmp.name
+        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            f"Could not connect to '{url}'. Check the URL and your internet connection."
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            f"Request to '{url}' timed out after {timeout}s. The site may be slow or unreachable."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch URL '{url}': {exc}") from exc
 
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'outtmpl': temp_audio_path.replace('.mp3', ''),
-            'quiet': True,
-            'no_warnings': True,
-        }
-        logger.info(f"Downloading audio from generic video URL: {url}")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+    # ── Friendly HTTP error messages ──────────────────────────────────────────
+    if resp.status_code == 403:
+        raise RuntimeError(
+            f"'{url}' blocked the request (HTTP 403 Forbidden). "
+            "The site requires login or only allows direct browser access."
+        )
+    if resp.status_code == 429:
+        raise RuntimeError(
+            f"'{url}' returned HTTP 429 Too Many Requests. "
+            "The site is rate-limiting. Try again in a few minutes."
+        )
+    if resp.status_code == 404:
+        raise RuntimeError(
+            f"Page not found (HTTP 404): '{url}'. Check that the URL is correct."
+        )
+    if resp.status_code >= 500:
+        raise RuntimeError(
+            f"'{url}' returned a server error (HTTP {resp.status_code}). "
+            "The site may be temporarily down."
+        )
+    if not resp.ok:
+        raise RuntimeError(
+            f"'{url}' returned HTTP {resp.status_code}."
+        )
 
-        actual_path = temp_audio_path.replace('.mp3', '.mp3')
-        if not os.path.exists(actual_path):
-            import glob
-            mp3_files = glob.glob(temp_audio_path.replace('.mp3', '') + "*.mp3")
-            if mp3_files:
-                actual_path = mp3_files[0]
-            else:
-                raise Exception("Could not locate downloaded audio file")
-
-        whisper_model = _get_whisper_model()
-        result = whisper_model.transcribe(actual_path, task="transcribe")
-        transcript_text = result["text"].strip()
-        detected_language = result["language"]
-
-        if not transcript_text:
-            raise Exception("Whisper returned empty transcript")
-
-        logger.info(f"Generic video transcribed, language: {detected_language}")
-        return [Document(
-            page_content=f"Video URL: {url}\nLanguage: {detected_language}\nTranscription source: Whisper\n\nTranscript:\n{transcript_text}",
-            metadata={
-                "source": url,
-                "type": "video",
-                "source_type": "generic_video",
-                "language": detected_language,
-            },
-        )]
-    except Exception as e:
-        logger.error(f"Generic video transcription failed for {url}: {e}")
-        return [Document(
-            page_content=f"Could not transcribe video from {url}. Error: {e}",
-            metadata={"source": url, "type": "video", "error": str(e)},
-        )]
-    finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            os.unlink(temp_audio_path)
-        for ext in ['.mp3', '.temp', '.part']:
-            path = temp_audio_path.replace('.mp3', '') + ext if temp_audio_path else None
-            if path and os.path.exists(path):
-                os.unlink(path)
-
-
-# ------------------------------------------------------------------------------
-# WEBPAGE URL EXTRACTION (unchanged from previous version)
-# ------------------------------------------------------------------------------
-def load_url_advanced(url: str) -> list[Document]:
-    """Extract clean content from any URL using multiple strategies."""
+    # ── Encoding detection ────────────────────────────────────────────────────
+    # requests guesses encoding from headers; chardet is more reliable for
+    # non-UTF-8 pages (some insurers still serve ISO-8859-1 / Windows-1252).
+    detected_enc = _detect_encoding(resp.content)
     try:
-        jina_url = f"https://r.jina.ai/{url}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(jina_url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            text = resp.text
-            lines = text.split('\n')
-            title = lines[0].strip() if lines else url
-            content = '\n'.join(lines[1:]) if len(lines) > 1 else text
-            return [Document(
-                page_content=f"URL: {url}\nTitle: {title}\n\n{content}",
-                metadata={"source": url, "extraction": "jina_reader", "title": title}
-            )]
-    except Exception as e:
-        logger.warning("Jina Reader failed for %s: %s", url, e)
+        html = resp.content.decode(detected_enc, errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        html = resp.text  # fallback to requests' own decoding
 
+    return html, resp.status_code
+
+
+def _fetch_with_playwright(url: str, timeout: int) -> str:
+    """
+    Fetch a JS-rendered page using Playwright (Chromium headless).
+
+    Playwright is an OPTIONAL dependency — the import is deferred to runtime
+    so the rest of the module loads fine even when it is not installed.
+    Pylance / pyright "import could not be resolved" warnings are expected and
+    harmless; the try/except ImportError handles the missing-package case.
+
+    Install with:
+        pip install playwright
+        playwright install chromium
+
+    Returns raw HTML string.
+    Raises RuntimeError if Playwright is not installed or the page fails to load.
+    """
+    # Deferred import — optional dependency.  # noqa: PLC0415
+    # pyright: ignore[reportMissingModuleSource]
     try:
-        from readability import Document as ReadabilityDoc
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        resp.raise_for_status()
-        readable = ReadabilityDoc(resp.text)
-        title = readable.title()
-        content = readable.summary()
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(content, "html.parser")
-        text = soup.get_text(separator="\n", strip=True)
-        if len(text) > 200:
-            return [Document(
-                page_content=f"URL: {url}\nTitle: {title}\n\n{text}",
-                metadata={"source": url, "extraction": "readability"}
-            )]
-    except Exception as e:
-        logger.warning("Readability fallback failed: %s", e)
+        import importlib
+        _pw_module   = importlib.import_module("playwright.sync_api")  # type: ignore[import-untyped]
+        sync_playwright = _pw_module.sync_playwright                   # type: ignore[attr-defined]
+        PWTimeout       = _pw_module.TimeoutError                      # type: ignore[attr-defined]
+    except ImportError:
+        raise RuntimeError(
+            "Playwright is not installed. Run: pip install playwright && playwright install chromium"
+        )
 
-    return _load_webpage(url)
-
-
-def _load_webpage(url: str) -> list[Document]:
-    text = None
-    title = url
+    logger.info("[Playwright] Fetching JS-rendered page: %s", url)
     try:
-        import trafilatura
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        downloaded = trafilatura.fetch_url(url, headers=headers, timeout=30)
-        if downloaded:
-            text = trafilatura.extract(downloaded, include_comments=False, include_tables=True)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            )
+            page = context.new_page()
             try:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(downloaded, "html.parser")
-                if soup.title and soup.title.string:
-                    title = soup.title.string.strip()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("trafilatura failed: %s", e)
+                page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            except PWTimeout:
+                # networkidle can time-out on chatty pages; domcontentloaded is enough
+                logger.warning("[Playwright] networkidle timed out — retrying with domcontentloaded")
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            html = page.content()
+            browser.close()
+        return html
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Playwright failed to load '{url}': {exc}") from exc
 
-    if not text or len(text.strip()) < _MIN_TEXT_LENGTH:
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def _load_web_page(
+    url: str,
+    *,
+    timeout: int = 20,
+    max_chars: int = 100_000,
+    user_agent: str = _BROWSER_UA,
+) -> list[Document]:
+    """
+    Fetch a web page and convert its main text content to a Document.
+
+    Strategy
+    --------
+    1. Fetch with requests + decode with chardet.
+    2. Parse HTML → clean text with BeautifulSoup + noise filters.
+    3. If the resulting text is too sparse (< _SPARSE_CONTENT_THRESHOLD chars),
+       fall back to Playwright headless browser to render JS-heavy pages.
+    4. Apply _clean_webpage_text() to remove nav noise and duplicate lines.
+    5. Truncate at max_chars and return as a single Document.
+    """
+    try:
+        import requests  # noqa: F401
+        from bs4 import BeautifulSoup  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "requests and beautifulsoup4 are required for web scraping: "
+            "pip install requests beautifulsoup4"
+        )
+
+    html = None
+    title = url
+
+    # ── Step 1: Try requests ──────────────────────────────────────────────────
+    try:
+        html, _ = _fetch_with_requests(url, timeout=timeout, user_agent=user_agent)
+        clean_text, title = _parse_html_to_text(html)
+        logger.info(
+            "[WebPage/requests] %s → %d chars after cleaning", url, len(clean_text)
+        )
+    except RuntimeError:
+        raise  # re-raise friendly HTTP errors immediately (403, 404, 429, 5xx)
+    except Exception as exc:
+        logger.warning("[WebPage/requests] Failed for %s: %s — trying Playwright", url, exc)
+        clean_text = ""
+
+    # ── Step 2: Playwright fallback if content is too sparse ──────────────────
+    if len(clean_text) < _SPARSE_CONTENT_THRESHOLD:
+        logger.info(
+            "[WebPage] Sparse content (%d chars) from requests — trying Playwright for %s",
+            len(clean_text), url,
+        )
         try:
-            from bs4 import BeautifulSoup
-            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                tag.decompose()
-            if soup.title and soup.title.string:
-                title = soup.title.string.strip()
-            bs_text = re.sub(r'\n{3,}', '\n\n', soup.get_text(separator="\n", strip=True))
-            if len(bs_text.strip()) > len((text or "").strip()):
-                text = bs_text
-        except Exception as e:
-            logger.warning("requests+bs4 fallback failed: %s", e)
+            playwright_html = _fetch_with_playwright(url, timeout=max(timeout, 30))
+            pw_text, pw_title = _parse_html_to_text(playwright_html)
+            if len(pw_text) > len(clean_text):
+                clean_text = pw_text
+                title = pw_title or title
+                logger.info(
+                    "[WebPage/Playwright] %s → %d chars after cleaning", url, len(clean_text)
+                )
+            else:
+                logger.warning(
+                    "[WebPage/Playwright] No improvement for %s (%d chars)", url, len(pw_text)
+                )
+        except RuntimeError as pw_exc:
+            logger.warning("[WebPage/Playwright] Skipped: %s", pw_exc)
 
-    if not text or len(text.strip()) < 150:
-        return [Document(
-            page_content=(
-                f"⚠️ Could not extract meaningful content from: {url}\n\n"
-                "This page likely requires login, JavaScript rendering, or blocks bots."
-            ),
-            metadata={"source": url, "type": "webpage", "error": "insufficient_content"},
-        )]
+    if not clean_text:
+        return []
+
+    # ── Step 3: Truncate and build Document ───────────────────────────────────
+    clean_text = clean_text[:max_chars]
 
     return [Document(
-        page_content=f"Web Page: {title}\nURL: {url}\n\n{text}",
-        metadata={"source": url, "type": "webpage", "title": title},
+        page_content=clean_text,
+        metadata={
+            "source": url,
+            "source_url": url,
+            "filename": url,
+            "title": title,
+            "page": 1,
+            "source_type": "web",
+            "doc_type": "general",
+            "char_count": len(clean_text),
+        },
     )]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_document(file_path: str, filename: str = "") -> list[Document]:
+    """
+    Load a local file and return a list of LangChain Documents.
+
+    Dispatches to the appropriate loader based on file extension.
+    Raises FileValidationError for unsupported or oversized files.
+    Raises RuntimeError when a required library is missing.
+
+    Parameters
+    ----------
+    file_path : Absolute path to the local file (e.g. a temp file).
+    filename  : Original filename (used for metadata and extension detection).
+                Defaults to basename of file_path.
+    """
+    fname = filename or os.path.basename(file_path)
+    ext = Path(fname).suffix.lower()
+
+    # ── Size check ────────────────────────────────────────────────────────────
+    try:
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_SIZE_BYTES:
+            raise FileValidationError(
+                f"File '{fname}' is {size // (1024*1024)} MB — exceeds the "
+                f"{MAX_FILE_SIZE_BYTES // (1024*1024)} MB limit."
+            )
+    except FileNotFoundError:
+        raise FileValidationError(f"File not found: {file_path}")
+
+    # ── Extension check ───────────────────────────────────────────────────────
+    if ext not in ALLOWED_EXTENSIONS:
+        raise FileValidationError(
+            f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}"
+        )
+
+    # ── Dispatch to loader ────────────────────────────────────────────────────
+    if ext == ".pdf":
+        return _load_pdf(file_path, fname)
+    if ext in (".docx", ".doc"):
+        return _load_docx(file_path, fname)
+    if ext == ".txt":
+        return _load_txt(file_path, fname)
+    if ext == ".csv":
+        return _load_csv(file_path, fname)
+    if ext in (".xlsx", ".xls"):
+        return _load_xlsx(file_path, fname)
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"):
+        return _load_image(file_path, fname)
+    if ext in (".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm"):
+        return _load_audio(file_path, fname)
+
+    raise FileValidationError(f"No loader implemented for extension '{ext}'")
 
 
 def load_url(url: str) -> list[Document]:
-    """Main entry point for URL loading – supports webpages and any video URL."""
+    """
+    Load content from a URL.
+
+    Routing:
+      - YouTube URL → _load_youtube()
+      - Everything else → fetch HTML, strip tags, return as Document
+
+    Returns a list of Documents (multiple for YouTube chunks, usually one
+    for web pages).
+    """
     if is_youtube_url(url):
         return _load_youtube(url)
-    # Check if it looks like a video URL (common patterns)
-    video_patterns = [r'(vimeo\.com)', r'(dailymotion\.com)', r'(twitch\.tv)', r'(facebook\.com/watch)', r'(tiktok\.com)']
-    if any(re.search(p, url) for p in video_patterns):
-        return _load_generic_video(url)
-    return load_url_advanced(url)
+    return _load_web_page(url)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN DOCUMENT DISPATCHER (unchanged from original)
-# ══════════════════════════════════════════════════════════════════════════════
-def load_document(file_path: str, original_name: str) -> list[Document]:
-    validate_file(file_path, original_name)
-    ext = Path(original_name).suffix.lower()
-    try:
-        if ext in (".txt", ".html", ".htm"):
-            return _load_text(file_path, original_name)
-        if ext == ".eml":
-            return _load_eml(file_path, original_name)
-        if ext == ".pdf":
-            return _load_pdf_fast(file_path, original_name)
-        if ext in (".docx", ".doc"):
-            return _load_docx(file_path, original_name)
-        if ext in (".xlsx", ".xls"):
-            return _load_excel(file_path, original_name)
-        if ext in (".pptx", ".ppt"):
-            return _load_pptx(file_path, original_name)
-        if ext == ".csv":
-            return _load_csv(file_path, original_name)
-        return _docling_load(file_path, original_name)
-    except Exception as exc:
-        logger.error("Failed to load %s: %s", original_name, exc)
-        return [Document(
-            page_content=f"[Error reading {original_name}]: {exc}",
-            metadata={"source": original_name, "error": str(exc)},
-        )]
+def load_url_advanced(
+    url: str,
+    *,
+    timeout: int = 30,
+    max_chars: int = 100_000,
+    user_agent: str = _BROWSER_UA,
+) -> list[Document]:
+    """
+    Advanced URL loader with configurable timeout, size limit, and user-agent.
 
-
-# ── PDF fast (pdfplumber + pypdf + Docling fallback) ──────────────────────────
-def _load_pdf_fast(path: str, name: str) -> list[Document]:
-    docs = []
-    total_text = 0
-    try:
-        import pdfplumber
-        with pdfplumber.open(path) as pdf:
-            for page_no, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
-                tables = page.extract_tables()
-                if tables:
-                    for table in tables:
-                        rows = []
-                        for row in table:
-                            cells = [str(c).strip() if c else "" for c in row]
-                            rows.append(" | ".join(cells))
-                        text += "\n\n" + "\n".join(rows)
-                text = _normalize_units(text.strip())
-                total_text += len(text)
-                if text:
-                    docs.append(Document(
-                        page_content=text,
-                        metadata={"source": name, "page": page_no, "extraction": "pdfplumber"},
-                    ))
-        logger.info("pdfplumber extracted %d page(s), %d chars from %s", len(docs), total_text, name)
-    except Exception as exc:
-        logger.warning("pdfplumber failed for %s: %s — trying pypdf", name, exc)
-        docs, total_text = _load_pdf_pypdf(path, name)
-
-    if total_text < _MIN_TEXT_LENGTH:
-        logger.info("Low text from pdfplumber (%d chars) — falling back to Docling OCR for %s", total_text, name)
-        return _docling_load(path, name)
-
-    return docs or [Document(
-        page_content="(Empty PDF — no text extracted)",
-        metadata={"source": name, "extraction": "pdfplumber"},
-    )]
-
-
-def _load_pdf_pypdf(path: str, name: str) -> tuple[list[Document], int]:
-    docs = []
-    total_text = 0
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(path)
-        for page_no, page in enumerate(reader.pages, start=1):
-            text = _normalize_units((page.extract_text() or "").strip())
-            total_text += len(text)
-            if text:
-                docs.append(Document(
-                    page_content=text,
-                    metadata={"source": name, "page": page_no, "extraction": "pypdf"},
-                ))
-        logger.info("pypdf extracted %d page(s), %d chars from %s", len(docs), total_text, name)
-    except Exception as exc:
-        logger.warning("pypdf also failed for %s: %s", name, exc)
-    return docs, total_text
-
-
-# ── DOCX ──────────────────────────────────────────────────────────────────────
-def _load_docx(path: str, name: str) -> list[Document]:
-    try:
-        from docx import Document as DocxDocument
-        doc = DocxDocument(path)
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        text = _normalize_units("\n\n".join(paragraphs))
-        if not text.strip():
-            return [Document(page_content="(Empty document)", metadata={"source": name})]
-        return [Document(
-            page_content=text,
-            metadata={"source": name, "page": 1, "extraction": "python-docx"},
-        )]
-    except Exception as exc:
-        logger.warning("python-docx failed for %s: %s — trying Docling", name, exc)
-        return _docling_load(path, name)
-
-
-# ── EXCEL ─────────────────────────────────────────────────────────────────────
-def _load_excel(path: str, name: str) -> list[Document]:
-    try:
-        import pandas as pd
-        xls = pd.ExcelFile(path)
-        docs = []
-        for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name)
-            text = f"Sheet: {sheet_name}\n\n{df.to_string(index=False)}"
-            text = _normalize_units(text)
-            docs.append(Document(
-                page_content=text,
-                metadata={"source": name, "page": sheet_name, "extraction": "pandas"},
-            ))
-        return docs or [Document(page_content="(Empty spreadsheet)", metadata={"source": name})]
-    except Exception as exc:
-        logger.warning("pandas excel failed for %s: %s — trying Docling", name, exc)
-        return _docling_load(path, name)
-
-
-# ── POWERPOINT ────────────────────────────────────────────────────────────────
-def _load_pptx(path: str, name: str) -> list[Document]:
-    try:
-        from pptx import Presentation
-        prs = Presentation(path)
-        docs = []
-        for slide_no, slide in enumerate(prs.slides, start=1):
-            parts = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    parts.append(shape.text_frame.text)
-                if shape.has_table:
-                    table = shape.table
-                    rows = []
-                    for row in table.rows:
-                        cells = [cell.text.strip() for cell in row.cells]
-                        rows.append(" | ".join(cells))
-                    parts.append("\n".join(rows))
-            text = _normalize_units("\n\n".join(parts))
-            if text.strip():
-                docs.append(Document(
-                    page_content=text,
-                    metadata={"source": name, "page": slide_no, "extraction": "python-pptx"},
-                ))
-        return docs or [Document(page_content="(Empty presentation)", metadata={"source": name})]
-    except Exception as exc:
-        logger.warning("python-pptx failed for %s: %s — trying Docling", name, exc)
-        return _docling_load(path, name)
-
-
-# ── CSV ───────────────────────────────────────────────────────────────────────
-def _load_csv(path: str, name: str) -> list[Document]:
-    try:
-        import pandas as pd
-        df = pd.read_csv(path)
-        text = df.to_string(index=False)
-        return [Document(
-            page_content=_normalize_units(text),
-            metadata={"source": name, "page": 1, "extraction": "pandas"},
-        )]
-    except Exception as exc:
-        logger.error("CSV load failed for %s: %s", name, exc)
-        return [Document(
-            page_content=f"[Error reading CSV {name}]: {exc}",
-            metadata={"source": name, "error": str(exc)},
-        )]
-
-
-# ── PLAIN TEXT / EML / HTML ─────────────────────────────────────────────────────────
-def _load_text(path: str, name: str) -> list[Document]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-    return [Document(page_content=text, metadata={"source": name})]
-
-
-def _load_eml(path: str, name: str) -> list[Document]:
-    import email
-    from email import policy as email_policy
-    with open(path, "rb") as f:
-        msg = email.message_from_binary_file(f, policy=email_policy.default)
-    body = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            ct = part.get_content_type()
-            if ct == "text/plain":
-                body += part.get_content() or ""
-            elif ct == "text/html" and not body:
-                body += re.sub(r"<[^>]+>", " ", part.get_content() or "")
-    else:
-        body = msg.get_content() or ""
-    text = (
-        f"Subject: {msg.get('Subject', '')}\n"
-        f"From: {msg.get('From', '')}\n"
-        f"To: {msg.get('To', '')}\n"
-        f"Date: {msg.get('Date', '')}\n\n"
-        f"{body.strip()}"
-    )
-    return [Document(page_content=text, metadata={"source": name})]
-
-
-# ── DOCLING FALLBACK (OCR for scanned PDFs) ───────────────────────────────────
-_CONVERTER = None
-def _get_converter():
-    global _CONVERTER
-    if _CONVERTER is None:
-        from docling.document_converter import DocumentConverter
-        _CONVERTER = DocumentConverter()
-        logger.info("Docling DocumentConverter initialised (OCR fallback).")
-    return _CONVERTER
-
-def _docling_load(path: str, name: str) -> list[Document]:
-    try:
-        converter = _get_converter()
-        result = converter.convert(path)
-        doc = result.document
-        docs = []
-        pages = getattr(doc, "pages", None)
-        if pages:
-            for page_no, page in pages.items():
-                page_items = [
-                    item for item, _ in doc.iterate_items()
-                    if hasattr(item, "prov") and item.prov
-                    and any(p.page_no == page_no for p in item.prov)
-                ]
-                if page_items:
-                    parts = []
-                    for item in page_items:
-                        if hasattr(item, "export_to_markdown"):
-                            parts.append(item.export_to_markdown())
-                        elif hasattr(item, "text"):
-                            parts.append(item.text)
-                    page_text = _normalize_units("\n\n".join(parts))
-                    if page_text.strip():
-                        docs.append(Document(
-                            page_content=page_text,
-                            metadata={"source": name, "page": page_no, "extraction": "docling-ocr"},
-                        ))
-        if not docs:
-            markdown = _normalize_units(doc.export_to_markdown())
-            if markdown.strip():
-                docs.append(Document(
-                    page_content=markdown,
-                    metadata={"source": name, "page": 1, "extraction": "docling-ocr"},
-                ))
-        logger.info("Docling OCR extracted %d page(s) from %s", len(docs), name)
-        return docs or [Document(
-            page_content="(Empty document — no text extracted even with OCR)",
-            metadata={"source": name, "extraction": "docling-ocr"},
-        )]
-    except Exception as exc:
-        logger.error("Docling OCR also failed for %s: %s", name, exc)
-        return [Document(
-            page_content=f"[Extraction failed for {name}]: {exc}",
-            metadata={"source": name, "error": str(exc)},
-        )]
+    Identical routing to load_url() (YouTube vs web page) but exposes
+    additional parameters for callers that need finer control.
+    """
+    if is_youtube_url(url):
+        return _load_youtube(url)
+    return _load_web_page(url, timeout=timeout, max_chars=max_chars, user_agent=user_agent)

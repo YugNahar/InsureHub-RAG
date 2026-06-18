@@ -48,40 +48,22 @@ AIAgent/
 ```
 
 ---
-## Step 1.5 — Create your .env file
 
-Copy the example below into a file called `.env` in the project root 
-(same folder as docker-compose.yml):
-
-    VLLM_HOST=http://<your-vllm-server-ip>:7000
-    VLLM_MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ
-    EMBED_MODEL=BAAI/bge-base-en-v1.5
-    ADMIN_USERNAME=admin
-    ADMIN_PASSWORD=yourpassword
-    AUTH_SECRET_KEY=pick-any-long-random-string
-    AUTH_TOKEN_EXPIRE_MINUTES=480
-
-Never commit this file to git.
----
 ## Step 2 — Point It at Your vLLM Server
 
 Open `docker-compose.yml` in a text editor. Find the `environment` section under the `api` service and update the vLLM host if yours is different:
 
 ```yaml
 environment:
-  - VLLM_HOST=${VLLM_HOST}
-  - VLLM_MODEL=${VLLM_MODEL}
-  - EMBED_MODEL=${EMBED_MODEL}
-  - ADMIN_USERNAME=${ADMIN_USERNAME}
-  - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-  - AUTH_SECRET_KEY=${AUTH_SECRET_KEY}
-  - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
+  - VLLM_HOST=http://123.253.124.14:7000
+  - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+  - EMBED_MODEL=BAAI/bge-base-en-v1.5
 ```
 
 Before going further, confirm your vLLM server is actually reachable:
 
 ```
-curl $VLLM_HOST/v1/models
+curl http://123.253.124.14:7000/v1/models
 ```
 
 If you get back a JSON response listing models, you're good. If it times out or refuses the connection, the server is either down or blocked by a firewall — sort that out before continuing, otherwise the app will start but won't be able to answer any questions.

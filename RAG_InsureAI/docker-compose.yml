@@ -16,13 +16,9 @@ services:
         reservations:
           memory: 2G
     environment:
-    - VLLM_HOST=${VLLM_HOST}
-    - VLLM_MODEL=${VLLM_MODEL}
-    - EMBED_MODEL=${EMBED_MODEL}
-    - ADMIN_USERNAME=${ADMIN_USERNAME}
-    - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-    - AUTH_SECRET_KEY=${AUTH_SECRET_KEY}
-    - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
+      - VLLM_HOST=http://123.253.124.14:7000
+      - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+      - EMBED_MODEL=BAAI/bge-base-en-v1.5
     volumes:
       - ./app:/app
       - upload_data:/tmp/uploads
