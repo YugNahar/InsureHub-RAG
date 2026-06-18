@@ -15,14 +15,14 @@ services:
           memory: 6G
         reservations:
           memory: 2G
-        environment:
-          - VLLM_HOST=${VLLM_HOST}
-          - VLLM_MODEL=${VLLM_MODEL}
-          - EMBED_MODEL=${EMBED_MODEL}
-          - ADMIN_USERNAME=${ADMIN_USERNAME}
-          - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-          - AUTH_SECRET_KEY=${AUTH_SECRET_KEY}
-          - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
+    environment:
+    - VLLM_HOST=${VLLM_HOST}
+    - VLLM_MODEL=${VLLM_MODEL}
+    - EMBED_MODEL=${EMBED_MODEL}
+    - ADMIN_USERNAME=${ADMIN_USERNAME}
+    - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    - AUTH_SECRET_KEY=${AUTH_SECRET_KEY}
+    - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
     volumes:
       - ./app:/app
       - upload_data:/tmp/uploads
