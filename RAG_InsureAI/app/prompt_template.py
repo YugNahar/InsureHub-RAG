@@ -1,5 +1,5 @@
 """
-Prompt Templates — Optimized for Qwen2.5-3B-Instruct-AWQ (4096 token limit)
+Prompt Templates — Optimized for Qwen2.5-7B-Instruct-AWQ (4096 token limit)
 """
 
 # ─────────────────────────────────────────────────────────────────────────────

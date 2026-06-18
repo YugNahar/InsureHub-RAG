@@ -10,17 +10,24 @@ import re
 import tempfile
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import requests
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from document_loader import load_document, load_url, extract_urls
-from metadata_tagger import tag_document
+from semantic_chunker import SemanticChunker
+from metadata_tagger import (
+    tag_document,
+    classify_query,
+    build_metadata_filter,
+    classify_document_type,
+    classify_chunk_intent,
+    classify_chunk_policy_type,
+)
 from validator import detect_conflict, validate_grounding
 from router import get_insurance_llm, get_general_llm, VLLM_HOST
 from prompt_template import (
@@ -32,15 +39,19 @@ from vector_store import ChromaVectorStore
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-RETRIEVE_K = 12
-RERANK_K = 6
-MAX_CONTEXT_CHARS = 6000
+RETRIEVE_K = 16
+RERANK_K = 8
+# 3500 chars ≈ 875 tokens of context.  Total input ≈ 1100 tokens (prompt+context+question)
+# → prefill is ~1 second; 200 max_tokens of output ≈ 8 seconds at 24 tok/s on vLLM.
+# Context compressor already strips irrelevant sentences, so 3500 chars is still rich.
+MAX_CONTEXT_CHARS = 3500
 SUMMARY_MAX_CHARS = 20000
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION DETECTION (unchanged)
+# SECTION DETECTION (doc-type aware)
 # ══════════════════════════════════════════════════════════════════════════════
-_SECTION_PATTERNS: dict[str, list[str]] = {
+
+_POLICY_SECTION_PATTERNS: dict[str, list[str]] = {
     "definitions": [
         r"\bdefin", r"\bmeans?\b", r"\bshall mean\b", r"\brefers? to\b",
         r"\binterpretation\b", r"\bglossary\b",
@@ -79,14 +90,78 @@ _SECTION_PATTERNS: dict[str, list[str]] = {
     ],
 }
 
-def _detect_section(text: str) -> str:
+_HANDBOOK_SECTION_PATTERNS: dict[str, list[str]] = {
+    "definitions": [
+        r"\bdefin", r"\bmeans?\b", r"\bshall mean\b", r"\brefers? to\b",
+        r"\binterpretation\b", r"\bglossary\b",
+    ],
+    "principles": [
+        r"\butmost good faith\b", r"\buberrima fide\b",
+        r"\bsubrogation\b", r"\bcontribution\b",
+        r"\binsurable interest\b", r"\bindemnity principle\b",
+        r"\bproximate cause\b", r"\bprinciple of\b",
+    ],
+    "legislation": [
+        r"\bact\b", r"\bsection \d", r"\bclause \d", r"\bschedule\b",
+        r"\bregulation\b", r"\bnotification\b", r"\bgazette\b",
+        r"\bprovision\b", r"\bamendment\b", r"\bstatute\b",
+        r"\birda\b", r"\birdai\b",
+    ],
+    "case_law": [
+        r"\bv\.\b", r"\bjudgment\b", r"\bjudgement\b",
+        r"\bsupreme court\b", r"\bhigh court\b",
+        r"\bheld that\b", r"\bcourt held\b",
+        r"\bappeal\b", r"\bpetition\b", r"\bwrit\b",
+    ],
+    "history": [
+        r"\bhistory\b", r"\bevolution\b", r"\borigin\b",
+        r"\bnationaliz", r"\bnationalised\b",
+        r"\bestablish", r"\bfounded\b", r"\bincorporated\b",
+        r"\b19\d\d\b", r"\b20\d\d\b",
+    ],
+    "types_of_insurance": [
+        r"\btypes of insurance\b", r"\bclassification\b",
+        r"\bgeneral insurance\b", r"\blife insurance\b",
+        r"\bmarine insurance\b", r"\bfire insurance\b",
+        r"\bmotor insurance\b", r"\bhealth insurance\b",
+        r"\bcrop insurance\b", r"\bmicro.?insurance\b",
+    ],
+    "chapter": [
+        r"\bchapter\b", r"\bunit\b", r"\bmodule\b",
+        r"\bintroduction\b", r"\boverview\b", r"\bbackground\b",
+        r"\bsummary\b", r"\bconclusion\b",
+    ],
+}
+
+# Backward-compat alias
+_SECTION_PATTERNS = _POLICY_SECTION_PATTERNS
+
+
+def _detect_section(text: str, doc_type: str = "policy_document") -> str:
+    """
+    Detect the most likely section label for a chunk of text using regex.
+
+    Uses different pattern sets depending on document type:
+      - policy_document              → policy-oriented labels (benefits, exclusions, …)
+      - reference_handbook/regulatory → handbook labels (principles, case_law, …)
+      - general/youtube/other         → falls back to policy patterns
+
+    Requires ≥ 2 pattern hits to assign a section label — a single weak hit
+    is not enough evidence and causes false-positive labels.
+    """
+    patterns = (
+        _HANDBOOK_SECTION_PATTERNS
+        if doc_type in ("reference_handbook", "regulatory")
+        else _POLICY_SECTION_PATTERNS
+    )
     t = text.lower()
-    scores = {s: sum(1 for p in pats if re.search(p, t)) for s, pats in _SECTION_PATTERNS.items()}
+    scores = {s: sum(1 for p in pats if re.search(p, t)) for s, pats in patterns.items()}
     best = max(scores, key=scores.__getitem__)
-    return best if scores[best] > 0 else "general"
+    return best if scores[best] >= 2 else "general"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DOCUMENT ROUTING (unchanged)
+# DOCUMENT ROUTING
 # ══════════════════════════════════════════════════════════════════════════════
 _DOCUMENT_ROUTING_MAP = [
     (["hajj", "umrah", "pilgrimage", "mecca", "rak travel", "outbound", "rak_travel"], "RAK_Travel_Outbound"),
@@ -122,7 +197,7 @@ def _route_to_documents(query: str, available_sources: list[str]) -> Optional[li
     return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONDITIONAL LOGIC DETECTOR (unchanged)
+# CONDITIONAL LOGIC DETECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 _CONDITION_TRIGGERS = [
     r"\bonly if\b", r"\bunless\b", r"\bprovided that\b", r"\bsubject to\b",
@@ -145,7 +220,7 @@ def _extract_condition_hint(chunks: list[Document]) -> Optional[str]:
     return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KEYWORD EXTRACTION (unchanged)
+# KEYWORD EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 _STOPWORDS = frozenset({
     "the", "a", "an", "and", "or", "of", "in", "to", "is", "are", "be",
@@ -161,28 +236,120 @@ def _extract_keywords(text: str) -> list[str]:
     return list(dict.fromkeys(t for t in tokens if t not in _STOPWORDS))[:40]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION-AWARE CHUNKER (unchanged)
+# SECTION-AWARE CHUNKER
 # ══════════════════════════════════════════════════════════════════════════════
 class SectionChunker:
-    def __init__(self, chunk_size: int = 900, chunk_overlap: int = 120):
-        self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""],
-            keep_separator=False,
+    """
+    Args
+    ----
+    chunk_size, chunk_overlap : kept for backward-compatible call signatures
+        (e.g. SectionChunker(chunk_size=600, chunk_overlap=80)). chunk_size
+        is now used as the semantic chunker's max_chunk_chars ceiling and
+        chunk_overlap as a floor for min_chunk_chars — chunk_overlap no
+        longer produces literal overlapping text, since semantic boundaries
+        are chosen at low-similarity points and don't need it.
+    embed_model : the shared embedding model (e.g. ChromaVectorStore's
+        embed_model). Pass this in to avoid loading a second copy of the
+        model — see semantic_chunker.py.
+    breakpoint_percentile : forwarded to SemanticChunker; higher = fewer,
+        larger chunks.
+    """
+    def __init__(
+        self,
+        chunk_size: int = 900,
+        chunk_overlap: int = 120,
+        embed_model: Any = None,
+        breakpoint_percentile: float = 90.0,
+    ):
+        self._splitter = SemanticChunker(
+            embed_model=embed_model,
+            breakpoint_percentile=breakpoint_percentile,
+            min_chunk_chars=max(150, chunk_overlap),
+            max_chunk_chars=chunk_size,
         )
-    def split_documents(self, docs: list[Document]) -> list[Document]:
+
+    def split_documents(
+        self,
+        docs: list[Document],
+        doc_type: str = "policy_document",
+        llm: Any = None,
+    ) -> list[Document]:
+        """
+        Split documents into overlapping chunks and annotate each chunk with:
+          - section: intent/section label (regex fast-path; LLM for ambiguous
+            or YouTube/conversational chunks when llm is provided)
+          - policy_type: per-chunk policy type (regex fast-path; LLM for
+            ambiguous or YouTube chunks when llm is provided)
+          - keywords: extracted keyword list
+
+        Args:
+            docs:     List of LangChain Document objects to split.
+            doc_type: Document type from classify_document_type().
+                      Controls which section-label vocabulary is used.
+                      Defaults to "policy_document" for backward compatibility.
+            llm:      Optional LangChain LLM instance. When provided, used for
+                      chunk-level intent and policy_type classification on
+                      ambiguous or YouTube/conversational chunks.
+        """
         chunks = []
         for doc in docs:
+            # Inherit doc_type from document metadata if present
+            effective_doc_type = doc.metadata.get("doc_type", doc_type)
+
+            # Determine if this is YouTube/conversational content
+            is_youtube = effective_doc_type in ("youtube",) or \
+                         "whisper" in str(doc.metadata.get("source_type", "")) or \
+                         "youtube" in str(doc.metadata.get("source", "")).lower()
+
             raw = self._splitter.split_documents([doc])
             for chunk in raw:
-                chunk.metadata["section"] = _detect_section(chunk.page_content)
+                # ── Section / intent label ─────────────────────────────────
+                # For YouTube chunks, always use LLM (regex misses colloquial).
+                # For policy/handbook chunks, regex fast-path first; LLM only
+                # when regex is ambiguous (handled inside classify_chunk_intent).
+                if llm is not None:
+                    chunk.metadata["section"] = classify_chunk_intent(
+                        chunk.page_content,
+                        doc_type=effective_doc_type,
+                        llm=llm,
+                        force_llm=is_youtube,
+                    )
+                else:
+                    # No LLM: use regex-only _detect_section (backward compat)
+                    chunk.metadata["section"] = _detect_section(
+                        chunk.page_content, doc_type=effective_doc_type
+                    )
+
+                # ── Per-chunk policy_type ──────────────────────────────────
+                # Always classify at chunk level — overrides the doc-level
+                # "general" that tag_document() assigns to non-policy documents.
+                # This means a handbook chapter on "motor claims" correctly
+                # gets policy_type="motor" rather than "general".
+                if llm is not None:
+                    chunk_policy = classify_chunk_policy_type(
+                        chunk.page_content,
+                        llm=llm,
+                        force_llm=is_youtube,
+                    )
+                else:
+                    chunk_policy = classify_chunk_policy_type(
+                        chunk.page_content,
+                        llm=None,
+                    )
+
+                # Only override the doc-level policy_type if we found something
+                # more specific than "general" at the chunk level.
+                if chunk_policy != "general":
+                    chunk.metadata["policy_type"] = chunk_policy
+                # else: keep whatever the doc-level tag set (could be a real
+                # policy type for policy_document, or "general" for others)
+
                 chunk.metadata["keywords"] = _extract_keywords(chunk.page_content)
             chunks.extend(raw)
         return chunks
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONTEXT BUILDER (unchanged)
+# CONTEXT BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 def _chunks_within_context_limit(chunks: list[Document], max_chars: int) -> list[Document]:
     """Select complete chunks that fit the context budget."""
@@ -230,7 +397,7 @@ def _sources_from_chunks(chunks: list[Document]) -> list[str]:
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUERY CLASSIFICATION HELPERS (unchanged)
+# QUERY CLASSIFICATION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 _ALL_DOCS_EXPLICIT = [
     "from all documents", "from all files", "from all resumes",
@@ -301,7 +468,7 @@ def _fields_from_question(question: str) -> list[str]:
     return fields or ["name", "policy_number", "coverage", "premium"]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEALTH HELPERS (unchanged)
+# HEALTH HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def wait_for_vllm(retries: int = 20, delay: int = 3) -> bool:
     for _ in range(retries):
@@ -322,22 +489,33 @@ def list_vllm_models() -> list[str]:
         return []
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAG PIPELINE — TurboVec Vector Edition with HyDE, Hybrid Search, Citation
+# RAG PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 class RAGPipeline:
     def __init__(self):
         self._vector_store = ChromaVectorStore()
-        self._chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
+        # Pass the embed_model already loaded by ChromaVectorStore/TurboVec
+        # so the chunker doesn't load a second copy of the model.
+        self._chunker = SectionChunker(
+            chunk_size=600, chunk_overlap=80, embed_model=self._vector_store.embed_model
+        )
 
     @property
     def vector_store(self):
-        """Public accessor for the underlying vector store."""
         return self._vector_store
 
     @property
     def chunker(self):
-        """Public accessor for the document chunker."""
         return self._chunker
+
+    # ── Shared LLM accessor (lazy, temperature=0) ──────────────────────────
+    def _get_llm(self):
+        """Return a zero-temperature LLM for metadata classification tasks."""
+        try:
+            return get_insurance_llm(temperature=0)
+        except Exception as exc:
+            logger.warning("[RAG] Could not get LLM for metadata classification: %s", exc)
+            return None
 
     # ── Document ingestion ─────────────────────────────────────────────────
     def add_document(self, uploaded_file) -> int:
@@ -347,33 +525,153 @@ class RAGPipeline:
             tmp_path = tmp.name
         try:
             raw_docs = load_document(tmp_path, uploaded_file.name)
-            chunks = self._chunker.split_documents(raw_docs)
             upload_id = uuid.uuid4().hex[:12]
             unique_source = f"{upload_id}_{uploaded_file.name}"
-            preview = raw_docs[0].page_content[:600] if raw_docs else ""
-            doc_tags = tag_document(uploaded_file.name, preview)
+
+            # ── Step 1: Classify document type ─────────────────────────────
+            preview = raw_docs[0].page_content[:5000] if raw_docs else ""
+            extra_text = " ".join(d.page_content for d in raw_docs[1:4])[:5000]
+            doc_type = classify_document_type(
+                uploaded_file.name, preview, extra_text
+            )
+            logger.info("Document type for '%s': %s", uploaded_file.name, doc_type)
+
+            llm = None
+            try:
+                llm = self._get_llm()
+            except Exception:
+                pass
+
+            # ── Step 2: Tag document (skips keyword matching for non-policy)
+            doc_tags = tag_document(
+                uploaded_file.name, preview,
+                extra_text=extra_text,
+                doc_type=doc_type,
+                llm=llm,
+            )
+
+            # ── Step 3: Annotate raw docs so chunker inherits doc_type ──────
+            for raw_doc in raw_docs:
+                raw_doc.metadata["doc_type"] = doc_type
+
+            # ── Step 4: Get LLM for per-chunk classification ─────────────
+
+            # ── Step 5: Chunk with doc-type-aware section + policy_type ────
+            # Pass llm so chunker can call classify_chunk_intent() and
+            # classify_chunk_policy_type() on each chunk.
+            chunks = self._chunker.split_documents(
+                raw_docs, doc_type=doc_type, llm=llm
+            )
+
+            # ── Step 6: Attach source + doc-level tags to every chunk ───────
             for chunk in chunks:
                 chunk.metadata["source"] = unique_source
                 chunk.metadata["filename"] = uploaded_file.name
+                # Apply doc-level tags first (insurer, policy_type, etc.)
                 chunk.metadata.update(doc_tags)
+                # doc_type must always be the classified value — update() above
+                # may overwrite it from doc_tags (which also sets doc_type),
+                # but we re-assert it explicitly to be safe.
+                chunk.metadata["doc_type"] = doc_type
+                # Restore the chunk-level policy_type if chunker set a more
+                # specific one (chunk.metadata["policy_type"] was set by
+                # split_documents BEFORE update() overwrote it with doc_tags).
+                # We need to re-run per-chunk policy_type after the update.
+                # Fix: classify_chunk_policy_type is idempotent — re-classify
+                # using the already-embedded text (cheap since regex is fast).
+                chunk_policy = classify_chunk_policy_type(
+                    chunk.page_content, llm=llm,
+                    force_llm=False,  # regex already ran; LLM only if ambiguous
+                )
+                if chunk_policy != "general":
+                    chunk.metadata["policy_type"] = chunk_policy
+                # If chunk_policy == "general", keep the doc-level policy_type
+                # (from doc_tags) which may be more specific for policy docs.
+
             self._vector_store.add_documents(chunks)
             return len(chunks)
         finally:
             os.unlink(tmp_path)
 
     def add_url(self, url: str) -> int:
+        """
+        Load content from a URL (web page or YouTube), classify and tag it,
+        then ingest into the vector store with full chunk-level metadata.
+
+        Fixed vs original:
+        - Classifies doc_type (was missing — all URL chunks had no doc_type).
+        - Calls tag_document() for doc-level insurer/policy_type.
+        - Calls classify_chunk_intent() + classify_chunk_policy_type() per chunk
+          so even YouTube/conversational content gets meaningful section and
+          policy_type metadata rather than always "general".
+        - Detects YouTube URLs and sets force_llm=True for those chunks.
+        """
         docs = load_url(url)
-        chunks = self._chunker.split_documents(docs)
+        if not docs:
+            return 0
+
         upload_id = uuid.uuid4().hex[:12]
         unique_source = f"{upload_id}_{url[:40]}"
+
+        # ── Detect source type for YouTube-aware classification ──────────
+        is_youtube = any(
+            "youtube" in str(doc.metadata.get("source_type", "")).lower() or
+            "whisper" in str(doc.metadata.get("source_type", "")).lower() or
+            "youtube.com" in url or "youtu.be" in url
+            for doc in docs
+        )
+        source_type = "youtube" if is_youtube else "web"
+
+        # ── Classify document type ────────────────────────────────────────
+        preview = docs[0].page_content[:5000] if docs else ""
+        extra_text = " ".join(d.page_content for d in docs[1:4])[:5000]
+        # YouTube content is always "general" at the doc level — chunk-level
+        # classification will provide the real signal.
+        doc_type = classify_document_type(url, preview, extra_text)
+        logger.info("Document type for URL '%s': %s (youtube=%s)", url, doc_type, is_youtube)
+
+        llm = None
+        try:
+            llm = self._get_llm()
+        except Exception:
+            pass
+
+        # ── Doc-level tag ─────────────────────────────────────────────────
+        doc_tags = tag_document(url, preview, extra_text=extra_text, doc_type=doc_type, llm=llm)
+
+        # ── Annotate raw docs with doc_type and source_type ───────────────
+        for doc in docs:
+            doc.metadata["doc_type"] = doc_type
+            doc.metadata.setdefault("source_type", source_type)
+
+        # ── Chunk with per-chunk intent + policy_type classification ──────
+        chunks = self._chunker.split_documents(docs, doc_type=doc_type, llm=llm)
+
+        # ── Delete any previous version of this URL then ingest ───────────
         self._vector_store.delete_by_field("source_url", url)
+
         for chunk in chunks:
             chunk.metadata["source"] = unique_source
             chunk.metadata["source_url"] = url
+            chunk.metadata["filename"] = url
+            chunk.metadata.update(doc_tags)
+            chunk.metadata["doc_type"] = doc_type
+
+            # Re-classify per-chunk policy_type after update() (same fix as
+            # add_document — update() overwrites the chunker's chunk-level
+            # policy_type with the doc-level one from doc_tags).
+            chunk_policy = classify_chunk_policy_type(
+                chunk.page_content,
+                llm=llm,
+                force_llm=is_youtube,   # always use LLM for YouTube
+            )
+            if chunk_policy != "general":
+                chunk.metadata["policy_type"] = chunk_policy
+
         self._vector_store.add_documents(chunks)
         return len(chunks)
 
-    # ── Document management ─────────────────────────────────────────────────
+    # ── Document management ────────────────────────────────────────────────
     def list_documents(self) -> list[str]:
         return self._vector_store.list_values("filename")
 
@@ -384,10 +682,15 @@ class RAGPipeline:
         self._vector_store.delete_by_field("filename", doc_name)
 
     def get_document_tags(self, doc_name: str) -> dict:
-        results = self._vector_store.collection.get(where={"filename": doc_name}, limit=1, include=["metadatas"])
+        results = self._vector_store.collection.get(
+            where={"filename": doc_name}, limit=1, include=["metadatas"]
+        )
         if results.get("metadatas"):
             meta = results["metadatas"][0]
-            return {"insurer": meta.get("insurer", "UNKNOWN"), "policy_type": meta.get("policy_type", "general")}
+            return {
+                "insurer": meta.get("insurer", "UNKNOWN"),
+                "policy_type": meta.get("policy_type", "general"),
+            }
         return {"insurer": "UNKNOWN", "policy_type": "general"}
 
     def get_full_content(self, source: str) -> str:
@@ -417,14 +720,23 @@ class RAGPipeline:
         try:
             prompt = URL_SUMMARY_PROMPT.format(context=full_text, question="Summarize this content.")
         except Exception:
-            prompt = f"Please provide a comprehensive summary of the following web page content.\nInclude all key points, names, numbers, dates, and important details.\n\nContent:\n{full_text}\n\nDetailed Summary:"
+            prompt = (
+                f"Please provide a comprehensive summary of the following web page content.\n"
+                f"Include all key points, names, numbers, dates, and important details.\n\n"
+                f"Content:\n{full_text}\n\nDetailed Summary:"
+            )
         llm = get_insurance_llm(temperature=0.3)
         response = llm.invoke(prompt)
         answer = response.content if hasattr(response, "content") else str(response)
         return answer, [url]
 
     # ── Query entry point (backward compat) ────────────────────────────────
-    def query(self, question: str, model: str, allowed_docs: Optional[list[str]] = None) -> tuple[str, list[str], Optional[pd.DataFrame]]:
+    def query(
+        self,
+        question: str,
+        model: str,
+        allowed_docs: Optional[list[str]] = None,
+    ) -> tuple[str, list[str], Optional[pd.DataFrame]]:
         question = question.strip()
         if not question:
             return "Question cannot be empty.", [], None
@@ -438,14 +750,14 @@ class RAGPipeline:
         """Generate query variations using HyDE."""
         hyde_prompt = ChatPromptTemplate.from_template(
             "Write a detailed hypothetical answer to the following question. "
-            "Use insurance policy language. Do NOT use any real facts, just plausible text.\n\nQuestion: {question}\n\nHypothetical answer:"
+            "Use insurance policy language. Do NOT use any real facts, just plausible text.\n\n"
+            "Question: {question}\n\nHypothetical answer:"
         )
         llm = get_insurance_llm(temperature=0.5)
         chain = hyde_prompt | llm | StrOutputParser()
         executor = None
         try:
             import concurrent.futures
-
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(chain.invoke, {"question": question})
             hypo = future.result(timeout=8)
@@ -466,7 +778,6 @@ class RAGPipeline:
         if not question:
             return "Question cannot be empty.", False, []
 
-        # URL questions do not depend on the document knowledge base.
         urls = extract_urls(question)
         if urls:
             url = urls[0].rstrip(".,;:!?)]}")
@@ -487,10 +798,17 @@ class RAGPipeline:
         if self._vector_store.count() == 0:
             return "EMPTY_KB", True, []
 
-        # ── Query expansion (HyDE) ─────────────────────────────────────────
+        # ── Query expansion (HyDE) + metadata filter ──────────────────────
+        llm = None
+        try:
+            llm = self._get_llm()
+        except Exception:
+            pass
+        query_meta = classify_query(question, llm=llm)
         routed_docs = _route_to_documents(question, self.list_documents())
-        filter_meta = self._source_filter(routed_docs)
+        filter_meta = build_metadata_filter(query_meta, routed_docs)
         expanded_queries = self._expand_query(question)
+
         all_chunks = []
         for q in expanded_queries:
             chunks = self._vector_store.search(
@@ -498,14 +816,10 @@ class RAGPipeline:
                 top_k=RERANK_K,
                 filter_metadata=filter_meta,
                 use_hybrid=True,
-                use_reranker=False,  # Don't apply citation-based reranking yet; we'll handle it in post-processing
+                use_reranker=True,
             )
             all_chunks.extend(chunks)
-        chunks = self._deduplicate_chunks(all_chunks)
-        chunks = self._vector_store._rerank(question, 
-            [(c.metadata.get('id',''), c.page_content, c.metadata, 0) for c in chunks], 
-            RETRIEVE_K)
-        chunks = [Document(page_content=t, metadata=m) for _, t, m, _ in chunks]
+        chunks = self._deduplicate_chunks(all_chunks)[:RETRIEVE_K]
 
         if not chunks:
             return "Not mentioned in documents.", False, []
@@ -513,14 +827,13 @@ class RAGPipeline:
         chunks = _chunks_within_context_limit(chunks, MAX_CONTEXT_CHARS)
         sources = _sources_from_chunks(chunks)
 
-        # ── Build context with forced citations ────────────────────────────
         context = _build_structured_context(chunks, max_chars=MAX_CONTEXT_CHARS)
         condition_hint = _extract_condition_hint(chunks)
         has_conflict, insurers = detect_conflict(chunks)
         conflict_hint = ""
         if has_conflict:
             conflict_hint = (
-                "The context contains multiple insurers "
+                f"The context contains multiple insurers "
                 f"({', '.join(sorted(insurers))}). Keep each insurer's facts separate."
             )
 
@@ -549,15 +862,19 @@ ANSWER (with citations):"""
         response = llm.invoke(citation_prompt)
         answer = response.content if hasattr(response, "content") else str(response)
 
-        # Post‑processing: warn if no citations found
         if "[Source:" not in answer and "Not mentioned" not in answer:
-            answer += "\n\n⚠️ **Warning:** The above answer could not be verified with explicit citations. Please verify against the original documents."
+            answer += (
+                "\n\n⚠️ **Warning:** The above answer could not be verified with explicit "
+                "citations. Please verify against the original documents."
+            )
 
-        # Grounding validation
         grounded, missing = validate_grounding(answer, context)
         if not grounded and missing:
             missing_values = ", ".join(sorted(str(m) for m in missing))
-            answer += f"\n\n⚠️ Warning: These figures could not be verified in the source documents: {missing_values}. Please cross-check against the original policy document."
+            answer += (
+                f"\n\n⚠️ Warning: These figures could not be verified in the source documents: "
+                f"{missing_values}. Please cross-check against the original policy document."
+            )
 
         return answer, False, sources
 
@@ -571,52 +888,69 @@ ANSWER (with citations):"""
         return {"source": {"$in": unique_sources}}
 
     @staticmethod
+    def _content_fingerprint(text: str) -> str:
+        normalised = re.sub(r"[^a-z0-9]", "", text.lower())
+        return normalised[:200]
+
+    @staticmethod
     def _deduplicate_chunks(chunks: list[Document]) -> list[Document]:
-        unique: dict[tuple[str, object, str], Document] = {}
+        """
+        Remove duplicate and near-duplicate chunks from a retrieval result.
+
+        Two-pass deduplication:
+          Pass 1 (exact) — key = (source, page, full_text).
+          Pass 2 (fingerprint) — key = content_fingerprint(text).
+        """
+        def _score(chunk: Document) -> float:
+            return chunk.metadata.get("rerank_score", chunk.metadata.get("similarity", 0.0))
+
+        exact: dict[tuple[str, object, str], Document] = {}
         for chunk in chunks:
             key = (
                 str(chunk.metadata.get("source", "Unknown")),
                 chunk.metadata.get("page"),
                 chunk.page_content,
             )
-            existing = unique.get(key)
-            chunk_score = chunk.metadata.get("rerank_score", chunk.metadata.get("similarity", 0))
-            existing_score = (
-                existing.metadata.get("rerank_score", existing.metadata.get("similarity", 0))
-                if existing
-                else float("-inf")
-            )
-            if existing is None or chunk_score > existing_score:
-                unique[key] = chunk
-        return sorted(
-            unique.values(),
-            key=lambda chunk: chunk.metadata.get(
-                "rerank_score",
-                chunk.metadata.get("similarity", 0),
-            ),
-            reverse=True,
+            existing = exact.get(key)
+            if existing is None or _score(chunk) > _score(existing):
+                exact[key] = chunk
+
+        fingerprint: dict[str, Document] = {}
+        for chunk in exact.values():
+            fp = RAGPipeline._content_fingerprint(chunk.page_content)
+            existing = fingerprint.get(fp)
+            if existing is None or _score(chunk) > _score(existing):
+                fingerprint[fp] = chunk
+
+        logger.debug(
+            "_deduplicate_chunks: %d in → %d after exact → %d after fingerprint",
+            len(chunks), len(exact), len(fingerprint),
         )
 
+        return sorted(fingerprint.values(), key=_score, reverse=True)
+
     def _summarize_with_citations(self, content: str, question: str) -> str:
-        prompt = f"""Summarize the following web page content in a detailed, structured way (like Perplexity). Use headings, bullet points, and include all important facts (dates, numbers, names). Do not add external knowledge.
-
-Content:
-{content[:6000]}
-
-Question: {question}
-
-Detailed summary:"""
+        prompt = (
+            f"Summarize the following web page content in a detailed, structured way. "
+            f"Use headings, bullet points, and include all important facts (dates, numbers, names). "
+            f"Do not add external knowledge.\n\nContent:\n{content[:6000]}\n\n"
+            f"Question: {question}\n\nDetailed summary:"
+        )
         llm = get_insurance_llm(temperature=0.3)
         response = llm.invoke(prompt)
         return response.content if hasattr(response, "content") else str(response)
 
-    # ── URL / general queries ──────────────────────────────────────────────
     def general_query(self, question: str) -> str:
         llm = get_general_llm(temperature=0.7)
         response = llm.invoke(GENERAL_PROMPT.format(question=question))
         return response.content if hasattr(response, "content") else str(response)
 
-    def _rag_query(self, question: str, model: str, allowed_docs: Optional[list[str]] = None) -> tuple[str, list[str]]:
+    def _rag_query(
+        self,
+        question: str,
+        model: str,
+        allowed_docs: Optional[list[str]] = None,
+    ) -> tuple[str, list[str]]:
         llm = get_insurance_llm(temperature=0)
         filter_meta = self._source_filter(allowed_docs)
         chunks = self._vector_store.search(question, top_k=5, filter_metadata=filter_meta)
@@ -630,7 +964,12 @@ Detailed summary:"""
         return answer, sources
 
     # ── Bulk structured extraction ─────────────────────────────────────────
-    def _extract_all_docs(self, question: str, model: str, doc_names: list[str]) -> tuple[str, list[str], Optional[pd.DataFrame]]:
+    def _extract_all_docs(
+        self,
+        question: str,
+        model: str,
+        doc_names: list[str],
+    ) -> tuple[str, list[str], Optional[pd.DataFrame]]:
         llm = get_insurance_llm(temperature=0)
         fields = _fields_from_question(question)
         _FIELD_HINTS = {
@@ -670,9 +1009,18 @@ Detailed summary:"""
             pairs = sorted(zip(documents, metadatas), key=page_key)
             raw_chunks = [document for document, _ in pairs]
             context = "\n\n".join(raw_chunks)[:6000]
-            hints = "\n".join(f"- For {f}: {_FIELD_HINTS[f]}" for f in fields if f in _FIELD_HINTS)
+            hints = "\n".join(
+                f"- For {f}: {_FIELD_HINTS[f]}" for f in fields if f in _FIELD_HINTS
+            )
             fields_str = ", ".join(f'"{f}"' for f in fields)
-            prompt = f"Extract data from this document. Reply with ONLY a single JSON object using these EXACT keys: {fields_str}\nRules:\n- Use null if a field is not found.\n{hints}\n- One value per field (string). If multiple, join with \", \".\n- No explanation. No extra keys. Just the JSON.\n\nDocument ({doc_name}):\n{context}\n\nJSON:"
+            prompt = (
+                f"Extract data from this document. Reply with ONLY a single JSON object "
+                f"using these EXACT keys: {fields_str}\n"
+                f"Rules:\n- Use null if a field is not found.\n{hints}\n"
+                f"- One value per field (string). If multiple, join with \", \".\n"
+                f"- No explanation. No extra keys. Just the JSON.\n\n"
+                f"Document ({doc_name}):\n{context}\n\nJSON:"
+            )
             raw = llm.invoke(prompt)
             parsed = self._parse_json(raw.content if hasattr(raw, "content") else str(raw))
             for f in fields:
@@ -688,14 +1036,21 @@ Detailed summary:"""
         df.columns = [c.replace("_", " ").title() for c in df.columns]
         return f"Extracted from {len(rows)} document(s). Download Excel above.", doc_names, df
 
-    def _find_doc_by_name_in_query(self, question: str, allowed_docs: Optional[list[str]] = None) -> Optional[str]:
+    def _find_doc_by_name_in_query(
+        self,
+        question: str,
+        allowed_docs: Optional[list[str]] = None,
+    ) -> Optional[str]:
         q_words = set(question.lower().split())
         doc_names = allowed_docs if allowed_docs else self.list_documents()
         best_doc, best_score = None, 0
         for doc_name in doc_names:
             stem = re.sub(r'[_\-.]', ' ', doc_name)
             stem = re.sub(r'([a-z])([A-Z])', r'\1 \2', stem)
-            doc_words = set(w.lower() for w in stem.split() if w.lower() not in {"resume", "cv", "pdf", "updated", "doc"})
+            doc_words = set(
+                w.lower() for w in stem.split()
+                if w.lower() not in {"resume", "cv", "pdf", "updated", "doc"}
+            )
             matches = len(q_words & doc_words)
             if matches > best_score:
                 best_score = matches

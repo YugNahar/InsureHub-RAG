@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Vector store data (rebuilt on ingest — not source code)
+RAG_InsureAI/app/chroma_db/
+RAG_InsureAI/app/turbovec_data/
+RAG_InsureAI/app/state/
+
+# Uploaded files
+RAG_InsureAI/app/video/
+*.pdf
+
+# Environment / secrets
+.env
+*.env
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Claude Code internal
+.claude/
+
+# Logs
+*.log

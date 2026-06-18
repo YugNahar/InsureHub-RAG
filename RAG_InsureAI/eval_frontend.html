@@ -78,6 +78,47 @@
   .config-row select, .config-row input[type=number] { padding: 3px 6px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: 12px; font-family: var(--font); }
   .toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text2); cursor: pointer; }
   .toggle input { accent-color: var(--accent); cursor: pointer; }
+  /* Ingest tabs */
+  .ingest-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .ingest-tab { flex: 1; padding: 5px 0; font-size: 11px; font-weight: 600; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text2); cursor: pointer; transition: all .15s; text-align: center; }
+  .ingest-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  /* YouTube input */
+  .yt-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .yt-input { width: 100%; padding: 8px 10px; font-size: 12px; border: 1.5px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-family: var(--font); transition: border-color .15s; }
+  .yt-input:focus { outline: none; border-color: var(--accent); }
+  .yt-input::placeholder { color: var(--text3); }
+  /* LLM error banner */
+  .llm-banner { display: none; margin: 12px 16px 0; padding: 10px 14px; background: var(--warn-bg); border: 1px solid var(--warn); border-radius: var(--radius-sm); font-size: 12px; color: var(--warn); line-height: 1.5; }
+  .llm-banner strong { font-weight: 600; display: block; margin-bottom: 2px; }
+  .llm-banner.show { display: flex; align-items: flex-start; gap: 8px; }
+  .llm-banner .close-btn { cursor: pointer; font-size: 16px; line-height: 1; flex-shrink: 0; margin-top: -1px; }
+  /* Summary cards */
+  .summary-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 14px; background: var(--surface); }
+  .summary-card .s-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .summary-card .s-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .summary-card .s-source { font-size: 11px; color: var(--text3); margin-bottom: 10px; word-break: break-all; }
+  .summary-card .s-divider { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  .summary-card .s-body { font-size: 13px; color: var(--text); line-height: 1.75; white-space: pre-wrap; word-break: break-word; }
+  .summary-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
+  /* Modal overlay for full summary */
+  .summary-modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); backdrop-filter: blur(3px); z-index: 1000; align-items: center; justify-content: center; }
+  .summary-modal-bg.show { display: flex; }
+  .summary-modal { background: var(--surface); border: 1px solid var(--border2); border-radius: var(--radius); padding: 24px 28px; max-width: 680px; width: 90%; max-height: 80vh; display: flex; flex-direction: column; gap: 12px; }
+  .summary-modal h3 { font-size: 14px; font-weight: 600; color: var(--text); margin: 0; }
+  .summary-modal .modal-body { font-size: 13px; color: var(--text); line-height: 1.75; overflow-y: auto; white-space: pre-wrap; word-break: break-word; flex: 1; }
+  .summary-modal .modal-footer { display: flex; justify-content: flex-end; }
+  .summary-modal .modal-close { padding: 6px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border2); background: var(--surface2); color: var(--text2); font-size: 12px; cursor: pointer; font-family: var(--font); }
+  /* Sidebar doc summary peek button */
+  .doc-item .peek { color: var(--text3); cursor: pointer; font-size: 14px; line-height: 1; background: none; border: none; padding: 0; }
+  .doc-item .peek:hover { color: var(--accent); }
+  /* Cache badge */
+  .cache-hit-badge { display: inline-flex; align-items: center; gap: 4px; background: var(--accent-bg); border: 1px solid var(--accent); border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 600; color: var(--accent); margin-left: 8px; }
+  /* Main nav tabs (top level) */
+  .main-tabs { display: flex; gap: 2px; padding: 0 24px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+  .main-tab { padding: 10px 16px; font-size: 13px; cursor: pointer; border: none; background: none; color: var(--text2); border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: var(--font); transition: color .12s; }
+  .main-tab:hover { color: var(--text); }
+  .main-tab.active { color: var(--text); font-weight: 500; border-bottom-color: var(--accent); }
+  #mpanel-eval, #mpanel-summaries { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
   /* API url */
   .api-input { width: 100%; padding: 5px 8px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: 11px; font-family: var(--mono); }
   /* Main area */
@@ -176,6 +217,19 @@
 </head>
 <body>
 
+<!-- Summary modal -->
+<div class="summary-modal-bg" id="summary-modal-bg" onclick="if(event.target===this)closeSummaryModal()">
+  <div class="summary-modal">
+    <h3 id="modal-title">Document Summary</h3>
+    <div class="summary-meta" id="modal-meta"></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:0">
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer">
+      <button class="modal-close" onclick="closeSummaryModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <div id="loading-overlay">
   <div class="loading-card">
     <div class="big-spin"></div>
@@ -192,20 +246,50 @@
       <div class="logo">Insure<span>Hub</span> <span style="font-weight:400;color:var(--text2)">/ RAG Eval</span></div>
     </div>
 
-    <!-- Upload -->
+    <!-- Upload / YouTube / Webpage tabs -->
     <div class="sidebar-section">
-      <div class="sidebar-label">document</div>
-      <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
-        <div class="icon">📄</div>
-        <strong>Drop file here</strong>
-        <p>PDF · DOCX · TXT</p>
-        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.text">
+      <div class="ingest-tabs">
+        <div class="ingest-tab active" id="tab-doc" onclick="switchIngestTab('doc')">📄 Document</div>
+        <div class="ingest-tab" id="tab-yt" onclick="switchIngestTab('yt')">▶ YouTube</div>
+        <div class="ingest-tab" id="tab-web" onclick="switchIngestTab('web')">🌐 Webpage</div>
       </div>
-      <div class="file-pill" id="file-pill">
-        <span class="name" id="pill-name"></span>
-        <span class="rm" onclick="clearFile()" title="Remove">✕</span>
+
+      <!-- File upload panel -->
+      <div id="panel-doc">
+        <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+          <div class="icon">📄</div>
+          <strong>Drop file here</strong>
+          <p>PDF · DOCX · TXT</p>
+          <input type="file" id="file-input" accept=".pdf,.docx,.txt,.text">
+        </div>
+        <div class="file-pill" id="file-pill">
+          <span class="name" id="pill-name"></span>
+          <span class="rm" onclick="clearFile()" title="Remove">✕</span>
+        </div>
+        <button class="run-btn" style="width:100%;margin-top:10px;font-size:12px;height:32px" id="upload-btn" onclick="uploadFile()" disabled>Upload &amp; ingest</button>
       </div>
-      <button class="run-btn" style="width:100%;margin-top:10px;font-size:12px;height:32px" id="upload-btn" onclick="uploadFile()" disabled>Upload & ingest</button>
+
+      <!-- YouTube panel -->
+      <div id="panel-yt" style="display:none">
+        <div class="yt-wrap">
+          <input class="yt-input" id="yt-url" placeholder="https://youtube.com/watch?v=…" />
+          <button class="run-btn" style="width:100%;font-size:12px;height:32px" id="yt-btn" onclick="ingestVideo()">▶ Ingest transcript</button>
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-top:8px;line-height:1.5">
+          Fetches the auto-generated or manual caption. Falls back to Whisper if no captions are available.
+        </div>
+      </div>
+
+      <!-- Webpage panel -->
+      <div id="panel-web" style="display:none">
+        <div class="yt-wrap">
+          <input class="yt-input" id="web-url" placeholder="https://example.com/insurance-policy" />
+          <button class="run-btn" style="width:100%;font-size:12px;height:32px" id="web-btn" onclick="ingestWebpage()">🌐 Scrape &amp; ingest</button>
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-top:8px;line-height:1.5">
+          Fetches and cleans the page's main text content. Falls back to a headless browser render for JS-heavy pages.
+        </div>
+      </div>
     </div>
 
     <!-- Ingested docs -->
@@ -230,30 +314,86 @@
       </div>
       <div class="config-row" style="margin-bottom:6px">
         <label class="toggle"><input type="checkbox" id="cfg-answer" checked> Generate full answer</label>
-        <label class="toggle"><input type="checkbox" id="cfg-ragas" checked> Run RAGAS</label>
+        <label class="toggle"><input type="checkbox" id="cfg-ragas"> Run RAGAS <span style="font-size:10px;color:var(--text3)">(+3 LLM calls)</span></label>
       </div>
+    </div>
+
+    <!-- LLM status banner -->
+    <div class="llm-banner" id="llm-banner">
+      <span style="font-size:18px;flex-shrink:0">⚠️</span>
+      <div style="flex:1">
+        <strong id="llm-banner-title">LLM not configured</strong>
+        <span id="llm-banner-body">Retrieval still works. Answer generation &amp; RAGAS scoring are disabled.</span>
+      </div>
+      <span class="close-btn" onclick="document.getElementById('llm-banner').classList.remove('show')" title="Dismiss">✕</span>
+    </div>
+    <!-- LLM config hint (shown only when unconfigured) -->
+    <div id="llm-config-hint" style="display:none;margin:0 16px 12px;padding:10px 14px;background:var(--info-bg);border:1px solid var(--info);border-radius:6px;font-size:11px;color:var(--info);line-height:1.6">
+      <strong style="display:block;margin-bottom:4px">How to enable the LLM</strong>
+      Set one of these before starting the server:<br>
+      <code style="font-size:10px">export OPENAI_API_KEY=sk-…</code><br>
+      <code style="font-size:10px">export ANTHROPIC_API_KEY=sk-ant-…</code><br>
+      <code style="font-size:10px">export VLLM_HOST=http://… VLLM_MODEL=…</code>
     </div>
 
     <!-- API -->
     <div class="sidebar-section">
       <div class="sidebar-label">backend url</div>
-      <input class="api-input" id="api-url" value="http://localhost:8001" />
+      <input class="api-input" id="api-url" value="http://localhost:8002" />
+    </div>
+
+    <!-- vLLM model selector -->
+    <div class="sidebar-section" id="model-selector-section" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <div class="sidebar-label" style="margin-bottom:0">vllm model</div>
+        <button onclick="detectModels()" style="font-size:10px;padding:2px 8px;border:1px solid var(--border2);border-radius:4px;background:var(--surface2);color:var(--text2);cursor:pointer">Detect</button>
+      </div>
+      <select id="model-select" style="width:100%;padding:5px 8px;border:1px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface);color:var(--text);font-size:11px;font-family:var(--mono)" onchange="selectModel(this.value)">
+        <option value="">— click Detect —</option>
+      </select>
+      <div id="model-status" style="font-size:10px;color:var(--text3);margin-top:4px"></div>
     </div>
   </aside>
 
   <!-- MAIN -->
   <main class="main">
-    <div class="topbar">
-      <input class="query-input" id="query-input" placeholder="Ask something about your documents…" />
-      <button class="run-btn" id="run-btn" onclick="runEval()" disabled>▶ Evaluate</button>
+    <div class="main-tabs">
+      <button class="main-tab active" id="mtab-eval" onclick="switchMainTab('eval')">Evaluator</button>
+      <button class="main-tab" id="mtab-summaries" onclick="switchMainTab('summaries')">Summaries</button>
     </div>
 
-    <div class="content" id="content">
-      <div class="empty" id="empty-state">
-        <div class="big">🔍</div>
-        <p>Upload a document and type a query to start evaluating your RAG pipeline.</p>
+    <!-- Evaluator panel -->
+    <div id="mpanel-eval">
+      <div class="topbar">
+        <input class="query-input" id="query-input" placeholder="Ask something about your documents…" />
+        <button class="run-btn" id="run-btn" onclick="runEval()" disabled>▶ Evaluate</button>
       </div>
-      <div id="results" style="display:none"></div>
+      <div class="content" id="content">
+        <div class="empty" id="empty-state">
+          <div class="big">🔍</div>
+          <p>Upload a document and type a query to start evaluating your RAG pipeline.</p>
+        </div>
+        <div id="results" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- Summaries panel -->
+    <div id="mpanel-summaries" style="display:none">
+      <div class="topbar" style="gap:12px">
+        <span style="font-size:14px;font-weight:600;color:var(--text)">Knowledge Base Summaries</span>
+        <span style="font-size:12px;color:var(--text3)" id="summary-count-label"></span>
+        <div style="flex:1"></div>
+        <button class="run-btn" style="height:32px;font-size:12px;background:var(--surface2);color:var(--text2);border:1px solid var(--border2)" onclick="loadSummaries()">↻ Refresh</button>
+        <button class="run-btn" style="height:32px;font-size:12px;background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn)" onclick="clearCache()" title="Flush expired query cache entries">⚡ Flush cache</button>
+      </div>
+      <div class="content">
+        <div id="cache-stats-bar" style="margin-bottom:14px;display:none">
+          <div class="status-bar" id="cache-stats-content"></div>
+        </div>
+        <div id="summary-list">
+          <div class="empty"><div class="big">📋</div><p>No summaries yet. Ingest documents to generate summaries.</p></div>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -262,6 +402,16 @@
 <script>
 const API = () => document.getElementById('api-url').value.replace(/\/$/, '');
 let selectedFile = null;
+
+// ── Ingest tab switcher ───────────────────────────────────────────────────────
+function switchIngestTab(tab) {
+  document.getElementById('panel-doc').style.display = tab === 'doc' ? '' : 'none';
+  document.getElementById('panel-yt').style.display  = tab === 'yt'  ? '' : 'none';
+  document.getElementById('panel-web').style.display = tab === 'web' ? '' : 'none';
+  document.getElementById('tab-doc').classList.toggle('active', tab === 'doc');
+  document.getElementById('tab-yt').classList.toggle('active',  tab === 'yt');
+  document.getElementById('tab-web').classList.toggle('active', tab === 'web');
+}
 
 // ── Drag & drop ───────────────────────────────────────────────────────────────
 const dz = document.getElementById('drop-zone');
@@ -310,6 +460,64 @@ async function uploadFile() {
   }
 }
 
+// ── YouTube ingestion ─────────────────────────────────────────────────────────
+async function ingestVideo() {
+  const url = document.getElementById('yt-url').value.trim();
+  if (!url) { document.getElementById('yt-url').focus(); return; }
+  const btn = document.getElementById('yt-btn');
+  btn.disabled = true; btn.textContent = '⏳ Fetching transcript…';
+  try {
+    const res = await fetch(`${API()}/eval/ingest-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert('YouTube ingest error: ' + (err.detail || res.statusText));
+      return;
+    }
+    const data = await res.json();
+    showToast(`✓ ${data.chunks_added} chunks ingested from ${data.video_id} (${data.source_type}, ${data.language})`);
+    document.getElementById('yt-url').value = '';
+    loadDocList();
+    document.getElementById('run-btn').disabled = false;
+  } catch(e) {
+    alert('Network error — is the backend running at ' + API() + '?');
+  } finally {
+    btn.disabled = false; btn.textContent = '▶ Ingest transcript';
+  }
+}
+
+// ── Webpage ingestion ─────────────────────────────────────────────────────────
+async function ingestWebpage() {
+  const url = document.getElementById('web-url').value.trim();
+  if (!url) { document.getElementById('web-url').focus(); return; }
+  const btn = document.getElementById('web-btn');
+  btn.disabled = true; btn.textContent = '⏳ Scraping page…';
+  try {
+    const res = await fetch(`${API()}/eval/ingest-webpage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert('Webpage ingest error: ' + (err.detail || res.statusText));
+      return;
+    }
+    const data = await res.json();
+    showToast(`✓ ${data.chunks_added} chunks ingested from "${data.title}"`);
+    document.getElementById('web-url').value = '';
+    loadDocList();
+    document.getElementById('run-btn').disabled = false;
+  } catch(e) {
+    alert('Network error — is the backend running at ' + API() + '?');
+  } finally {
+    btn.disabled = false; btn.textContent = '🌐 Scrape & ingest';
+  }
+}
+
 // ── Doc list ──────────────────────────────────────────────────────────────────
 async function loadDocList() {
   try {
@@ -321,38 +529,59 @@ async function loadDocList() {
     if (!data.sources.length) { list.innerHTML = '<div class="doc-empty">No documents yet</div>'; return; }
     list.innerHTML = data.sources.map(s => `
       <div class="doc-item">
-        <span>📃</span>
+        <span>${docIcon(s)}</span>
         <span class="src" title="${s}">${s}</span>
+        <button class="peek" onclick="peekSummary('${encodeURIComponent(s)}')" title="View summary">📋</button>
         <span class="del" onclick="deleteDoc('${encodeURIComponent(s)}')" title="Remove">✕</span>
       </div>`).join('');
     document.getElementById('run-btn').disabled = false;
   } catch(e) {}
 }
 
+function docIcon(source) {
+  const s = (source || '').toLowerCase();
+  if (s.includes('youtube.com') || s.includes('youtu.be')) return '▶';
+  if (s.startsWith('http://') || s.startsWith('https://')) return '🌐';
+  return '📃';
+}
+
 async function deleteDoc(enc) {
   const src = decodeURIComponent(enc);
   if (!confirm(`Remove "${src}" from the knowledge base?`)) return;
-  await fetch(`${API()}/eval/documents/${enc}`, { method: 'DELETE' });
+  await fetch(`${API()}/eval/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: src })
+  });
   loadDocList();
 }
 
-// ── Evaluate ──────────────────────────────────────────────────────────────────
+// ── Evaluate (streaming) ──────────────────────────────────────────────────────
 async function runEval() {
   const query = document.getElementById('query-input').value.trim();
   if (!query) { document.getElementById('query-input').focus(); return; }
 
-  showLoading('Retrieving chunks…');
+  const generateAnswer = document.getElementById('cfg-answer').checked;
+  const runRagas       = document.getElementById('cfg-ragas').checked;
   const payload = {
     query,
-    top_k: parseInt(document.getElementById('cfg-topk').value) || 5,
-    use_hybrid: document.getElementById('cfg-hybrid').checked,
-    use_reranker: document.getElementById('cfg-rerank').checked,
-    generate_answer: document.getElementById('cfg-answer').checked,
-    run_ragas: document.getElementById('cfg-ragas').checked,
+    top_k:           parseInt(document.getElementById('cfg-topk').value) || 5,
+    use_hybrid:      document.getElementById('cfg-hybrid').checked,
+    use_reranker:    document.getElementById('cfg-rerank').checked,
+    generate_answer: generateAnswer,
+    run_ragas:       runRagas,
   };
 
-  setTimeout(() => setLoadingStep('Scoring with RAGAS…'), 1500);
-  setTimeout(() => setLoadingStep('Generating answer…'), 3000);
+  // ── Use streaming endpoint when answer is requested ───────────────────────
+  if (generateAnswer && !runRagas) {
+    await runStreamingEval(query, payload);
+    return;
+  }
+
+  // ── Non-streaming path (RAGAS enabled or no answer) ───────────────────────
+  showLoading('Retrieving chunks…');
+  setTimeout(() => setLoadingStep('Generating answer…'), 800);
+  if (runRagas) setTimeout(() => setLoadingStep('Scoring with RAGAS (3 LLM calls)…'), 3000);
 
   try {
     const res = await fetch(`${API()}/eval/query`, {
@@ -372,6 +601,130 @@ async function runEval() {
   } catch(e) {
     hideLoading();
     alert('Network error — is the backend running at ' + API() + '?');
+  }
+}
+
+// ── Streaming eval ────────────────────────────────────────────────────────────
+// Flow:
+//   1. Server emits "retrieval_complete" with all chunk/metadata data (~0.5s)
+//      → renderResults() draws the full tab UI (chunks, metadata, timing)
+//      → We auto-switch to the Answer tab and grab its answer-box element
+//   2. Server streams "token" events → answer box fills in real time
+//   3. Server emits "done" → timing rows updated with actual LLM ms
+async function runStreamingEval(query, payload) {
+  showLoading('Retrieving chunks…');
+  const t0 = Date.now();
+
+  try {
+    const res = await fetch(`${API()}/eval/query/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      hideLoading();
+      alert('Stream error: ' + res.statusText);
+      return;
+    }
+
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let   buf     = '';
+    let   answerEl    = null;   // set after renderResults()
+    let   firstToken  = true;
+    let   uiRendered  = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+
+        // ── Step 1: retrieval done — render full UI ───────────────────────
+        if (ev.type === 'retrieval_complete') {
+          hideLoading();
+          // ev has the same shape as EvalResponse (minus the final answer)
+          renderResults(ev);
+          uiRendered = true;
+
+          // Switch to Answer tab so the user sees the answer streaming in
+          const answerTab = document.querySelector('.tab[onclick*="answer"]');
+          if (answerTab) switchTab('answer', answerTab);
+
+          // Grab the answer box rendered by renderResults
+          answerEl = document.querySelector('#tab-answer .answer-box');
+          if (answerEl) {
+            answerEl.textContent = '';   // clear "(answer generation disabled)" placeholder
+            const ttft_hint = document.createElement('span');
+            ttft_hint.id = 'stream-ttft';
+            ttft_hint.style.cssText = 'color:var(--text3);font-size:12px;display:block;margin-bottom:6px';
+            ttft_hint.textContent = 'generating answer…';
+            answerEl.parentElement.insertBefore(ttft_hint, answerEl);
+          }
+        }
+
+        // ── Step 2: answer tokens stream in ──────────────────────────────
+        else if (ev.type === 'token') {
+          if (answerEl) {
+            if (firstToken) {
+              firstToken = false;
+              const ttft = ((Date.now() - t0) / 1000).toFixed(1);
+              const hint = document.getElementById('stream-ttft');
+              if (hint) hint.textContent = `first token: ${ttft}s — generating…`;
+            }
+            answerEl.textContent += ev.text;
+          }
+        }
+
+        // ── Step 3: generation complete ───────────────────────────────────
+        else if (ev.type === 'done') {
+          const hint = document.getElementById('stream-ttft');
+          if (hint) hint.remove();
+
+          // Update the timing rows with real numbers
+          const timingDiv = document.querySelector('#tab-answer .timing-rows');
+          if (timingDiv && ev.llm_ms !== undefined) {
+            const ret_ms  = ev.retrieval_ms ?? 0;
+            const llm_ms  = ev.llm_ms ?? 0;
+            const tot_ms  = ev.timing_ms ?? (ret_ms + llm_ms);
+            timingDiv.innerHTML = [
+              timingRow('Retrieval (BM25 + dense + rerank)', ret_ms),
+              timingRow('LLM generation', llm_ms),
+              timingRow('RAGAS scoring', 0),
+              timingRow('Total', tot_ms),
+            ].join('');
+            // Update the "total time" metric card
+            const metricCards = document.querySelectorAll('.metric-card .value');
+            if (metricCards[2]) metricCards[2].textContent = (tot_ms/1000).toFixed(2)+'s';
+          }
+          if (ev.from_cache) {
+            const hint2 = document.createElement('span');
+            hint2.style.cssText = 'color:var(--text3);font-size:12px;display:block;margin-top:6px';
+            hint2.textContent = `cache hit — ${(ev.timing_ms/1000).toFixed(2)}s`;
+            if (answerEl) answerEl.parentElement.appendChild(hint2);
+          }
+        }
+
+        // ── Error ─────────────────────────────────────────────────────────
+        else if (ev.type === 'error') {
+          hideLoading();
+          if (!uiRendered) {
+            alert('Error: ' + ev.message);
+          } else if (answerEl) {
+            answerEl.textContent = '[Error: ' + ev.message + ']';
+          }
+        }
+      }
+    }
+  } catch(e) {
+    hideLoading();
+    alert('Network error — is the backend running at ' + API() + '? ' + e);
   }
 }
 
@@ -436,6 +789,7 @@ function renderResults(d) {
               <span class="badge b-neutral">${m.section}</span>
               <span class="badge b-info">${m.insurer}</span>
               <span class="badge b-neutral">${m.policy_type}</span>
+              ${m.source_type ? `<span class="badge b-neutral">${m.source_type}</span>` : ''}
               ${scoreBadge(m.rerank_score ?? m.similarity_score)}
             </div>
             <div class="meta-grid" style="font-size:12px">
@@ -622,9 +976,276 @@ function showToast(msg) {
   setTimeout(() => t.remove(), 3500);
 }
 
+// ── Main tab switcher ──────────────────────────────────────────────────────────
+function switchMainTab(tab) {
+  document.getElementById('mpanel-eval').style.display       = tab === 'eval'      ? 'flex' : 'none';
+  document.getElementById('mpanel-summaries').style.display  = tab === 'summaries' ? 'flex' : 'none';
+  document.getElementById('mtab-eval').classList.toggle('active',      tab === 'eval');
+  document.getElementById('mtab-summaries').classList.toggle('active',  tab === 'summaries');
+  if (tab === 'summaries') {
+    loadSummaries();
+    loadCacheStats();
+  }
+}
+
+// ── Summaries ──────────────────────────────────────────────────────────────────
+let _summaryCache = [];   // keep a copy so peekSummary can look up by source
+
+async function loadSummaries() {
+  try {
+    const res = await fetch(`${API()}/eval/summaries`);
+    if (!res.ok) return;
+    const data = await res.json();
+    _summaryCache = data.summaries;
+    const label = document.getElementById('summary-count-label');
+    if (label) label.textContent = `${data.count} ${data.count === 1 ? 'summary' : 'summaries'}`;
+    const list = document.getElementById('summary-list');
+    if (!list) return;
+    if (!data.summaries.length) {
+      list.innerHTML = '<div class="empty"><div class="big">📋</div><p>No summaries yet. Ingest a document, video, or webpage to generate one.</p></div>';
+      return;
+    }
+    list.innerHTML = data.summaries.map((s, i) => summaryCard(s, i)).join('');
+  } catch(e) {}
+}
+
+function summaryCard(s, i) {
+  const icon = s.summary_type === 'video' ? '▶' : s.summary_type === 'webpage' ? '🌐' : '📄';
+  const typeColor = s.summary_type === 'video' ? 'b-danger' : s.summary_type === 'webpage' ? 'b-info' : 'b-neutral';
+  const displayTitle = s.title || s.source;
+  const ago = s.ingested_at ? timeAgo(s.ingested_at) : '';
+  return `<div class="summary-card">
+    <div class="s-header">
+      <span style="font-size:18px">${icon}</span>
+      <span class="s-title" title="${esc(s.source)}">${esc(displayTitle)}</span>
+      ${ago ? `<span style="font-size:11px;color:var(--text3);white-space:nowrap">${ago}</span>` : ''}
+    </div>
+    <div class="s-source">${esc(s.source)}</div>
+    <div class="summary-meta">
+      <span class="badge ${typeColor}">${s.summary_type || 'document'}</span>
+      ${s.insurer && s.insurer !== 'UNKNOWN' ? `<span class="badge b-info">${esc(s.insurer)}</span>` : ''}
+      ${s.policy_type && s.policy_type !== 'general' ? `<span class="badge b-green">${esc(s.policy_type)}</span>` : ''}
+      ${s.doc_type ? `<span class="badge b-neutral">${esc(s.doc_type)}</span>` : ''}
+      ${s.chunk_count ? `<span class="badge b-neutral">${s.chunk_count} chunks</span>` : ''}
+    </div>
+    <hr class="s-divider">
+    <div class="s-body">${esc(s.text)}</div>
+  </div>`;
+}
+
+function timeAgo(iso) {
+  try {
+    const diff = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  } catch(e) { return ''; }
+}
+
+// ── Summary modal (peek from sidebar) ─────────────────────────────────────────
+async function peekSummary(enc) {
+  const source = decodeURIComponent(enc);
+  // Try local cache first, then fetch
+  let s = _summaryCache.find(x => x.source === source);
+  if (!s) {
+    try {
+      await loadSummaries();   // refresh cache
+      s = _summaryCache.find(x => x.source === source);
+    } catch(e) {}
+  }
+  if (!s) {
+    showToast('No summary found for this document. Re-ingest to generate one.');
+    return;
+  }
+  const icon = s.summary_type === 'video' ? '▶ ' : s.summary_type === 'webpage' ? '🌐 ' : '📄 ';
+  const typeColor = s.summary_type === 'video' ? 'b-danger' : s.summary_type === 'webpage' ? 'b-info' : 'b-neutral';
+  document.getElementById('modal-title').textContent = icon + (s.title || s.source);
+  document.getElementById('modal-meta').innerHTML = `
+    <span class="badge ${typeColor}">${s.summary_type || 'document'}</span>
+    ${s.insurer && s.insurer !== 'UNKNOWN' ? `<span class="badge b-info">${esc(s.insurer)}</span>` : ''}
+    ${s.policy_type && s.policy_type !== 'general' ? `<span class="badge b-green">${esc(s.policy_type)}</span>` : ''}
+    ${s.doc_type ? `<span class="badge b-neutral">${esc(s.doc_type)}</span>` : ''}
+    ${s.chunk_count ? `<span class="badge b-neutral">${s.chunk_count} chunks</span>` : ''}
+  `;
+  document.getElementById('modal-body').textContent = s.text;
+  document.getElementById('summary-modal-bg').classList.add('show');
+}
+
+function closeSummaryModal() {
+  document.getElementById('summary-modal-bg').classList.remove('show');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSummaryModal();
+});
+
+// ── KV Cache ───────────────────────────────────────────────────────────────────
+async function loadCacheStats() {
+  try {
+    const res = await fetch(`${API()}/eval/cache/stats`);
+    if (!res.ok) return;
+    const d = await res.json();
+    const bar = document.getElementById('cache-stats-bar');
+    const content = document.getElementById('cache-stats-content');
+    if (!bar || !content) return;
+    bar.style.display = 'block';
+    content.innerHTML = `
+      <span style="font-size:13px;font-weight:500;color:var(--text)">Query Cache</span>
+      <span style="margin-left:12px;font-size:12px;color:var(--text2)">
+        ${d.live_entries} live · ${d.expired_entries} expired · ${d.total_hits} total hits · TTL ${d.ttl_seconds}s
+      </span>
+    `;
+  } catch(e) {}
+}
+
+async function clearCache() {
+  if (!confirm('Flush all expired cache entries?')) return;
+  try {
+    const res = await fetch(`${API()}/eval/cache/flush`, { method: 'POST' });
+    const d = await res.json();
+    showToast(`✓ Cache flush — ${d.entries_removed} expired entries removed`);
+    loadCacheStats();
+  } catch(e) { alert('Cache flush failed.'); }
+}
+
+// Show cache-hit indicator on results
+function _showCacheHit(fromCache) {
+  const topbar = document.querySelector('#mpanel-eval .topbar');
+  const existing = document.getElementById('cache-hit-indicator');
+  if (existing) existing.remove();
+  if (fromCache) {
+    const badge = document.createElement('span');
+    badge.id = 'cache-hit-indicator';
+    badge.className = 'cache-hit-badge';
+    badge.textContent = '⚡ cached';
+    badge.title = 'This result was served from the query cache';
+    topbar.appendChild(badge);
+  }
+}
+
+// ── vLLM model selector ────────────────────────────────────────────────────────
+async function detectModels() {
+  const sel    = document.getElementById('model-select');
+  const status = document.getElementById('model-status');
+  status.textContent = 'Detecting…';
+  try {
+    const res  = await fetch(`${API()}/eval/llm-models`);
+    const data = await res.json();
+    const models = data.available_models || [];
+    if (!models.length) {
+      status.textContent = 'No models found on vLLM server.';
+      return;
+    }
+    sel.innerHTML = models.map(m =>
+      `<option value="${m}" ${m === data.active_model ? 'selected' : ''}>${m}</option>`
+    ).join('');
+    status.textContent = `Active: ${data.active_model || models[0]}`;
+    // Auto-select active model if it differs from what's configured
+    if (data.active_model && data.active_model !== (sel.value)) {
+      sel.value = data.active_model;
+    }
+  } catch(e) {
+    status.textContent = 'Failed to reach backend.';
+  }
+}
+
+async function selectModel(modelId) {
+  const status = document.getElementById('model-status');
+  if (!modelId) return;
+  try {
+    const res  = await fetch(`${API()}/eval/llm-models/select`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: modelId}),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      status.textContent = `Active: ${data.active_model}`;
+      // Re-probe LLM to update the banner
+      probeLLM();
+    }
+  } catch(e) {
+    status.textContent = 'Failed to switch model.';
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────────
+async function probeLLM() {
+  const banner      = document.getElementById('llm-banner');
+  const bannerTitle = document.getElementById('llm-banner-title');
+  const bannerBody  = document.getElementById('llm-banner-body');
+  const hint        = document.getElementById('llm-config-hint');
+  const modelSec    = document.getElementById('model-selector-section');
+  try {
+    const res  = await fetch(`${API()}/eval/llm-test`);
+    const data = await res.json();
+
+    if (data.status === 'ok') {
+      banner.classList.remove('show');
+      hint.style.display = 'none';
+      // Show model selector for vLLM so user can switch models easily
+      if (data.backend === 'vllm') {
+        modelSec.style.display = 'block';
+        detectModels();
+      }
+      return;
+    }
+
+    banner.classList.add('show');
+
+    if (data.status === 'unconfigured') {
+      bannerTitle.textContent = 'LLM not configured';
+      bannerBody.textContent  = 'No API key or vLLM server is set. Retrieval works; answers are disabled.';
+      hint.style.display      = 'block';
+      modelSec.style.display  = 'none';
+    } else if (data.backend === 'vllm' && (data.message || '').includes('does not exist')) {
+      // Wrong model name — show model selector so user can pick the right one
+      bannerTitle.textContent = 'Wrong model name';
+      bannerBody.textContent  = 'The configured model does not exist on the vLLM server. Use the selector below to pick the correct one.';
+      hint.style.display      = 'none';
+      modelSec.style.display  = 'block';
+      detectModels();   // auto-populate the dropdown
+    } else {
+      bannerTitle.textContent = `LLM error (${data.backend || 'unknown'})`;
+      bannerBody.textContent  = (data.message || 'Connection failed.').substring(0, 200);
+      hint.style.display      = 'none';
+      if (data.backend === 'vllm') { modelSec.style.display = 'block'; detectModels(); }
+    }
+  } catch(e) {
+    banner.classList.add('show');
+    bannerTitle.textContent = 'Backend unreachable';
+    bannerBody.textContent  = `Cannot connect to ${API()}. Is the server running?`;
+    hint.style.display      = 'none';
+    modelSec.style.display  = 'none';
+  }
+}
 loadDocList();
+probeLLM();
+loadSummaries();   // pre-populate cache so peekSummary works immediately
 setInterval(loadDocList, 15000);
+setInterval(loadSummaries, 30000);
+
+// Update LLM banner and cache indicator after every eval response
+const _origRender = renderResults;
+renderResults = function(d) {
+  const banner = document.getElementById('llm-banner');
+  const bannerTitle = document.getElementById('llm-banner-title');
+  const bannerBody  = document.getElementById('llm-banner-body');
+  if (d.answer && d.answer.startsWith('[LLM error')) {
+    const msg = d.answer.replace('[LLM error: ', '').replace(']', '');
+    bannerTitle.textContent = 'LLM call failed';
+    bannerBody.textContent  = msg.substring(0, 160);
+    banner.classList.add('show');
+  } else if (d.answer && !d.answer.startsWith('[LLM')) {
+    banner.classList.remove('show');
+    document.getElementById('llm-config-hint').style.display = 'none';
+  }
+  _showCacheHit(!!(d.doc_metadata && d.doc_metadata.from_cache));
+  _origRender(d);
+};
 </script>
 </body>
 </html>

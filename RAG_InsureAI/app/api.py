@@ -33,8 +33,7 @@ import aiohttp
 import re
 from bs4 import BeautifulSoup
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from auth import create_login_endpoint, require_auth
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import APIConnectionError, APIStatusError, APITimeoutError
@@ -270,17 +269,6 @@ async def _get_job(job_id: str) -> dict | None:
 
 
 app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc")
-create_login_endpoint(app)
-
-from fastapi.responses import FileResponse
-
-@app.get("/auth")
-async def auth_page():
-    return FileResponse("/app/auth.html")
-
-@app.get("/admin")
-async def admin_page():
-    return FileResponse("/app/admin.html")
 
 
 @app.on_event("startup")
@@ -300,11 +288,6 @@ async def _start_job_pruner():
             except Exception:
                 logger.exception("Periodic job pruner failed")
     app.state.job_pruner_task = asyncio.create_task(_prune_loop())
-@app.on_event("startup")
-async def _warmup_pipeline():
-    """Pre-load embedding model and vector store at startup so first request is fast."""
-    await asyncio.to_thread(_get_pipeline)
-    logger.info("Pipeline warmed up — embedding model loaded and ready.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -372,20 +355,49 @@ def _describe_llm_failure(exc: Exception) -> tuple[int, str]:
 
 def _ingest_file(tmp_path: str, filename: str) -> int:
     from document_loader import load_document
-    from metadata_tagger import tag_document
+    from metadata_tagger import tag_document, classify_document_type
 
     pipeline = _get_pipeline()
     raw_docs = load_document(tmp_path, filename)
-    chunks = pipeline.chunker.split_documents(raw_docs)
+
+    llm = None
+    try:
+        llm = pipeline._get_llm()
+    except Exception:
+        pass
+
     # Use a unique source key per upload so identical filenames don't collide.
     upload_id = uuid.uuid4().hex[:12]
     unique_source = f"{upload_id}_{filename}"
-    preview = raw_docs[0].page_content[:600] if raw_docs else ""
-    doc_tags = tag_document(filename, preview)
+
+    # ── Step 1: Classify document type BEFORE tagging ─────────────────────────
+    # Use up to 5 000 chars of preview + next 3 pages so the classifier has
+    # enough signal (legal handbooks often start with a table of contents, with
+    # the substantive text beginning only on later pages).
+    preview = raw_docs[0].page_content[:5000] if raw_docs else ""
+    extra_text = " ".join(d.page_content for d in raw_docs[1:4])[:5000]
+    doc_type = classify_document_type(filename, preview, extra_text)
+    logger.info("Document type for '%s': %s", filename, doc_type)
+
+    # ── Step 2: Tag document (skips keyword matching for non-policy docs) ──────
+    doc_tags = tag_document(filename, preview, extra_text=extra_text, doc_type=doc_type, llm=llm)
+
+    # ── Step 3: Annotate raw docs so the chunker inherits doc_type ────────────
+    for raw_doc in raw_docs:
+        raw_doc.metadata["doc_type"] = doc_type
+
+    # ── Step 4: Chunk with doc-type-aware section detection ───────────────────
+    chunks = pipeline.chunker.split_documents(raw_docs, doc_type=doc_type)
+
+    # ── Step 5: Attach source, filename, and tags to every chunk ─────────────
     for chunk in chunks:
         chunk.metadata["source"] = unique_source
         chunk.metadata["filename"] = filename
         chunk.metadata.update(doc_tags)
+        # Guarantee doc_type is not overwritten by doc_tags (it is set there
+        # too, but be explicit for clarity and future-proofing).
+        chunk.metadata["doc_type"] = doc_type
+
     pipeline.vector_store.add_documents(chunks)
     return len(chunks)
 
@@ -482,7 +494,7 @@ def _chunk_transcript(transcript_text: str, url: str, title: str = "") -> list:
 
 # ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
-async def upload_video(req: URLRequest, _=Depends(require_auth)):
+async def upload_video(req: URLRequest):
     url = req.url.strip()
     multi = _get_multi_rag()
     if multi.video_exists(url):
@@ -507,7 +519,7 @@ async def upload_video(req: URLRequest, _=Depends(require_auth)):
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
 @app.post("/upload-webpage")
-async def upload_webpage(req: URLRequest, _=Depends(require_auth)):
+async def upload_webpage(req: URLRequest):
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL.")
@@ -517,19 +529,103 @@ async def upload_webpage(req: URLRequest, _=Depends(require_auth)):
     try:
         docs = await asyncio.to_thread(load_url_advanced, url)
         if not docs or len(docs[0].page_content.strip()) < 200:
-            raise HTTPException(status_code=400, detail="Could not extract meaningful content from this URL.")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not extract meaningful content from this URL. "
+                    "The page may require JavaScript, a login, or block bots."
+                ),
+            )
+
+        # ── Classify doc-level metadata (insurer, policy_type) ───────────────
+        # This mirrors what _ingest_file() does for uploaded documents so that
+        # webpage chunks participate in query-time metadata filtering just like
+        # PDF/DOCX chunks do.
+        from metadata_tagger import tag_document, classify_chunk_policy_type, classify_chunk_intent
+        from router import get_insurance_llm
+
+        llm = None
+        try:
+            llm = get_insurance_llm(temperature=0)
+        except Exception as llm_exc:
+            logger.warning("[upload-webpage] LLM unavailable — falling back to regex classification: %s", llm_exc)
+
+        preview    = docs[0].page_content[:5000]
+        extra_text = docs[0].page_content[5000:10000]
+        page_title = docs[0].metadata.get("title", url)
+
+        doc_meta = tag_document(
+            page_title,
+            preview,
+            extra_text=extra_text,
+            doc_type="general",
+            llm=llm,
+        )
+        logger.info(
+            "[upload-webpage] '%s' → insurer=%s, policy_type=%s",
+            url, doc_meta.get("insurer", "UNKNOWN"), doc_meta.get("policy_type", "general"),
+        )
+
+        # ── Chunk ─────────────────────────────────────────────────────────────
         chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
-        chunks = chunker.split_documents(docs)
+        chunks  = chunker.split_documents(docs)
+
+        # ── Classify every chunk (section + policy_type) ─────────────────────
         for chunk in chunks:
             chunk.metadata["source_type"] = "webpage"
-            chunk.metadata["source_url"] = url
+            chunk.metadata["source_url"]  = url
+
+            # Section / intent classification
+            chunk.metadata["section"] = classify_chunk_intent(
+                chunk.page_content,
+                doc_type="general",
+                llm=llm,
+                force_llm=False,
+            )
+
+            # Per-chunk policy_type — fall back to doc-level if still "general"
+            chunk_policy = classify_chunk_policy_type(
+                chunk.page_content,
+                llm=llm,
+                force_llm=False,
+            )
+            chunk.metadata["policy_type"] = (
+                chunk_policy
+                if chunk_policy != "general"
+                else doc_meta.get("policy_type", "general")
+            )
+
+            # Propagate doc-level fields to every chunk
+            chunk.metadata["insurer"]  = doc_meta.get("insurer", "UNKNOWN")
+            chunk.metadata["doc_type"] = "general"
+            chunk.metadata.setdefault("filename", url)
+            chunk.metadata.setdefault("source",   url)
+
+        assigned_policy_types = list({c.metadata.get("policy_type", "general") for c in chunks})
+        assigned_sections     = list({c.metadata.get("section", "general")     for c in chunks})
+        general_count = sum(1 for c in chunks if c.metadata.get("policy_type", "general") == "general")
+
+        logger.info(
+            "[upload-webpage] %d chunks | policy_types=%s | sections=%s | %d/%d still 'general'",
+            len(chunks), assigned_policy_types, assigned_sections, general_count, len(chunks),
+        )
+
         multi.add_webpage_chunks(url, chunks)
-        return {"status": "success", "url": url, "chunks": len(chunks)}
+        return {
+            "status":  "success",
+            "url":     url,
+            "title":   page_title,
+            "chunks":  len(chunks),
+            "insurer": doc_meta.get("insurer", "UNKNOWN"),
+            "assigned_policy_types": assigned_policy_types,
+            "assigned_sections":     assigned_sections,
+            "chunks_still_general_policy_type": general_count,
+        }
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Webpage upload failed")
-        raise HTTPException(status_code=500, detail="Webpage ingestion failed unexpectedly.") from exc
+        raise HTTPException(status_code=500, detail=f"Webpage ingestion failed: {exc}") from exc
 
 
 # ── List videos ──────────────────────────────────────────────────────────────
@@ -693,7 +789,7 @@ async def ask_documents_only(req: AskRequest):
 
 # ── Upload (async) ────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), _=Depends(require_auth)):
+async def upload(file: UploadFile = File(...)):
     await _prune_jobs()
     suffix = os.path.splitext(file.filename or "")[1].lower()
     supported = ALLOWED_EXTENSIONS
@@ -765,18 +861,46 @@ class AskURLRequest(BaseModel):
 
 
 async def fetch_url_text_async(url: str, max_chars: int = 1500) -> str:
+    """
+    Async helper used by /ask-url for fast, lightweight URL fetching.
+    Uses the same tag-removal and noise-filtering logic as the main
+    document_loader._load_web_page() so results are consistent.
+    """
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={"User-Agent": "Mozilla/5.0 (compatible; InsureHubBot/1.0)"},
+            ) as resp:
                 resp.raise_for_status()
-                html = await resp.text()
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
+                html = await resp.text(errors="replace")
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove the same boilerplate tags as document_loader
+        for tag in soup(["script", "style", "nav", "footer", "header",
+                         "aside", "form", "noscript", "svg", "iframe",
+                         "button", "figure", "picture"]):
             tag.decompose()
-        text = soup.get_text(separator=" ", strip=True)
+
+        container = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.find("section")
+            or soup.find("body")
+            or soup
+        )
+        raw_text = container.get_text(separator="\n", strip=True)
+
+        # Apply noise filter: drop lines shorter than 4 words
+        lines = [l for l in raw_text.splitlines() if len(l.strip().split()) >= 4]
+        text  = "\n".join(lines)
+        text  = re.sub(r"\n{3,}", "\n\n", text).strip()
+
         return text[:max_chars] if text else ""
-    except Exception as e:
-        logger.error(f"URL fetch error: {e}")
+    except Exception as exc:
+        logger.error("URL fetch error for %s: %s", url, exc)
         return ""
 
 
@@ -911,3 +1035,211 @@ async def transcribe_audio(file: UploadFile = File(...)):
 async def health():
     pipeline = _get_pipeline()
     return {"status": "ok", "chunks": pipeline.vector_store.count()}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RAG EVALUATION ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RetrieveRequest(BaseModel):
+    question: str
+    top_k: int = 12
+
+
+class EvaluateRequest(BaseModel):
+    question: str
+    top_k: int = 12
+    run_ragas: bool = True
+
+
+def _serialize_chunk(rank: int, doc) -> dict:
+    """Convert a LangChain Document to a JSON-serialisable dict."""
+    meta = dict(doc.metadata) if doc.metadata else {}
+    # Convert any non-serialisable values (e.g. keyword lists) to strings
+    for k, v in list(meta.items()):
+        if isinstance(v, (list, dict)):
+            meta[k] = _json.dumps(v)
+        elif not isinstance(v, (str, int, float, bool, type(None))):
+            meta[k] = str(v)
+    return {
+        "rank": rank,
+        "content": doc.page_content,
+        "metadata": {
+            "filename":    meta.get("filename", meta.get("source", "Unknown")),
+            "source":      meta.get("source", "Unknown"),
+            "page":        meta.get("page", "?"),
+            "section":     meta.get("section", "general"),
+            "insurer":     meta.get("insurer", "—"),
+            "policy_type": meta.get("policy_type", "—"),
+            "similarity":  round(float(meta.get("similarity", 0)), 4),
+            "rerank_score": round(float(meta.get("rerank_score", meta.get("similarity", 0))), 4),
+            "keywords":    meta.get("keywords", ""),
+        },
+    }
+
+
+# ── /retrieve — pure retrieval, NO LLM call ──────────────────────────────────
+@app.post("/retrieve")
+async def retrieve_chunks(req: RetrieveRequest):
+    """
+    Return ranked chunks + full metadata for a query.
+    No LLM is called — this is pure vector/hybrid retrieval.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if _get_pipeline().vector_store.count() == 0:
+        raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload a document first.")
+
+    t0 = time.time()
+    try:
+        chunks = await asyncio.to_thread(
+            _get_pipeline().vector_store.search,
+            req.question,
+            req.top_k,
+            None,          # filter_metadata
+            True,          # use_hybrid
+            True,          # use_reranker
+        )
+    except Exception as exc:
+        logger.exception("Retrieval failed")
+        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
+
+    retrieval_ms = round((time.time() - t0) * 1000)
+    serialised = [_serialize_chunk(i + 1, doc) for i, doc in enumerate(chunks)]
+    return {
+        "chunks": serialised,
+        "total_chunks": len(serialised),
+        "retrieval_time_ms": retrieval_ms,
+    }
+
+
+# ── /evaluate — full pipeline evaluation with optional RAGAS ─────────────────
+@app.post("/evaluate")
+async def evaluate(req: EvaluateRequest):
+    """
+    Full RAG evaluation pipeline:
+      1. Retrieve chunks  → retrieval_time_ms
+      2. Generate answer  → llm_time_ms
+      3. RAGAS scoring    → ragas_time_ms  (skipped when run_ragas=false)
+    Returns chunks, metadata, answer, timings, and RAGAS scores.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if _get_pipeline().vector_store.count() == 0:
+        raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload a document first.")
+
+    # ── Step 1: Retrieve ──────────────────────────────────────────────────────
+    t_retrieve_start = time.time()
+    try:
+        chunks = await asyncio.to_thread(
+            _get_pipeline().vector_store.search,
+            req.question,
+            req.top_k,
+            None, True, True,
+        )
+    except Exception as exc:
+        logger.exception("Retrieval failed during evaluation")
+        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
+    retrieval_ms = round((time.time() - t_retrieve_start) * 1000)
+
+    serialised_chunks = [_serialize_chunk(i + 1, doc) for i, doc in enumerate(chunks)]
+    contexts = [doc.page_content for doc in chunks]
+
+    # ── Step 2: Generate LLM answer ───────────────────────────────────────────
+    t_llm_start = time.time()
+    answer = ""
+    sources = []
+    try:
+        answer, _, sources = await asyncio.wait_for(
+            asyncio.to_thread(_get_pipeline().knowledge_query, req.question),
+            timeout=_ASK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        answer = "⚠️ LLM timed out."
+    except Exception as exc:
+        logger.warning("LLM generation failed during evaluation: %s", exc)
+        answer = f"⚠️ LLM error: {exc}"
+    llm_ms = round((time.time() - t_llm_start) * 1000)
+
+    # ── Step 3: RAGAS scoring ─────────────────────────────────────────────────
+    ragas_ms = 0
+    ragas_scores: dict = {
+        "faithfulness": None,
+        "answer_relevancy": None,
+        "context_precision": None,
+        "error": None,
+    }
+
+    if req.run_ragas and contexts and answer and not answer.startswith("⚠️"):
+        t_ragas_start = time.time()
+        try:
+            from datasets import Dataset
+            from ragas import evaluate as ragas_evaluate
+            from ragas.metrics import faithfulness, answer_relevancy, context_precision
+            from langchain_openai import ChatOpenAI
+            from ragas.llms import LangchainLLMWrapper
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+
+            from router import VLLM_HOST, VLLM_MODEL, VLLM_API_KEY
+
+            ragas_llm = ChatOpenAI(
+                model=VLLM_MODEL,
+                base_url=f"{VLLM_HOST}/v1",
+                api_key=VLLM_API_KEY,
+                temperature=0,
+                max_tokens=512,
+                timeout=60,
+                max_retries=1,
+            )
+            ragas_llm_wrapper = LangchainLLMWrapper(ragas_llm)
+
+            embed_model = _get_pipeline().vector_store.embed_model
+            ragas_embed_wrapper = LangchainEmbeddingsWrapper(embed_model)
+
+            eval_dataset = Dataset.from_dict({
+                "question":  [req.question],
+                "answer":    [answer],
+                "contexts":  [contexts[:6]],   # cap to 6 to stay within token limits
+                "ground_truth": [""],           # empty — not required for these 3 metrics
+            })
+
+            metrics_to_run = [faithfulness, answer_relevancy, context_precision]
+            for m in metrics_to_run:
+                m.llm = ragas_llm_wrapper
+                if hasattr(m, "embeddings"):
+                    m.embeddings = ragas_embed_wrapper
+
+            result = await asyncio.wait_for(
+                asyncio.to_thread(ragas_evaluate, eval_dataset, metrics=metrics_to_run),
+                timeout=120,
+            )
+            result_dict = result.to_pandas().iloc[0].to_dict()
+            ragas_scores["faithfulness"]       = round(float(result_dict.get("faithfulness", 0) or 0), 4)
+            ragas_scores["answer_relevancy"]   = round(float(result_dict.get("answer_relevancy", 0) or 0), 4)
+            ragas_scores["context_precision"]  = round(float(result_dict.get("context_precision", 0) or 0), 4)
+        except asyncio.TimeoutError:
+            ragas_scores["error"] = "RAGAS evaluation timed out after 120s."
+            logger.warning("RAGAS timed out")
+        except ImportError as exc:
+            ragas_scores["error"] = f"RAGAS library not installed: {exc}"
+            logger.warning("RAGAS import failed: %s", exc)
+        except Exception as exc:
+            ragas_scores["error"] = f"RAGAS evaluation failed: {exc}"
+            logger.warning("RAGAS failed: %s", exc)
+        finally:
+            ragas_ms = round((time.time() - t_ragas_start) * 1000)
+
+    total_ms = retrieval_ms + llm_ms + ragas_ms
+    return {
+        "answer":  answer,
+        "sources": sources,
+        "chunks":  serialised_chunks,
+        "timing": {
+            "retrieval_ms": retrieval_ms,
+            "llm_ms":       llm_ms,
+            "ragas_ms":     ragas_ms,
+            "total_ms":     total_ms,
+        },
+        "ragas": ragas_scores,
+    }

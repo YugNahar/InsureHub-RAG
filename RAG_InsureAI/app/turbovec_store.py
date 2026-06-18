@@ -508,6 +508,33 @@ class TurboVecStore:
                 values.add(val)
         return sorted(values)
 
+    def get_metadata_summary(self, match_field: str, match_value: str) -> Dict[str, Any]:
+        """Summarize metadata for all chunks where metadata[match_field] == match_value.
+
+        Returns the chunk count plus unique values seen for 'policy_type' and
+        'section', so callers (e.g. the eval API) can inspect what's stored
+        without scanning chunks themselves.
+        """
+        policy_types = set()
+        sections = set()
+        chunk_count = 0
+        for meta in self._metadatas.values():
+            if meta.get(match_field) != match_value:
+                continue
+            chunk_count += 1
+            policy_type = meta.get("policy_type")
+            if policy_type:
+                policy_types.add(policy_type)
+            section = meta.get("section")
+            if section:
+                sections.add(section)
+        return {
+            match_field: match_value,
+            "chunk_count": chunk_count,
+            "policy_types": sorted(policy_types),
+            "sections": sorted(sections),
+        }
+
     # ------------------------------------------------------------------
     # Dense search via TurboVec
     # ------------------------------------------------------------------
@@ -579,7 +606,17 @@ class TurboVecStore:
             return []
         query_emb = self._embed([query])[0]
         query_emb_2d = np.expand_dims(query_emb, axis=0)
-        safe_k = min(k, self._next_seq_id)
+        # The ANN index is unaware of metadata filters — it returns the global
+        # top-k by cosine similarity, and filters are applied AFTER.  When a
+        # restrictive filter is active (e.g. doc_type=youtube) the target docs
+        # may not appear in a small top-k because other source types rank higher.
+        # Pre-fetch a large candidate pool so that filtered subsets still have
+        # enough candidates to fill the requested k slots.
+        if filter_meta:
+            fetch_k = min(max(k * 15, 100), self._next_seq_id)
+        else:
+            fetch_k = min(k * 2, self._next_seq_id)
+        safe_k = max(fetch_k, 1)
         scores, indices = self._tvec_index.search(query_emb_2d, k=safe_k)
         scores = scores[0]
         indices = indices[0]
@@ -605,16 +642,38 @@ class TurboVecStore:
         if bm25 is None or not self._bm25_corpus:
             return []
         tokens = query.lower().split()
-        scores = bm25.get_scores(tokens)
-        filtered_with_scores = [
-            (scores[idx], doc_id, text, meta)
-            for idx, (doc_id, text, meta) in enumerate(self._bm25_corpus)
-            if self._metadata_matches_filter(meta, filter_meta)
-        ]
-        filtered_with_scores.sort(key=lambda x: x[0], reverse=True)
+
+        # When a metadata filter is active, score only the matching sub-corpus.
+        # This prevents IDF weights from being diluted by unrelated documents
+        # and gives more accurate BM25 scores within the filtered slice.
+        if filter_meta:
+            filtered_corpus = [
+                (doc_id, text, meta)
+                for doc_id, text, meta in self._bm25_corpus
+                if self._metadata_matches_filter(meta, filter_meta)
+            ]
+            if not filtered_corpus:
+                return []
+            # Build a temporary BM25 index over just the filtered docs.
+            tokenized = [text.lower().split() for _, text, _ in filtered_corpus]
+            from rank_bm25 import BM25Okapi
+            sub_bm25 = BM25Okapi(tokenized)
+            scores = sub_bm25.get_scores(tokens)
+            scored = [
+                (float(scores[idx]), doc_id, text, meta)
+                for idx, (doc_id, text, meta) in enumerate(filtered_corpus)
+            ]
+        else:
+            scores = bm25.get_scores(tokens)
+            scored = [
+                (float(scores[idx]), doc_id, text, meta)
+                for idx, (doc_id, text, meta) in enumerate(self._bm25_corpus)
+            ]
+
+        scored.sort(key=lambda x: x[0], reverse=True)
         return [
-            (doc_id, text, meta, float(score))
-            for score, doc_id, text, meta in filtered_with_scores[:k]
+            (doc_id, text, meta, score)
+            for score, doc_id, text, meta in scored[:k]
             if score > 0
         ]
 
@@ -622,11 +681,33 @@ class TurboVecStore:
     # Reranker — does NOT mutate in-memory meta dicts
     # ------------------------------------------------------------------
 
+    def _ensure_reranker(self):
+        if self.reranker is None:
+            self.reranker = CrossEncoder(RERANKER_MODEL_NAME)
+            logger.info("[Reranker] cross-encoder loaded: %s", RERANKER_MODEL_NAME)
+
+    def warmup(self):
+        """
+        Force-load all models and run a dummy inference pass so that JIT
+        compilation and CUDA graph capture happen at startup, not on the
+        first user query.
+        """
+        logger.info("[Warmup] starting embedding model warmup ...")
+        self.embed_model.encode(
+            ["warmup insurance policy claim coverage"],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        logger.info("[Warmup] embedding model ready")
+        logger.info("[Warmup] loading cross-encoder reranker ...")
+        self._ensure_reranker()
+        self.reranker.predict([("warmup query", "warmup document text")])
+        logger.info("[Warmup] reranker ready")
+
     def _rerank(self, query: str, candidates: List[tuple], top_k: int) -> List[tuple]:
         if not candidates:
             return []
-        if self.reranker is None:
-            self.reranker = CrossEncoder(RERANKER_MODEL_NAME)
+        self._ensure_reranker()
         pairs = [(query, text) for (_, text, _, _) in candidates]
         rerank_scores = self.reranker.predict(pairs)
         combined = list(zip(candidates, rerank_scores))
@@ -636,6 +717,29 @@ class TurboVecStore:
             # Don't mutate the shared meta dict — return a pristine copy
             reranked.append((doc_id, text, dict(meta), float(score)))
         return reranked
+
+    def rerank_documents(self, query: str, docs: List[Document], top_k: int) -> List[Document]:
+        """
+        Rerank a list of Documents in a single CrossEncoder.predict() call.
+
+        Use this instead of per-search reranking when multiple searches have
+        been merged and deduplicated — one call is far cheaper than N calls.
+        """
+        if not docs:
+            return []
+        self._ensure_reranker()
+        pairs = [(query, doc.page_content) for doc in docs]
+        scores = self.reranker.predict(pairs)
+        ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        result = []
+        for doc, score in ranked[:top_k]:
+            new_doc = Document(page_content=doc.page_content, metadata=dict(doc.metadata))
+            new_doc.metadata["rerank_score"] = float(score)
+            base_method = doc.metadata.get("retrieval_method", "dense")
+            if "+rerank" not in base_method:
+                new_doc.metadata["retrieval_method"] = base_method + "+rerank"
+            result.append(new_doc)
+        return result
 
     # ------------------------------------------------------------------
     # Public search API
