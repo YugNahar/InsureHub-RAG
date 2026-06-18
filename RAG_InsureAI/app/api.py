@@ -87,6 +87,10 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8501",
     "http://127.0.0.1:8080",
+    "https://insureai-chat.lovable.app",
+    "https://*.lovable.app",
+    "https://*.lovableproject.com",
+    "https://id-preview--1f3edfb5-f351-48b6-baff-3a69cba3ed88.lovable.app",
 ]
 
 

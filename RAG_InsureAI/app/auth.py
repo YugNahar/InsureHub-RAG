@@ -20,7 +20,7 @@ from pydantic import BaseModel
 # ── Config from .env ──────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "change-me-in-production-please")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES", "480"))  # 8 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES") or "480") # 8 hours
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "")  # bcrypt hash
