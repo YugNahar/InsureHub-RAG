@@ -48,27 +48,72 @@ AIAgent/
 ```
 
 ---
+## Step 1.5 — Create Your `.env` File
 
-## Step 2 — Point It at Your vLLM Server
+Create a file named `.env` in the project root (same directory as `docker-compose.yml`).
 
-Open `docker-compose.yml` in a text editor. Find the `environment` section under the `api` service and update the vLLM host if yours is different:
+Example:
+
+```env
+VLLM_HOST=http://<your-vllm-server-ip>:7000
+VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+EMBED_MODEL=BAAI/bge-base-en-v1.5
+
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=yourpassword
+
+AUTH_SECRET_KEY=pick-any-long-random-string
+AUTH_TOKEN_EXPIRE_MINUTES=480
+```
+
+**Important:**
+
+* Never commit this file to Git.
+* Use a long random string for `AUTH_SECRET_KEY`.
+* Change the default admin username and password before deploying to production.
+
+---
+
+## Step 2 — Configure the vLLM Connection
+
+Open `docker-compose.yml` and verify that the API service loads values from the `.env` file:
 
 ```yaml
 environment:
-  - VLLM_HOST=http://123.253.124.14:7000
-  - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
-  - EMBED_MODEL=BAAI/bge-base-en-v1.5
+  - VLLM_HOST=${VLLM_HOST}
+  - VLLM_MODEL=${VLLM_MODEL}
+  - EMBED_MODEL=${EMBED_MODEL}
+
+  - ADMIN_USERNAME=${ADMIN_USERNAME}
+  - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+  - AUTH_SECRET_KEY=${AUTH_SECRET_KEY}
+  - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
 ```
 
-Before going further, confirm your vLLM server is actually reachable:
+Before continuing, verify the vLLM server is reachable:
+
+```bash
+curl $VLLM_HOST/v1/models
+```
+
+Expected response:
+
+```json
+{
+  "data": [...]
+}
+```
+
+If the request times out or returns a connection error, verify:
+
+* The vLLM server is running.
+* The host and port are correct.
+* Firewall rules allow access to port `7000`.
+
+The API container can start without the vLLM server, but document questions will fail until the model server becomes reachable.
 
 ```
-curl http://123.253.124.14:7000/v1/models
 ```
-
-If you get back a JSON response listing models, you're good. If it times out or refuses the connection, the server is either down or blocked by a firewall — sort that out before continuing, otherwise the app will start but won't be able to answer any questions.
-
----
 
 ## Step 3 — Build and Start
 
