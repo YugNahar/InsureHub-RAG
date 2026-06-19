@@ -89,6 +89,7 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:8080",
     "https://insureai-chat.lovable.app",
     "https://id-preview--1f3edfb5-f351-48b6-baff-3a69cba3ed88.lovable.app",
+    "https://insurehub-rag-frontend-zqp6.vercel.app",
 ]
 
 
@@ -309,11 +310,12 @@ async def _warmup_pipeline():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_csv_env("CORS_ALLOW_ORIGINS", _DEFAULT_CORS_ORIGINS),
-    allow_origin_regex=r"https://.*\.(lovable\.app|lovableproject\.com)",
+    allow_origin_regex=r"https://.*\.(lovable\.app|lovableproject\.com|vercel\.app)",
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
+
 # ── Existing imports ──────────────────────────────────────────────────────────
 from rag import RAGPipeline
 
