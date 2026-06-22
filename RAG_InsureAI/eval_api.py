@@ -419,6 +419,8 @@ _QUERY_STOP_WORDS = {
     # domain-generic: present in virtually every insurance chunk, so not discriminating
     'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
     'plan', 'claim', 'claims', 'benefits', 'benefit',
+    # generic time/measurement words — too common to indicate topic coverage
+    'period', 'time', 'duration', 'date', 'days', 'year', 'month', 'months',
 }
 
 def _context_covers_query(query: str, docs: list) -> bool:

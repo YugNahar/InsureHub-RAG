@@ -18,6 +18,8 @@ _QUERY_STOP_WORDS = {
     # domain-generic insurance terms that appear in almost every chunk
     'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
     'plan', 'claim', 'claims', 'benefits', 'benefit',
+    # generic time/measurement words — too common to indicate topic coverage
+    'period', 'time', 'duration', 'date', 'days', 'year', 'month', 'months',
 }
 
 def _context_covers_query(query: str, docs: list) -> bool:
@@ -289,11 +291,55 @@ class MultiSourceRAG:
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
             logger.info(f"Document filter: {document_filter}")
 
+        # ── Stage-2 candidate retrieval ───────────────────────────────────────
+        # Use a wider pre-rerank pool (30 candidates) so the cross-encoder has
+        # enough choices.  Reranking happens after the pool is assembled below.
         doc_chunks = await asyncio.to_thread(
             self.doc_pipeline._vector_store.search,
-            retrieval_query, top_k=6, use_hybrid=True, use_reranker=True,
+            retrieval_query, top_k=30, use_hybrid=True, use_reranker=False,
             filter_metadata=filter_meta
         )
+
+        # ── Stage-1 source guarantee ──────────────────────────────────────────
+        # The main ANN search is capped at top-30 across ALL chunks in the store.
+        # When the store has hundreds of PDF chunks, a small YouTube transcript
+        # (only 2–5 chunks) can fall entirely below that ceiling even though its
+        # document-level summary IS semantically relevant.
+        # Fix: query the SummaryStore for the top-N relevant *sources*, then for
+        # each source absent from the candidate pool run a tiny targeted search
+        # (top_k=2) to guarantee at least one representative chunk.
+        if not document_filter and self.doc_pipeline._summary_store.count() > 0:
+            try:
+                relevant_summaries = await asyncio.to_thread(
+                    self.doc_pipeline._summary_store.search, retrieval_query, 5
+                )
+                in_pool_srcs = {d.metadata.get("source", "") for d in doc_chunks}
+                for summary_doc in relevant_summaries:
+                    src = summary_doc.metadata.get("source", "")
+                    if src and src not in in_pool_srcs:
+                        boost = await asyncio.to_thread(
+                            self.doc_pipeline._vector_store.search,
+                            retrieval_query, 2, {"source": {"$eq": src}}, True, False,
+                        )
+                        if boost:
+                            existing = {d.page_content[:80] for d in doc_chunks}
+                            doc_chunks = doc_chunks + [
+                                d for d in boost if d.page_content[:80] not in existing
+                            ]
+                            in_pool_srcs.add(src)
+                            logger.info(
+                                "[MultiSourceRAG] stage-1 boost: added %d chunk(s) from %r",
+                                len(boost), src,
+                            )
+            except Exception as _exc:
+                logger.debug("[MultiSourceRAG] stage-1 guarantee skipped: %s", _exc)
+
+        # Rerank the assembled candidate pool once (avoids per-source rerank calls)
+        if doc_chunks:
+            doc_chunks = await asyncio.to_thread(
+                self.doc_pipeline._vector_store.rerank_documents,
+                retrieval_query, doc_chunks, 8,
+            )
 
         if not document_filter:
             video_chunks = await asyncio.to_thread(
@@ -344,22 +390,26 @@ class MultiSourceRAG:
             )
 
         # Build context
+        _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
+        _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
         context_parts, sources = [], []
         for chunk in all_chunks:
             source_type = chunk.metadata.get("source_type", "document")
-            if source_type == "document":
+            doc_type = chunk.metadata.get("doc_type", "")
+            if source_type in _VIDEO_SOURCE_TYPES or doc_type == "youtube":
+                url = chunk.metadata.get("source_url") or chunk.metadata.get("source", "Unknown URL")
+                title = chunk.metadata.get("video_title", "")
+                label = f"Video: {title or url}"
+                sources.append(url)
+            elif source_type in _WEBPAGE_SOURCE_TYPES:
+                url = chunk.metadata.get("source_url") or chunk.metadata.get("source", "Unknown URL")
+                label = f"Webpage: {url}"
+                sources.append(url)
+            else:
                 src = chunk.metadata.get("source", "Unknown")
                 page = chunk.metadata.get("page", "?")
                 label = f"Document: {src} (Page {page})"
                 sources.append(f"{src} (page {page})")
-            elif source_type == "video":
-                url = chunk.metadata.get("source_url", "Unknown URL")
-                label = f"Video: {url}"
-                sources.append(url)
-            else:
-                url = chunk.metadata.get("source_url", "Unknown URL")
-                label = f"Webpage: {url}"
-                sources.append(url)
             context_parts.append(f"[{label}]\n{chunk.page_content}")
         full_context = "\n\n".join(context_parts)
         if len(full_context) > self.max_context_chars:
