@@ -7,6 +7,41 @@ import logging
 import re
 from typing import List, Tuple, Optional
 
+# ── Context coverage check ────────────────────────────────────────────────────
+# Domain-generic terms that appear in virtually every insurance chunk and
+# therefore give no signal about whether a chunk covers the specific query topic.
+_QUERY_STOP_WORDS = {
+    'what', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'how', 'does',
+    'do', 'i', 'my', 'me', 'by', 'with', 'under', 'about', 'can', 'will',
+    'which', 'when', 'where', 'to', 'and', 'or', 'at', 'this', 'that', 'it',
+    'its', 'be', 'been', 'has', 'have', 'had', 'any', 'all', 'from', 'on',
+    # domain-generic insurance terms that appear in almost every chunk
+    'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
+    'plan', 'claim', 'claims', 'benefits', 'benefit',
+}
+
+def _context_covers_query(query: str, docs: list) -> bool:
+    """True if ≥1 retrieved chunk contains at least one discriminating query keyword.
+
+    Guards against cross-encoder false positives where a chunk scores highly but
+    doesn't actually contain any query-specific term (e.g. a 'Duty of Assured'
+    chunk scoring 0.87 for 'What is a deductible?').
+    """
+    query_terms = {
+        w for w in re.findall(r'\b[a-z]{3,}\b', query.lower())
+        if w not in _QUERY_STOP_WORDS
+    }
+    if not query_terms:
+        return True  # no discriminating terms — assume covered
+    for doc in docs:
+        text = (
+            doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
+        ).lower()
+        chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
+        if query_terms & chunk_terms:
+            return True
+    return False
+
 
 def _strip_model_preamble(text: str) -> str:
     """Remove auto-generated meta-commentary lines the LLM prepends to answers."""
@@ -365,7 +400,22 @@ class MultiSourceRAG:
             prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
         else:
-            prompt = CONVERSATIONAL_RAG_PROMPT.format(history=history, context=full_context, question=question)
+            # Append a fallback hint when retrieved chunks have no discriminating
+            # keyword overlap with the query — the LLM should then use general
+            # knowledge and clearly label it so users know the docs don't cover it.
+            ctx_covered = _context_covers_query(question, all_chunks)
+            fallback_suffix = (
+                "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
+                "explicit information about this specific topic. Provide a helpful "
+                "general insurance explanation from your training knowledge and clearly "
+                "label it: 'General knowledge (not from your uploaded documents): '"
+                if not ctx_covered else ""
+            )
+            prompt = CONVERSATIONAL_RAG_PROMPT.format(
+                history=history,
+                context=full_context + fallback_suffix,
+                question=question,
+            )
             llm = get_insurance_llm(temperature=0.3)
 
         response = await asyncio.to_thread(llm.invoke, prompt)

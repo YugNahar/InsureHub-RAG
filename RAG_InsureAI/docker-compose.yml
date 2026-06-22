@@ -1,29 +1,66 @@
+# Two services, one image:
+#   api  — production chat API (Yug's conversation intelligence) → port 8501
+#   eval — RAG evaluation tool (retrieval quality + RAGAS UI)    → port 8002
+#
+# Both share the same TurboVec vector store volume (insurehub_data), so
+# documents uploaded via either service are visible to the other.
+#
+# Cloudflare / Vercel should point to the `api` service (port 8501).
+# Developers use the `eval` service (port 8002) for tuning and testing.
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  shm_size: '2gb'
+  deploy:
+    resources:
+      limits:
+        memory: 4G
+      reservations:
+        memory: 1G
+  environment:
+    - EMBED_MODEL=BAAI/bge-base-en-v1.5
+    - VLLM_HOST=http://123.253.124.14:7000
+    - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+  volumes:
+    - insurehub_data:/root/.insurehub
+    - insurehub_tmp:/root/.insurehub_tmp
+    - hf_cache:/root/.cache/huggingface
+    - whisper_cache:/root/.cache/whisper
+  restart: unless-stopped
+
 services:
 
+  # ── Production chat API (conversation intelligence, /ask, /upload, etc.) ────
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *common
     container_name: insurehub_api
+    working_dir: /app/app
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8501"]
+    ports:
+      - "8501:8501"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8501/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+  # ── RAG evaluation tool (retrieval tuning, streaming UI, RAGAS metrics) ─────
+  eval:
+    <<: *common
+    container_name: insurehub_eval
+    working_dir: /app
+    command: ["uvicorn", "eval_api:app", "--host", "0.0.0.0", "--port", "8001"]
     ports:
       - "8002:8001"
-    shm_size: '2gb'
-    deploy:
-      resources:
-        limits:
-          memory: 6G
-        reservations:
-          memory: 2G
-    environment:
-      - EMBED_MODEL=BAAI/bge-base-en-v1.5
-      - VLLM_HOST=http://123.253.124.14:7000
-      - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
-    volumes:
-      - insurehub_data:/root/.insurehub
-      - insurehub_tmp:/root/.insurehub_tmp
-      - hf_cache:/root/.cache/huggingface
-      - whisper_cache:/root/.cache/whisper
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8001/eval/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
 
 volumes:
   insurehub_data:

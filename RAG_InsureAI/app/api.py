@@ -45,8 +45,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from auth import create_login_endpoint, require_auth
-
 _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
 _MAX_HISTORY_TURNS = 3  # keep last 3 exchanges to stay within token limit
 _UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
@@ -285,13 +283,15 @@ create_login_endpoint(app)
 
 from fastapi.responses import FileResponse
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 @app.get("/auth")
 async def auth_page():
-    return FileResponse("/app/auth.html")
+    return FileResponse(os.path.join(_APP_DIR, "auth.html"))
 
 @app.get("/admin")
 async def admin_page():
-    return FileResponse("/app/admin.html")
+    return FileResponse(os.path.join(_APP_DIR, "admin.html"))
 
 @app.on_event("startup")
 async def _init_async_lock():
