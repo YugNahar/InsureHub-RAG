@@ -35,17 +35,22 @@ from prompt_template import (
     RAG_PROMPT,
 )
 from vector_store import ChromaVectorStore
+from summary_store import SummaryStore
+from summarizer import generate_summary
+from context_compressor import ContextCompressor
+from kv_cache import QueryKVCache
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 RETRIEVE_K = 16
 RERANK_K = 8
-# 3500 chars ≈ 875 tokens of context.  Total input ≈ 1100 tokens (prompt+context+question)
-# → prefill is ~1 second; 200 max_tokens of output ≈ 8 seconds at 24 tok/s on vLLM.
-# Context compressor already strips irrelevant sentences, so 3500 chars is still rich.
-MAX_CONTEXT_CHARS = 3500
+MAX_CONTEXT_CHARS = 10000
 SUMMARY_MAX_CHARS = 20000
+# How many candidate sources Stage 1 (summary search) hands to Stage 2
+# (chunk search) in knowledge_query()'s two-stage retrieval.
+SUMMARY_STAGE1_TOP_K = 5
+LLM_CONTEXT_WINDOW_CHARS = 12000
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION DETECTION (doc-type aware)
@@ -236,36 +241,79 @@ def _extract_keywords(text: str) -> list[str]:
     return list(dict.fromkeys(t for t in tokens if t not in _STOPWORDS))[:40]
 
 # ══════════════════════════════════════════════════════════════════════════════
+# QUERY CLEANING
+# ══════════════════════════════════════════════════════════════════════════════
+_STOP_WORDS = frozenset({
+    # Question words
+    "what", "who", "how", "when", "where", "why", "which",
+    # Auxiliary verbs
+    "is", "are", "was", "were", "be", "been", "being",
+    "can", "could", "will", "would", "should", "shall",
+    "may", "might", "must", "do", "does", "did", "done",
+    "have", "has", "had", "get", "got",
+    # Common verbs used in questions
+    "tell", "explain", "describe", "define", "list", "show", "give",
+    "mean", "means", "refer", "refers", "work", "works",
+    # Articles, prepositions, conjunctions, pronouns
+    "a", "an", "the",
+    "in", "of", "on", "at", "by", "to", "for", "from", "with",
+    "into", "onto", "upon", "about", "above", "below", "between",
+    "and", "or", "but", "nor", "yet", "so",
+    "if", "then", "than", "as", "that", "this", "these", "those",
+    "me", "us", "my", "i", "you", "your", "we", "our",
+    "it", "its", "they", "them", "their",
+    # Filler phrases
+    "please", "just", "really", "actually", "basically",
+})
+
+
+def _clean_query(query: str) -> str:
+    """
+    Strip punctuation and stop words from the query before retrieval.
+    Keeps only the meaningful topic words so BM25 and dense search
+    match document content rather than question structure.
+    Example: 'What is Insurance?' → 'Insurance'
+    The original query with punctuation is still used for LLM prompts.
+    """
+    # Remove punctuation
+    cleaned = re.sub(r"[?!;:,\.]+", "", query).strip()
+    # Filter stop words, keep tokens longer than 1 char
+    tokens = [t for t in cleaned.split() if t.lower() not in _STOP_WORDS and len(t) > 1]
+    result = " ".join(tokens)
+    # Fall back to punctuation-stripped query if all tokens were stop words
+    return result if result else cleaned
+
+
+def _extract_query_intent(query: str) -> str:
+    """
+    Extract the core topic from a query by removing stop words.
+    Example: 'What is a ULIP?' → 'ulip'
+    """
+    cleaned = re.sub(r"[?!.,;:]+", "", query.lower()).strip()
+    tokens  = [t for t in cleaned.split() if t not in _STOP_WORDS and len(t) > 1]
+    return " ".join(tokens) if tokens else cleaned
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION-AWARE CHUNKER
 # ══════════════════════════════════════════════════════════════════════════════
 class SectionChunker:
     """
-    Args
-    ----
-    chunk_size, chunk_overlap : kept for backward-compatible call signatures
-        (e.g. SectionChunker(chunk_size=600, chunk_overlap=80)). chunk_size
-        is now used as the semantic chunker's max_chunk_chars ceiling and
-        chunk_overlap as a floor for min_chunk_chars — chunk_overlap no
-        longer produces literal overlapping text, since semantic boundaries
-        are chosen at low-similarity points and don't need it.
-    embed_model : the shared embedding model (e.g. ChromaVectorStore's
-        embed_model). Pass this in to avoid loading a second copy of the
-        model — see semantic_chunker.py.
-    breakpoint_percentile : forwarded to SemanticChunker; higher = fewer,
-        larger chunks.
+    Wrapper around SemanticChunker that adds section/keyword metadata to chunks.
+    All chunking (500-word chunks, 60-word overlap, page merging) is delegated
+    to SemanticChunker internally.
+
+    chunk_size / chunk_overlap accepted for backward compat but unused.
     """
     def __init__(
         self,
-        chunk_size: int = 900,
-        chunk_overlap: int = 120,
+        chunk_size: int = 2000,      # accepted for backward compat, unused
+        chunk_overlap: int = 600,    # accepted for backward compat, unused
         embed_model: Any = None,
         breakpoint_percentile: float = 90.0,
     ):
         self._splitter = SemanticChunker(
             embed_model=embed_model,
-            breakpoint_percentile=breakpoint_percentile,
-            min_chunk_chars=max(150, chunk_overlap),
-            max_chunk_chars=chunk_size,
+            breakpoint_pct=breakpoint_percentile,
         )
 
     def split_documents(
@@ -275,77 +323,41 @@ class SectionChunker:
         llm: Any = None,
     ) -> list[Document]:
         """
-        Split documents into overlapping chunks and annotate each chunk with:
-          - section: intent/section label (regex fast-path; LLM for ambiguous
-            or YouTube/conversational chunks when llm is provided)
-          - policy_type: per-chunk policy type (regex fast-path; LLM for
-            ambiguous or YouTube chunks when llm is provided)
-          - keywords: extracted keyword list
-
-        Args:
-            docs:     List of LangChain Document objects to split.
-            doc_type: Document type from classify_document_type().
-                      Controls which section-label vocabulary is used.
-                      Defaults to "policy_document" for backward compatibility.
-            llm:      Optional LangChain LLM instance. When provided, used for
-                      chunk-level intent and policy_type classification on
-                      ambiguous or YouTube/conversational chunks.
+        Split documents and annotate each chunk with section/policy_type/keywords.
+        Page merging and page-number recovery are handled by SemanticChunker.
         """
-        chunks = []
-        for doc in docs:
-            # Inherit doc_type from document metadata if present
-            effective_doc_type = doc.metadata.get("doc_type", doc_type)
+        chunks = self._splitter.split_documents(docs)
 
-            # Determine if this is YouTube/conversational content
-            is_youtube = effective_doc_type in ("youtube",) or \
-                         "whisper" in str(doc.metadata.get("source_type", "")) or \
-                         "youtube" in str(doc.metadata.get("source", "")).lower()
+        for chunk in chunks:
+            effective_doc_type = chunk.metadata.get("doc_type", doc_type)
+            is_youtube = (
+                effective_doc_type == "youtube"
+                or "whisper" in str(chunk.metadata.get("source_type", "")).lower()
+                or "youtube" in str(chunk.metadata.get("source", "")).lower()
+            )
 
-            raw = self._splitter.split_documents([doc])
-            for chunk in raw:
-                # ── Section / intent label ─────────────────────────────────
-                # For YouTube chunks, always use LLM (regex misses colloquial).
-                # For policy/handbook chunks, regex fast-path first; LLM only
-                # when regex is ambiguous (handled inside classify_chunk_intent).
-                if llm is not None:
-                    chunk.metadata["section"] = classify_chunk_intent(
-                        chunk.page_content,
-                        doc_type=effective_doc_type,
-                        llm=llm,
-                        force_llm=is_youtube,
-                    )
-                else:
-                    # No LLM: use regex-only _detect_section (backward compat)
-                    chunk.metadata["section"] = _detect_section(
-                        chunk.page_content, doc_type=effective_doc_type
-                    )
+            if llm is not None:
+                chunk.metadata["section"] = classify_chunk_intent(
+                    chunk.page_content,
+                    doc_type=effective_doc_type,
+                    llm=llm,
+                    force_llm=is_youtube,
+                )
+            else:
+                chunk.metadata["section"] = _detect_section(
+                    chunk.page_content, doc_type=effective_doc_type
+                )
 
-                # ── Per-chunk policy_type ──────────────────────────────────
-                # Always classify at chunk level — overrides the doc-level
-                # "general" that tag_document() assigns to non-policy documents.
-                # This means a handbook chapter on "motor claims" correctly
-                # gets policy_type="motor" rather than "general".
-                if llm is not None:
-                    chunk_policy = classify_chunk_policy_type(
-                        chunk.page_content,
-                        llm=llm,
-                        force_llm=is_youtube,
-                    )
-                else:
-                    chunk_policy = classify_chunk_policy_type(
-                        chunk.page_content,
-                        llm=None,
-                    )
+            chunk_policy = classify_chunk_policy_type(
+                chunk.page_content,
+                llm=llm if llm is not None else None,
+                force_llm=is_youtube if llm is not None else False,
+            )
+            if chunk_policy != "general":
+                chunk.metadata["policy_type"] = chunk_policy
 
-                # Only override the doc-level policy_type if we found something
-                # more specific than "general" at the chunk level.
-                if chunk_policy != "general":
-                    chunk.metadata["policy_type"] = chunk_policy
-                # else: keep whatever the doc-level tag set (could be a real
-                # policy type for policy_document, or "general" for others)
+            chunk.metadata["keywords"] = _extract_keywords(chunk.page_content)
 
-                chunk.metadata["keywords"] = _extract_keywords(chunk.page_content)
-            chunks.extend(raw)
         return chunks
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -373,16 +385,35 @@ def _chunks_within_context_limit(chunks: list[Document], max_chars: int) -> list
 
 
 def _build_structured_context(chunks: list[Document], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    _CHUNK_MIN  = 200   # guaranteed minimum chars per chunk
+    _CHUNK_MAX  = 1500  # max chars per chunk (same for all source types)
+
     parts = []
+    used = 0
     for chunk in chunks:
+        remaining = max(max_chars - used, _CHUNK_MIN)
+        allotted  = min(_CHUNK_MAX, remaining)
+
         section = chunk.metadata.get("section", "general").title()
-        source = chunk.metadata.get("source", "Unknown")
-        page = chunk.metadata.get("page", "?")
-        parts.append(f"[Section: {section} | Source: {source} | Page: {page}]\n{chunk.page_content}")
-    full = "\n\n".join(parts)
-    if len(full) > max_chars:
-        full = full[:max_chars] + "... (truncated)"
-    return full
+        source  = chunk.metadata.get("source", "Unknown")
+        page    = chunk.metadata.get("page", "?")
+        header  = f"[Section: {section} | Source: {source} | Page: {page}]\n"
+
+        body = chunk.page_content
+        space_for_body = allotted - len(header)
+        if space_for_body <= 0:
+            body = body[:_CHUNK_MIN]
+        elif len(body) > space_for_body:
+            body = body[:space_for_body] + "…"
+
+        part = header + body
+        parts.append(part)
+        used += len(part) + 2
+
+        if used >= max_chars and chunk is not chunks[-1]:
+            break
+
+    return "\n\n".join(parts)
 
 def _sources_from_chunks(chunks: list[Document]) -> list[str]:
     seen, result = set(), []
@@ -494,15 +525,34 @@ def list_vllm_models() -> list[str]:
 class RAGPipeline:
     def __init__(self):
         self._vector_store = ChromaVectorStore()
-        # Pass the embed_model already loaded by ChromaVectorStore/TurboVec
-        # so the chunker doesn't load a second copy of the model.
+        self._summary_store = SummaryStore()
         self._chunker = SectionChunker(
-            chunk_size=600, chunk_overlap=80, embed_model=self._vector_store.embed_model
+            embed_model=self._vector_store.embed_model,
         )
+        self._compressor = ContextCompressor(
+            embed_model=self._vector_store.embed_model,
+            max_chars_per_chunk=LLM_CONTEXT_WINDOW_CHARS,
+        )
+        _cache_path = os.path.join(
+            os.getenv("INSUREHUB_DATA_DIR", os.path.expanduser("~/.insurehub")),
+            "cache",
+            "query_kv_cache.json",
+        )
+        self._cache = QueryKVCache(
+            cache_path=_cache_path,
+            ttl_seconds=int(os.getenv("KV_CACHE_TTL", "3600")),
+            max_entries=int(os.getenv("KV_CACHE_MAX_ENTRIES", "500")),
+            sem_threshold=float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.78")),
+        )
+        logger.info("[RAGPipeline] KV cache ready — path=%s", _cache_path)
 
     @property
     def vector_store(self):
         return self._vector_store
+
+    @property
+    def summary_store(self):
+        return self._summary_store
 
     @property
     def chunker(self):
@@ -517,6 +567,31 @@ class RAGPipeline:
             logger.warning("[RAG] Could not get LLM for metadata classification: %s", exc)
             return None
 
+    # ── Summary-index maintenance (Stage 1 of two-stage retrieval) ─────────
+    def _upsert_summary(
+        self,
+        chunks: list[Document],
+        source: str,
+        doc_meta: dict,
+        llm: Any = None,
+    ) -> None:
+        """
+        Generate a 200-300 word summary for a newly-ingested source and store
+        it in the summary index, so knowledge_query() can use it for Stage 1
+        retrieval. Never raises — a failure here should not fail ingestion,
+        it just means that source is excluded from Stage-1 narrowing later
+        (knowledge_query()'s guard treats un-summarized sources as always
+        included, so this fails safe).
+        """
+        try:
+            summary_llm = llm if llm is not None else self._get_llm()
+            summary_text = generate_summary(chunks, source, doc_meta, summary_llm)
+            self._summary_store.upsert(source, summary_text, doc_meta)
+        except Exception as exc:
+            logger.warning(
+                "[RAG] Summary generation/upsert failed for source=%s: %s", source, exc
+            )
+
     # ── Document ingestion ─────────────────────────────────────────────────
     def add_document(self, uploaded_file) -> int:
         suffix = os.path.splitext(uploaded_file.name)[1]
@@ -528,7 +603,6 @@ class RAGPipeline:
             upload_id = uuid.uuid4().hex[:12]
             unique_source = f"{upload_id}_{uploaded_file.name}"
 
-            # ── Step 1: Classify document type ─────────────────────────────
             preview = raw_docs[0].page_content[:5000] if raw_docs else ""
             extra_text = " ".join(d.page_content for d in raw_docs[1:4])[:5000]
             doc_type = classify_document_type(
@@ -542,7 +616,6 @@ class RAGPipeline:
             except Exception:
                 pass
 
-            # ── Step 2: Tag document (skips keyword matching for non-policy)
             doc_tags = tag_document(
                 uploaded_file.name, preview,
                 extra_text=extra_text,
@@ -550,62 +623,29 @@ class RAGPipeline:
                 llm=llm,
             )
 
-            # ── Step 3: Annotate raw docs so chunker inherits doc_type ──────
             for raw_doc in raw_docs:
                 raw_doc.metadata["doc_type"] = doc_type
 
-            # ── Step 4: Get LLM for per-chunk classification ─────────────
-
-            # ── Step 5: Chunk with doc-type-aware section + policy_type ────
-            # Pass llm so chunker can call classify_chunk_intent() and
-            # classify_chunk_policy_type() on each chunk.
             chunks = self._chunker.split_documents(
                 raw_docs, doc_type=doc_type, llm=llm
             )
 
-            # ── Step 6: Attach source + doc-level tags to every chunk ───────
+            _CHUNK_SKIP_FIELDS = {"insurer_confidence", "policy_type_confidence", "all_insurers", "all_policy_types"}
             for chunk in chunks:
                 chunk.metadata["source"] = unique_source
                 chunk.metadata["filename"] = uploaded_file.name
-                # Apply doc-level tags first (insurer, policy_type, etc.)
-                chunk.metadata.update(doc_tags)
-                # doc_type must always be the classified value — update() above
-                # may overwrite it from doc_tags (which also sets doc_type),
-                # but we re-assert it explicitly to be safe.
+                chunk.metadata.update({k: v for k, v in doc_tags.items() if k not in _CHUNK_SKIP_FIELDS})
                 chunk.metadata["doc_type"] = doc_type
-                # Restore the chunk-level policy_type if chunker set a more
-                # specific one (chunk.metadata["policy_type"] was set by
-                # split_documents BEFORE update() overwrote it with doc_tags).
-                # We need to re-run per-chunk policy_type after the update.
-                # Fix: classify_chunk_policy_type is idempotent — re-classify
-                # using the already-embedded text (cheap since regex is fast).
-                chunk_policy = classify_chunk_policy_type(
-                    chunk.page_content, llm=llm,
-                    force_llm=False,  # regex already ran; LLM only if ambiguous
-                )
-                if chunk_policy != "general":
-                    chunk.metadata["policy_type"] = chunk_policy
-                # If chunk_policy == "general", keep the doc-level policy_type
-                # (from doc_tags) which may be more specific for policy docs.
+                chunk.metadata.setdefault("source_type", "document")
 
             self._vector_store.add_documents(chunks)
+            doc_meta = {"filename": uploaded_file.name, "doc_type": doc_type, **doc_tags}
+            self._upsert_summary(chunks, unique_source, doc_meta, llm)
             return len(chunks)
         finally:
             os.unlink(tmp_path)
 
     def add_url(self, url: str) -> int:
-        """
-        Load content from a URL (web page or YouTube), classify and tag it,
-        then ingest into the vector store with full chunk-level metadata.
-
-        Fixed vs original:
-        - Classifies doc_type (was missing — all URL chunks had no doc_type).
-        - Calls tag_document() for doc-level insurer/policy_type.
-        - Calls classify_chunk_intent() + classify_chunk_policy_type() per chunk
-          so even YouTube/conversational content gets meaningful section and
-          policy_type metadata rather than always "general".
-        - Detects YouTube URLs and sets force_llm=True for those chunks.
-        """
         docs = load_url(url)
         if not docs:
             return 0
@@ -613,7 +653,6 @@ class RAGPipeline:
         upload_id = uuid.uuid4().hex[:12]
         unique_source = f"{upload_id}_{url[:40]}"
 
-        # ── Detect source type for YouTube-aware classification ──────────
         is_youtube = any(
             "youtube" in str(doc.metadata.get("source_type", "")).lower() or
             "whisper" in str(doc.metadata.get("source_type", "")).lower() or
@@ -622,12 +661,16 @@ class RAGPipeline:
         )
         source_type = "youtube" if is_youtube else "web"
 
-        # ── Classify document type ────────────────────────────────────────
         preview = docs[0].page_content[:5000] if docs else ""
         extra_text = " ".join(d.page_content for d in docs[1:4])[:5000]
-        # YouTube content is always "general" at the doc level — chunk-level
-        # classification will provide the real signal.
-        doc_type = classify_document_type(url, preview, extra_text)
+
+        # For YouTube content always preserve doc_type="youtube" so the
+        # semantic chunker knows to use word-window pseudo-sentences instead
+        # of punctuation splitting (auto-generated captions have no punctuation).
+        if is_youtube:
+            doc_type = "youtube"
+        else:
+            doc_type = classify_document_type(url, preview, extra_text)
         logger.info("Document type for URL '%s': %s (youtube=%s)", url, doc_type, is_youtube)
 
         llm = None
@@ -636,39 +679,36 @@ class RAGPipeline:
         except Exception:
             pass
 
-        # ── Doc-level tag ─────────────────────────────────────────────────
         doc_tags = tag_document(url, preview, extra_text=extra_text, doc_type=doc_type, llm=llm)
 
-        # ── Annotate raw docs with doc_type and source_type ───────────────
         for doc in docs:
             doc.metadata["doc_type"] = doc_type
             doc.metadata.setdefault("source_type", source_type)
 
-        # ── Chunk with per-chunk intent + policy_type classification ──────
         chunks = self._chunker.split_documents(docs, doc_type=doc_type, llm=llm)
 
-        # ── Delete any previous version of this URL then ingest ───────────
         self._vector_store.delete_by_field("source_url", url)
 
+        _CHUNK_SKIP_FIELDS = {"insurer_confidence", "policy_type_confidence", "all_insurers", "all_policy_types"}
         for chunk in chunks:
             chunk.metadata["source"] = unique_source
             chunk.metadata["source_url"] = url
             chunk.metadata["filename"] = url
-            chunk.metadata.update(doc_tags)
+            chunk.metadata.update({k: v for k, v in doc_tags.items() if k not in _CHUNK_SKIP_FIELDS})
             chunk.metadata["doc_type"] = doc_type
+            chunk.metadata.setdefault("source_type", "youtube" if is_youtube else "document")
 
-            # Re-classify per-chunk policy_type after update() (same fix as
-            # add_document — update() overwrites the chunker's chunk-level
-            # policy_type with the doc-level one from doc_tags).
             chunk_policy = classify_chunk_policy_type(
                 chunk.page_content,
                 llm=llm,
-                force_llm=is_youtube,   # always use LLM for YouTube
+                force_llm=is_youtube,
             )
             if chunk_policy != "general":
                 chunk.metadata["policy_type"] = chunk_policy
 
         self._vector_store.add_documents(chunks)
+        doc_meta = {"filename": url, "source_url": url, "doc_type": doc_type, **doc_tags}
+        self._upsert_summary(chunks, unique_source, doc_meta, llm)
         return len(chunks)
 
     # ── Document management ────────────────────────────────────────────────
@@ -677,9 +717,26 @@ class RAGPipeline:
 
     def clear_documents(self) -> None:
         self._vector_store.delete_all()
+        try:
+            self._summary_store.delete_all()
+        except Exception as exc:
+            logger.warning("[RAG] Failed to clear summary store: %s", exc)
 
     def remove_document(self, doc_name: str) -> None:
+        try:
+            results = self._vector_store.collection.get(
+                where={"filename": doc_name}, include=["metadatas"]
+            )
+            sources = {m.get("source") for m in (results.get("metadatas") or []) if m.get("source")}
+        except Exception as exc:
+            logger.warning("[RAG] Could not look up sources for '%s' before delete: %s", doc_name, exc)
+            sources = set()
         self._vector_store.delete_by_field("filename", doc_name)
+        for source in sources:
+            try:
+                self._summary_store.delete(source)
+            except Exception as exc:
+                logger.warning("[RAG] Failed to delete summary for source=%s: %s", source, exc)
 
     def get_document_tags(self, doc_name: str) -> dict:
         results = self._vector_store.collection.get(
@@ -773,10 +830,84 @@ class RAGPipeline:
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
 
+    def _summary_stage1_filter(self, question: str) -> Optional[dict]:
+        """
+        Stage 1 of two-stage retrieval: narrow the Stage-2 chunk search to
+        the sources whose summary best matches the question.
+
+        Guard rail: a source that has no summary yet (ingested before this
+        feature existed, or summary generation failed) is ALWAYS included
+        regardless of the summary search result. That means this can only
+        narrow the search among sources that already have a summary — it
+        can never make an existing, un-summarized document unreachable.
+
+        Returns None (meaning "no filter, search everything") whenever the
+        summary index is empty, unavailable, or doesn't actually narrow
+        anything down.
+        """
+        try:
+            if self._summary_store.count() == 0:
+                return None
+            all_sources = set(self._vector_store.list_values("source"))
+            if not all_sources:
+                return None
+            summarized = set(self._summary_store.list_sources())
+            unsummarized = all_sources - summarized
+            top_sources = set(self._summary_store.get_top_sources(question, top_k=SUMMARY_STAGE1_TOP_K))
+            top_sources &= summarized  # drop any stale entries for already-deleted docs
+            allowed = top_sources | unsummarized
+            if not allowed or allowed >= all_sources:
+                return None  # nothing to narrow
+            return {"source": {"$in": sorted(allowed)}}
+        except Exception as exc:
+            logger.warning("[RAG] Summary-stage source narrowing failed (%s) — skipping it.", exc)
+            return None
+
     def knowledge_query(self, question: str) -> tuple[str, bool, list[str]]:
         question = question.strip()
         if not question:
             return "Question cannot be empty.", False, []
+
+        # Clean query for retrieval (strip ?, !, ;, : so BM25 tokens match).
+        # LLM prompts and cache keys keep the original question with punctuation.
+        search_question = _clean_query(question)
+        logger.info(
+            "[RAGPipeline] query=%r  search=%r  intent=%r",
+            question[:80], search_question[:80], _extract_query_intent(question)[:60],
+        )
+
+        # ── KV cache lookup ────────────────────────────────────────────────
+        _current_sources = self._vector_store.list_sources()
+        _cache_key = QueryKVCache.make_key(
+            query=question,
+            top_k=RERANK_K,
+            use_hybrid=True,
+            use_reranker=True,
+            generate_answer=True,
+            run_ragas=False,
+            sources=_current_sources,
+        )
+
+        # 1. Exact hit — same question, same source set, within TTL.
+        _cached = self._cache.get(_cache_key)
+        if _cached is not None:
+            logger.info("[RAGPipeline] KV cache exact hit for query=%r", question[:80])
+            return _cached["answer"], _cached["is_general"], _cached["sources"]
+
+        # 2. Semantic hit — rephrased question close enough in embedding space.
+        try:
+            _q_emb = self._vector_store.embed_model.encode(
+                [question], normalize_embeddings=True, show_progress_bar=False
+            )[0]
+            _sem_cached = self._cache.semantic_get(_q_emb)
+            if _sem_cached is not None:
+                logger.info("[RAGPipeline] KV cache semantic hit for query=%r", question[:80])
+                return _sem_cached["answer"], _sem_cached["is_general"], _sem_cached["sources"]
+        except Exception as _exc:
+            logger.warning("[RAGPipeline] KV cache semantic lookup failed: %s", _exc)
+            _q_emb = None
+        else:
+            pass  # _q_emb already set above
 
         urls = extract_urls(question)
         if urls:
@@ -798,7 +929,6 @@ class RAGPipeline:
         if self._vector_store.count() == 0:
             return "EMPTY_KB", True, []
 
-        # ── Query expansion (HyDE) + metadata filter ──────────────────────
         llm = None
         try:
             llm = self._get_llm()
@@ -807,8 +937,21 @@ class RAGPipeline:
         query_meta = classify_query(question, llm=llm)
         routed_docs = _route_to_documents(question, self.list_documents())
         filter_meta = build_metadata_filter(query_meta, routed_docs)
-        expanded_queries = self._expand_query(question)
 
+        # Stage 1 (summaries) → Stage 2 (chunks): skipped when an explicit
+        # keyword route already pinned the source set, since that's a more
+        # specific signal than a semantic summary match.
+        if not routed_docs:
+            summary_filter = self._summary_stage1_filter(question)
+            if summary_filter:
+                filter_meta = (
+                    {"$and": [filter_meta, summary_filter]} if filter_meta else summary_filter
+                )
+
+        expanded_queries = self._expand_query(search_question)
+
+        # Retrieve with cleaned query for accurate BM25+dense matching.
+        # Single reranker pass uses original question (cross-encoder reads natural language).
         all_chunks = []
         for q in expanded_queries:
             chunks = self._vector_store.search(
@@ -816,18 +959,20 @@ class RAGPipeline:
                 top_k=RERANK_K,
                 filter_metadata=filter_meta,
                 use_hybrid=True,
-                use_reranker=True,
+                use_reranker=False,
             )
             all_chunks.extend(chunks)
         chunks = self._deduplicate_chunks(all_chunks)[:RETRIEVE_K]
+        if len(chunks) > 1:
+            chunks = self._vector_store.rerank_documents(question, chunks, top_k=RERANK_K)
 
         if not chunks:
             return "Not mentioned in documents.", False, []
 
-        chunks = _chunks_within_context_limit(chunks, MAX_CONTEXT_CHARS)
+        chunks = self._compressor.compress_to_budget(question, chunks, LLM_CONTEXT_WINDOW_CHARS)
         sources = _sources_from_chunks(chunks)
 
-        context = _build_structured_context(chunks, max_chars=MAX_CONTEXT_CHARS)
+        context = _build_structured_context(chunks, max_chars=LLM_CONTEXT_WINDOW_CHARS)
         condition_hint = _extract_condition_hint(chunks)
         has_conflict, insurers = detect_conflict(chunks)
         conflict_hint = ""
@@ -876,6 +1021,16 @@ ANSWER (with citations):"""
                 f"{missing_values}. Please cross-check against the original policy document."
             )
 
+        # ── Store result in KV cache ───────────────────────────────────────
+        try:
+            _payload = {"answer": answer, "is_general": False, "sources": sources}
+            # Reuse the embedding computed at the top of this method if available,
+            # otherwise skip the semantic index (exact-match cache still works).
+            _store_emb = _q_emb if "_q_emb" in dir() and _q_emb is not None else None
+            self._cache.put(_cache_key, _payload, query_embedding=_store_emb, query_text=question)
+        except Exception as _exc:
+            logger.warning("[RAGPipeline] KV cache put failed: %s", _exc)
+
         return answer, False, sources
 
     @staticmethod
@@ -900,6 +1055,11 @@ ANSWER (with citations):"""
         Two-pass deduplication:
           Pass 1 (exact) — key = (source, page, full_text).
           Pass 2 (fingerprint) — key = content_fingerprint(text).
+
+        Note: with overlap enabled, adjacent chunks share ~100 words of text.
+        The fingerprint uses only the first 200 normalised chars, which is
+        well within the non-overlapping body of each chunk, so overlapping
+        chunks are NOT incorrectly deduplicated against each other.
         """
         def _score(chunk: Document) -> float:
             return chunk.metadata.get("rerank_score", chunk.metadata.get("similarity", 0.0))
@@ -953,11 +1113,11 @@ ANSWER (with citations):"""
     ) -> tuple[str, list[str]]:
         llm = get_insurance_llm(temperature=0)
         filter_meta = self._source_filter(allowed_docs)
-        chunks = self._vector_store.search(question, top_k=5, filter_metadata=filter_meta)
+        chunks = self._vector_store.search(_clean_query(question), top_k=5, filter_metadata=filter_meta)
         if not chunks:
             return "Not mentioned in documents.", []
-        chunks = _chunks_within_context_limit(chunks, MAX_CONTEXT_CHARS)
-        context = _build_structured_context(chunks, max_chars=MAX_CONTEXT_CHARS)
+        chunks = self._compressor.compress_to_budget(question, chunks, LLM_CONTEXT_WINDOW_CHARS)
+        context = _build_structured_context(chunks, max_chars=LLM_CONTEXT_WINDOW_CHARS)
         sources = _sources_from_chunks(chunks)
         response = llm.invoke(RAG_PROMPT.format(context=context, question=question))
         answer = response.content if hasattr(response, "content") else str(response)

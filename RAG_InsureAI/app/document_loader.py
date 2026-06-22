@@ -70,10 +70,6 @@ MAX_FILE_SIZE_BYTES: int = 50 * 1024 * 1024  # 50 MB
 _SAFE_TMP_ROOT = os.path.expanduser("~/.insurehub_tmp")
 os.makedirs(_SAFE_TMP_ROOT, exist_ok=True)
 
-# YouTube transcript chunk settings
-_YT_CHUNK_WORDS: int = 800
-_YT_CHUNK_OVERLAP_WORDS: int = 80
-
 # Minimum meaningful line length for webpage noise filtering (words)
 _MIN_LINE_WORDS: int = 4
 
@@ -197,29 +193,121 @@ def _get_whisper_model():
 # YOUTUBE LOADER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _chunk_words(words: list[str], chunk_size: int, overlap: int) -> list[str]:
+def _clean_youtube_transcript(text: str) -> str:
     """
-    Split a word list into overlapping chunks.
+    Clean YouTube auto-generated transcript text.
+    Removes filler words and deduplicates sentences that appear twice in a row
+    (a common YouTube auto-caption artifact where each spoken sentence is
+    repeated in the next caption segment).
+    """
+    # Remove filler words/phrases (case-insensitive, whole word only)
+    filler_patterns = [
+        r"\buh\b", r"\bum\b", r"\buhh\b", r"\bumm\b",
+        r"\byou know\b", r"\bi mean\b", r"\blike\b(?=\s+\w)",
+        r"\bso\b(?=\s*,|\s*$)", r"\bright\b(?=\s*,|\s*$)",
+        r"\bokay so\b", r"\balright so\b",
+    ]
+    for pat in filler_patterns:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE)
 
-    Each chunk contains at most `chunk_size` words, with `overlap` words
-    from the previous chunk prepended for context continuity.
+    # Collapse multiple spaces
+    text = re.sub(r"  +", " ", text).strip()
+
+    # Deduplicate consecutive repeated sentences/phrases.
+    # YouTube auto-captions often repeat each clause in the next segment:
+    # "... basis of mutual solidarity  basis of mutual solidarity ..."
+    # We detect this by splitting into sentences and removing back-to-back dups.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    deduped: list[str] = []
+    prev = None
+    for s in sentences:
+        s_norm = s.strip().lower()
+        if s_norm and s_norm != prev:
+            deduped.append(s.strip())
+            prev = s_norm
+
+    # Also catch partial overlapping repetition at phrase level (split on commas/conjunctions)
+    rejoined = " ".join(deduped)
+    # Remove exact substring repetitions at word-ngram level (window of 8 words)
+    words = rejoined.split()
+    result_words: list[str] = []
+    i = 0
+    while i < len(words):
+        # Look for a repeated window of 6+ words starting from position i
+        found_dup = False
+        for wlen in range(min(12, len(words) - i), 5, -1):
+            window = words[i:i + wlen]
+            # Check if this window appears just after current position
+            next_start = i + wlen
+            if next_start + wlen <= len(words):
+                next_window = words[next_start:next_start + wlen]
+                if window == next_window:
+                    result_words.extend(window)
+                    i += wlen * 2  # skip both copies
+                    found_dup = True
+                    break
+        if not found_dup:
+            result_words.append(words[i])
+            i += 1
+
+    cleaned = " ".join(result_words)
+    # Final whitespace cleanup
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _get_video_title(url: str, video_id: str) -> str:
+    """Fetch YouTube video title via the public oEmbed API (no auth required)."""
+    try:
+        import requests as _req
+        oembed = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        resp = _req.get(oembed, timeout=6)
+        if resp.ok:
+            title = resp.json().get("title", "").strip()
+            if title:
+                logger.info("[YouTube] Video title from oEmbed: %r", title)
+                return title
+    except Exception as exc:
+        logger.debug("[YouTube] oEmbed title fetch failed: %s", exc)
+    return f"YouTube video ({video_id})"
+
+
+def _detect_transcript_language(text: str) -> str:
     """
-    chunks: list[str] = []
-    start = 0
-    total = len(words)
-    while start < total:
-        end = min(start + chunk_size, total)
-        chunks.append(" ".join(words[start:end]))
-        if end >= total:
-            break
-        start = end - overlap
-    return chunks
+    Detect transcript language. Returns an ISO 639-1 code or 'unknown'.
+
+    Strategy:
+      1. Try langdetect library if installed.
+      2. Fallback: fraction of ASCII chars — non-Latin scripts score very low.
+    """
+    sample = text[:3000]
+    try:
+        from langdetect import detect  # type: ignore
+        lang = detect(sample)
+        return lang or "unknown"
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # ASCII-fraction heuristic: Urdu/Arabic/Chinese/Devanagari have very few ASCII chars
+    if not sample:
+        return "unknown"
+    ascii_count = sum(1 for c in sample if ord(c) < 128)
+    ascii_frac = ascii_count / len(sample)
+    if ascii_frac > 0.80:
+        return "en"
+    # Rough detection: Urdu/Arabic block is U+0600–U+06FF
+    arabic_count = sum(1 for c in sample if "؀" <= c <= "ۿ")
+    if arabic_count / len(sample) > 0.05:
+        return "ur"  # Urdu / Arabic script
+    return "unknown"
 
 
 def _load_youtube(url: str) -> list[Document]:
     """
-    Load a YouTube video transcript and return overlapping text chunks
-    as LangChain Document objects.
+    Load a YouTube video transcript and return the full text as a single
+    LangChain Document ready for semantic chunking.
 
     Strategy
     --------
@@ -231,6 +319,8 @@ def _load_youtube(url: str) -> list[Document]:
     Each chunk carries metadata:
       source       : original YouTube URL
       video_id     : 11-character YouTube video ID
+      video_title  : human-readable title from YouTube oEmbed API
+      language     : detected transcript language (ISO 639-1)
       chunk_index  : 0-based chunk number
       source_type  : "youtube_transcript" or "whisper"
       doc_type     : "youtube"
@@ -323,38 +413,59 @@ def _load_youtube(url: str) -> list[Document]:
                 "[Whisper] Transcription complete for %s (%d chars)", video_id, len(full_text)
             )
 
-    if not full_text:
+    if not full_text.strip():
         raise ValueError(f"No transcript content found for: {url}")
 
-    # ── Chunk the transcript into overlapping word windows ────────────────────
-    words = full_text.split()
-    if not words:
-        raise ValueError(f"Transcript is blank for: {url}")
-
-    text_chunks = _chunk_words(words, _YT_CHUNK_WORDS, _YT_CHUNK_OVERLAP_WORDS)
+    # Clean filler words and duplicate sentences from auto-generated captions
+    original_len = len(full_text)
+    full_text = _clean_youtube_transcript(full_text)
     logger.info(
-        "[YouTube] %d chunks created from %d words (chunk=%d, overlap=%d)",
-        len(text_chunks), len(words), _YT_CHUNK_WORDS, _YT_CHUNK_OVERLAP_WORDS,
+        "[YouTube] Transcript cleaned: %d → %d chars (removed %.0f%%)",
+        original_len, len(full_text),
+        100 * (1 - len(full_text) / max(original_len, 1)),
     )
 
-    docs: list[Document] = []
-    for idx, chunk_text in enumerate(text_chunks):
-        docs.append(Document(
-            page_content=chunk_text,
-            metadata={
-                "source": url,
-                "video_id": video_id,
-                "chunk_index": idx,
-                "source_type": source_type,
-                "doc_type": "youtube",
-                # These will be overwritten by eval_api.py / rag.py with
-                # LLM-classified values:
-                "section": "general",
-                "policy_type": "general",
-            },
-        ))
+    # Detect transcript language — warn if non-English so the user knows
+    # that English queries may not retrieve content from this video.
+    detected_lang = _detect_transcript_language(full_text)
+    if detected_lang not in ("en", "unknown"):
+        logger.warning(
+            "[YouTube] Non-English transcript detected (lang=%s) for %s. "
+            "English queries will likely not match this content.",
+            detected_lang, url,
+        )
+    else:
+        logger.info("[YouTube] Transcript language: %s", detected_lang)
 
-    return docs
+    # Fetch human-readable video title
+    video_title = _get_video_title(url, video_id)
+
+    # Return the ENTIRE transcript as a single Document.
+    # The SemanticChunker in rag.py / api.py will do all chunking — it uses
+    # word-window pseudo-sentences for YouTube content (no punctuation) and
+    # finds topic-shift boundaries across the full text.  Pre-splitting here
+    # with fixed word windows prevents the semantic chunker from detecting any
+    # boundary that straddles a word-cut.
+    word_count = len(full_text.split())
+    logger.info(
+        "[YouTube] Returning full transcript as single document: %d words, %d chars, title=%r",
+        word_count, len(full_text), video_title,
+    )
+
+    return [Document(
+        page_content=full_text,
+        metadata={
+            "source":       url,
+            "video_id":     video_id,
+            "video_title":  video_title,
+            "language":     detected_lang,
+            "chunk_index":  0,
+            "source_type":  source_type,
+            "doc_type":     "youtube",
+            "section":      "general",
+            "policy_type":  "general",
+        },
+    )]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

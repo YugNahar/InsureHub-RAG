@@ -142,11 +142,7 @@ def get_insurance_llm(temperature: float = 0, max_tokens: int = 0):
                 f"VLLM_HOST is set ({VLLM_HOST}) but no models are available. "
                 "Check that the vLLM server is running."
             )
-        # Default 200 tokens: at ~24 tok/s on the shared Qwen 7B AWQ server
-        # that's ~8 s of generation time.  The concise prompt keeps answers
-        # within this budget.  Override with VLLM_MAX_TOKENS env var or the
-        # max_tokens argument (used by RAGAS which only needs ~80 tokens of JSON).
-        _default = int(os.getenv("VLLM_MAX_TOKENS", "400"))
+        _default = int(os.getenv("VLLM_MAX_TOKENS", "1024"))
         _mt = max_tokens if max_tokens > 0 else _default
         logger.debug("[LLM] vLLM model=%s max_tokens=%d", model, _mt)
         return ChatOpenAI(

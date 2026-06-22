@@ -200,6 +200,8 @@ from video_store import VideoVectorStore
 from webpage_store import WebpageVectorStore
 from calculator import compute_insurance_benefits, _is_calculation_question
 from prompt_template import STRICT_GROUNDED_PROMPT, CALCULATION_PROMPT, CONVERSATIONAL_RAG_PROMPT
+from context_compressor import ContextCompressor
+from rag import LLM_CONTEXT_WINDOW_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +210,15 @@ class MultiSourceRAG:
         self.doc_pipeline = RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = 3500
+        self.max_context_chars = 4000   # ~8 × 500-char semantic chunks
+        # Share the embed model already loaded by doc_pipeline — no duplicate memory.
+        self._compressor = ContextCompressor(
+            embed_model=self.doc_pipeline.vector_store.embed_model,
+            similarity_threshold=0.38,
+            min_sentences=2,
+            max_sentences=10,
+            max_chars_per_chunk=LLM_CONTEXT_WINDOW_CHARS,
+        )
 
     def _merge_chunks(self, chunks: List[Document]) -> List[Document]:
         seen = {}
@@ -284,6 +294,19 @@ class MultiSourceRAG:
         if needs_human and not _is_insurance_related(question):
             is_off_topic = True
             needs_human = False
+        # ── Context compression (only when needed) ────────────────────────────
+        # Skip compression entirely when the chunks already fit in the LLM's
+        # input window — with 500-char chunks this will usually be the case.
+        # Only compress when the aggregate exceeds LLM_CONTEXT_WINDOW_CHARS.
+        total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
+        if total_retrieved_chars > LLM_CONTEXT_WINDOW_CHARS:
+            logger.info(
+                "[MultiSourceRAG] Context too large (%d chars > %d limit) — compressing",
+                total_retrieved_chars, LLM_CONTEXT_WINDOW_CHARS,
+            )
+            all_chunks = self._compressor.compress_to_budget(
+                question, all_chunks, max_total_chars=LLM_CONTEXT_WINDOW_CHARS
+            )
 
         # Build context
         context_parts, sources = [], []

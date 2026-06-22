@@ -163,25 +163,31 @@ class ContextCompressor:
         max_total_chars: int,
     ) -> List[Document]:
         """
-        Compress chunks so their combined character count fits within
-        *max_total_chars*.  Useful as a final safety net before building the
-        LLM prompt.
+        Trim chunks so their combined character count fits within
+        *max_total_chars*.
+
+        This method does NOT compress individual chunks that are already
+        smaller than the budget — it only trims when the aggregate total
+        exceeds the LLM's context window.
 
         Steps:
-          1. Run normal sentence-level compression.
-          2. If total still exceeds budget, progressively lower the threshold
-             chunk-by-chunk until it fits.
-          3. As a last resort, hard-truncate the final chunk that exceeds the
-             remaining budget rather than dropping it entirely.
+          1. Walk chunks in order (highest relevance first, caller's
+             responsibility to pre-sort).
+          2. If a chunk fits in the remaining budget, include it as-is.
+          3. If a chunk would exceed the remaining budget, keep only the
+             most query-relevant sentences from it that still fit.
+          4. As a last resort, hard-truncate at a sentence boundary.
         """
-        compressed = self.compress(query, chunks)
-
-        total = sum(len(d.page_content) for d in compressed)
+        total = sum(len(d.page_content) for d in chunks)
         if total <= max_total_chars:
-            return compressed
+            # Everything already fits — return untouched, zero embedding cost.
+            return chunks
 
-        # Progressive tightening: drop sentences from the most-compressed
-        # (longest) chunks first until we fit.
+        logger.info(
+            "[Compressor] budget trim: %d chars across %d chunks → target %d chars",
+            total, len(chunks), max_total_chars,
+        )
+
         query_emb: np.ndarray = self._model.encode(
             [query], normalize_embeddings=True, show_progress_bar=False
         )[0]
@@ -189,27 +195,35 @@ class ContextCompressor:
         budget = max_total_chars
         final: List[Document] = []
 
-        for doc in compressed:
+        for doc in chunks:
             remaining = budget - sum(len(d.page_content) for d in final)
             if remaining <= 0:
                 break
 
             text = doc.page_content
+
+            # Chunk fits in remaining budget — include it as-is, no compression.
             if len(text) <= remaining:
                 final.append(doc)
                 continue
 
-            # Hard-compress this chunk: only keep sentences that fit
+            # Chunk is too large for remaining budget — keep only the most
+            # query-relevant sentences that fit within `remaining` chars.
             is_yt = (
                 doc.metadata.get("doc_type") == "youtube"
                 or "youtube" in str(doc.metadata.get("source_type", "")).lower()
                 or "whisper" in str(doc.metadata.get("source_type", "")).lower()
             )
             sentences = _split_sentences(text, for_youtube=is_yt)
+
             if len(sentences) <= 1:
-                # Atomic: hard-truncate at a sentence boundary if possible
+                # Single atomic sentence — hard-truncate at the nearest
+                # sentence boundary rather than cutting mid-word.
                 truncated = text[:remaining].rsplit('. ', 1)[0] + '…'
-                final.append(Document(page_content=truncated, metadata={**doc.metadata, "hard_truncated": True}))
+                final.append(Document(
+                    page_content=truncated,
+                    metadata={**doc.metadata, "hard_truncated": True},
+                ))
                 break
 
             sent_embs = self._model.encode(
@@ -229,16 +243,21 @@ class ContextCompressor:
                     break
 
             if not kept_indices:
-                # Even the best sentence is too long — hard-truncate it
+                # Even the single best sentence is too long — hard-truncate it.
                 best = sentences[int(ranked[0])]
                 truncated = best[:remaining] + '…'
-                final.append(Document(page_content=truncated, metadata={**doc.metadata, "hard_truncated": True}))
+                final.append(Document(
+                    page_content=truncated,
+                    metadata={**doc.metadata, "hard_truncated": True},
+                ))
                 break
 
+            # Re-assemble in original document order (not relevance order)
+            # so the LLM reads coherent prose, not a jumbled ranking.
             kept_text = ' '.join(sentences[i] for i in sorted(kept_indices))
             final.append(Document(
                 page_content=kept_text,
-                metadata={**doc.metadata, "budget_compressed": True},
+                metadata={**doc.metadata, "budget_trimmed": True},
             ))
 
         return final

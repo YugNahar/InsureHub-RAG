@@ -18,11 +18,13 @@ RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
+COPY app/ ./app/
+COPY eval_api.py eval_frontend.html ./
 
-COPY app/ .
+EXPOSE 8001
 
-EXPOSE 8502
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl --fail http://localhost:8001/eval/health || exit 1
 
-HEALTHCHECK CMD curl --fail http://localhost:8502/health || exit 1
-
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8502"]
+CMD ["uvicorn", "eval_api:app", "--host", "0.0.0.0", "--port", "8001"]

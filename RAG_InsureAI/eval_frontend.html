@@ -339,7 +339,7 @@
     <!-- API -->
     <div class="sidebar-section">
       <div class="sidebar-label">backend url</div>
-      <input class="api-input" id="api-url" value="http://localhost:8002" />
+      <input class="api-input" id="api-url" value="http://localhost:8001" />
     </div>
 
     <!-- vLLM model selector -->
@@ -478,7 +478,15 @@ async function ingestVideo() {
       return;
     }
     const data = await res.json();
-    showToast(`✓ ${data.chunks_added} chunks ingested from ${data.video_id} (${data.source_type}, ${data.language})`);
+    const title   = data.video_title || data.video_id;
+    const topic   = data.doc_metadata?.topic   || '';
+    const entity  = data.doc_metadata?.entity  || '';
+    const langTag = data.language && data.language !== 'en' ? ` [lang: ${data.language}]` : '';
+    const tagLine = [topic, entity].filter(Boolean).join(' · ');
+    showToast(`✓ ${data.chunks_added} chunks ingested — "${title}"${langTag}${tagLine ? ' (' + tagLine + ')' : ''}`);
+    if (data.language_warning) {
+      setTimeout(() => alert('⚠️ ' + data.language_warning), 500);
+    }
     document.getElementById('yt-url').value = '';
     loadDocList();
     document.getElementById('run-btn').disabled = false;
@@ -703,6 +711,20 @@ async function runStreamingEval(query, payload) {
             const metricCards = document.querySelectorAll('.metric-card .value');
             if (metricCards[2]) metricCards[2].textContent = (tot_ms/1000).toFixed(2)+'s';
           }
+          // Update sources to only what the LLM actually cited
+          if (ev.sources && ev.sources.length) {
+            const answerCard = document.querySelector('#tab-answer .card');
+            if (answerCard) {
+              let srcDiv = answerCard.querySelector('.cited-sources');
+              if (!srcDiv) {
+                srcDiv = document.createElement('div');
+                srcDiv.className = 'cited-sources';
+                srcDiv.style.cssText = 'margin-top:12px;font-size:12px;color:var(--text3)';
+                answerCard.appendChild(srcDiv);
+              }
+                srcDiv.innerHTML = 'Sources: ' + ev.sources.map(s => `<span class="badge b-neutral">${s}</span>`).join(' ');
+            }
+          }
           if (ev.from_cache) {
             const hint2 = document.createElement('span');
             hint2.style.cssText = 'color:var(--text3);font-size:12px;display:block;margin-top:6px';
@@ -734,7 +756,7 @@ function renderResults(d) {
   const el = document.getElementById('results');
   el.style.display = 'block';
 
-  const avgScore = d.chunks.reduce((a,c) => a + (c.rerank_score ?? c.similarity_score), 0) / (d.chunks.length || 1);
+  const avgScore = d.chunks.reduce((a,c) => a + c.similarity_score, 0) / (d.chunks.length || 1);
   const metaFields = d.chunk_metadata[0] ? Object.keys(d.chunk_metadata[0]).length : 0;
 
   el.innerHTML = `
@@ -790,6 +812,10 @@ function renderResults(d) {
               <span class="badge b-info">${m.insurer}</span>
               <span class="badge b-neutral">${m.policy_type}</span>
               ${m.source_type ? `<span class="badge b-neutral">${m.source_type}</span>` : ''}
+              ${m.chunk_type  ? `<span class="badge b-neutral" title="chunk_type">${m.chunk_type}</span>` : ''}
+              ${m.topic && m.topic !== 'general' ? `<span class="badge b-info" title="topic">${m.topic}</span>` : ''}
+              ${m.entity && m.entity !== 'general' ? `<span class="badge b-info" title="entity">${m.entity}</span>` : ''}
+              ${m.video_title ? `<span class="badge b-neutral" title="video title" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">▶ ${m.video_title}</span>` : ''}
               ${scoreBadge(m.rerank_score ?? m.similarity_score)}
             </div>
             <div class="meta-grid" style="font-size:12px">
@@ -899,7 +925,7 @@ function esc(s) {
 function metaRows(obj) {
   return Object.entries(obj).map(([k,v]) => {
     if (v === null || v === undefined || v === '') return '';
-    const val = Array.isArray(v) ? v.join(', ') : String(v);
+    const val = Array.isArray(v) ? v.join(', ') : (v !== null && typeof v === 'object' ? JSON.stringify(v) : String(v));
     return `<span class="meta-key">${k}</span><span class="meta-val">${esc(val.substring(0,120))}</span>`;
   }).join('');
 }
@@ -1102,13 +1128,12 @@ async function loadCacheStats() {
 }
 
 async function clearCache() {
-  if (!confirm('Flush all expired cache entries?')) return;
+  if (!confirm('Clear all cached query results? This forces fresh retrieval and LLM generation on next query.')) return;
   try {
-    const res = await fetch(`${API()}/eval/cache/flush`, { method: 'POST' });
-    const d = await res.json();
-    showToast(`✓ Cache flush — ${d.entries_removed} expired entries removed`);
+    await fetch(`${API()}/eval/cache/clear`, { method: 'POST' });
+    showToast(`✓ Cache cleared — next query will run fresh`);
     loadCacheStats();
-  } catch(e) { alert('Cache flush failed.'); }
+  } catch(e) { alert('Cache clear failed.'); }
 }
 
 // Show cache-hit indicator on results

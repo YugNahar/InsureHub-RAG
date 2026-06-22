@@ -33,7 +33,7 @@ import aiohttp
 import re
 from bs4 import BeautifulSoup
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, Depends
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from auth import create_login_endpoint, require_auth
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -44,6 +44,8 @@ import json as _json
 sys.path.insert(0, os.path.dirname(__file__))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+from auth import create_login_endpoint, require_auth
 
 _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
 _MAX_HISTORY_TURNS = 3  # keep last 3 exchanges to stay within token limit
@@ -81,10 +83,16 @@ def _get_async_lock() -> asyncio.Lock:
 _DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5173",
+    "http://localhost:8000",
+    "http://localhost:8001",
+    "http://localhost:8002",
     "http://localhost:8501",
     "http://localhost:8080",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8001",
+    "http://127.0.0.1:8002",
     "http://127.0.0.1:8501",
     "http://127.0.0.1:8080",
     "https://insureai-chat.lovable.app",
@@ -419,6 +427,8 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
         chunk.metadata["doc_type"] = doc_type
 
     pipeline.vector_store.add_documents(chunks)
+    doc_meta = {"filename": filename, "doc_type": doc_type, **doc_tags}
+    pipeline._upsert_summary(chunks, unique_source, doc_meta, llm)
     return len(chunks)
 
 
@@ -497,39 +507,79 @@ def _get_multi_rag() -> MultiSourceRAG:
     return _multi_rag
 
 
-def _chunk_transcript(transcript_text: str, url: str, title: str = "") -> list:
+def _chunk_transcript(transcript_text: str, url: str, title: str = "", doc_meta: dict | None = None) -> list:
     from langchain_core.documents import Document
 
-    chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
+    if doc_meta is None:
+        doc_meta = {}
+
+    chunker = SectionChunker(chunk_size=500, chunk_overlap=100)
     doc = Document(
         page_content=transcript_text,
-        metadata={"source_url": url, "title": title, "type": "video_transcript"},
+        metadata={
+            "source_url":  url,
+            "source":      url,       # needed for is_youtube check in SectionChunker
+            "title":       title,
+            "doc_type":    "youtube", # tells SemanticChunker to use word-window splitting
+            "source_type": "youtube_transcript",
+        },
     )
-    chunks = chunker.split_documents([doc])
+    chunks = chunker.split_documents([doc], doc_type="youtube")
     for chunk in chunks:
+        # source_type="video" so VideoVectorStore.search(filter={"source_type":"video"}) matches
         chunk.metadata["source_type"] = "video"
-        chunk.metadata["source_url"] = url
+        chunk.metadata["source_url"]  = url
+        # Propagate doc-level metadata so insurer/policy_type filters work on video chunks
+        chunk.metadata.setdefault("insurer",     doc_meta.get("insurer",     "UNKNOWN"))
+        chunk.metadata.setdefault("policy_type", doc_meta.get("policy_type", "general"))
+        chunk.metadata.setdefault("section",     doc_meta.get("section",     "general"))
+        chunk.metadata.setdefault("keywords",    doc_meta.get("keywords",    ""))
     return chunks
 
 
 # ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
-async def upload_video(req: URLRequest, _=Depends(require_auth)):
+async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
     url = req.url.strip()
     multi = _get_multi_rag()
     if multi.video_exists(url):
         return {"status": "already_exists", "url": url, "message": "Video already in knowledge base."}
     try:
         from document_loader import load_url
+        from metadata_tagger import tag_document
+        from router import get_insurance_llm
 
         docs = await asyncio.to_thread(load_url, url)
-        if not docs or not docs[0].page_content.strip():
+        if not docs or not any(d.page_content.strip() for d in docs):
             raise HTTPException(status_code=400, detail="Could not extract transcript from this video.")
-        transcript_text = docs[0].page_content
+        transcript_text = " ".join(d.page_content for d in docs if d.page_content.strip())
         title = docs[0].metadata.get("title", url)
-        chunks = _chunk_transcript(transcript_text, url, title)
+
+        # Classify insurer / policy_type so filters work on video chunks
+        llm = None
+        try:
+            llm = get_insurance_llm(temperature=0)
+        except Exception as llm_exc:
+            logger.warning("[upload-video] LLM unavailable — falling back to regex classification: %s", llm_exc)
+
+        preview    = transcript_text[:5000]
+        extra_text = transcript_text[5000:10000]
+        doc_meta = tag_document(title, preview, extra_text=extra_text, doc_type="youtube", llm=llm)
+        logger.info(
+            "[upload-video] '%s' → insurer=%s, policy_type=%s",
+            url, doc_meta.get("insurer", "UNKNOWN"), doc_meta.get("policy_type", "general"),
+        )
+
+        chunks = _chunk_transcript(transcript_text, url, title, doc_meta=doc_meta)
         multi.add_video_chunks(url, chunks)
-        return {"status": "success", "url": url, "chunks": len(chunks)}
+        return {
+            "status":  "success",
+            "url":     url,
+            "title":   title,
+            "chunks":  len(chunks),
+            "insurer": doc_meta.get("insurer", "UNKNOWN"),
+            "policy_type": doc_meta.get("policy_type", "general"),
+        }
     except HTTPException:
         raise
     except Exception as exc:
@@ -539,7 +589,7 @@ async def upload_video(req: URLRequest, _=Depends(require_auth)):
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
 @app.post("/upload-webpage")
-async def upload_webpage(req: URLRequest, _=Depends(require_auth)):
+async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL.")
@@ -587,7 +637,7 @@ async def upload_webpage(req: URLRequest, _=Depends(require_auth)):
         )
 
         # ── Chunk ─────────────────────────────────────────────────────────────
-        chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
+        chunker = SectionChunker(chunk_size=2000, chunk_overlap=600)
         chunks  = chunker.split_documents(docs)
 
         # ── Classify every chunk (section + policy_type) ─────────────────────
@@ -657,7 +707,7 @@ async def list_videos():
 
 # ── Delete video ─────────────────────────────────────────────────────────────
 @app.delete("/videos/{url:path}")
-async def delete_video(url: str):
+async def delete_video(url: str, _: str = Depends(require_auth)):
     multi = _get_multi_rag()
     if not multi.video_exists(url):
         raise HTTPException(status_code=404, detail="Video URL not found.")
@@ -674,7 +724,7 @@ async def list_webpages():
 
 # ── Delete webpage ───────────────────────────────────────────────────────────
 @app.delete("/webpages/{url:path}")
-async def delete_webpage(url: str):
+async def delete_webpage(url: str, _: str = Depends(require_auth)):
     multi = _get_multi_rag()
     if not multi.webpage_exists(url):
         raise HTTPException(status_code=404, detail="Webpage URL not found.")
@@ -809,7 +859,7 @@ async def ask_documents_only(req: AskRequest):
 
 # ── Upload (async) ────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), _=Depends(require_auth)):
+async def upload(file: UploadFile = File(...), _: str = Depends(require_auth)):
     await _prune_jobs()
     suffix = os.path.splitext(file.filename or "")[1].lower()
     supported = ALLOWED_EXTENSIONS
@@ -1011,18 +1061,18 @@ async def list_docs():
 
 
 @app.delete("/docs")
-async def clear_docs():
+async def clear_docs(_: str = Depends(require_auth)):
     await asyncio.to_thread(_get_pipeline().clear_documents)
     return {"status": "cleared"}
 
 
 @app.delete("/docs/{name:path}")
-async def remove_doc(name: str):
+async def remove_doc(name: str, _: str = Depends(require_auth)):
     pipeline = _get_pipeline()
     filenames_before = set(pipeline.vector_store.list_values("filename"))
     if name not in filenames_before:
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found.")
-    pipeline.vector_store.delete_by_field("filename", name)
+    await asyncio.to_thread(pipeline.remove_document, name)
     return {"removed": True, "filename": name}
 
 
