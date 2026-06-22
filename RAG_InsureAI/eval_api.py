@@ -411,6 +411,33 @@ def _should_force_llm(doc_type: str, source_type: str = "") -> bool:
 _MIN_RERANK_FOR_LLM = 0.08   # minimum rerank score to pass a chunk into LLM context
 _LLM_GUARANTEED_TOP = 2      # always keep this many top chunks regardless of threshold
 
+_QUERY_STOP_WORDS = {
+    'what', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'how', 'does',
+    'do', 'i', 'my', 'me', 'by', 'with', 'under', 'about', 'can', 'will',
+    'which', 'when', 'where', 'to', 'and', 'or', 'at', 'this', 'that', 'it',
+    'its', 'be', 'been', 'has', 'have', 'had', 'any', 'all', 'from', 'on',
+    # domain-generic: present in virtually every insurance chunk, so not discriminating
+    'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
+    'plan', 'claim', 'claims', 'benefits', 'benefit',
+}
+
+def _context_covers_query(query: str, docs: list) -> bool:
+    """True if ≥1 chunk contains at least 1 discriminating keyword from the query.
+
+    Filters both common English stop words and domain-generic insurance terms so that a
+    chunk containing only 'insurance' doesn't falsely match a query about 'deductibles'.
+    """
+    import re
+    query_terms = {w for w in re.findall(r'\b[a-z]{3,}\b', query.lower()) if w not in _QUERY_STOP_WORDS}
+    if not query_terms:
+        return True  # no discriminating terms — can't tell, assume covered
+    for doc in docs:
+        text = (doc.page_content if hasattr(doc, "page_content") else doc.get("text", "")).lower()
+        chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
+        if query_terms & chunk_terms:  # at least 1 specific term found
+            return True
+    return False
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SOURCE INTENT + SHARED RETRIEVAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1345,17 +1372,25 @@ def eval_query(req: EvalRequest):
                 d.metadata.get("source", "") for d in raw_docs_for_llm if d.metadata.get("source")
             ))
             src_list = ", ".join(f'"{s}"' for s in unique_srcs)
+            ctx_covered = _context_covers_query(req.query, raw_docs_for_llm)
+            _fallback_note = (
+                "\nIMPORTANT: The retrieved document chunks do NOT contain explicit information "
+                "about this specific topic. Provide a helpful, accurate general insurance "
+                "explanation from your training knowledge and begin your answer with: "
+                "'General knowledge (not from uploaded documents): '"
+                if not ctx_covered else ""
+            )
             citation_prompt = (
                 f"You are an insurance document assistant. "
-                f"Answer ONLY using the CONTEXT chunks provided below. "
-                f"Do NOT use your training knowledge, general knowledge, or any information not present in the CONTEXT. "
-                f"The CONTEXT contains chunks from these sources: {src_list}. "
-                f"Use information from ALL sources that have relevant content — do not ignore any source. "
-                f"Answer the EXACT question asked — do not answer a related but different question. "
-                f"After EVERY fact or sentence, cite its source as [Doc: filename, p.N]."
-                f"If the answer is not explicitly present in the CONTEXT, respond with exactly: "
-                f"'Not mentioned in the provided documents.'"
-                f"{_conflict_note}{_cond_note}\n\n"
+                f"The CONTEXT below contains chunks from these sources: {src_list}.\n"
+                f"RULES:\n"
+                f"1. If the CONTEXT contains relevant information: answer using ONLY the CONTEXT "
+                f"and cite every fact as [Doc: filename, p.N].\n"
+                f"2. If the CONTEXT does NOT explicitly cover the question: provide a clear, "
+                f"accurate general insurance explanation from your training knowledge and label "
+                f"it 'General knowledge (not from uploaded documents): '.\n"
+                f"3. Answer the EXACT question asked. Use ALL sources that have relevant content."
+                f"{_conflict_note}{_cond_note}{_fallback_note}\n\n"
                 f"{summary_section}CONTEXT:\n{context}\n\nQUESTION: {req.query}\nANSWER:"
             )
             answer_llm = llm or get_eval_llm()
@@ -1545,17 +1580,25 @@ def eval_query_stream(req: EvalRequest):
             d.metadata.get("source", "") for d in raw_docs_for_llm if d.metadata.get("source")
         ))
         stream_src_list = ", ".join(f'"{s}"' for s in stream_unique_srcs)
+        stream_ctx_covered = _context_covers_query(req.query, raw_docs_for_llm)
+        stream_fallback_note = (
+            "\nIMPORTANT: The retrieved document chunks do NOT contain explicit information "
+            "about this specific topic. Provide a helpful, accurate general insurance "
+            "explanation from your training knowledge and begin your answer with: "
+            "'General knowledge (not from uploaded documents): '"
+            if not stream_ctx_covered else ""
+        )
         prompt = (
             f"You are an insurance document assistant. "
-            f"Answer ONLY using the CONTEXT chunks provided below. "
-            f"Do NOT use your training knowledge, general knowledge, or any information not present in the CONTEXT. "
-            f"The CONTEXT contains chunks from these sources: {stream_src_list}. "
-            f"Use information from ALL sources that have relevant content — do not ignore any source. "
-            f"Answer the EXACT question asked — do not answer a related but different question. "
-            f"After EVERY fact or sentence, cite its source as [Doc: filename, p.N]."
-            f"If the answer is not explicitly present in the CONTEXT, respond with exactly: "
-            f"'Not mentioned in the provided documents.'"
-            f"{conflict_hint}\n\n"
+            f"The CONTEXT below contains chunks from these sources: {stream_src_list}.\n"
+            f"RULES:\n"
+            f"1. If the CONTEXT contains relevant information: answer using ONLY the CONTEXT "
+            f"and cite every fact as [Doc: filename, p.N].\n"
+            f"2. If the CONTEXT does NOT explicitly cover the question: provide a clear, "
+            f"accurate general insurance explanation from your training knowledge and label "
+            f"it 'General knowledge (not from uploaded documents): '.\n"
+            f"3. Answer the EXACT question asked. Use ALL sources that have relevant content."
+            f"{conflict_hint}{stream_fallback_note}\n\n"
             f"{summary_section}CONTEXT:\n{context}\n\nQUESTION: {req.query}\nANSWER:"
         )
         t_llm = time.perf_counter()
