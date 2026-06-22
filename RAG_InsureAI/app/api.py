@@ -1100,6 +1100,13 @@ async def transcribe_audio(file: UploadFile = File(...)):
             os.unlink(tmp_path)
 
 
+# ── REST aliases for frontend (/videos POST, /webpages POST) ─────────────────
+# Frontend uses REST-idiomatic POST /videos and POST /webpages; register the
+# same handlers under both paths without duplicating logic.
+app.add_api_route("/videos",   upload_video,   methods=["POST"], dependencies=[Depends(require_auth)])
+app.add_api_route("/webpages", upload_webpage, methods=["POST"], dependencies=[Depends(require_auth)])
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
