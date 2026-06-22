@@ -23,6 +23,8 @@ x-common: &common
     - EMBED_MODEL=BAAI/bge-base-en-v1.5
     - VLLM_HOST=http://123.253.124.14:7000
     - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+    - ADMIN_USERNAME=admin
+    - ADMIN_PASSWORD=insurehub2026
   volumes:
     - insurehub_data:/root/.insurehub
     - insurehub_tmp:/root/.insurehub_tmp

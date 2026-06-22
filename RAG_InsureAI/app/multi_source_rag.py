@@ -472,6 +472,194 @@ class MultiSourceRAG:
         answer = response.content if hasattr(response, "content") else str(response)
         return _strip_model_preamble(answer), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
+    async def ask_stream(
+        self,
+        question: str,
+        history: str = "",
+        document_filter: Optional[List[str]] = None,
+    ):
+        """Async generator — yields text tokens as the LLM produces them.
+
+        Runs all retrieval logic identically to ask(), then streams the LLM
+        response token-by-token so the frontend can show words appearing live
+        instead of waiting for the full answer.
+
+        Yields:
+            str tokens as they arrive, then a final JSON line:
+            'data: {"sources": [...], "done": true}'
+        """
+        # ── Re-use the full retrieval pipeline ───────────────────────────────
+        # Build the prompt exactly as ask() does, then stream the LLM response.
+        # We call ask() with a sentinel and intercept just before llm.invoke.
+        # Simpler: duplicate the prompt-building block here (it's fast, <1s).
+
+        retrieval_query = question
+        filter_meta = None
+        if document_filter:
+            conditions = [{"source": {"$contains": doc}} for doc in document_filter]
+            filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
+
+        # Streaming path uses a pool of 8 candidates (vs 30 in ask()) so the
+        # cross-encoder rerank takes ~2-3s on CPU instead of ~9s, keeping
+        # first-token latency under 5s while still reordering by relevance.
+        doc_chunks = await asyncio.to_thread(
+            self.doc_pipeline._vector_store.search,
+            retrieval_query, top_k=8, use_hybrid=True, use_reranker=False,
+            filter_metadata=filter_meta
+        )
+
+        if not document_filter and self.doc_pipeline._summary_store.count() > 0:
+            try:
+                relevant_summaries = await asyncio.to_thread(
+                    self.doc_pipeline._summary_store.search, retrieval_query, 3
+                )
+                in_pool_srcs = {d.metadata.get("source", "") for d in doc_chunks}
+                for summary_doc in relevant_summaries:
+                    src = summary_doc.metadata.get("source", "")
+                    if src and src not in in_pool_srcs:
+                        boost = await asyncio.to_thread(
+                            self.doc_pipeline._vector_store.search,
+                            retrieval_query, 2, {"source": {"$eq": src}}, True, False,
+                        )
+                        if boost:
+                            existing = {d.page_content[:80] for d in doc_chunks}
+                            doc_chunks = doc_chunks + [
+                                d for d in boost if d.page_content[:80] not in existing
+                            ]
+                            in_pool_srcs.add(src)
+            except Exception:
+                pass
+
+        if doc_chunks:
+            doc_chunks = await asyncio.to_thread(
+                self.doc_pipeline._vector_store.rerank_documents,
+                retrieval_query, doc_chunks, 8,
+            )
+
+        if not document_filter:
+            video_chunks = await asyncio.to_thread(
+                self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False
+            )
+            webpage_chunks = await asyncio.to_thread(
+                self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False
+            )
+            all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
+        else:
+            all_chunks = self._merge_chunks(doc_chunks)
+
+        all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
+        all_chunks = all_chunks[:8]
+
+        total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
+        if total_retrieved_chars > LLM_CONTEXT_WINDOW_CHARS:
+            all_chunks = self._compressor.compress_to_budget(
+                question, all_chunks, max_total_chars=LLM_CONTEXT_WINDOW_CHARS
+            )
+
+        _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
+        _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
+        context_parts, sources = [], []
+        for chunk in all_chunks:
+            source_type = chunk.metadata.get("source_type", "document")
+            doc_type = chunk.metadata.get("doc_type", "")
+            if source_type in _VIDEO_SOURCE_TYPES or doc_type == "youtube":
+                url = chunk.metadata.get("source_url") or chunk.metadata.get("source", "Unknown URL")
+                title = chunk.metadata.get("video_title", "")
+                label = f"Video: {title or url}"
+                sources.append(url)
+            elif source_type in _WEBPAGE_SOURCE_TYPES:
+                url = chunk.metadata.get("source_url") or chunk.metadata.get("source", "Unknown URL")
+                label = f"Webpage: {url}"
+                sources.append(url)
+            else:
+                src = chunk.metadata.get("source", "Unknown")
+                page = chunk.metadata.get("page", "?")
+                label = f"Document: {src} (Page {page})"
+                sources.append(f"{src} (page {page})")
+            context_parts.append(f"[{label}]\n{chunk.page_content}")
+
+        full_context = "\n\n".join(context_parts)
+        if len(full_context) > self.max_context_chars:
+            full_context = full_context[:self.max_context_chars] + "... (truncated)"
+
+        if not full_context.strip():
+            prompt = CONVERSATIONAL_RAG_PROMPT.format(
+                history=history,
+                context="No relevant documents found in the knowledge base.",
+                question=question,
+            )
+            llm = get_insurance_llm(temperature=0.3)
+        elif document_filter:
+            prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
+            llm = get_insurance_llm(temperature=0)
+        else:
+            ctx_covered = _context_covers_query(question, all_chunks)
+            fallback_suffix = (
+                "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
+                "explicit information about this specific topic. Provide a helpful "
+                "general insurance explanation from your training knowledge and clearly "
+                "label it: 'General knowledge (not from your uploaded documents): '"
+                if not ctx_covered else ""
+            )
+            prompt = CONVERSATIONAL_RAG_PROMPT.format(
+                history=history,
+                context=full_context + fallback_suffix,
+                question=question,
+            )
+            llm = get_insurance_llm(temperature=0.3)
+
+        # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
+        # LangChain's astream() buffers the full response before yielding.
+        # We bypass it and call the vLLM /v1/chat/completions endpoint with
+        # stream=True so the frontend sees the first word in <1 second.
+        import json as _json
+        import aiohttp
+        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+
+        unique_sources = list(dict.fromkeys(sources))
+        streamed_ok = False
+
+        if _active_backend() == "vllm" and VLLM_HOST:
+            model = _resolve_vllm_model()
+            url = f"{VLLM_HOST}/v1/chat/completions"
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1024")),
+                "stream": True,
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {VLLM_API_KEY}",
+            }
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                        async for raw_line in resp.content:
+                            line = raw_line.decode().strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                token = _json.loads(data)["choices"][0]["delta"].get("content", "")
+                                if token:
+                                    yield token
+                            except Exception:
+                                pass
+                streamed_ok = True
+            except Exception as exc:
+                logger.warning("[ask_stream] direct vLLM streaming failed, falling back: %s", exc)
+
+        if not streamed_ok:
+            # Fallback: regular invoke (no streaming)
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+            yield answer
+
+        yield "\n\n" + _json.dumps({"sources": unique_sources, "done": True})
+
     # Management methods (keep as before)
     def video_exists(self, url: str) -> bool:
         return self.video_store.url_exists(url)

@@ -1019,27 +1019,35 @@ async def ask_url(req: AskURLRequest):
 # ── Streaming ask endpoint (documents only, unchanged) ────────────────────────
 @app.post("/ask-stream")
 async def ask_stream(req: AskRequest):
+    """True token-streaming endpoint — yields LLM tokens as SSE text/plain.
+
+    The final line is a JSON object: {"sources": [...], "done": true}
+    which the frontend uses to display citations after the answer streams in.
+    """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     async def generate():
-        pipeline = _get_pipeline()
+        multi = _get_multi_rag()
         try:
-            answer, _, _ = await asyncio.wait_for(
-                asyncio.to_thread(pipeline.knowledge_query, req.question),
-                timeout=_ASK_TIMEOUT_SECONDS,
-            )
-            for chunk in [answer[i:i+30] for i in range(0, len(answer), 30)]:
-                yield chunk
-                await asyncio.sleep(0.01)
+            async for token in multi.ask_stream(req.question, document_filter=None):
+                yield token
+                await asyncio.sleep(0)  # yield to event loop so uvicorn flushes each chunk
         except asyncio.TimeoutError:
-            logger.warning("Streaming ask timed out after %ds", _ASK_TIMEOUT_SECONDS)
-            yield "Error: The AI model server is taking too long to respond. Please try again in a moment."
+            yield "\n\nError: The AI model server is taking too long. Please try again."
         except Exception as exc:
             logger.exception("Streaming ask failed")
-            yield "Error: The backend could not generate an answer due to an unexpected internal error."
+            yield "\n\nError: Could not generate an answer due to an internal error."
 
-    return StreamingResponse(generate(), media_type="text/plain")
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 # ── Docs management ───────────────────────────────────────────────────────────
