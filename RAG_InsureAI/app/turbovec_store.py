@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import threading
 import uuid
 from typing import List, Optional, Dict, Any
@@ -60,6 +61,58 @@ def _get_embed_dim(embed_model: SentenceTransformer) -> int:
     return embed_model.get_sentence_embedding_dimension()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Process-wide shared models
+# ──────────────────────────────────────────────────────────────────────────
+# Every TurboVecStore (documents / videos / webpages) used to instantiate its
+# own SentenceTransformer and its own CrossEncoder, so a single process ended
+# up holding 3 redundant copies of each model in memory. Both models are
+# stateless w.r.t. any one collection's data, so they're hoisted here as
+# lazily-loaded, process-wide singletons and shared by reference across every
+# TurboVecStore instance. Each model is still loaded at most once for the
+# life of the process; `.encode()` / `.predict()` still run fresh on every
+# call exactly as before — only the "create the model object" step is
+# deduplicated.
+_SHARED_EMBED_MODELS: Dict[str, SentenceTransformer] = {}
+_SHARED_EMBED_LOCK = threading.Lock()
+
+_shared_reranker: Optional[CrossEncoder] = None
+_SHARED_RERANKER_LOCK = threading.Lock()
+
+
+def _get_shared_embed_model(embed_model_name: str) -> SentenceTransformer:
+    """
+    Return the process-wide SentenceTransformer for *embed_model_name*,
+    loading it on first use. Keyed by model name so a future caller that
+    passes a different embed_model_name still gets correct (if separate)
+    caching, while all current callers — which all use the same default
+    model — share one instance.
+    """
+    model = _SHARED_EMBED_MODELS.get(embed_model_name)
+    if model is not None:
+        return model
+    with _SHARED_EMBED_LOCK:
+        model = _SHARED_EMBED_MODELS.get(embed_model_name)
+        if model is None:
+            model = SentenceTransformer(embed_model_name)
+            model.max_seq_length = 512
+            _SHARED_EMBED_MODELS[embed_model_name] = model
+            logger.info("[SharedModels] embedding model loaded: %s", embed_model_name)
+    return model
+
+
+def _get_shared_reranker() -> CrossEncoder:
+    """Return the process-wide CrossEncoder reranker, loading it on first use."""
+    global _shared_reranker
+    if _shared_reranker is not None:
+        return _shared_reranker
+    with _SHARED_RERANKER_LOCK:
+        if _shared_reranker is None:
+            _shared_reranker = CrossEncoder(RERANKER_MODEL_NAME)
+            logger.info("[SharedModels] reranker loaded: %s", RERANKER_MODEL_NAME)
+    return _shared_reranker
+
+
 class TurboVecStore:
     """
     A ChromaDB-replacement vector store backed by TurboQuantIndex for dense
@@ -91,13 +144,18 @@ class TurboVecStore:
         self.bm25_cache_path = os.path.join(self.persist_dir, f"{collection_name}_bm25.pkl")
         self.idmap_path = os.path.join(self.persist_dir, f"{collection_name}_idmap.json")
 
-        # Embedding model
-        self.embed_model = SentenceTransformer(embed_model_name)
-        self.embed_model.max_seq_length = 512
+        # Embedding model — process-wide shared instance (see
+        # _get_shared_embed_model). Every collection (documents/videos/
+        # webpages) uses the same model name by default, so they all resolve
+        # to the same underlying object instead of each loading their own copy.
+        self.embed_model = _get_shared_embed_model(embed_model_name)
         self.embed_dim = _get_embed_dim(self.embed_model)
         self.bit_width = bit_width
 
-        # Reranker (lazy-loaded)
+        # Reranker — also process-wide shared (see _ensure_reranker below).
+        # Kept as an instance attribute for backward compatibility with any
+        # code that reads store.reranker directly, but it always points at
+        # the same shared object once loaded.
         self.reranker = None
 
         # BM25 state
@@ -387,7 +445,7 @@ class TurboVecStore:
             if not isinstance(corpus, list) or cached_count != len(self._docs):
                 return False
             self._bm25_corpus = corpus
-            tokenized = [text.lower().split() for _, text, _ in corpus]
+            tokenized = [self._tokenize(text) for _, text, _ in corpus]
             self._bm25_index = BM25Okapi(tokenized) if tokenized else None
             logger.info("BM25 cache loaded for %s (%d docs).", self.collection_name, len(corpus))
             return True
@@ -416,7 +474,7 @@ class TurboVecStore:
         tokenized = []
         corpus = []
         for doc_id, text in self._docs.items():
-            tokens = text.lower().split()
+            tokens = self._tokenize(text)
             tokenized.append(tokens)
             corpus.append((doc_id, text, self._metadatas.get(doc_id, {})))
         self._bm25_index = BM25Okapi(tokenized)
@@ -637,11 +695,23 @@ class TurboVecStore:
     # BM25 search
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """
+        Tokenize text for BM25: lowercase + strip punctuation so that
+        query tokens like 'ulip?' match document tokens like 'ulip'.
+        Without this, every query ending in '?' gets zero BM25 score for
+        the last keyword (e.g. 'What is a ULIP?' → token 'ulip?' never
+        matches document token 'ulip').
+        """
+        return [re.sub(r'[^\w]', '', t) for t in text.lower().split()
+                if re.sub(r'[^\w]', '', t)]
+
     def _bm25_search(self, query: str, k: int, filter_meta: Optional[Dict] = None) -> List[tuple]:
         bm25 = self._get_bm25()
         if bm25 is None or not self._bm25_corpus:
             return []
-        tokens = query.lower().split()
+        tokens = self._tokenize(query)
 
         # When a metadata filter is active, score only the matching sub-corpus.
         # This prevents IDF weights from being diluted by unrelated documents
@@ -655,7 +725,7 @@ class TurboVecStore:
             if not filtered_corpus:
                 return []
             # Build a temporary BM25 index over just the filtered docs.
-            tokenized = [text.lower().split() for _, text, _ in filtered_corpus]
+            tokenized = [self._tokenize(text) for _, text, _ in filtered_corpus]
             from rank_bm25 import BM25Okapi
             sub_bm25 = BM25Okapi(tokenized)
             scores = sub_bm25.get_scores(tokens)
@@ -683,8 +753,7 @@ class TurboVecStore:
 
     def _ensure_reranker(self):
         if self.reranker is None:
-            self.reranker = CrossEncoder(RERANKER_MODEL_NAME)
-            logger.info("[Reranker] cross-encoder loaded: %s", RERANKER_MODEL_NAME)
+            self.reranker = _get_shared_reranker()
 
     def warmup(self):
         """
@@ -708,14 +777,14 @@ class TurboVecStore:
         if not candidates:
             return []
         self._ensure_reranker()
-        pairs = [(query, text) for (_, text, _, _) in candidates]
+        pairs = [(query, c[1]) for c in candidates]
         rerank_scores = self.reranker.predict(pairs)
         combined = list(zip(candidates, rerank_scores))
         combined.sort(key=lambda x: x[1], reverse=True)
         reranked = []
-        for (doc_id, text, meta, _), score in combined[:top_k]:
-            # Don't mutate the shared meta dict — return a pristine copy
-            reranked.append((doc_id, text, dict(meta), float(score)))
+        for c, score in combined[:top_k]:
+            dense_score = c[4] if len(c) > 4 else c[3]
+            reranked.append((c[0], c[1], dict(c[2]), float(score), dense_score))
         return reranked
 
     def rerank_documents(self, query: str, docs: List[Document], top_k: int) -> List[Document]:
@@ -763,11 +832,36 @@ class TurboVecStore:
         hybrid_used = use_hybrid
         if hybrid_used:
             bm25_candidates = self._bm25_search(query, k=top_k, filter_meta=filter_metadata)
+            # Reciprocal Rank Fusion — combines dense and BM25 rank positions so a
+            # chunk that scores high in BM25 (exact keyword match) but low in dense
+            # is not penalised by keeping only the weak dense score.
+            _RRF_K = 60
+            dense_map = {
+                doc_id: (rank, text, meta, score)
+                for rank, (doc_id, text, meta, score) in enumerate(dense_candidates)
+            }
+            # Normalize BM25 scores to [0,1] so BM25-only hits get a
+            # meaningful similarity value instead of 0.0
+            _bm25_max = max((s for _, _, _, s in bm25_candidates), default=1.0) or 1.0
+            bm25_map = {
+                doc_id: (rank, text, meta, score / _bm25_max)
+                for rank, (doc_id, text, meta, score) in enumerate(bm25_candidates)
+            }
+            n_dense = len(dense_candidates)
+            n_bm25 = len(bm25_candidates)
+            all_ids = set(dense_map) | set(bm25_map)
             merged = {}
-            for doc_id, text, meta, score in dense_candidates + bm25_candidates:
-                if doc_id not in merged:
-                    merged[doc_id] = (doc_id, text, meta, score)
-            candidates = list(merged.values())
+            for doc_id in all_ids:
+                d_rank = dense_map[doc_id][0] if doc_id in dense_map else n_dense
+                b_rank = bm25_map[doc_id][0] if doc_id in bm25_map else n_bm25
+                rrf = 1.0 / (_RRF_K + d_rank + 1) + 1.0 / (_RRF_K + b_rank + 1)
+                if doc_id in dense_map:
+                    _, text, meta, dense_score = dense_map[doc_id]
+                else:
+                    _, text, meta, bm25_norm = bm25_map[doc_id]
+                    dense_score = bm25_norm  # normalized BM25 score as proxy
+                merged[doc_id] = (doc_id, text, meta, rrf, dense_score)
+            candidates = sorted(merged.values(), key=lambda x: x[3], reverse=True)
         else:
             candidates = dense_candidates
 
@@ -778,15 +872,35 @@ class TurboVecStore:
             candidates = candidates[:top_k]
 
         docs = []
-        for doc_id, text, meta, orig_score in candidates:
+        for candidate in candidates:
+            doc_id, text, meta = candidate[0], candidate[1], candidate[2]
+            orig_score = candidate[3]
+            # For hybrid results, candidate[4] holds the original dense cosine score
+            dense_score = candidate[4] if len(candidate) > 4 else orig_score
             doc = Document(page_content=text, metadata=dict(meta))
-            doc.metadata["similarity"] = orig_score
+            doc.metadata["similarity"] = dense_score
+            doc.metadata["rrf_score"] = orig_score
             method = "hybrid" if hybrid_used else "dense"
             if reranker_used:
                 method += "+rerank"
             doc.metadata["retrieval_method"] = method
             docs.append(doc)
         return docs
+
+    def get_all_by_filter(self, filter_meta: Dict[str, Any]) -> List[Document]:
+        """
+        Return ALL documents that match *filter_meta* by scanning in-memory metadata.
+        Unlike search(), this does NOT use the ANN index — it is guaranteed to find
+        every document that satisfies the filter regardless of its embedding distance
+        from any query.  Use it when you need completeness rather than relevance ranking
+        (e.g. fetching all YouTube chunks by doc_type).
+        """
+        results: List[Document] = []
+        for doc_id, text in self._docs.items():
+            meta = self._metadatas.get(doc_id, {})
+            if self._metadata_matches_filter(meta, filter_meta):
+                results.append(Document(page_content=text, metadata={**meta}))
+        return results
 
     def count(self) -> int:
         return len(self._docs)

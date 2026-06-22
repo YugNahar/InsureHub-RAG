@@ -58,6 +58,10 @@ class SummaryStore:
         """Remove the summary for *source* (no-op if not found)."""
         self._store.delete_by_field("source", source)
 
+    def delete_all(self) -> None:
+        """Remove every summary (used when the whole knowledge base is cleared)."""
+        self._store.delete_all()
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
@@ -82,6 +86,10 @@ class SummaryStore:
 
     def source_exists(self, source: str) -> bool:
         return source in self._store.list_values("source")
+
+    def list_sources(self) -> List[str]:
+        """Return the *source* value of every stored summary (cheap — no text/metadata)."""
+        return self._store.list_values("source")
 
     def count(self) -> int:
         return self._store.count()

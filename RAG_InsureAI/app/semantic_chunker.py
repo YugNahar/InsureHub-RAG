@@ -1,41 +1,23 @@
 """
-semantic_chunker.py — Embedding-based semantic chunking for InsureHub RAG.
+semantic_chunker.py — Paragraph-based semantic chunker for InsureHub RAG.
 
-Replaces fixed-size character/word splitting with boundaries that follow
-the actual meaning of the text.
+Embedding model : BAAI/bge-base-en-v1.5  (same model used by TurboVec for retrieval)
 
-How it works
-------------
-1. Split the input into sentences (or, for unpunctuated YouTube/Whisper
-   transcripts, fixed word-window pseudo-sentences — same approach already
-   used by context_compressor.py).
-2. Embed each sentence blended with a small window of its neighbors (using
-   the same BGE model already loaded by TurboVec), to smooth out noise from
-   very short sentences.
-3. Compute cosine distance between every pair of consecutive sentence
-   embeddings.
-4. Wherever that distance spikes above a percentile threshold (a topic
-   shift), cut a new chunk.
-5. Hard min/max character guards prevent pathological output: chunks below
-   `min_chunk_chars` get merged into a neighbor, and a chunk is force-cut at
-   `max_chunk_chars` even if no semantic breakpoint occurred (protects the
-   LLM context window on long, topically-uniform stretches of text).
-6. Sliding-window overlap: the last `overlap_chars` of each chunk are
-   prepended to the next chunk so retrieval never misses facts that straddle
-   a boundary (same mechanic as LangChain RecursiveCharacterTextSplitter).
-
-Target sizes (recommended caller config)
------------------------------------------
-  chunk_size    = 3000  chars  ≈ 500 words  — enough context per chunk
-  overlap_chars = 600   chars  ≈ 100 words  — bridges cross-boundary facts
-  min_chunk_chars = 900 chars  ≈ 150 words  — prevents tiny orphan chunks
-
-YouTube pseudo-sentence window
---------------------------------
-  Auto-generated captions have no punctuation, so we split on fixed word
-  windows (40 words each) as pseudo-sentences for the embedding step.
-  40-word windows give ~12-13 pseudo-sentences per 500-word chunk, which
-  is enough variety for the cosine-distance boundary detector to work well.
+Strategy (same for ALL content types — PDFs, YouTube, web pages):
+1. Split text into paragraphs (blank lines → single newlines → 50-word windows).
+2. Embed every paragraph with BAAI/bge-base-en-v1.5.
+3. Greedy grouping — for each new paragraph compute its cosine similarity to
+   the MEAN embedding of all paragraphs already in the current group:
+     similarity >= 0.4  AND  group still fits in 500 words
+         → same topic → add to current group
+     similarity <  0.4  OR   group would exceed 500 words
+         → topic shifted or too big → flush group as a chunk, start new group
+   Using the group mean (centroid) means the decision considers ALL paragraphs
+   in the group, not just the last one — so paragraphs 1-2-3-4-5 that all
+   discuss the same concept get grouped into ONE chunk even though only
+   consecutive pairs are directly compared by other methods.
+4. Cap chunks at 500 words. Force a new chunk even without a topic shift.
+5. Prepend the last 60 words of each chunk to the next chunk (overlap).
 """
 from __future__ import annotations
 
@@ -49,268 +31,308 @@ from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
 
-# Sentence must have at least this many chars to be embedded / kept.
-_MIN_SENT_CHARS = 25
+# ── Tuning ──────────────────────────────────────────────────────────────────────
+MAX_CHUNK_WORDS   = 500   # hard word ceiling per chunk
+OVERLAP_WORDS     = 60    # words from previous chunk prepended to next
+SIM_THRESHOLD     = 0.4   # cosine similarity floor — below this = topic shift
+_MIN_PARA_CHARS   = 20    # drop blank / very short fragments
 
-# Word-window size for YouTube/Whisper transcripts (no punctuation).
-# 40 words ≈ 240 chars — large enough for meaningful embeddings,
-# small enough to give the boundary detector ~12 windows per 500-word chunk.
-_YT_WORD_WINDOW = 40
-
-_DEFAULT_EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
+# ── Embedding model ─────────────────────────────────────────────────────────────
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
 _default_model: Any = None
 
 
 def _get_default_embed_model() -> Any:
-    """
-    Lazy-loaded fallback embedding model, used only if a caller doesn't pass
-    one in. Prefer passing the shared TurboVec embed_model instead — this
-    fallback loads a second copy of the model into memory.
-    """
     global _default_model
     if _default_model is None:
         from sentence_transformers import SentenceTransformer
         logger.warning(
-            "[SemanticChunker] No embed_model provided — lazy-loading a "
-            "second copy of '%s'. Pass the shared TurboVec embed_model to "
-            "avoid the extra memory cost.",
-            _DEFAULT_EMBED_MODEL_NAME,
+            "[SemanticChunker] No embed_model passed — lazy-loading '%s'. "
+            "Pass the shared TurboVec embed_model to avoid a duplicate copy in memory.",
+            EMBED_MODEL_NAME,
         )
-        _default_model = SentenceTransformer(_DEFAULT_EMBED_MODEL_NAME)
+        _default_model = SentenceTransformer(EMBED_MODEL_NAME)
     return _default_model
 
 
-def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
+# ── Step 1: paragraph splitting ─────────────────────────────────────────────────
+
+def _split_paragraphs(text: str) -> List[str]:
     """
-    Split text into sentences.
+    Split text into paragraphs — the atomic units that get embedded.
 
-    For normal text: uses punctuation boundaries with abbreviation protection.
-    For YouTube transcripts (for_youtube=True): auto-generated captions have
-    no punctuation, so we fall back to fixed word-window chunks (_YT_WORD_WINDOW
-    words each) which act as pseudo-sentences for the embedding step. If
-    punctuation splitting produces fewer than 2 sentences, the word-window
-    fallback is always tried regardless of for_youtube.
+    Tier 1 — blank-line splitting  (standard PDFs, handbooks, web pages)
+    Tier 2 — single-newline splitting  (PDFs where blank lines are stripped)
+    Tier 3 — fixed 50-word windows  (YouTube transcripts — no newlines at all)
     """
-    abbrev = re.sub(
-        r'\b(Mr|Mrs|Ms|Dr|Prof|vs|etc|e\.g|i\.e|fig|no|pg|pp|vol|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.',
-        r'\1<DOT>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    abbrev = re.sub(r'(\d+)\.(\d)', r'\1<DOT>\2', abbrev)
-    raw = re.split(r'(?<=[.!?])\s+(?=[A-Z\d\"\'\(])', abbrev)
-    punct_sentences = [
-        s.replace('<DOT>', '.').strip()
-        for s in raw
-        if len(s.replace('<DOT>', '').strip()) >= _MIN_SENT_CHARS
-    ]
+    # Tier 1: blank lines
+    paras = [p.strip() for p in re.split(r'\n{2,}', text) if len(p.strip()) >= _MIN_PARA_CHARS]
+    if len(paras) >= 2:
+        return paras
 
-    if len(punct_sentences) >= 2 and not for_youtube:
-        return punct_sentences
+    # Tier 2: single newlines
+    lines = [l.strip() for l in text.split('\n') if len(l.strip()) >= _MIN_PARA_CHARS]
+    if len(lines) >= 2:
+        return lines
 
+    # Tier 3: 50-word windows (YouTube / no-newline transcripts)
     words = text.split()
-    if len(words) >= 10:
-        window_sentences = []
-        for i in range(0, len(words), _YT_WORD_WINDOW):
-            chunk = " ".join(words[i:i + _YT_WORD_WINDOW])
-            if len(chunk) >= _MIN_SENT_CHARS:
-                window_sentences.append(chunk)
-        if len(window_sentences) >= 2:
-            return window_sentences
+    if len(words) >= 20:
+        windows: List[str] = []
+        for i in range(0, len(words), 50):
+            w = " ".join(words[i: i + 50])
+            if len(w) >= _MIN_PARA_CHARS:
+                windows.append(w)
+        if len(windows) >= 2:
+            return windows
 
-    return punct_sentences if punct_sentences else [text]
+    return [text.strip()] if text.strip() else []
 
+
+# ── Page-merge helper ────────────────────────────────────────────────────────────
+_PAGE_MARKER_RE = re.compile(r"<<<PAGE:([^>]+)>>>")
+
+
+def _merge_pages(docs: List[Document]) -> List[Document]:
+    """
+    Merge per-page Documents from the same PDF/DOCX into one Document so
+    topic boundaries are detected across page breaks (not forced at them).
+    <<<PAGE:N>>> markers are embedded so page numbers can be recovered later.
+    """
+    if len(docs) <= 1:
+        return docs
+
+    groups: dict[str, List[Document]] = {}
+    order: List[str] = []
+    for doc in docs:
+        src = doc.metadata.get("source") or doc.metadata.get("filename") or str(id(doc))
+        if src not in groups:
+            groups[src] = []
+            order.append(src)
+        groups[src].append(doc)
+
+    merged: List[Document] = []
+    for src in order:
+        group     = groups[src]
+        has_pages = any("page" in d.metadata for d in group)
+        if len(group) == 1 or not has_pages:
+            merged.extend(group)
+            continue
+
+        group_sorted = sorted(group, key=lambda d: int(d.metadata.get("page", 0)))
+        parts: List[str] = []
+        for d in group_sorted:
+            pg = d.metadata.get("page", "?")
+            parts.append(f"<<<PAGE:{pg}>>>\n{d.page_content}")
+        full_text = "\n\n".join(parts)
+
+        base_meta = dict(group_sorted[0].metadata)
+        base_meta["page"]        = group_sorted[0].metadata.get("page", 1)
+        base_meta["total_pages"] = group_sorted[-1].metadata.get("total_pages", len(group_sorted))
+        merged.append(Document(page_content=full_text, metadata=base_meta))
+        logger.info("[SemanticChunker] Merged %d pages of '%s'", len(group_sorted), src)
+
+    return merged
+
+
+# ── Core chunker ─────────────────────────────────────────────────────────────────
 
 class SemanticChunker:
     """
-    Embedding-based semantic chunker with sliding-window overlap.
+    Paragraph-based semantic chunker using BAAI/bge-base-en-v1.5.
+
+    Groups consecutive paragraphs into one chunk as long as:
+      (a) the new paragraph's cosine similarity to the group's mean embedding
+          is >= sim_threshold  (default 0.4), AND
+      (b) adding the paragraph would not exceed max_chunk_words (default 500).
+
+    Using the group mean (centroid) means all N paragraphs currently in the
+    group influence the decision — not just the last one.  So a group of 5
+    ULIP paragraphs keeps its ULIP character and correctly absorbs a 6th ULIP
+    paragraph even if it phrased things differently.
 
     Parameters
     ----------
-    embed_model : SentenceTransformer
-        Shared embedding model (pass the same BGE model used elsewhere —
-        e.g. ChromaVectorStore.embed_model — to avoid loading a duplicate).
-    breakpoint_percentile : float
-        A sentence-to-sentence distance must be in the top X percentile of
-        all distances within the document to be treated as a chunk boundary.
-        Higher = fewer, larger chunks. Default 90.
-    buffer_size : int
-        Number of neighboring sentences blended with each sentence before
-        embedding, to stabilize the embedding of very short sentences.
-    min_chunk_chars : int
-        Chunks below this size are merged into a neighbor.
-        Recommended: 900 chars ≈ 150 words.
-    max_chunk_chars : int
-        Hard ceiling — force a cut even without a semantic breakpoint once a
-        chunk reaches this size, so one topically-uniform stretch of text
-        can't grow unbounded.
-        Recommended: 3000 chars ≈ 500 words.
-    overlap_chars : int
-        Number of characters from the END of the previous chunk to prepend
-        to the START of the next chunk. This sliding-window overlap ensures
-        facts that straddle a chunk boundary are retrievable from either
-        side. Set to 0 to disable overlap.
-        Recommended: 600 chars ≈ 100 words.
+    embed_model     : SentenceTransformer — pass the shared TurboVec model.
+    max_chunk_words : int   — word ceiling per chunk (default 500).
+    overlap_words   : int   — words prepended to next chunk (default 60).
+    sim_threshold   : float — min cosine similarity to stay in same group (default 0.4).
     """
 
     def __init__(
         self,
         embed_model: Any = None,
-        breakpoint_percentile: float = 90.0,
-        buffer_size: int = 1,
-        min_chunk_chars: int = 900,
-        max_chunk_chars: int = 3000,
-        overlap_chars: int = 600,
+        max_chunk_words: int = MAX_CHUNK_WORDS,
+        overlap_words: int = OVERLAP_WORDS,
+        sim_threshold: float = SIM_THRESHOLD,
+        # Backward-compat kwargs — accepted but ignored:
+        breakpoint_percentile: float = None,
+        breakpoint_pct: float = None,
+        buffer_size: int = None,
+        min_chunk_chars: int = None,
+        max_chunk_chars: int = None,
+        overlap_chars: int = None,
     ):
-        self._model = embed_model
-        self._pct = breakpoint_percentile
-        self._buffer = buffer_size
-        self._min_chars = min_chunk_chars
-        self._max_chars = max_chunk_chars
-        self._overlap = overlap_chars
+        self._model         = embed_model
+        self._max_words     = max_chunk_words
+        self._overlap_words = overlap_words
+        self._sim_threshold = sim_threshold
 
     def _model_or_default(self) -> Any:
         return self._model if self._model is not None else _get_default_embed_model()
 
-    # ------------------------------------------------------------------
-    # Core algorithm
-    # ------------------------------------------------------------------
-
-    def split_text(self, text: str, for_youtube: bool = False) -> List[str]:
+    def split_text(
+        self,
+        text: str,
+        for_youtube: bool = False,  # accepted for backward compat, ignored
+    ) -> List[str]:
         """
-        Split text into semantically coherent chunks with overlap.
+        Split *text* into final chunks.
 
-        Pass 1 — semantic boundary detection:
-          Embeds sentences, computes cosine distances, cuts at distance spikes.
-          Hard min/max char guards prevent pathological chunk sizes.
-
-        Pass 2 — sliding-window overlap:
-          Prepends the last `overlap_chars` of each chunk onto the start of
-          the next chunk. This is done on the *text* level (after Pass 1
-          assembles chunks from sentences) so the overlap is always a clean
-          word boundary rather than a mid-sentence cut.
+        Step 1 — paragraph splitting (blank lines / newlines / word windows)
+        Step 2 — embed every paragraph with BGE
+        Step 3 — greedy grouping:
+                   for each paragraph, compute cosine similarity to the
+                   MEAN embedding of all paragraphs already in the current group.
+                   If similar enough AND fits 500 words → add to group.
+                   Else → flush group as chunk, start fresh group.
+        Step 4 — 60-word overlap between consecutive chunks
         """
-        sentences = _split_sentences(text, for_youtube=for_youtube)
-        if len(sentences) < 2:
-            return [text] if text.strip() else []
+        paragraphs = _split_paragraphs(text)
+        if len(paragraphs) < 2:
+            return [text.strip()] if text.strip() else []
 
-        # Blend each sentence with a small window of neighbors for a more
-        # stable embedding (reduces noise from very short sentences).
-        combined = []
-        for i in range(len(sentences)):
-            lo = max(0, i - self._buffer)
-            hi = min(len(sentences), i + self._buffer + 1)
-            combined.append(" ".join(sentences[lo:hi]))
-
+        # ── Step 2: embed all paragraphs at once ────────────────────────────
         model = self._model_or_default()
         embeddings = model.encode(
-            combined, normalize_embeddings=True, batch_size=32, show_progress_bar=False
+            paragraphs,
+            normalize_embeddings=True,
+            batch_size=32,
+            show_progress_bar=False,
+        )  # shape: (n_paragraphs, embedding_dim)
+
+        # ── Step 3: greedy grouping ──────────────────────────────────────────
+        chunks: List[str] = []
+
+        # State of the current group being built
+        group_paras:   List[str] = [paragraphs[0]]
+        group_emb_sum: np.ndarray = embeddings[0].copy()   # running sum for fast mean
+        group_words:   int = len(paragraphs[0].split())
+
+        for i in range(1, len(paragraphs)):
+            para       = paragraphs[i]
+            para_emb   = embeddings[i]          # already L2-normalised
+            para_words = len(para.split())
+
+            # Mean embedding of current group (re-normalise for cosine dot product)
+            group_mean = group_emb_sum / len(group_paras)
+            norm = float(np.linalg.norm(group_mean))
+            if norm > 1e-9:
+                group_mean = group_mean / norm
+
+            # Cosine similarity: new paragraph vs current group mean
+            sim = float(np.dot(group_mean, para_emb))
+
+            same_topic    = sim >= self._sim_threshold
+            fits_in_limit = group_words + para_words <= self._max_words
+
+            logger.debug(
+                "[SemanticChunker] para[%d] sim=%.3f threshold=%.2f "
+                "words=%d/%d same_topic=%s fits=%s",
+                i, sim, self._sim_threshold,
+                group_words + para_words, self._max_words,
+                same_topic, fits_in_limit,
+            )
+
+            if same_topic and fits_in_limit:
+                # Similar topic + fits within 500 words → add to current group
+                group_paras.append(para)
+                group_emb_sum += para_emb
+                group_words   += para_words
+            else:
+                # Topic shifted or too big → flush current group as one chunk
+                chunks.append("\n\n".join(group_paras))
+                logger.debug(
+                    "[SemanticChunker] flushed chunk with %d paragraphs (%d words)",
+                    len(group_paras), group_words,
+                )
+                group_paras   = [para]
+                group_emb_sum = para_emb.copy()
+                group_words   = para_words
+
+        # Flush the last group
+        if group_paras:
+            chunks.append("\n\n".join(group_paras))
+
+        logger.info(
+            "[SemanticChunker] %d paragraphs → %d chunks (sim_threshold=%.2f, max_words=%d)",
+            len(paragraphs), len(chunks), self._sim_threshold, self._max_words,
         )
 
-        sims = np.array([
-            float(np.dot(embeddings[i], embeddings[i + 1]))
-            for i in range(len(embeddings) - 1)
-        ])
-        distances = 1 - sims
-
-        if len(distances) == 0:
-            return [text]
-
-        threshold = float(np.percentile(distances, self._pct))
-        # Strict ">" — if every distance is identical (uniform topic), no
-        # breakpoint should fire (using ">=" here would shatter every
-        # sentence into its own chunk in that degenerate case).
-        breakpoints = {i for i, d in enumerate(distances) if d > threshold}
-
-        # ── Pass 1: build chunks by semantic boundaries + size guards ─────
-        chunks: List[str] = []
-        current: List[str] = [sentences[0]]
-        current_len = len(sentences[0])
-
-        for i in range(1, len(sentences)):
-            sent = sentences[i]
-            semantic_break = (i - 1) in breakpoints
-            size_break = current_len + len(sent) + 1 > self._max_chars
-            if (semantic_break or size_break) and current_len >= self._min_chars:
-                chunks.append(" ".join(current))
-                current = [sent]
-                current_len = len(sent)
-            else:
-                current.append(sent)
-                current_len += len(sent) + 1
-
-        if current:
-            chunks.append(" ".join(current))
-
-        # Merge a too-small trailing chunk into its predecessor.
-        if len(chunks) > 1 and len(chunks[-1]) < self._min_chars:
-            chunks[-2] = chunks[-2] + " " + chunks[-1]
-            chunks.pop()
-
-        # ── Pass 2: apply sliding-window overlap ──────────────────────────
-        # Skip if overlap disabled or only one chunk (nothing to overlap).
-        if self._overlap > 0 and len(chunks) > 1:
-            chunks = self._apply_overlap(chunks, self._overlap)
+        # ── Step 4: sliding-window overlap ───────────────────────────────────
+        if self._overlap_words > 0 and len(chunks) > 1:
+            chunks = self._apply_overlap(chunks, self._overlap_words)
 
         return chunks
 
     @staticmethod
-    def _apply_overlap(chunks: List[str], overlap_chars: int) -> List[str]:
-        """
-        Prepend the last `overlap_chars` of chunk[i-1] to the start of
-        chunk[i] for every i > 0.
-
-        Overlap is trimmed to a word boundary so the prepended text never
-        starts mid-word. The separator between the overlap tail and the
-        chunk body is a single space (consistent with how chunks were built
-        from sentence lists).
-
-        The first chunk is never modified — it has no predecessor.
-        """
+    def _apply_overlap(chunks: List[str], overlap_words: int) -> List[str]:
+        """Prepend the last N words of chunk[i-1] to the start of chunk[i]."""
         result: List[str] = [chunks[0]]
-
         for i in range(1, len(chunks)):
-            prev = chunks[i - 1]
-            tail = prev[-overlap_chars:] if len(prev) > overlap_chars else prev
-
-            # Trim to the nearest word boundary so we don't start mid-word.
-            # Find the first space in tail (scan left-to-right) and drop
-            # everything before it — that guarantees a clean word start.
-            first_space = tail.find(" ")
-            if first_space != -1:
-                tail = tail[first_space + 1:]
-
-            # Avoid duplicating content when a short chunk is entirely
-            # covered by the overlap window.
+            prev_words = chunks[i - 1].split()
+            tail = (
+                " ".join(prev_words[-overlap_words:])
+                if len(prev_words) > overlap_words
+                else " ".join(prev_words)
+            )
             current = chunks[i]
-            if tail and not current.startswith(tail[:30]):
-                result.append(tail + " " + current)
+            if tail and not current.startswith(tail[:40]):
+                result.append(tail + "\n\n" + current)
             else:
                 result.append(current)
-
         return result
 
-    # ------------------------------------------------------------------
-    # LangChain-compatible interface
-    # ------------------------------------------------------------------
+    def split_documents(
+        self,
+        docs: List[Document],
+        doc_type: str = "policy_document",  # backward compat, ignored
+        llm: Any = None,                    # backward compat, ignored
+    ) -> List[Document]:
+        """
+        Split Documents into semantically coherent chunks.
+        Multi-page PDFs: pages merged first so topic detection spans page breaks.
+        Page numbers: recovered from <<<PAGE:N>>> markers after re-splitting.
+        """
+        docs = _merge_pages(docs)
 
-    def split_documents(self, docs: List[Document]) -> List[Document]:
-        """
-        Drop-in replacement for RecursiveCharacterTextSplitter.split_documents().
-        Detects YouTube/Whisper content automatically and switches to the
-        word-window sentence fallback for it.
-        """
         result: List[Document] = []
         for doc in docs:
-            is_youtube = (
-                doc.metadata.get("doc_type") == "youtube"
-                or "youtube" in str(doc.metadata.get("source_type", "")).lower()
-                or "whisper" in str(doc.metadata.get("source_type", "")).lower()
+            page_value = (
+                doc.metadata.get("page")
+                or doc.metadata.get("page_number")
+                or doc.metadata.get("page_num")
+                or 0
             )
-            pieces = self.split_text(doc.page_content, for_youtube=is_youtube)
+            pieces = self.split_text(doc.page_content)
             for idx, piece in enumerate(pieces):
+                markers = _PAGE_MARKER_RE.findall(piece)
+                recovered_page = page_value
+                if markers:
+                    try:
+                        nums = [int(m) for m in markers]
+                        recovered_page = min(nums)
+                    except (ValueError, TypeError):
+                        recovered_page = markers[0]
+                    piece = _PAGE_MARKER_RE.sub("", piece).strip()
+
                 result.append(Document(
                     page_content=piece,
-                    metadata={**doc.metadata, "chunk_index": idx, "chunking_method": "semantic"},
+                    metadata={
+                        **doc.metadata,
+                        "page":            recovered_page,
+                        "chunk_index":     idx,
+                        "chunking_method": "semantic",
+                    },
                 ))
         return result

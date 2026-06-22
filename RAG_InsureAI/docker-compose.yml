@@ -4,10 +4,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: rag_api
-    command: uvicorn api:app --host 0.0.0.0 --port 8502 
+    container_name: insurehub_api
     ports:
-      - "8502:8502"
+      - "8002:8001"
     shm_size: '2gb'
     deploy:
       resources:
@@ -16,23 +15,18 @@ services:
         reservations:
           memory: 2G
     environment:
-    - VLLM_HOST=${VLLM_HOST}
-    - VLLM_MODEL=${VLLM_MODEL}
-    - EMBED_MODEL=${EMBED_MODEL}
-    - ADMIN_USERNAME=${ADMIN_USERNAME}
-    - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-    - AUTH_SECRET_KEY=${AUTH_SECRET_KEY}
-    - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
+      - EMBED_MODEL=BAAI/bge-base-en-v1.5
+      - VLLM_HOST=http://123.253.124.14:7000
+      - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
     volumes:
-      - ./app:/app
-      - upload_data:/tmp/uploads
-      - whisper_cache:/root/.cache/whisper
-      - turbovec_data:/app/turbovec_data
+      - insurehub_data:/root/.insurehub
+      - insurehub_tmp:/root/.insurehub_tmp
       - hf_cache:/root/.cache/huggingface
+      - whisper_cache:/root/.cache/whisper
     restart: unless-stopped
 
 volumes:
-  upload_data:
-  whisper_cache:
-  turbovec_data:
+  insurehub_data:
+  insurehub_tmp:
   hf_cache:
+  whisper_cache:

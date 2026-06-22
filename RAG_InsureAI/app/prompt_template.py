@@ -107,7 +107,8 @@ Answer:"""
 # RAG PROMPT (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 RAG_PROMPT = """\
-Use ONLY the context below to answer. If not in context, say: "Not mentioned in documents."
+Answer ONLY using the context chunks below. Do NOT use your training knowledge or any information outside the context.
+If the answer is not present in the context, say exactly: "Not mentioned in the provided documents."
 Never invent facts. Cite the document name for every claim.
 
 Context:
