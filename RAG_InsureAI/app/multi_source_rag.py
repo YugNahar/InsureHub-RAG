@@ -24,6 +24,175 @@ def _strip_model_preamble(text: str) -> str:
         clean.pop(0)
     return "\n".join(clean).strip()
 
+
+# ── Short follow-up detection & reformulation ──────────────────────────────
+# When a user sends a very short message (e.g. "yes", "ok", "what about that")
+# the raw text has no standalone semantic content for vector retrieval, causing
+# near-zero similarity scores and a false human-handoff trigger.  If history is
+# available we reformulate the query by merging with the last assistant turn.
+_SHORT_FOLLOWUP_PHRASES = frozenset({
+    "yes", "ok", "okay", "sure", "yeah", "yep", "yup",
+    "tell me more", "go on", "continue", "and", "and?",
+    "what about that", "what about it", "how about that", "how about it",
+    "explain", "elaborate", "more", "really", "interesting",
+    "i see", "got it", "understood", "right", "correct",
+    "no", "nope", "nah", "not really",
+    "why", "why not", "how", "how so",
+    "can you elaborate", "can you explain",
+})
+
+
+def _is_short_followup(question: str) -> bool:
+    """Detect if *question* is a short, low-content follow-up message.
+
+    Returns ``True`` when the message is under ~4 words and either matches a
+    known continuation phrase or is so short it cannot carry standalone
+    retrieval meaning.
+    """
+    q = question.strip().lower().strip("!.,?;:")
+    words = q.split()
+    if len(words) > 4:
+        return False
+    # Exact match against known continuation phrases
+    if q in _SHORT_FOLLOWUP_PHRASES:
+        return True
+    # Any 1-2 word message that isn't a normal-length question qualifies
+    if len(words) <= 2:
+        return True
+    return False
+
+
+def _reformulate_with_history(question: str, history: str) -> str:
+    """Merge a short follow-up with the last assistant turn from *history*.
+
+    The returned string is used **only** for the retrieval query — the original
+    *question* is still passed to the LLM prompt so the model answers what the
+    user actually asked.
+    """
+    lines = history.strip().split("\n")
+    last_assistant = ""
+    for line in reversed(lines):
+        if line.startswith("Assistant:"):
+            last_assistant = line[len("Assistant:"):].strip()
+            break
+    if last_assistant:
+        return f"{last_assistant} {question}"
+    return question
+
+
+def _is_insurance_related(question: str) -> bool:
+    """Return True if *question* is plausibly about insurance or a related domain.
+
+    Uses simple keyword/pattern matching — no LLM call.  Returns False for
+    clearly off-topic queries (history, geography, tech comparisons, etc.).
+    """
+    q = question.lower().strip()
+
+    # If the question is VERY short (1-2 words), assume it could be
+    # insurance-related (e.g. "tell me more", "what about that") — avoids
+    # false-off-topic for short follow-ups.  3-word queries like "chatgpt
+    # vs claude" are long enough to carry clear topic content, so they
+    # proceed to pattern matching below.
+    if len(q.split()) <= 2:
+        return True
+
+    # ── Insurance / finance domain indicators ──────────────────────────────
+    # Check these BEFORE off-topic patterns: if the query contains any actual
+    # insurance vocabulary, it IS insurance-related regardless of phrasing.
+    # This prevents phrases like "difference between term and whole life"
+    # or "what is the history of insurance" from being falsely flagged as
+    # off-topic just because they contain a generic pattern like "difference
+    # between" or "history of".
+    _INSURANCE_INDICATORS = re.compile(
+        r"\b("
+        r"insurance|policy|premium|deductible|coverage|claim|claims|"
+        r"insure|insured|insurer|underwriting|underwrite|"
+        r"cover|covered|covers|covers? (?:for|against|up to|of|on)|"
+        r"premiums|co-pay|copay|deductibles|"
+        r"health|medical|hospital|surgery|prescription|medication|"
+        r"vehicle|car|motor|auto|bike|two-wheeler|four-wheeler|"
+        r"travel|trip|flight|baggage|luggage|cancellation|"
+        r"life|term life|whole life|endowment|ulip|"
+        r"home|house|property|rental|landlord|tenant|"
+        r"accident|disability|critical illness|cancer|"
+        r"liability|third.party|comprehensive|"
+        r"limit|limits|sum insured|sum.assured|"
+        r"maternity|dental|vision|"
+        r"agent|broker|renewal|grace period|waiting period|"
+        r"no.claim|ncb|bonus|"
+        r"nominee|beneficiary|"
+        r"claim (?:form|process|settlement|rejection|approval)|"
+        r"cashless|reimbursement|"
+        r"roadside assistance|towing|"
+        r"personal accident|"
+        r"retirement|pension|annuity|"
+        r"finance|financial|investment|savings|"
+        r"hdfc ergo|icici|bajaj|tata aig|reliance|"
+        r"new india|oriental|national|united india|"
+        r"irda|regulator|"
+        r"cover note|certi.* of insurance|"
+        r"aog|marine|cargo|"
+        r"group insurance|corporate|"
+        r"rider|add.on"
+        r")\b"
+    )
+    if _INSURANCE_INDICATORS.search(q):
+        return True
+
+    # ── Off-topic indicators ──────────────────────────────────────────────
+    # These patterns only apply if the query has NO insurance vocabulary at
+    # all.  Each sub-pattern uses \b word boundaries and \s+ for whitespace
+    # between words (avoids trailing-space issues).
+    _OFF_TOPIC_PATTERNS = re.compile(
+        r"(?:"
+        r"\b(?:who\s+is|who\s+was|who\s+are|when\s+was|when\s+did|when\s+is|where\s+is|where\s+was)\b|"
+        r"\b(?:history\s+of|definition\s+of)\b|"
+        r"\b(?:mother\s+of|father\s+of)\b|"
+        r"\b(?:born\s+in|died\s+in|capital\s+of|population\s+of)\b|"
+        r"\bchatgpt\b|\bclaude\b|\bgpt-4\b|"
+        r"\brecipe\b|\bhow\s+to\s+cook\b|\bingredients\b|"
+        r"\bhow\s+to\s+play\b|\brules\s+of\b|\bsoccer\b|\bfootball\b|\bcricket\b|\bbasketball\b|"
+        r"\bmovie\b|\bactor\b|\bactress\b|\bsinger\b|\bsong\b|\balbum\b|"
+        r"\bpython\b|\bjavascript\b|\bjava\b|\bc\+\+\b|\bprogramming\b|\bcode\b|\balgorithm\b|"
+        r"\bweather\b|\btemperature\b|\bforecast\b|"
+        r"\btranslate\b|\bmeaning\s+of\b"
+        r")"
+    )
+    if _OFF_TOPIC_PATTERNS.search(q):
+        return False
+
+    # For queries that don't match insurance indicators and don't match
+    # off-topic patterns, fall back to generic question patterns combined
+    # with insurance-adjacent words.
+
+    # ── Generic question patterns (insurance-adjacent) ─────────────────────
+    _GENERIC_INSURANCE_PATTERNS = re.compile(
+        r"\b("
+        r"what (?:are|is|does|about)|"
+        r"how (?:much|many|does|can|to|do)|"
+        r"can (?:i|we|you)|"
+        r"do (?:i|we|you)|"
+        r"tell me about|explain|"
+        r"benefits|features|details|"
+        r"am i|is it|will it|"
+        r"recommend|suggest|"
+        r"best (?:for|option|plan|policy|)"
+        r")\b"
+    )
+    # Only count generic patterns if they contain at least one insurance-adjacent word
+    _INSURANCE_ADJACENT = re.compile(
+        r"\b(cover|protect|risk|plan|option|policy|benefit|pay|cost|fee|charge|"
+        r"amount|document|upload|file|paper|letter|receipt)"
+        r"\b"
+    )
+    if _GENERIC_INSURANCE_PATTERNS.search(q) and _INSURANCE_ADJACENT.search(q):
+        return True
+
+    # Default: when in doubt, assume it IS insurance-related (better to let the
+    # retrieval similarity decide than to falsely mark as off-topic).
+    return True
+
+
 from langchain_core.documents import Document
 from rag import RAGPipeline
 from router import get_insurance_llm
@@ -49,7 +218,25 @@ class MultiSourceRAG:
                 seen[h] = chunk
         return list(seen.values())
 
-    async def ask(self, question: str, history: str = "", document_filter: Optional[List[str]] = None) -> Tuple[str, List[str]]:
+    async def ask(self, question: str, history: str = "", document_filter: Optional[List[str]] = None) -> Tuple[str, List[str], bool, bool]:
+        """
+        Returns (answer, sources, needs_human, is_off_topic).
+        needs_human is True when no relevant context was found — meaning the
+        model has no grounding and is answering from general knowledge or not
+        at all.  The caller should flag the query for human follow-up.
+        is_off_topic is True when the question is clearly not insurance-related
+        (e.g. history, geography, tech comparisons) — the caller should return
+        a friendly refusal instead of a human handoff.
+        """
+        # ── Short follow-up reformulation ──────────────────────────────────────
+        # Very short messages ("yes", "ok", "what about that") have no standalone
+        # semantic content, so raw retrieval returns near-zero similarity and
+        # incorrectly triggers human handoff.  If history exists, reformulate the
+        # retrieval query by merging with the last assistant turn.
+        is_short = _is_short_followup(question)
+        has_history = bool(history.strip())
+        retrieval_query = _reformulate_with_history(question, history) if (is_short and has_history) else question
+
         # Build filter
         filter_meta = None
         if document_filter:
@@ -59,16 +246,16 @@ class MultiSourceRAG:
 
         doc_chunks = await asyncio.to_thread(
             self.doc_pipeline._vector_store.search,
-            question, top_k=6, use_hybrid=True, use_reranker=True,
+            retrieval_query, top_k=6, use_hybrid=True, use_reranker=True,
             filter_metadata=filter_meta
         )
 
         if not document_filter:
             video_chunks = await asyncio.to_thread(
-                self.video_store.search, question, top_k=4, use_hybrid=True, use_reranker=True
+                self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=True
             )
             webpage_chunks = await asyncio.to_thread(
-                self.webpage_store.search, question, top_k=4, use_hybrid=True, use_reranker=True
+                self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=True
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
@@ -76,6 +263,27 @@ class MultiSourceRAG:
 
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
         all_chunks = all_chunks[:8]
+
+        # --- Determine whether retrieved content is relevant enough to ground the answer ---
+        # If the top chunk has similarity <= 0.05, the retrieval essentially found nothing
+        # relevant.  Flag needs_human so the caller can trigger a human handoff.
+        # 
+        # Short follow-ups with available history bypass raw-similarity detection:
+        # the reformulated query should retrieve meaningful context, and even if
+        # scores are low the conversation history provides enough grounding.
+        top_similarity = all_chunks[0].metadata.get("similarity", 0) if all_chunks else 0
+        needs_human = (top_similarity <= 0.05)
+        if is_short and has_history:
+            needs_human = False
+
+        # ── Off-topic detection ────────────────────────────────────────────────
+        # If retrieval found nothing relevant AND the question is clearly not
+        # about insurance, mark it as off-topic so the caller can give a friendly
+        # refusal instead of triggering a human handoff.
+        is_off_topic = False
+        if needs_human and not _is_insurance_related(question):
+            is_off_topic = True
+            needs_human = False
 
         # Build context
         context_parts, sources = [], []
@@ -110,7 +318,7 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0)
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
-            return _strip_model_preamble(answer), list(dict.fromkeys(sources))
+            return _strip_model_preamble(answer), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
         if not full_context.strip():
             # No documents at all — use general knowledge
@@ -122,7 +330,7 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0.3)
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
-            return _strip_model_preamble(answer), []
+            return _strip_model_preamble(answer), [], True, False
 
         # ── Prompt selection ──────────────────────────────────────────────────
         # STRICT grounding only when the user is asking about a specific uploaded
@@ -139,7 +347,7 @@ class MultiSourceRAG:
 
         response = await asyncio.to_thread(llm.invoke, prompt)
         answer = response.content if hasattr(response, "content") else str(response)
-        return _strip_model_preamble(answer), list(dict.fromkeys(sources))
+        return _strip_model_preamble(answer), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
     # Management methods (keep as before)
     def video_exists(self, url: str) -> bool:

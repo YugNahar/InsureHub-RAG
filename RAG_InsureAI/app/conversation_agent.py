@@ -83,6 +83,9 @@ FOLLOW_UP_QUESTIONS = {
 }
 
 class ConversationAgent:
+    # Keep at most this many user/assistant turn pairs in session history
+    _MAX_HISTORY_TURNS = 5
+
     def __init__(self, vector_store, multi_rag):
         self.vector_store = vector_store
         self.multi_rag = multi_rag
@@ -94,13 +97,36 @@ class ConversationAgent:
     def _classify_intent(self, question: str) -> str:
         """
         Returns:
+            "SMALL_TALK"  – plain greetings, thanks, casual chat with no real request
             "DISCOVERY"   – user wants to explore/buy a specific category
             "CATEGORY"    – user directly names a category (e.g., "Home insurance")
             "GENERAL"     – user asks for all insurance options
             "INFORMATIONAL" – user asks a specific question
         """
         q = question.lower().strip()
-        
+
+        # ── SMALL_TALK: pure greetings / thanks / casual chat (no embedded question or request) ──
+        _PURE_GREETINGS = {
+            "hi", "hello", "hey", "hi there", "hello there", "hey there",
+            "thanks", "thank you", "thanks a lot", "thank you so much", "ty",
+            "good morning", "good afternoon", "good evening",
+            "how are you", "how are you doing", "how's it going", "howdy",
+            "bye", "goodbye", "see you", "see you later", "take care",
+            "what's up", "sup", "nice", "great", "ok", "okay",
+        }
+        stripped = q.strip().strip("!.,? ").strip()
+        # Check if the message is exactly a small-talk phrase (no extra content)
+        if stripped in _PURE_GREETINGS:
+            return "SMALL_TALK"
+        # Also match if the message has only small-talk words separated by punctuation/whitespace
+        # (e.g. "hi!" , "hello!!" , "good morning!" , "hey there" , "thank you!")
+        words = re.findall(r"[a-zA-Z'!.,?]+", stripped)
+        if words:
+            combined = " ".join(w.strip("!.,? ").lower() for w in words if w.strip("!.,? ")).strip()
+            if combined and combined in _PURE_GREETINGS:
+                return "SMALL_TALK"
+        # ── END SMALL_TALK ──
+
         # GENERAL intent – wants to see all options
         general_phrases = [
             "what insurance", "what options", "all insurance", "list insurance",
@@ -187,6 +213,31 @@ class ConversationAgent:
         return [opt for opt in cat["options"]]
 
     # -------------------------------------------------------------------------
+    # CONVERSATION HISTORY HELPERS
+    # -------------------------------------------------------------------------
+    def _build_history_string(self, session_id: str) -> str:
+        """Build a formatted history string from stored session messages."""
+        session = self.sessions.get(session_id, {})
+        messages = session.get("messages", [])
+        # Take only the last N turns
+        recent = messages[-self._MAX_HISTORY_TURNS * 2:]
+        parts = []
+        for role, content in recent:
+            label = "User" if role == "user" else "Assistant"
+            parts.append(f"{label}: {content}")
+        return "\n".join(parts)
+
+    def _append_turn(self, session_id: str, user_msg: str, assistant_msg: str) -> None:
+        """Append a user/assistant turn to session history, capped at MAX_HISTORY_TURNS."""
+        session = self.sessions.setdefault(session_id, {})
+        messages = session.setdefault("messages", [])
+        messages.append(("user", user_msg))
+        messages.append(("assistant", assistant_msg))
+        # Keep only the most recent N turns
+        if len(messages) > self._MAX_HISTORY_TURNS * 2:
+            session["messages"] = messages[-(self._MAX_HISTORY_TURNS * 2):]
+
+    # -------------------------------------------------------------------------
     # DOCUMENT NAME EXTRACTION (for informational queries)
     # -------------------------------------------------------------------------
     # Common insurance/travel words that appear in document names but are too
@@ -236,7 +287,7 @@ class ConversationAgent:
         self, session_id: str, user_message: str, history: str
     ) -> Tuple[dict, bool]:
         session = self.sessions.get(session_id, {"stage": STATE_DISCOVERY, "selected_category": None})
-        stage = session["stage"]
+        stage = session.get("stage", STATE_DISCOVERY)
         selected_cat = session.get("selected_category")
 
         # ----- REFINEMENT STAGE (user selecting a sub‑option) -----
@@ -247,7 +298,7 @@ class ConversationAgent:
                     matched = opt
                     break
             if matched:
-                answer = await self._answer_for_policy_type(selected_cat, matched["label"], session.get("original_question", ""))
+                answer = await self._answer_for_policy_type(session_id, selected_cat, matched["label"], session.get("original_question", ""), history)
                 self.sessions[session_id] = {"stage": STATE_DISCOVERY, "selected_category": None}
                 return {
                     "message": answer,
@@ -284,10 +335,65 @@ class ConversationAgent:
         intent = self._classify_intent(user_message)
         logger.info(f"Intent: {intent} | Message: {user_message}")
 
+        # ----- SMALL TALK: warm, hardcoded reply — no RAG, no LLM call -----
+        if intent == "SMALL_TALK":
+                    small_talk_msg = "Hi there! 👋 I'm InsureAI, your insurance assistant. How can I help you today? Feel free to ask me about any insurance policy, coverage details, or let me help you find the right plan."
+                    return {
+                        "message": small_talk_msg,
+                        "options": [],
+                        "multi_select": False,
+                        "next_question": "",
+                        "intent": "small_talk",
+                        "stage": "details"
+                    }, True
+
         # ----- CASE C: INFORMATIONAL INTENT -----
         if intent == "INFORMATIONAL":
             doc_names = self._extract_document_names(user_message)
-            answer, _ = await self.multi_rag.ask(user_message, history, document_filter=doc_names if doc_names else None)
+            session_history = self._build_history_string(session_id)
+            answer, _, needs_human, is_off_topic = await self.multi_rag.ask(
+                user_message, session_history,
+                document_filter=doc_names if doc_names else None
+            )
+
+            if is_off_topic:
+                off_topic_msg = (
+                    "Ha, that's a bit outside my lane! 😄 I'm best with insurance "
+                    "questions — policies, coverage, claims, premiums. Anything "
+                    "insurance-related I can help you with?"
+                )
+                self._append_turn(session_id, user_message, off_topic_msg)
+                return {
+                    "message": off_topic_msg,
+                    "options": [],
+                    "multi_select": False,
+                    "next_question": "",
+                    "intent": "informational",
+                    "stage": "details",
+                }, True
+
+            if needs_human:
+                logger.warning(
+                    "HANDOFF_TRIGGERED | session=%s | question=%s | intent=informational | "
+                    "top_similarity <= 0.05 — no relevant context found",
+                    session_id, user_message,
+                )
+                handoff_msg = (
+                    "I'm not sure I can help with that one. Let me connect you "
+                    "with one of our team members who can assist you further."
+                )
+                self._append_turn(session_id, user_message, handoff_msg)
+                return {
+                    "message": handoff_msg,
+                    "options": [],
+                    "multi_select": False,
+                    "next_question": "",
+                    "intent": "informational",
+                    "stage": "details",
+                    "needs_human": True,
+                }, True
+
+            self._append_turn(session_id, user_message, answer)
             return {
                 "message": answer,
                 "options": [],
@@ -296,7 +402,6 @@ class ConversationAgent:
                 "intent": "informational",
                 "stage": "details"
             }, True
-
         # ----- CASE B: GENERAL INTENT (show all categories) -----
         if intent == "GENERAL":
             options = self._get_all_main_categories()
@@ -354,7 +459,7 @@ class ConversationAgent:
     # -------------------------------------------------------------------------
     # ANSWER FOR SELECTED SUB‑OPTION (using knowledge base)
     # -------------------------------------------------------------------------
-    async def _answer_for_policy_type(self, category_id: str, sub_option_label: str, original_question: str) -> str:
+    async def _answer_for_policy_type(self, session_id: str, category_id: str, sub_option_label: str, original_question: str, history: str = "") -> str:
         # Map sub‑option to policy_type metadata (for filtering)
         type_map = {
             "car": "motor", "bike": "motor", "commercial": "motor",
@@ -379,7 +484,7 @@ class ConversationAgent:
         from router import get_insurance_llm
         context = _build_structured_context(chunks, max_chars=2000)
         prompt = CONVERSATIONAL_RAG_PROMPT.format(
-            history="",
+            history=history,
             context=context,
             question=f"Provide a detailed overview of {sub_option_label} insurance policy, including what it covers, key benefits, exclusions, and conditions."
         )
