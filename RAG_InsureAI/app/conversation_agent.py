@@ -121,12 +121,44 @@ class ConversationAgent:
 
         # ── SMALL_TALK: pure greetings / thanks / casual chat (no embedded question or request) ──
         _PURE_GREETINGS = {
-            "hi", "hello", "hey", "hi there", "hello there", "hey there",
-            "thanks", "thank you", "thanks a lot", "thank you so much", "ty",
-            "good morning", "good afternoon", "good evening",
-            "how are you", "how are you doing", "how's it going", "howdy",
-            "bye", "goodbye", "see you", "see you later", "take care",
-            "what's up", "sup", "nice", "great", "ok", "okay",
+            # Basic greetings
+            "hi", "hello", "hey", "hiya", "heya", "yo", "sup", "howdy",
+            "hi there", "hello there", "hey there", "hiya there",
+            "hi hi", "hello hello", "hey hey",
+            # Time-based greetings
+            "good morning", "good afternoon", "good evening", "good night",
+            "gm", "gn", "good day", "good to see you",
+            # How are you variants
+            "how are you", "how are you doing", "how are you today",
+            "how's it going", "how is it going", "how's everything",
+            "how are things", "how are things going", "how do you do",
+            "how have you been", "how's your day", "how is your day",
+            "how's your day going", "you doing okay", "you good",
+            "all good", "hope you're well", "hope you are well",
+            # Thanks
+            "thanks", "thank you", "thank you so much", "thanks a lot",
+            "thanks so much", "many thanks", "thanks a ton", "ty",
+            "thx", "thnx", "thnks", "cheers", "much appreciated",
+            "appreciate it", "appreciate that", "thanks for that",
+            "thank you very much", "thank u", "thanks mate",
+            # Farewells
+            "bye", "goodbye", "good bye", "bye bye", "later", "see ya",
+            "see you", "see you later", "see you soon", "take care",
+            "have a good day", "have a great day", "have a nice day",
+            "have a good one", "catch you later", "talk later",
+            "talk soon", "cya", "ttyl", "peace", "adios", "hasta la vista",
+            # Acknowledgements
+            "ok", "okay", "ok thanks", "okay thanks", "alright", "cool",
+            "got it", "sounds good", "perfect", "great", "nice", "noted",
+            "understood", "makes sense", "sure", "yep", "yup", "yeah",
+            "no problem", "no worries", "sure thing", "of course",
+            # Greetings with name
+            "hi insureai", "hello insureai", "hey insureai", "hi layla",
+            "hello layla", "hey layla",
+            # Restart / other
+            "start", "start over", "restart", "reset", "menu", "help",
+            "hi again", "hello again", "hey again", "back again",
+            "i'm back", "im back",
         }
         stripped = q.strip().strip("!.,? ").strip()
         # Check if the message is exactly a small-talk phrase (no extra content)
@@ -367,15 +399,49 @@ class ConversationAgent:
 
         # ----- SMALL TALK: warm, hardcoded reply — no RAG, no LLM call -----
         if intent == "SMALL_TALK":
-                    small_talk_msg = "Hi there! 👋 I'm Layla, your insurance advisor from Nexsys IT Consulting. How can I help you today?"
-                    return {
-                        "message": small_talk_msg,
-                        "options": [],
-                        "multi_select": False,
-                        "next_question": "",
-                        "intent": "small_talk",
-                        "stage": "details"
-                    }, True
+            import random
+            _q = user_message.lower().strip().strip("!.,? ")
+            if any(w in _q for w in ["bye", "goodbye", "see you", "later", "cya", "take care", "adios", "ttyl", "peace"]):
+                small_talk_msg = random.choice([
+                    "Take care! Feel free to come back anytime you have insurance questions. 😊",
+                    "Bye! Whenever you need help with anything insurance-related, I'm right here.",
+                    "See you! Don't hesitate to reach out if anything comes up.",
+                ])
+            elif any(w in _q for w in ["thank", "thanks", "ty", "thx", "cheers", "appreciate"]):
+                small_talk_msg = random.choice([
+                    "Happy to help! Let me know if there's anything else you want to know. 😊",
+                    "Anytime! That's what I'm here for. Any other questions?",
+                    "Glad I could help! Feel free to ask anything else.",
+                ])
+            elif any(w in _q for w in ["morning", "afternoon", "evening", "night", "gm", "gn"]):
+                small_talk_msg = random.choice([
+                    "Good to see you! How can I help you with insurance today?",
+                    "Hey! Hope your day's going well. Got any insurance questions I can help with?",
+                    "Hi! Great to chat. What can I help you with today?",
+                ])
+            elif any(w in _q for w in ["how are you", "how's it", "how are things", "you doing", "you good", "how do you do"]):
+                small_talk_msg = random.choice([
+                    "Doing great, thanks for asking! Ready to help you with any insurance questions. 😊",
+                    "All good here! What can I help you with today?",
+                    "I'm good! What insurance question can I sort out for you?",
+                ])
+            elif any(w in _q for w in ["start", "restart", "reset", "menu", "help", "back"]):
+                small_talk_msg = "Sure! I can help you with insurance policies, coverage details, claims, and more. What would you like to know?"
+            else:
+                small_talk_msg = random.choice([
+                    "Hey! 👋 I'm Layla, your insurance advisor from Nexsys IT Consulting. What can I help you with today?",
+                    "Hi there! I'm Layla from Nexsys IT Consulting. Got an insurance question? I'm all ears. 😊",
+                    "Hello! What insurance question can I help you with today?",
+                    "Hey! Good to see you. What's on your mind?",
+                ])
+            return {
+                "message": small_talk_msg,
+                "options": [],
+                "multi_select": False,
+                "next_question": "",
+                "intent": "small_talk",
+                "stage": "details"
+            }, True
 
         # ----- CASE C: INFORMATIONAL INTENT -----
         if intent == "INFORMATIONAL":

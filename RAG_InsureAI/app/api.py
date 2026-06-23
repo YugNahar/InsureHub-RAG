@@ -1017,6 +1017,65 @@ async def ask_url(req: AskURLRequest):
 
 
 # ── Streaming ask endpoint (documents only, unchanged) ────────────────────────
+_STREAM_GREETINGS = {
+    "hi", "hello", "hey", "hiya", "heya", "yo", "sup", "howdy",
+    "hi there", "hello there", "hey there", "hiya there",
+    "good morning", "good afternoon", "good evening", "good night",
+    "gm", "gn", "good day",
+    "how are you", "how are you doing", "how are you today",
+    "how's it going", "how is it going", "how's everything",
+    "how are things", "how do you do", "how have you been",
+    "how's your day", "you doing okay", "you good", "all good",
+    "thanks", "thank you", "thank you so much", "thanks a lot",
+    "thanks so much", "many thanks", "ty", "thx", "thnx", "cheers",
+    "much appreciated", "appreciate it", "thank u", "thanks mate",
+    "bye", "goodbye", "good bye", "bye bye", "later", "see ya",
+    "see you", "see you later", "take care", "cya", "ttyl",
+    "have a good day", "have a great day", "have a nice day",
+    "ok", "okay", "alright", "cool", "great", "nice", "noted",
+    "got it", "sounds good", "perfect", "sure", "yep", "yup", "yeah",
+    "start", "restart", "reset", "menu", "back", "hi again", "hello again",
+}
+
+def _greeting_reply(question: str) -> str | None:
+    import random
+    q = question.lower().strip().strip("!.,? ")
+    words = q.split()
+    # strip punctuation from words for matching
+    clean = " ".join(w.strip("!.,?") for w in words)
+    if clean not in _STREAM_GREETINGS and q not in _STREAM_GREETINGS:
+        return None
+    if any(w in q for w in ["bye", "goodbye", "see you", "later", "cya", "take care"]):
+        return random.choice([
+            "Take care! Come back anytime you have an insurance question. 😊",
+            "Bye! I'm here whenever you need help with anything insurance-related.",
+        ])
+    if any(w in q for w in ["thank", "thanks", "ty", "thx", "cheers", "appreciate"]):
+        return random.choice([
+            "Happy to help! Anything else you want to know? 😊",
+            "Anytime! That's what I'm here for. Any other questions?",
+            "Glad I could help! Ask away if you need anything else.",
+        ])
+    if any(w in q for w in ["morning", "afternoon", "evening", "night", "gm", "gn"]):
+        return random.choice([
+            "Hey, good to see you! Got any insurance questions I can help with?",
+            "Hi! Hope your day's going well. What can I help you with today?",
+        ])
+    if any(w in q for w in ["how are", "how's it", "you doing", "you good", "how do you"]):
+        return random.choice([
+            "Doing great, thanks for asking! What insurance question can I help you with? 😊",
+            "All good here! What can I help you with today?",
+        ])
+    if any(w in q for w in ["start", "restart", "reset", "menu", "back"]):
+        return "Sure! Ask me anything about insurance — policies, coverage, claims, I've got you. 😊"
+    return random.choice([
+        "Hey! 👋 What insurance question can I help you with today?",
+        "Hi there! Got an insurance question? I'm all ears. 😊",
+        "Hello! What can I help you with today?",
+        "Hey! Good to see you. What's on your mind?",
+    ])
+
+
 @app.post("/ask-stream")
 async def ask_stream(req: AskRequest):
     """True token-streaming endpoint — yields LLM tokens as SSE text/plain.
@@ -1026,6 +1085,23 @@ async def ask_stream(req: AskRequest):
     """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    # Fast-path: greetings bypass the LLM entirely — instant reply
+    greeting_reply = _greeting_reply(req.question)
+    if greeting_reply:
+        import json as _json
+        async def _greeting_gen():
+            yield greeting_reply
+            yield "\n\n" + _json.dumps({"sources": [], "done": True})
+        return StreamingResponse(
+            _greeting_gen(),
+            media_type="text/plain",
+            headers={
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache, no-transform",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def generate():
         from multi_source_rag import _strip_markdown
