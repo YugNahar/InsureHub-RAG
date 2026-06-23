@@ -352,9 +352,8 @@ class ConversationAgent:
         # ----- KNOWLEDGE_BASE: user asking about capabilities / what I know / how I work -----
         if intent == "KNOWLEDGE_BASE":
             kb_msg = (
-                "I am an insurance AI assistant and can help with insurance policies, claims, "
-                "coverage details, underwriting requirements, exclusions, benefits, disclosures, "
-                "and related insurance topics using the information available in my knowledge base."
+                "I'm loaded up with insurance knowledge across health, life, motor, travel, home "
+                "and more! What would you like to explore?"
             )
             self._append_turn(session_id, user_message, kb_msg)
             return {
@@ -368,7 +367,7 @@ class ConversationAgent:
 
         # ----- SMALL TALK: warm, hardcoded reply — no RAG, no LLM call -----
         if intent == "SMALL_TALK":
-                    small_talk_msg = "Hi there! 👋 I'm InsureAI, your insurance assistant. How can I help you today? Feel free to ask me about any insurance policy, coverage details, or let me help you find the right plan."
+                    small_talk_msg = "Hi there! 👋 I'm Layla, your insurance advisor from Nexsys IT Consulting. How can I help you today?"
                     return {
                         "message": small_talk_msg,
                         "options": [],
