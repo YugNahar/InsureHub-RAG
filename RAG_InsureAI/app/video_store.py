@@ -57,9 +57,8 @@ class VideoVectorStore:
         results = []
         seen = set()
         try:
-            raw = self._store._collection.get(include=["metadatas"])
             url_to_title: Dict[str, str] = {}
-            for meta in raw.get("metadatas", []):
+            for meta in self._store._metadatas.values():
                 u = meta.get("source_url", "")
                 if u and u not in url_to_title:
                     url_to_title[u] = meta.get("video_title") or meta.get("title") or u

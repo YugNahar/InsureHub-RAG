@@ -553,7 +553,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
         if not docs or not any(d.page_content.strip() for d in docs):
             raise HTTPException(status_code=400, detail="Could not extract transcript from this video.")
         transcript_text = " ".join(d.page_content for d in docs if d.page_content.strip())
-        title = docs[0].metadata.get("title", url)
+        title = docs[0].metadata.get("video_title") or docs[0].metadata.get("title") or url
 
         # Classify insurer / policy_type so filters work on video chunks
         llm = None
