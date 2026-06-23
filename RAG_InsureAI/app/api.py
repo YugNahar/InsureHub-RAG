@@ -702,7 +702,23 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
 @app.get("/videos")
 async def list_videos():
     multi = _get_multi_rag()
-    return {"videos": multi.list_videos()}
+    # Videos uploaded via /upload-video (stored in video_store)
+    urls = list(multi.list_videos())
+    # Also surface YouTube transcripts stored as docs (uploaded via file upload)
+    pipeline = _get_pipeline()
+    try:
+        all_filenames = pipeline.vector_store.list_values("filename")
+        for fn in all_filenames:
+            if fn.startswith("youtube_"):
+                # filename: youtube_<VIDEO_ID>_<Title>.txt — extract video ID
+                parts = fn[len("youtube_"):].split("_", 1)
+                video_id = parts[0]
+                yt_url = f"https://www.youtube.com/watch?v={video_id}"
+                if yt_url not in urls:
+                    urls.append(yt_url)
+    except Exception:
+        pass
+    return {"videos": urls}
 
 
 # ── Delete video ─────────────────────────────────────────────────────────────
@@ -1156,7 +1172,12 @@ async def list_docs():
                 counts[fn] = counts.get(fn, 0) + 1
     except Exception:
         pass
-    documents = [f"{s} ({counts.get(s, 0)} chunks)" for s in filenames]
+    # Exclude YouTube transcripts — they belong in the /videos section
+    documents = [
+        f"{s} ({counts.get(s, 0)} chunks)"
+        for s in filenames
+        if not s.startswith("youtube_")
+    ]
     return {"documents": documents}
 
 
