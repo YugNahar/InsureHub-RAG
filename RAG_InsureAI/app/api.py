@@ -571,7 +571,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
         )
 
         chunks = _chunk_transcript(transcript_text, url, title, doc_meta=doc_meta)
-        multi.add_video_chunks(url, chunks)
+        multi.add_video_chunks(url, chunks, title=title)
         return {
             "status":  "success",
             "url":     url,
@@ -705,27 +705,17 @@ async def list_videos():
     results = []
     seen_urls = set()
 
-    # Videos uploaded via /upload-video (stored in video_store with metadata)
-    try:
-        all_meta = multi.video_store.collection.get(include=["metadatas"])
-        for meta in all_meta["metadatas"]:
-            url = meta.get("source") or meta.get("url")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                results.append({"url": url, "title": meta.get("title", url)})
-    except Exception:
-        for url in multi.list_videos():
-            if url not in seen_urls:
-                seen_urls.add(url)
-                results.append({"url": url, "title": url})
+    # Videos uploaded via /upload-video — titles stored in video_store metadata
+    for item in multi.video_store.list_videos_with_titles():
+        if item["url"] not in seen_urls:
+            seen_urls.add(item["url"])
+            results.append(item)
 
     # Also surface YouTube transcripts stored as docs (uploaded via file upload)
     pipeline = _get_pipeline()
     try:
-        all_filenames = pipeline.vector_store.list_values("filename")
-        for fn in all_filenames:
+        for fn in pipeline.vector_store.list_values("filename"):
             if fn.startswith("youtube_"):
-                # filename: youtube_<VIDEO_ID>_<Title>.txt
                 rest = fn[len("youtube_"):]
                 parts = rest.split("_", 1)
                 video_id = parts[0]

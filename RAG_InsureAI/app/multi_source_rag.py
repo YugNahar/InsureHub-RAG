@@ -690,8 +690,8 @@ class MultiSourceRAG:
     # Management methods (keep as before)
     def video_exists(self, url: str) -> bool:
         return self.video_store.url_exists(url)
-    def add_video_chunks(self, url: str, chunks: List[Document]):
-        self.video_store.add_video_chunks(url, chunks)
+    def add_video_chunks(self, url: str, chunks: List[Document], title: str = ""):
+        self.video_store.add_video_chunks(url, chunks, title=title)
     def delete_video(self, url: str):
         self.video_store.delete_by_url(url)
     def list_videos(self) -> List[str]:

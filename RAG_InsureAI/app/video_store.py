@@ -24,13 +24,18 @@ class VideoVectorStore:
             persist_subdir="videos",
         )
 
-    def add_video_chunks(self, url: str, chunks: List[Document]) -> List[str]:
+    def add_video_chunks(self, url: str, chunks: List[Document], title: str = "") -> List[str]:
         if not chunks:
             return []
         self.delete_by_url(url)
         for chunk in chunks:
             chunk.metadata["source_url"] = url
             chunk.metadata["source_type"] = "video"
+            # Ensure title is always stored so list_videos_with_titles() can retrieve it
+            if title:
+                chunk.metadata["video_title"] = title
+            elif "title" in chunk.metadata and not chunk.metadata.get("video_title"):
+                chunk.metadata["video_title"] = chunk.metadata["title"]
         return self._store.add_documents(chunks)
 
     def delete_by_url(self, url: str):
@@ -42,6 +47,32 @@ class VideoVectorStore:
 
     def list_urls(self) -> List[str]:
         return self._store.list_values("source_url")
+
+    def list_videos_with_titles(self) -> List[Dict[str, str]]:
+        """Return [{url, title}] for every stored video."""
+        urls = self._store.list_values("source_url")
+        if not urls:
+            return []
+        # Get title for each URL from the first matching chunk's metadata
+        results = []
+        seen = set()
+        try:
+            raw = self._store._collection.get(include=["metadatas"])
+            url_to_title: Dict[str, str] = {}
+            for meta in raw.get("metadatas", []):
+                u = meta.get("source_url", "")
+                if u and u not in url_to_title:
+                    url_to_title[u] = meta.get("video_title") or meta.get("title") or u
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    results.append({"url": u, "title": url_to_title.get(u, u)})
+        except Exception:
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    results.append({"url": u, "title": u})
+        return results
 
     def search(
         self,

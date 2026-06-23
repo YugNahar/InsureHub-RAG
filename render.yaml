@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: insurehub-api
+    runtime: docker
+    dockerfilePath: ./RAG_InsureAI/Dockerfile
+    dockerContext: ./RAG_InsureAI
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: EMBED_MODEL
+        value: BAAI/bge-base-en-v1.5
+      - key: VLLM_HOST
+        value: http://123.253.124.14:7000
+      - key: VLLM_MODEL
+        value: Qwen/Qwen2.5-7B-Instruct-AWQ
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        value: insurehub2026
+      - key: AUTH_SECRET_KEY
+        value: insurehub-rag-secret-2026
+      - key: AUTH_TOKEN_EXPIRE_MINUTES
+        value: "43200"
+    disk:
+      name: insurehub-data
+      mountPath: /root/.insurehub
+      sizeGB: 1
