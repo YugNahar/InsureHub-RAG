@@ -105,6 +105,20 @@ class ConversationAgent:
         """
         q = question.lower().strip()
 
+        # ── KNOWLEDGE_BASE / CAPABILITY: user asking about what the assistant knows or has access to ──
+        knowledge_base_phrases = [
+            "what do you know", "what all have you ingested", "what have you ingested",
+            "what documents", "what is in your knowledge base", "what is your knowledge base",
+            "what information", "what data", "what can you do",
+            "how do you work", "how do you know", "how does this work",
+            "tell me about yourself", "what are you", "what are your capabilities",
+            "what sources", "what policies", "what insurance",
+            "knowledge base", "what have you been trained on", "what are you trained on",
+            "what files", "what can you help with", "what can i ask",
+        ]
+        if any(phrase in q for phrase in knowledge_base_phrases):
+            return "KNOWLEDGE_BASE"
+
         # ── SMALL_TALK: pure greetings / thanks / casual chat (no embedded question or request) ──
         _PURE_GREETINGS = {
             "hi", "hello", "hey", "hi there", "hello there", "hey there",
@@ -334,6 +348,23 @@ class ConversationAgent:
         # ----- INTENT CLASSIFICATION -----
         intent = self._classify_intent(user_message)
         logger.info(f"Intent: {intent} | Message: {user_message}")
+
+        # ----- KNOWLEDGE_BASE: user asking about capabilities / what I know / how I work -----
+        if intent == "KNOWLEDGE_BASE":
+            kb_msg = (
+                "I am an insurance AI assistant and can help with insurance policies, claims, "
+                "coverage details, underwriting requirements, exclusions, benefits, disclosures, "
+                "and related insurance topics using the information available in my knowledge base."
+            )
+            self._append_turn(session_id, user_message, kb_msg)
+            return {
+                "message": kb_msg,
+                "options": [],
+                "multi_select": False,
+                "next_question": "",
+                "intent": "knowledge_base",
+                "stage": "details",
+            }, True
 
         # ----- SMALL TALK: warm, hardcoded reply — no RAG, no LLM call -----
         if intent == "SMALL_TALK":
