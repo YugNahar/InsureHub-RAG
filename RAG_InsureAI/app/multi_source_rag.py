@@ -45,6 +45,33 @@ def _context_covers_query(query: str, docs: list) -> bool:
     return False
 
 
+def _strip_markdown(text: str) -> str:
+    """Convert markdown-formatted LLM output to plain conversational prose.
+
+    The chat prompt forbids bullet points and bold, but the model sometimes
+    ignores that — especially when the retrieved context itself contains
+    formatted content. This cleanup runs on every token so the user never
+    sees raw markdown.
+    """
+    import re
+    # Remove bold/italic markers
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
+    # Remove ATX headers (## Heading → Heading)
+    text = re.sub(r'^#{1,4}\s+', '', text, flags=re.MULTILINE)
+    # Convert bullet list items to flowing prose: "- item" or "* item" → "item, "
+    # First item on a new line: replace "\n- " with ", "
+    text = re.sub(r'\n\s*[-*]\s+', ' ', text)
+    # Numbered list items: "\n1. " → " "
+    text = re.sub(r'\n\s*\d+\.\s+', ' ', text)
+    # Inline code backticks
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Collapse 3+ newlines → 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Strip leftover leading/trailing whitespace per line
+    lines = [l.rstrip() for l in text.split('\n')]
+    return '\n'.join(lines)
+
+
 def _strip_model_preamble(text: str) -> str:
     """Remove auto-generated meta-commentary lines the LLM prepends to answers."""
     # Use simple string replace to strip robot emoji — avoids regex encoding issues
@@ -426,7 +453,7 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0)
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
-            return _strip_model_preamble(answer), list(dict.fromkeys(sources)), needs_human, is_off_topic
+            return _strip_markdown(_strip_model_preamble(answer)), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
         if not full_context.strip():
             # No documents at all — use general knowledge
@@ -438,7 +465,7 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0.3)
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
-            return _strip_model_preamble(answer), [], True, False
+            return _strip_markdown(_strip_model_preamble(answer)), [], True, False
 
         # ── Prompt selection ──────────────────────────────────────────────────
         # STRICT grounding only when the user is asking about a specific uploaded
@@ -470,7 +497,7 @@ class MultiSourceRAG:
 
         response = await asyncio.to_thread(llm.invoke, prompt)
         answer = response.content if hasattr(response, "content") else str(response)
-        return _strip_model_preamble(answer), list(dict.fromkeys(sources)), needs_human, is_off_topic
+        return _strip_markdown(_strip_model_preamble(answer)), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
     async def ask_stream(
         self,

@@ -1028,11 +1028,27 @@ async def ask_stream(req: AskRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     async def generate():
+        from multi_source_rag import _strip_markdown
         multi = _get_multi_rag()
         try:
+            buf = ""
             async for token in multi.ask_stream(req.question, document_filter=None):
-                yield token
-                await asyncio.sleep(0)  # yield to event loop so uvicorn flushes each chunk
+                if token.startswith('\n\n{'):
+                    # Final sources JSON — flush any remaining buffer then send it
+                    if buf:
+                        yield _strip_markdown(buf)
+                        await asyncio.sleep(0)
+                    yield token
+                    return
+                buf += token
+                # Flush whenever we have a complete word boundary (space or newline)
+                # so the user sees words appear live, not character by character
+                if ' ' in buf or '\n' in buf:
+                    yield _strip_markdown(buf)
+                    buf = ""
+                    await asyncio.sleep(0)
+            if buf:
+                yield _strip_markdown(buf)
         except asyncio.TimeoutError:
             yield "\n\nError: The AI model server is taking too long. Please try again."
         except Exception as exc:
