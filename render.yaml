@@ -2,7 +2,6 @@ services:
   - type: web
     name: insurehub-api
     runtime: docker
-    dockerfilePath: ./RAG_InsureAI/Dockerfile
     dockerContext: ./RAG_InsureAI
     plan: free
     healthCheckPath: /health
