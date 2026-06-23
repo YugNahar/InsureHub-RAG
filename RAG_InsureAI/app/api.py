@@ -702,23 +702,42 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
 @app.get("/videos")
 async def list_videos():
     multi = _get_multi_rag()
-    # Videos uploaded via /upload-video (stored in video_store)
-    urls = list(multi.list_videos())
+    results = []
+    seen_urls = set()
+
+    # Videos uploaded via /upload-video (stored in video_store with metadata)
+    try:
+        all_meta = multi.video_store.collection.get(include=["metadatas"])
+        for meta in all_meta["metadatas"]:
+            url = meta.get("source") or meta.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                results.append({"url": url, "title": meta.get("title", url)})
+    except Exception:
+        for url in multi.list_videos():
+            if url not in seen_urls:
+                seen_urls.add(url)
+                results.append({"url": url, "title": url})
+
     # Also surface YouTube transcripts stored as docs (uploaded via file upload)
     pipeline = _get_pipeline()
     try:
         all_filenames = pipeline.vector_store.list_values("filename")
         for fn in all_filenames:
             if fn.startswith("youtube_"):
-                # filename: youtube_<VIDEO_ID>_<Title>.txt — extract video ID
-                parts = fn[len("youtube_"):].split("_", 1)
+                # filename: youtube_<VIDEO_ID>_<Title>.txt
+                rest = fn[len("youtube_"):]
+                parts = rest.split("_", 1)
                 video_id = parts[0]
                 yt_url = f"https://www.youtube.com/watch?v={video_id}"
-                if yt_url not in urls:
-                    urls.append(yt_url)
+                if yt_url not in seen_urls:
+                    seen_urls.add(yt_url)
+                    raw_title = parts[1].replace("_", " ").replace(".txt", "").strip() if len(parts) > 1 else yt_url
+                    results.append({"url": yt_url, "title": raw_title})
     except Exception:
         pass
-    return {"videos": urls}
+
+    return {"videos": results}
 
 
 # ── Delete video ─────────────────────────────────────────────────────────────
@@ -1174,7 +1193,7 @@ async def list_docs():
         pass
     # Exclude YouTube transcripts — they belong in the /videos section
     documents = [
-        f"{s} ({counts.get(s, 0)} chunks)"
+        {"filename": s, "chunks": counts.get(s, 0)}
         for s in filenames
         if not s.startswith("youtube_")
     ]
