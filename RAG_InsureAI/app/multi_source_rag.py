@@ -114,16 +114,43 @@ _SHORT_FOLLOWUP_PHRASES = frozenset({
     "can you elaborate", "can you explain",
 })
 
+# Referential/ordinal patterns that indicate a follow-up question even when
+# the message is longer than 4 words (e.g. "explain about the second one more").
+# These carry no standalone retrieval meaning — they refer back to items the
+# assistant just listed — so they must trigger history-based reformulation.
+_REFERENTIAL_PATTERN = re.compile(
+    r"(?:"
+    r"\b(first|second|third|fourth|fifth|last|other)\s+(one|option|type|item)\b|"
+    r"\b(that|this)\s+one\b|"
+    r"\bthe\s+other\s+one\b|"
+    r"\bmore\s+about\s+(it|that|this)\b|"
+    r"\bexplain\s+(more\s+)?(about\s+)?the\s+(first|second|third|fourth|fifth|last|other)\b|"
+    r"\btell\s+me\s+more\s+about\s+the\s+(first|second|third|fourth|fifth|last|other)\b|"
+    r"\belaborate\s+on\s+that\b|"
+    r"\bexplain\s+more\b"
+    r")"
+)
+
 
 def _is_short_followup(question: str) -> bool:
     """Detect if *question* is a short, low-content follow-up message.
 
     Returns ``True`` when the message is under ~4 words and either matches a
     known continuation phrase or is so short it cannot carry standalone
-    retrieval meaning.
+    retrieval meaning.  Also returns ``True`` for longer messages that match
+    referential/ordinal patterns (e.g. "explain about the second one more")
+    because those refer back to items the assistant just listed and have no
+    standalone retrieval value.
     """
     q = question.strip().lower().strip("!.,?;:")
     words = q.split()
+
+    # Referential/ordinal patterns — independent of word count.
+    # These questions refer back to items the assistant just listed and have
+    # no standalone retrieval meaning (e.g. "explain about the second one").
+    if _REFERENTIAL_PATTERN.search(q):
+        return True
+
     if len(words) > 4:
         return False
     # Exact match against known continuation phrases
