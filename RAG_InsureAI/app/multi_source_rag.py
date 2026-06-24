@@ -411,6 +411,13 @@ class MultiSourceRAG:
         if needs_human and not _is_insurance_related(question):
             is_off_topic = True
             needs_human = False
+            # Skip the LLM entirely — return a firm, friendly refusal
+            return (
+                "I'm Layla, your insurance assistant! I can only help with insurance-related questions — things like policy coverage, premiums, claims, and benefits. Is there something about your insurance I can help you with today? 😊",
+                [],
+                False,
+                True,
+            )
         # ── Context compression (only when needed) ────────────────────────────
         # Skip compression entirely when the chunks already fit in the LLM's
         # input window — with 500-char chunks this will usually be the case.
@@ -496,13 +503,14 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0)
         else:
             # Append a fallback hint when retrieved chunks have no discriminating
-            # keyword overlap with the query — the LLM should then use general
-            # knowledge and clearly label it so users know the docs don't cover it.
+            # When the KB doesn't cover this topic, instruct the AI to say so
+            # and hand off to a human — do NOT answer from general knowledge.
             fallback_suffix = (
                 "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
-                "explicit information about this specific topic. Provide a helpful "
-                "general insurance explanation from your training knowledge and clearly "
-                "label it: 'General knowledge (not from your uploaded documents): '"
+                "information about this specific topic. Do NOT answer from your general "
+                "training knowledge. In one friendly sentence tell the user you don't have "
+                "this information in your knowledge base right now and that you'll connect "
+                "them with a human agent who can help."
                 if not ctx_covered else ""
             )
             prompt = CONVERSATIONAL_RAG_PROMPT.format(
@@ -664,9 +672,10 @@ class MultiSourceRAG:
             ctx_covered = _context_covers_query(question, all_chunks)
             fallback_suffix = (
                 "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
-                "explicit information about this specific topic. Provide a helpful "
-                "general insurance explanation from your training knowledge and clearly "
-                "label it: 'General knowledge (not from your uploaded documents): '"
+                "information about this specific topic. Do NOT answer from your general "
+                "training knowledge. In one friendly sentence tell the user you don't have "
+                "this information in your knowledge base right now and that you'll connect "
+                "them with a human agent who can help."
                 if not ctx_covered else ""
             )
             prompt = CONVERSATIONAL_RAG_PROMPT.format(

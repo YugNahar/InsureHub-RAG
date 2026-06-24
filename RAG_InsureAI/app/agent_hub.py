@@ -215,7 +215,10 @@ class AgentHub:
             return True  # popup already sent
 
         free = [a for a in self._agents.values() if a.active_session is None]
+        logger.info("request_handoff: session=%s agents_total=%d free=%d",
+                    session_id, len(self._agents), len(free))
         if not free:
+            logger.warning("request_handoff: no free agents — falling back to email")
             return False  # caller sends email
 
         session.status = "waiting"
@@ -472,6 +475,7 @@ class AgentHub:
     @staticmethod
     def response_needs_human(response: str, sources: list) -> bool:
         if sources:
+            logger.debug("response_needs_human=False (has sources)")
             return False
         phrases = [
             # Explicit can't-answer phrases
@@ -495,7 +499,10 @@ class AgentHub:
             "not available in",
         ]
         lower = response.lower()
-        return any(p in lower for p in phrases)
+        result = any(p in lower for p in phrases)
+        logger.info("response_needs_human=%s | sources=%d | response_snippet=%r",
+                    result, len(sources), response[:120])
+        return result
 
 
 hub = AgentHub()
