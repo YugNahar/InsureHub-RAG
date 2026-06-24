@@ -54,14 +54,25 @@ class VideoVectorStore:
                 chunk.metadata["video_title"] = chunk.metadata["title"]
         return self._store.add_documents(chunks)
 
+    def _resolve_stored_url(self, url: str) -> str | None:
+        """Find the exact stored URL that normalizes to the same value as url.
+
+        Old videos were ingested before normalization existed and still have
+        tracking params (si=, utm_*) in source_url. Comparing normalized input
+        against raw stored values misses them — so normalize both sides.
+        """
+        target = _normalize_video_url(url)
+        for stored in self._store.list_values("source_url"):
+            if _normalize_video_url(stored) == target:
+                return stored
+        return None
+
     def delete_by_url(self, url: str):
-        url = _normalize_video_url(url)
-        self._store.delete_by_field("source_url", url)
+        stored = self._resolve_stored_url(url) or _normalize_video_url(url)
+        self._store.delete_by_field("source_url", stored)
 
     def url_exists(self, url: str) -> bool:
-        url = _normalize_video_url(url)
-        urls = self._store.list_values("source_url")
-        return url in urls
+        return self._resolve_stored_url(url) is not None
 
     def list_urls(self) -> List[str]:
         return self._store.list_values("source_url")
