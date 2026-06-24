@@ -7,11 +7,14 @@ survives backend restarts and agent logouts.
 """
 import asyncio
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Set
+
+logger = logging.getLogger(__name__)
 
 from fastapi import WebSocket
 
