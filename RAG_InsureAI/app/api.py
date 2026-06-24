@@ -387,6 +387,10 @@ async def ws_agent_endpoint(websocket: WebSocket):
                 await _agent_hub.agent_send_message(agent_id, msg.get("session_id", ""), msg.get("content", ""))
             elif t == "release":
                 await _agent_hub.agent_release(agent_id)
+            elif t == "accept_handoff":
+                await _agent_hub.accept_handoff(agent_id, msg.get("session_id", ""))
+            elif t == "decline_handoff":
+                await _agent_hub.decline_handoff(agent_id, msg.get("session_id", ""))
     except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
     except Exception:
@@ -411,11 +415,23 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
             msg = await websocket.receive_json()
             msg_type = msg.get("type", "")
             if msg_type == "request_handoff":
-                assigned = await _agent_hub.request_handoff(session_id)
-                if not assigned:
+                notified = await _agent_hub.request_handoff(session_id)
+                if notified:
                     await websocket.send_json({
                         "type": "waiting",
-                        "message": "Hang tight! Looking for an available agent for you...",
+                        "message": "Hang tight! An agent has been notified and will join shortly...",
+                    })
+                else:
+                    # No agents online — trigger email and tell user
+                    unanswerable = next(
+                        (m.content for m in reversed(session.history) if m.role == "user"), ""
+                    )
+                    asyncio.create_task(
+                        _agent_hub.trigger_offline_escalation(session_id, unanswerable)
+                    )
+                    await websocket.send_json({
+                        "type": "handoff_timeout",
+                        "message": "No agents are available right now. We've emailed our support team — someone will reach out to you soon!",
                     })
             elif msg_type == "message":
                 content = (msg.get("content") or "").strip()
@@ -1303,16 +1319,25 @@ async def ask_stream(req: AskRequest):
                     except Exception:
                         final_data = {"sources": [], "done": True}
                     sources = final_data.get("sources", [])
-                    needs_human = (
-                        _agent_hub.response_needs_human(full_text, sources)
-                        and _agent_hub.online_count() > 0
-                    )
-                    final_data["needs_human"] = needs_human
+                    ai_cant_answer = _agent_hub.response_needs_human(full_text, sources)
+                    agents_online  = _agent_hub.online_count() > 0
+                    needs_human         = ai_cant_answer and agents_online
+                    offline_escalated   = ai_cant_answer and not agents_online
+                    final_data["needs_human"]       = needs_human
+                    final_data["offline_escalated"] = offline_escalated
                     # Log to hub — auto-create session if missing (handles backend restarts)
                     if req.session_id and req.session_id != "default":
                         _agent_hub.get_or_create_session(req.session_id)
-                        asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
-                        asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", full_text))
+                        if offline_escalated:
+                            # Must await so history is fully written before PDF is generated
+                            await _agent_hub.log_message(req.session_id, "user", req.question)
+                            await _agent_hub.log_message(req.session_id, "ai", full_text)
+                            asyncio.create_task(
+                                _agent_hub.trigger_offline_escalation(req.session_id, req.question)
+                            )
+                        else:
+                            asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
+                            asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", full_text))
                     yield "\n\n" + _json.dumps(final_data)
                     return
                 buf += token

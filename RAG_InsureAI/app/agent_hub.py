@@ -52,11 +52,15 @@ class HumanAgent:
     monitoring: Set[str] = field(default_factory=set)
 
 
+_HANDOFF_TIMEOUT = 30  # seconds agents have to accept before email is sent
+
+
 class AgentHub:
 
     def __init__(self):
         self._sessions: Dict[str, ChatSession] = {}
         self._agents: Dict[str, HumanAgent] = {}
+        self._pending_handoffs: Dict[str, asyncio.Task] = {}  # session_id → timeout task
         self._load_sessions()
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -195,19 +199,110 @@ class AgentHub:
     # ── Handoff ───────────────────────────────────────────────────────────────
 
     async def request_handoff(self, session_id: str) -> bool:
-        """Returns True if a free agent was immediately assigned."""
+        """
+        New flow: broadcast a popup to all free agents instead of auto-assigning.
+        Returns True if at least one agent was notified, False if no agents online.
+        If no agents are online the caller is responsible for offline escalation.
+        """
         session = self._sessions.get(session_id)
         if not session:
             return False
         if session.status == "human":
-            return True
+            return True  # already has an agent
+        if session_id in self._pending_handoffs:
+            return True  # popup already sent
+
         free = [a for a in self._agents.values() if a.active_session is None]
         if not free:
-            session.status = "waiting"
-            await self._broadcast_sessions_update()
-            return False
-        await self._assign_agent(session, free[0])
+            return False  # caller sends email
+
+        session.status = "waiting"
+        self._save_sessions()
+
+        # Get the unanswerable query (last user message in history)
+        unanswerable = next(
+            (m.content for m in reversed(session.history) if m.role == "user"), ""
+        )
+        title = session.history[0].content[:60] if session.history else f"Session #{session_id}"
+
+        # Send popup to every free agent
+        popup_msg = {
+            "type": "handoff_request",
+            "session_id": session_id,
+            "title": title,
+            "query": unanswerable,
+            "message_count": len(session.history),
+            "timeout": _HANDOFF_TIMEOUT,
+        }
+        for agent in free:
+            try:
+                await agent.ws.send_json(popup_msg)
+            except Exception:
+                pass
+
+        # Start timeout — if nobody accepts, send email and release
+        task = asyncio.create_task(self._handoff_timeout(session_id, unanswerable))
+        self._pending_handoffs[session_id] = task
+
+        await self._broadcast_sessions_update()
         return True
+
+    async def _handoff_timeout(self, session_id: str, unanswerable_query: str):
+        """Called after _HANDOFF_TIMEOUT seconds if no agent accepted the popup."""
+        await asyncio.sleep(_HANDOFF_TIMEOUT)
+        if session_id not in self._pending_handoffs:
+            return  # already accepted — task was cancelled
+        self._pending_handoffs.pop(session_id, None)
+        session = self._sessions.get(session_id)
+        if session and session.status == "waiting":
+            session.status = "ai"
+            self._save_sessions()
+            # Notify user that no agent took over
+            if session.user_ws:
+                try:
+                    await session.user_ws.send_json({
+                        "type": "handoff_timeout",
+                        "message": "No agent was available right now. We've emailed our support team and someone will reach out to you soon.",
+                    })
+                except Exception:
+                    pass
+        # Send escalation email in a thread so we don't block the event loop
+        import asyncio as _aio
+        history_snapshot = list(session.history) if session else []
+        await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
+        await self._broadcast_sessions_update()
+
+    async def accept_handoff(self, agent_id: str, session_id: str):
+        """Agent accepted the popup — assign and cancel the timeout."""
+        if session_id not in self._pending_handoffs:
+            return  # expired or already accepted
+        task = self._pending_handoffs.pop(session_id)
+        task.cancel()
+
+        session = self._sessions.get(session_id)
+        agent   = self._agents.get(agent_id)
+        if not session or not agent:
+            return
+        await self._assign_agent(session, agent)
+
+        # Tell all other agents the request was fulfilled
+        for a in self._agents.values():
+            if a.agent_id != agent_id:
+                try:
+                    await a.ws.send_json({"type": "handoff_fulfilled", "session_id": session_id})
+                except Exception:
+                    pass
+
+    async def decline_handoff(self, agent_id: str, session_id: str):
+        """Agent dismissed the popup — do nothing (timer still running for others)."""
+        pass
+
+    async def trigger_offline_escalation(self, session_id: str, unanswerable_query: str):
+        """Called directly when NO agents are online at the time the AI can't answer."""
+        import asyncio as _aio
+        session = self._sessions.get(session_id)
+        history_snapshot = list(session.history) if session else []
+        await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
 
     async def _assign_agent(self, session: "ChatSession", agent: "HumanAgent"):
         session.status = "human"
@@ -368,3 +463,13 @@ class AgentHub:
 
 
 hub = AgentHub()
+
+
+def _send_email_sync(session_id: str, history, unanswerable_query: str):
+    """Synchronous wrapper — runs in a thread via asyncio.to_thread."""
+    try:
+        from email_utils import send_escalation_email
+        send_escalation_email(session_id, history, unanswerable_query)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Email send failed for session %s", session_id)

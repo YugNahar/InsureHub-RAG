@@ -292,11 +292,63 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
   background: #7c2d12; color: #fed7aa;
   font-size: 0.78rem; text-align: center; padding: 6px; z-index: 999;
 }
+
+/* ── Handoff popup ── */
+.handoff-overlay {
+  display: none; position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.55); backdrop-filter: blur(2px);
+  align-items: center; justify-content: center;
+}
+.handoff-overlay.visible { display: flex; }
+.handoff-card {
+  background: #1a1f2e; border: 1px solid #374151;
+  border-radius: 16px; padding: 28px 28px 22px; width: 380px;
+  box-shadow: 0 25px 60px rgba(0,0,0,0.6);
+  animation: pop-in 0.2s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes pop-in { from{transform:scale(0.85);opacity:0} to{transform:scale(1);opacity:1} }
+.handoff-bell { font-size: 2.2rem; margin-bottom: 10px; }
+.handoff-title { font-size: 1.05rem; font-weight: 700; color: #e2e8f0; margin-bottom: 4px; }
+.handoff-sub { font-size: 0.75rem; color: #6b7280; margin-bottom: 16px; }
+.handoff-query-label { font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.08em; color: #f59e0b; margin-bottom: 6px; }
+.handoff-query {
+  background: #451a03; border: 1px solid #92400e; border-radius: 8px;
+  padding: 10px 12px; font-size: 0.82rem; color: #fcd34d; line-height: 1.5;
+  font-style: italic; margin-bottom: 18px; max-height: 80px; overflow-y: auto;
+}
+.handoff-timer-bar { background: #374151; border-radius: 4px; height: 4px; margin-bottom: 8px; overflow: hidden; }
+.handoff-timer-fill { height: 100%; background: #6366f1; border-radius: 4px; transition: width 1s linear; }
+.handoff-timer-text { font-size: 0.7rem; color: #6b7280; margin-bottom: 18px; }
+.handoff-actions { display: flex; gap: 10px; }
+.handoff-decline { flex: 1; padding: 10px; background: #1f2937; border: 1px solid #374151;
+  border-radius: 8px; color: #9ca3af; font-size: 0.85rem; cursor: pointer; transition: all 0.15s; }
+.handoff-decline:hover { background: #374151; color: #e2e8f0; }
+.handoff-accept { flex: 2; padding: 10px; background: #6366f1; border: none;
+  border-radius: 8px; color: white; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+.handoff-accept:hover { background: #5153cc; }
 </style>
 </head>
 <body>
 
 <div id="reconnect-banner">⚠ Connection lost — reconnecting automatically…</div>
+
+<!-- Handoff Request Popup -->
+<div class="handoff-overlay" id="handoff-overlay">
+  <div class="handoff-card">
+    <div class="handoff-bell">🔔</div>
+    <div class="handoff-title">User Needs Your Help!</div>
+    <div class="handoff-sub" id="popup-session-sub">Session loading…</div>
+    <div class="handoff-query-label">Unanswerable Query</div>
+    <div class="handoff-query" id="popup-query">…</div>
+    <div class="handoff-timer-bar"><div class="handoff-timer-fill" id="popup-timer-fill" style="width:100%"></div></div>
+    <div class="handoff-timer-text">Auto-dismisses in <span id="popup-countdown">30</span>s</div>
+    <div class="handoff-actions">
+      <button class="handoff-decline" id="popup-decline-btn" onclick="declineHandoffPopup()">✗ Not Now</button>
+      <button class="handoff-accept" id="popup-accept-btn" onclick="acceptHandoffPopup()">✓ Take Over This Chat</button>
+    </div>
+  </div>
+</div>
 
 <!-- Login Screen -->
 <div id="login-screen">
@@ -413,8 +465,62 @@ let myActiveSession = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let intentionalDisconnect = false;
-let allSessions = [];          // full list from last sessions_update
+let allSessions = [];           // full list from last sessions_update
 let unreadSessions = new Set(); // session ids with new msgs while not selected
+
+// ── Handoff popup state ───────────────────────────────────────────────────────
+let pendingHandoffSession = null;  // session_id of current popup
+let popupCountdownInterval = null;
+let popupTimeoutSecs = 30;
+
+function showHandoffPopup(msg) {
+  pendingHandoffSession = msg.session_id;
+  popupTimeoutSecs = msg.timeout || 30;
+
+  document.getElementById("popup-session-sub").textContent =
+    `Session #${msg.session_id} · ${msg.message_count || 0} messages`;
+  document.getElementById("popup-query").textContent =
+    msg.query || "(no query text)";
+  document.getElementById("popup-countdown").textContent = popupTimeoutSecs;
+  document.getElementById("popup-timer-fill").style.width = "100%";
+
+  document.getElementById("handoff-overlay").classList.add("visible");
+
+  clearInterval(popupCountdownInterval);
+  let remaining = popupTimeoutSecs;
+  popupCountdownInterval = setInterval(() => {
+    remaining--;
+    document.getElementById("popup-countdown").textContent = remaining;
+    const pct = (remaining / popupTimeoutSecs) * 100;
+    document.getElementById("popup-timer-fill").style.width = pct + "%";
+    if (remaining <= 0) {
+      clearInterval(popupCountdownInterval);
+      dismissHandoffPopup();
+    }
+  }, 1000);
+}
+
+function dismissHandoffPopup() {
+  clearInterval(popupCountdownInterval);
+  document.getElementById("handoff-overlay").classList.remove("visible");
+  pendingHandoffSession = null;
+}
+
+function acceptHandoffPopup() {
+  if (!pendingHandoffSession || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "accept_handoff", session_id: pendingHandoffSession }));
+  // Auto-select the session in the sidebar
+  const sid = pendingHandoffSession;
+  dismissHandoffPopup();
+  selectSession(sid);
+}
+
+function declineHandoffPopup() {
+  if (pendingHandoffSession && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "decline_handoff", session_id: pendingHandoffSession }));
+  }
+  dismissHandoffPopup();
+}
 
 // ── Login ───────────────────────────────────────────────────────────────────
 document.getElementById("login-btn").addEventListener("click", doLogin);
@@ -465,6 +571,8 @@ function openWebSocket() {
 
   ws.onmessage = ev => handle(JSON.parse(ev.data));
 
+  ws.onerror = () => { /* onclose always fires after onerror — handled there */ };
+
   ws.onclose = () => {
     if (intentionalDisconnect) return;
     scheduleReconnect();
@@ -472,10 +580,9 @@ function openWebSocket() {
 }
 
 function scheduleReconnect() {
-  const onDashboard = document.getElementById("dashboard").style.display !== "none";
-  if (!onDashboard) return;
   document.getElementById("reconnect-banner").style.display = "block";
-  setConnStatus(false);
+  const onDashboard = document.getElementById("dashboard").style.display !== "none";
+  if (onDashboard) setConnStatus(false);
   clearTimeout(reconnectTimer);
   const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempt), 15000);
   reconnectAttempt++;
@@ -530,6 +637,17 @@ function handle(msg) {
         updateConvHeader();
       }
       setInputEnabled(true);
+      break;
+
+    case "handoff_request":
+      // Another agent accepted while our popup was open — dismiss silently
+      if (pendingHandoffSession && pendingHandoffSession !== msg.session_id) break;
+      showHandoffPopup(msg);
+      break;
+
+    case "handoff_fulfilled":
+      // A different agent took the session we were looking at — dismiss popup
+      if (pendingHandoffSession === msg.session_id) dismissHandoffPopup();
       break;
   }
 }

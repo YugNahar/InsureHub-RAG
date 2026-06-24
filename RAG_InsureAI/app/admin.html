@@ -233,9 +233,18 @@
     margin-right: 6px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Reconnect banner ── */
+  #reconnect-banner {
+    display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+    background: #7c2d12; color: #fed7aa;
+    font-size: 0.78rem; text-align: center; padding: 7px;
+  }
 </style>
 </head>
 <body>
+
+<div id="reconnect-banner">⚠ Backend unreachable — retrying automatically…</div>
 
 <!-- Top bar -->
 <div class="topbar">
@@ -334,7 +343,32 @@ const token = localStorage.getItem('insure_token');
 if (!token) { window.location.href = '/auth'; }
 
 fetch(`${API}/auth/verify`, { headers: { Authorization: 'Bearer ' + token } })
-  .then(r => { if (!r.ok) { localStorage.clear(); window.location.href = '/auth'; } });
+  .then(r => { if (r.status === 401) { localStorage.clear(); window.location.href = '/auth'; } })
+  .catch(() => { /* backend may be starting — health poller will recover */ });
+
+// ── Backend health poller ─────────────────────────────────────────────────────
+let _backendDown = false;
+let _healthTimer = null;
+function _pollHealth() {
+  fetch(`${API}/health`).then(r => {
+    if (r.ok) {
+      if (_backendDown) {
+        _backendDown = false;
+        document.getElementById("reconnect-banner").style.display = "none";
+      }
+      _healthTimer = setTimeout(_pollHealth, 15000);
+    } else { _scheduleHealthRetry(); }
+  }).catch(() => _scheduleHealthRetry());
+}
+function _scheduleHealthRetry() {
+  if (!_backendDown) {
+    _backendDown = true;
+    document.getElementById("reconnect-banner").style.display = "block";
+  }
+  clearTimeout(_healthTimer);
+  _healthTimer = setTimeout(_pollHealth, 4000);
+}
+_pollHealth();
 
 const user = localStorage.getItem('insure_user') || 'admin';
 document.getElementById('userPill').textContent = '👤 ' + user;

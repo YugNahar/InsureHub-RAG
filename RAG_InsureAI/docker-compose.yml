@@ -25,6 +25,9 @@ x-common: &common
     - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
     - ADMIN_USERNAME=admin
     - ADMIN_PASSWORD=insurehub2026
+    - GMAIL_SENDER=lavishdevpura6@gmail.com
+    - GMAIL_APP_PASSWORD=dsye jnzz lphq vrtu
+    - AGENT_EMAIL=lavishdevpura6@gmail.com
   volumes:
     - insurehub_data:/root/.insurehub
     - insurehub_tmp:/root/.insurehub_tmp
