@@ -477,9 +477,6 @@ class AgentHub:
 
     @staticmethod
     def response_needs_human(response: str, sources: list) -> bool:
-        if sources:
-            logger.debug("response_needs_human=False (has sources)")
-            return False
         phrases = [
             # Explicit can't-answer phrases
             "don't have information",
@@ -494,6 +491,11 @@ class AgentHub:
             "cannot answer",
             "don't know",
             "outside my knowledge",
+            # Handoff canned messages (must trigger even when sources exist)
+            "let me get one of our agents",
+            "let me get a human agent",
+            "get one of our agents on it",
+            "connect you with a human",
             # AI used general knowledge fallback (label added by multi_source_rag)
             "general knowledge (not from your uploaded documents)",
             "not from your uploaded documents",
@@ -503,6 +505,12 @@ class AgentHub:
         ]
         lower = response.lower()
         result = any(p in lower for p in phrases)
+        # Only skip on sources when there is no explicit handoff phrase in the text.
+        # If the text itself says "let me get an agent", sources are irrelevant —
+        # the answer was replaced by the handoff message and must trigger a popup.
+        if not result and sources:
+            logger.debug("response_needs_human=False (has sources, no handoff phrase)")
+            return False
         logger.info("response_needs_human=%s | sources=%d | response_snippet=%r",
                     result, len(sources), response[:120])
         return result
