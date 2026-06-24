@@ -717,7 +717,8 @@ def _chunk_transcript(transcript_text: str, url: str, title: str = "", doc_meta:
 # ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
 async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
-    url = req.url.strip()
+    from video_store import _normalize_video_url
+    url = _normalize_video_url(req.url.strip())
     multi = _get_multi_rag()
     if multi.video_exists(url):
         return {"status": "already_exists", "url": url, "message": "Video already in knowledge base."}
@@ -908,9 +909,10 @@ async def list_videos():
 
 
 # ── Delete video ─────────────────────────────────────────────────────────────
-@app.delete("/videos/{url:path}")
+@app.delete("/videos")
 async def delete_video(url: str, _: str = Depends(require_auth)):
-    url = unquote(url)
+    from video_store import _normalize_video_url
+    url = _normalize_video_url(unquote(url))
     multi = _get_multi_rag()
     if not multi.video_exists(url):
         raise HTTPException(status_code=404, detail="Video URL not found.")
@@ -926,7 +928,7 @@ async def list_webpages():
 
 
 # ── Delete webpage ───────────────────────────────────────────────────────────
-@app.delete("/webpages/{url:path}")
+@app.delete("/webpages")
 async def delete_webpage(url: str, _: str = Depends(require_auth)):
     url = unquote(url)
     multi = _get_multi_rag()

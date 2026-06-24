@@ -5,6 +5,7 @@ deduplication, hybrid search, and reranking.
 import os
 import logging
 from typing import List, Optional, Dict, Any
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 from langchain_core.documents import Document
 
@@ -13,6 +14,20 @@ from turbovec_store import TurboVecStore
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = os.getenv("TVEC_VIDEOS_COLLECTION", "insurance_videos")
+
+
+def _normalize_video_url(url: str) -> str:
+    """Strip tracking params (si, utm_*, etc.) from video URLs."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    # Remove known tracking-only params
+    for key in ["si", "utm_source", "utm_medium", "utm_campaign", "feature"]:
+        params.pop(key, None)
+    clean_query = urlencode({k: v[0] for k, v in params.items()})
+    return urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, clean_query, ""
+    ))
 
 
 class VideoVectorStore:
@@ -25,6 +40,7 @@ class VideoVectorStore:
         )
 
     def add_video_chunks(self, url: str, chunks: List[Document], title: str = "") -> List[str]:
+        url = _normalize_video_url(url)
         if not chunks:
             return []
         self.delete_by_url(url)
@@ -39,9 +55,11 @@ class VideoVectorStore:
         return self._store.add_documents(chunks)
 
     def delete_by_url(self, url: str):
+        url = _normalize_video_url(url)
         self._store.delete_by_field("source_url", url)
 
     def url_exists(self, url: str) -> bool:
+        url = _normalize_video_url(url)
         urls = self._store.list_values("source_url")
         return url in urls
 
