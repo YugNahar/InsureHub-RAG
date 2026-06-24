@@ -912,11 +912,32 @@ async def list_videos():
 @app.delete("/videos")
 async def delete_video(url: str, _: str = Depends(require_auth)):
     from video_store import _normalize_video_url
+    import re as _re
     url = _normalize_video_url(unquote(url))
     multi = _get_multi_rag()
-    if not multi.video_exists(url):
+    deleted = False
+
+    # Source 1: videos added via /upload-video (stored in video_store)
+    if multi.video_exists(url):
+        multi.delete_video(url)
+        deleted = True
+
+    # Source 2: YouTube transcripts uploaded as files (stored in pipeline doc store
+    # with filename like "youtube_{video_id}_Title.txt")
+    m = _re.search(r"[?&]v=([^&]+)", url) or _re.search(r"youtu\.be/([^?]+)", url)
+    if m:
+        video_id = m.group(1)
+        pipeline = _get_pipeline()
+        try:
+            for fn in list(pipeline.vector_store.list_values("filename")):
+                if fn.startswith(f"youtube_{video_id}"):
+                    pipeline.vector_store.delete_by_field("filename", fn)
+                    deleted = True
+        except Exception as exc:
+            logger.warning("Failed to delete pipeline video chunks for %s: %s", url, exc)
+
+    if not deleted:
         raise HTTPException(status_code=404, detail="Video URL not found.")
-    multi.delete_video(url)
     return {"removed": True, "url": url}
 
 
