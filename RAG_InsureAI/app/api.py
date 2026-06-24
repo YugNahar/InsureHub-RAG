@@ -98,6 +98,8 @@ _DEFAULT_CORS_ORIGINS = [
     "https://insureai-chat.lovable.app",
     "https://id-preview--1f3edfb5-f351-48b6-baff-3a69cba3ed88.lovable.app",
     "https://insurehub-rag-frontend-zqp6.vercel.app",
+    # Admin + Agent panels on Vercel — update these after deploying panels/
+    "https://insurehub-panels.vercel.app",
 ]
 
 
