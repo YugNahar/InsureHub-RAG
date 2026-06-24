@@ -982,17 +982,39 @@ async def ask(req: AskRequest):
 
         answer = result.get("message", "")
         options = result.get("options", [])  # list of {id, label, description, recommended}
+        needs_human = result.get("needs_human", False)
 
         # Update conversation memory
         history_list.append({"role": "user", "content": req.question})
         history_list.append({"role": "assistant", "content": answer})
         await _save_conversation_history(req.session_id, history_list)
 
+        # ── Log to agent hub + trigger handoff if needed ─────────────────────
+        if req.session_id and req.session_id.strip():
+            _agent_hub.get_or_create_session(req.session_id)
+            agents_online = _agent_hub.online_count() > 0
+            offline_escalated = needs_human and not agents_online
+
+            if offline_escalated:
+                # Log first so the history is complete before the email is sent
+                await _agent_hub.log_message(req.session_id, "user", req.question)
+                await _agent_hub.log_message(req.session_id, "ai", answer)
+                asyncio.create_task(
+                    _agent_hub.trigger_offline_escalation(req.session_id, req.question)
+                )
+            else:
+                asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
+                asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", answer))
+                if needs_human and agents_online:
+                    # Fire the popup on the agent dashboard
+                    asyncio.create_task(_agent_hub.request_handoff(req.session_id))
+
         return {
             "answer": answer,
             "options": options,
             "sources": [],
             "conversation_continues": not is_complete,
+            "needs_human": needs_human,
         }
     except asyncio.TimeoutError:
         logger.warning("Conversational ask timed out after %ds", _ASK_TIMEOUT_SECONDS)
