@@ -31,6 +31,7 @@ import time
 import uuid
 import aiohttp
 import re
+from urllib.parse import unquote
 from bs4 import BeautifulSoup
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -909,6 +910,7 @@ async def list_videos():
 # ── Delete video ─────────────────────────────────────────────────────────────
 @app.delete("/videos/{url:path}")
 async def delete_video(url: str, _: str = Depends(require_auth)):
+    url = unquote(url)
     multi = _get_multi_rag()
     if not multi.video_exists(url):
         raise HTTPException(status_code=404, detail="Video URL not found.")
@@ -926,6 +928,7 @@ async def list_webpages():
 # ── Delete webpage ───────────────────────────────────────────────────────────
 @app.delete("/webpages/{url:path}")
 async def delete_webpage(url: str, _: str = Depends(require_auth)):
+    url = unquote(url)
     multi = _get_multi_rag()
     if not multi.webpage_exists(url):
         raise HTTPException(status_code=404, detail="Webpage URL not found.")

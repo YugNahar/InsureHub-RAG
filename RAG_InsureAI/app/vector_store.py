@@ -51,6 +51,9 @@ class ChromaVectorStore:
     def delete_by_source(self, source: str):
         self._store.delete_by_field("source", source)
 
+    def delete_by_field(self, field: str, value: str) -> None:
+        self._store.delete_by_field(field, value)
+
     def delete_all(self):
         self._store.delete_all()
 
