@@ -472,6 +472,7 @@ class AgentHub:
         if sources:
             return False
         phrases = [
+            # Explicit can't-answer phrases
             "don't have information",
             "don't have that",
             "not in my knowledge",
@@ -484,6 +485,12 @@ class AgentHub:
             "cannot answer",
             "don't know",
             "outside my knowledge",
+            # AI used general knowledge fallback (label added by multi_source_rag)
+            "general knowledge (not from your uploaded documents)",
+            "not from your uploaded documents",
+            "not in the uploaded documents",
+            "not covered in",
+            "not available in",
         ]
         lower = response.lower()
         return any(p in lower for p in phrases)
