@@ -1006,8 +1006,9 @@ async def ask(req: AskRequest):
                 asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
                 asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", answer))
                 if needs_human and agents_online:
-                    # Fire the popup on the agent dashboard
-                    asyncio.create_task(_agent_hub.request_handoff(req.session_id))
+                    # Fire the popup on the agent dashboard — pass question directly
+                    # to avoid race where history isn't written yet
+                    asyncio.create_task(_agent_hub.request_handoff(req.session_id, req.question))
 
         return {
             "answer": answer,
@@ -1392,6 +1393,11 @@ async def ask_stream(req: AskRequest):
                         else:
                             asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
                             asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", full_text))
+                            if needs_human and agents_online:
+                                # Await (not create_task) so the popup is sent to the agent
+                                # BEFORE the final JSON reaches the frontend. This guarantees
+                                # the question text is included and no race with frontend WS.
+                                await _agent_hub.request_handoff(req.session_id, req.question)
                     yield "\n\n" + _json.dumps(final_data)
                     return
                 buf += token

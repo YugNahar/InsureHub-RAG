@@ -584,10 +584,11 @@ async function loadVideos() {
 async function removeVideo(url) {
   if (!confirm('Remove this video?')) return;
   try {
-    const res = await fetch(`${API}/videos/${encodeURIComponent(url)}`, {
+    const res = await fetch(`${API}/videos?url=${encodeURIComponent(url)}`, {
       method: 'DELETE', headers: authHeaders(),
     });
     if (res.status === 401) { logout(); return; }
+    if (!res.ok) { showToast('Failed to remove video.', 'error'); return; }
     showToast('Video removed.', 'success');
     loadVideos();
   } catch { showToast('Failed to remove.', 'error'); }

@@ -411,6 +411,13 @@ class MultiSourceRAG:
         if needs_human and not _is_insurance_related(question):
             is_off_topic = True
             needs_human = False
+            # Skip the LLM entirely — return a firm, friendly refusal
+            return (
+                "I'm Layla, your insurance assistant! I can only help with insurance-related questions — things like policy coverage, premiums, claims, and benefits. Is there something about your insurance I can help you with today? 😊",
+                [],
+                False,
+                True,
+            )
         # ── Context compression (only when needed) ────────────────────────────
         # Skip compression entirely when the chunks already fit in the LLM's
         # input window — with 500-char chunks this will usually be the case.
@@ -485,29 +492,28 @@ class MultiSourceRAG:
             return _strip_markdown(_strip_model_preamble(answer)), [], True, False
 
         # ── Prompt selection ──────────────────────────────────────────────────
-        # STRICT grounding only when the user is asking about a specific uploaded
-        # document (document_filter is set).  For general insurance questions we
-        # use the conversational prompt so the LLM can fall back to general
-        # knowledge instead of incorrectly denying coverage based on an unrelated
-        # document that happened to score highest in retrieval.
         ctx_covered = _context_covers_query(question, all_chunks)
+
+        # If the KB has no relevant content for this question, skip the LLM
+        # entirely — small models ignore "don't use your training knowledge"
+        # instructions and answer from general knowledge anyway. Return a hard
+        # canned response so the handoff trigger fires reliably.
+        if not ctx_covered and not document_filter:
+            return (
+                "Hmm, I don't have that specific information in my knowledge base right now. "
+                "Let me get one of our agents on it — they'll be able to help you better! 😊",
+                [],
+                needs_human,
+                is_off_topic,
+            )
+
         if document_filter:
             prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
         else:
-            # Append a fallback hint when retrieved chunks have no discriminating
-            # keyword overlap with the query — the LLM should then use general
-            # knowledge and clearly label it so users know the docs don't cover it.
-            fallback_suffix = (
-                "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
-                "explicit information about this specific topic. Provide a helpful "
-                "general insurance explanation from your training knowledge and clearly "
-                "label it: 'General knowledge (not from your uploaded documents): '"
-                if not ctx_covered else ""
-            )
             prompt = CONVERSATIONAL_RAG_PROMPT.format(
                 history=history,
-                context=full_context + fallback_suffix,
+                context=full_context,
                 question=question,
             )
             llm = get_insurance_llm(temperature=0.3)
@@ -662,16 +668,16 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0)
         else:
             ctx_covered = _context_covers_query(question, all_chunks)
-            fallback_suffix = (
-                "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
-                "explicit information about this specific topic. Provide a helpful "
-                "general insurance explanation from your training knowledge and clearly "
-                "label it: 'General knowledge (not from your uploaded documents): '"
-                if not ctx_covered else ""
-            )
+            # Same guard as ask(): skip the LLM when KB doesn't cover the topic
+            if not ctx_covered:
+                yield (
+                    "Hmm, I don't have that specific information in my knowledge base right now. "
+                    "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                )
+                return
             prompt = CONVERSATIONAL_RAG_PROMPT.format(
                 history=history,
-                context=full_context + fallback_suffix,
+                context=full_context,
                 question=question,
             )
             llm = get_insurance_llm(temperature=0.3)

@@ -7,11 +7,14 @@ survives backend restarts and agent logouts.
 """
 import asyncio
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Set
+
+logger = logging.getLogger(__name__)
 
 from fastapi import WebSocket
 
@@ -198,11 +201,13 @@ class AgentHub:
 
     # ── Handoff ───────────────────────────────────────────────────────────────
 
-    async def request_handoff(self, session_id: str) -> bool:
+    async def request_handoff(self, session_id: str, question: str = "") -> bool:
         """
         New flow: broadcast a popup to all free agents instead of auto-assigning.
         Returns True if at least one agent was notified, False if no agents online.
         If no agents are online the caller is responsible for offline escalation.
+        Pass `question` directly to avoid a race condition where session history
+        isn't written yet when this is called as a background task.
         """
         session = self._sessions.get(session_id)
         if not session:
@@ -213,14 +218,17 @@ class AgentHub:
             return True  # popup already sent
 
         free = [a for a in self._agents.values() if a.active_session is None]
+        logger.info("request_handoff: session=%s agents_total=%d free=%d",
+                    session_id, len(self._agents), len(free))
         if not free:
+            logger.warning("request_handoff: no free agents — falling back to email")
             return False  # caller sends email
 
         session.status = "waiting"
         self._save_sessions()
 
-        # Get the unanswerable query (last user message in history)
-        unanswerable = next(
+        # Prefer the caller-supplied question; fall back to last user message in history
+        unanswerable = question or next(
             (m.content for m in reversed(session.history) if m.role == "user"), ""
         )
         title = session.history[0].content[:60] if session.history else f"Session #{session_id}"
@@ -470,8 +478,10 @@ class AgentHub:
     @staticmethod
     def response_needs_human(response: str, sources: list) -> bool:
         if sources:
+            logger.debug("response_needs_human=False (has sources)")
             return False
         phrases = [
+            # Explicit can't-answer phrases
             "don't have information",
             "don't have that",
             "not in my knowledge",
@@ -484,9 +494,18 @@ class AgentHub:
             "cannot answer",
             "don't know",
             "outside my knowledge",
+            # AI used general knowledge fallback (label added by multi_source_rag)
+            "general knowledge (not from your uploaded documents)",
+            "not from your uploaded documents",
+            "not in the uploaded documents",
+            "not covered in",
+            "not available in",
         ]
         lower = response.lower()
-        return any(p in lower for p in phrases)
+        result = any(p in lower for p in phrases)
+        logger.info("response_needs_human=%s | sources=%d | response_snippet=%r",
+                    result, len(sources), response[:120])
+        return result
 
 
 hub = AgentHub()
