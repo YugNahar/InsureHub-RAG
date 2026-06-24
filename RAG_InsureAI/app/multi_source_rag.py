@@ -492,30 +492,28 @@ class MultiSourceRAG:
             return _strip_markdown(_strip_model_preamble(answer)), [], True, False
 
         # ── Prompt selection ──────────────────────────────────────────────────
-        # STRICT grounding only when the user is asking about a specific uploaded
-        # document (document_filter is set).  For general insurance questions we
-        # use the conversational prompt so the LLM can fall back to general
-        # knowledge instead of incorrectly denying coverage based on an unrelated
-        # document that happened to score highest in retrieval.
         ctx_covered = _context_covers_query(question, all_chunks)
+
+        # If the KB has no relevant content for this question, skip the LLM
+        # entirely — small models ignore "don't use your training knowledge"
+        # instructions and answer from general knowledge anyway. Return a hard
+        # canned response so the handoff trigger fires reliably.
+        if not ctx_covered and not document_filter:
+            return (
+                "Hmm, I don't have that specific information in my knowledge base right now. "
+                "Let me get one of our agents on it — they'll be able to help you better! 😊",
+                [],
+                needs_human,
+                is_off_topic,
+            )
+
         if document_filter:
             prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
         else:
-            # Append a fallback hint when retrieved chunks have no discriminating
-            # When the KB doesn't cover this topic, instruct the AI to say so
-            # and hand off to a human — do NOT answer from general knowledge.
-            fallback_suffix = (
-                "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
-                "information about this specific topic. Do NOT answer from your general "
-                "training knowledge. In one friendly sentence tell the user you don't have "
-                "this information in your knowledge base right now and that you'll connect "
-                "them with a human agent who can help."
-                if not ctx_covered else ""
-            )
             prompt = CONVERSATIONAL_RAG_PROMPT.format(
                 history=history,
-                context=full_context + fallback_suffix,
+                context=full_context,
                 question=question,
             )
             llm = get_insurance_llm(temperature=0.3)
@@ -670,17 +668,16 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0)
         else:
             ctx_covered = _context_covers_query(question, all_chunks)
-            fallback_suffix = (
-                "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
-                "information about this specific topic. Do NOT answer from your general "
-                "training knowledge. In one friendly sentence tell the user you don't have "
-                "this information in your knowledge base right now and that you'll connect "
-                "them with a human agent who can help."
-                if not ctx_covered else ""
-            )
+            # Same guard as ask(): skip the LLM when KB doesn't cover the topic
+            if not ctx_covered:
+                yield (
+                    "Hmm, I don't have that specific information in my knowledge base right now. "
+                    "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                )
+                return
             prompt = CONVERSATIONAL_RAG_PROMPT.format(
                 history=history,
-                context=full_context + fallback_suffix,
+                context=full_context,
                 question=question,
             )
             llm = get_insurance_llm(temperature=0.3)
