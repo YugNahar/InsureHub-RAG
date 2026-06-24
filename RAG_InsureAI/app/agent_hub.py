@@ -198,11 +198,13 @@ class AgentHub:
 
     # ── Handoff ───────────────────────────────────────────────────────────────
 
-    async def request_handoff(self, session_id: str) -> bool:
+    async def request_handoff(self, session_id: str, question: str = "") -> bool:
         """
         New flow: broadcast a popup to all free agents instead of auto-assigning.
         Returns True if at least one agent was notified, False if no agents online.
         If no agents are online the caller is responsible for offline escalation.
+        Pass `question` directly to avoid a race condition where session history
+        isn't written yet when this is called as a background task.
         """
         session = self._sessions.get(session_id)
         if not session:
@@ -219,8 +221,8 @@ class AgentHub:
         session.status = "waiting"
         self._save_sessions()
 
-        # Get the unanswerable query (last user message in history)
-        unanswerable = next(
+        # Prefer the caller-supplied question; fall back to last user message in history
+        unanswerable = question or next(
             (m.content for m in reversed(session.history) if m.role == "user"), ""
         )
         title = session.history[0].content[:60] if session.history else f"Session #{session_id}"
