@@ -240,11 +240,32 @@
     background: #7c2d12; color: #fed7aa;
     font-size: 0.78rem; text-align: center; padding: 7px;
   }
+  #tunnel-bar {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 9990;
+    background: #0f172a; border-top: 1px solid #1e293b;
+    font-size: 0.72rem; color: #64748b; padding: 5px 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  #tunnel-bar a { color: #818cf8; text-decoration: none; }
+  #tunnel-bar a:hover { text-decoration: underline; }
+  #tunnel-copy-btn {
+    cursor: pointer; background: #1e293b; border: 1px solid #334155;
+    color: #94a3b8; border-radius: 4px; padding: 2px 8px; font-size: 0.7rem;
+  }
+  #tunnel-copy-btn:hover { background: #334155; }
 </style>
 </head>
 <body>
 
 <div id="reconnect-banner">⚠ Backend unreachable — retrying automatically…</div>
+
+<!-- Tunnel URL bar (bottom) -->
+<div id="tunnel-bar">
+  <span>Tunnel:</span>
+  <a id="tunnel-link" href="#" target="_blank">detecting…</a>
+  <button id="tunnel-copy-btn" onclick="copyTunnelUrl()">copy</button>
+  <span style="margin-left:auto;color:#475569">Agent panel: <a id="agent-link" href="#" target="_blank">—</a></span>
+</div>
 
 <!-- Top bar -->
 <div class="topbar">
@@ -629,6 +650,40 @@ async function removeWebpage(url) {
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+
+// ── Tunnel URL bar ────────────────────────────────────────────────────────────
+let _lastTunnelUrl = null;
+function refreshTunnelUrl() {
+  fetch(`${API}/tunnel-url`).then(r => r.json()).then(d => {
+    const url = d.url;
+    if (!url) {
+      document.getElementById('tunnel-link').textContent = 'tunnel not running';
+      document.getElementById('tunnel-link').href = '#';
+      document.getElementById('agent-link').textContent = '—';
+      document.getElementById('agent-link').href = '#';
+      return;
+    }
+    if (url !== _lastTunnelUrl) {
+      _lastTunnelUrl = url;
+      const link = document.getElementById('tunnel-link');
+      link.textContent = url.replace('https://', '');
+      link.href = url;
+      const agentLink = document.getElementById('agent-link');
+      agentLink.textContent = url.replace('https://', '') + '/agent-dashboard';
+      agentLink.href = url + '/agent-dashboard';
+    }
+  }).catch(() => {});
+}
+function copyTunnelUrl() {
+  if (!_lastTunnelUrl) return;
+  navigator.clipboard.writeText(_lastTunnelUrl).then(() => {
+    const btn = document.getElementById('tunnel-copy-btn');
+    btn.textContent = 'copied!';
+    setTimeout(() => btn.textContent = 'copy', 1500);
+  });
+}
+refreshTunnelUrl();
+setInterval(refreshTunnelUrl, 15000);
 </script>
 </body>
 </html>

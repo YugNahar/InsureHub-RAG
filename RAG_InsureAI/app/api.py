@@ -299,6 +299,33 @@ async def agent_dashboard_page():
     return FileResponse(os.path.join(_APP_DIR, "agent_dashboard.html"))
 
 
+@app.get("/tunnel-url")
+async def tunnel_url_endpoint():
+    """Return the current Cloudflare tunnel URL (read from file written by tunnel_watcher.py)."""
+    import urllib.request as _urllib
+    import re as _re
+    # Try live metrics first (most accurate)
+    try:
+        with _urllib.urlopen("http://localhost:20241/metrics", timeout=2) as r:
+            text = r.read().decode()
+        m = _re.search(r'userHostname="(https://[^"]+trycloudflare\.com)"', text)
+        if m:
+            return {"url": m.group(1), "source": "live"}
+    except Exception:
+        pass
+    # Fall back to file written by tunnel_watcher.py (inside mounted app/ dir)
+    url_file = os.path.join(_APP_DIR, "tunnel_url.txt")
+    if os.path.exists(url_file):
+        try:
+            with open(url_file) as f:
+                url = f.read().strip()
+            if url:
+                return {"url": url, "source": "file"}
+        except OSError:
+            pass
+    return {"url": None, "source": "none"}
+
+
 # ── Human handoff session endpoints ──────────────────────────────────────────
 
 _ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "insurehub2026")
