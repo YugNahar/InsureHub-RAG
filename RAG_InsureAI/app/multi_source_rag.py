@@ -7,6 +7,15 @@ import logging
 import re
 from typing import List, Tuple, Optional
 
+try:
+    from openai import APIConnectionError as _APIConnectionError, APITimeoutError as _APITimeoutError, APIStatusError as _APIStatusError
+except ImportError:
+    _APIConnectionError = Exception
+    _APITimeoutError = Exception
+    _APIStatusError = Exception
+
+_LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
+
 # ── Context coverage check ────────────────────────────────────────────────────
 # Domain-generic terms that appear in virtually every insurance chunk and
 # therefore give no signal about whether a chunk covers the specific query topic.
@@ -451,8 +460,12 @@ class MultiSourceRAG:
                 question=question
             )
             llm = get_insurance_llm(temperature=0)
-            response = await asyncio.to_thread(llm.invoke, prompt)
-            answer = response.content if hasattr(response, "content") else str(response)
+            try:
+                response = await asyncio.to_thread(llm.invoke, prompt)
+                answer = response.content if hasattr(response, "content") else str(response)
+            except _LLM_BACKEND_ERRORS as _exc:
+                logger.warning("[MultiSourceRAG] LLM backend unavailable for calculation: %s", _exc)
+                answer = "I'm sorry, I can't process that calculation right now — the AI model server seems to be unreachable. Please try again in a moment!"
             return _strip_markdown(_strip_model_preamble(answer)), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
         if not full_context.strip():
@@ -463,8 +476,12 @@ class MultiSourceRAG:
                 question=question
             )
             llm = get_insurance_llm(temperature=0.3)
-            response = await asyncio.to_thread(llm.invoke, prompt)
-            answer = response.content if hasattr(response, "content") else str(response)
+            try:
+                response = await asyncio.to_thread(llm.invoke, prompt)
+                answer = response.content if hasattr(response, "content") else str(response)
+            except _LLM_BACKEND_ERRORS as _exc:
+                logger.warning("[MultiSourceRAG] LLM backend unavailable (no-context path): %s", _exc)
+                answer = "Hmm, I don't have that in my knowledge base right now, and my AI model server seems to be temporarily unreachable. Try again in a moment or reach out to our support team!"
             return _strip_markdown(_strip_model_preamble(answer)), [], True, False
 
         # ── Prompt selection ──────────────────────────────────────────────────
@@ -473,6 +490,7 @@ class MultiSourceRAG:
         # use the conversational prompt so the LLM can fall back to general
         # knowledge instead of incorrectly denying coverage based on an unrelated
         # document that happened to score highest in retrieval.
+        ctx_covered = _context_covers_query(question, all_chunks)
         if document_filter:
             prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
@@ -480,7 +498,6 @@ class MultiSourceRAG:
             # Append a fallback hint when retrieved chunks have no discriminating
             # keyword overlap with the query — the LLM should then use general
             # knowledge and clearly label it so users know the docs don't cover it.
-            ctx_covered = _context_covers_query(question, all_chunks)
             fallback_suffix = (
                 "\n\nNOTE TO ASSISTANT: The retrieved document chunks do NOT contain "
                 "explicit information about this specific topic. Provide a helpful "
@@ -495,8 +512,32 @@ class MultiSourceRAG:
             )
             llm = get_insurance_llm(temperature=0.3)
 
-        response = await asyncio.to_thread(llm.invoke, prompt)
-        answer = response.content if hasattr(response, "content") else str(response)
+        # ── LLM invocation with backend-error guard ───────────────────────────
+        # When the context does NOT cover the query (out-of-KB question) and the
+        # LLM backend is unreachable, provide an immediate graceful fallback
+        # rather than waiting for a 150-second timeout.
+        try:
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+        except _LLM_BACKEND_ERRORS as _exc:
+            logger.warning(
+                "[MultiSourceRAG] LLM backend unavailable (ctx_covered=%s): %s",
+                ctx_covered, _exc,
+            )
+            if not ctx_covered:
+                # Out-of-KB query + backend down: inform user their question is valid
+                # but not in the KB AND the LLM is temporarily unreachable.
+                answer = (
+                    "Hmm, that topic doesn't seem to be covered in my knowledge base right now. "
+                    "On top of that, my AI model server is temporarily unreachable, so I can't "
+                    "pull from general knowledge either. Try again in a moment — or feel free to "
+                    "ask me something about your uploaded insurance documents!"
+                )
+            else:
+                answer = (
+                    "I couldn't reach the AI model server to generate your answer right now. "
+                    "Please try again in a moment!"
+                )
         return _strip_markdown(_strip_model_preamble(answer)), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
     async def ask_stream(

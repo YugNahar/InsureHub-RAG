@@ -274,15 +274,25 @@ class AgentHub:
 
     async def accept_handoff(self, agent_id: str, session_id: str):
         """Agent accepted the popup — assign and cancel the timeout."""
-        if session_id not in self._pending_handoffs:
-            return  # expired or already accepted
-        task = self._pending_handoffs.pop(session_id)
-        task.cancel()
-
         session = self._sessions.get(session_id)
         agent   = self._agents.get(agent_id)
         if not session or not agent:
             return
+
+        # Cancel the timeout task if still running (may be missing after server restart)
+        task = self._pending_handoffs.pop(session_id, None)
+        if task:
+            task.cancel()
+
+        # Guard: only assign if the session is still waiting (prevents double-accept)
+        if session.status not in ("waiting", "ai"):
+            # Already taken by someone else
+            try:
+                await agent.ws.send_json({"type": "handoff_fulfilled", "session_id": session_id})
+            except Exception:
+                pass
+            return
+
         await self._assign_agent(session, agent)
 
         # Tell all other agents the request was fulfilled
@@ -305,10 +315,27 @@ class AgentHub:
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
 
     async def _assign_agent(self, session: "ChatSession", agent: "HumanAgent"):
+        # ── Release the agent's existing session first (if any) ────────────────
+        if agent.active_session and agent.active_session != session.session_id:
+            old_session = self._sessions.get(agent.active_session)
+            if old_session and old_session.agent_id == agent.agent_id:
+                old_session.status = "ai"
+                old_session.agent_id = None
+                self._save_sessions()
+                if old_session.user_ws:
+                    try:
+                        await old_session.user_ws.send_json({
+                            "type": "agent_left",
+                            "message": "The agent is now assisting someone else. Layla is back to help!",
+                        })
+                    except Exception:
+                        pass
+
         session.status = "human"
         session.agent_id = agent.agent_id
         agent.active_session = session.session_id
         agent.monitoring.add(session.session_id)
+        self._save_sessions()
         history_payload = [
             {"role": m.role, "content": m.content, "timestamp": m.timestamp}
             for m in session.history

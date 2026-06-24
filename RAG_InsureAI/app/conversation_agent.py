@@ -447,10 +447,26 @@ class ConversationAgent:
         if intent == "INFORMATIONAL":
             doc_names = self._extract_document_names(user_message)
             session_history = self._build_history_string(session_id)
-            answer, _, needs_human, is_off_topic = await self.multi_rag.ask(
-                user_message, session_history,
-                document_filter=doc_names if doc_names else None
-            )
+            try:
+                answer, _, needs_human, is_off_topic = await self.multi_rag.ask(
+                    user_message, session_history,
+                    document_filter=doc_names if doc_names else None
+                )
+            except Exception as _rag_exc:
+                logger.warning("multi_rag.ask() raised an unexpected error: %s", _rag_exc)
+                err_msg = (
+                    "I'm having trouble reaching my AI model server right now. "
+                    "Please try again in a moment!"
+                )
+                self._append_turn(session_id, user_message, err_msg)
+                return {
+                    "message": err_msg,
+                    "options": [],
+                    "multi_select": False,
+                    "next_question": "",
+                    "intent": "informational",
+                    "stage": "details",
+                }, True
 
             if is_off_topic:
                 off_topic_msg = (

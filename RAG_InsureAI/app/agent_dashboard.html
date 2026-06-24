@@ -663,8 +663,11 @@ function handle(msg) {
       break;
 
     case "handoff_request":
-      // Another agent accepted while our popup was open — dismiss silently
-      if (pendingHandoffSession && pendingHandoffSession !== msg.session_id) break;
+      // If we already have a popup open for a DIFFERENT session, dismiss it first
+      // (the previous one will still be handled by its timeout on the server side).
+      // If it's the same session again, silently ignore the duplicate.
+      if (pendingHandoffSession === msg.session_id) break; // already showing
+      if (pendingHandoffSession) dismissHandoffPopup();    // dismiss old, show new
       showHandoffPopup(msg);
       break;
 
