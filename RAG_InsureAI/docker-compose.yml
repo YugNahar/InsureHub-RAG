@@ -50,8 +50,8 @@ services:
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8501/health"]
       interval: 30s
-      timeout: 10s
-      start_period: 90s
+      timeout: 30s
+      start_period: 180s
       retries: 3
 
   # ── RAG evaluation tool (retrieval tuning, streaming UI, RAGAS metrics) ─────
