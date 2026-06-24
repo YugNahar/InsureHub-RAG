@@ -33,10 +33,11 @@ import aiohttp
 import re
 from bs4 import BeautifulSoup
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from auth import create_login_endpoint, require_auth
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from agent_hub import hub as _agent_hub
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 import json as _json
@@ -292,6 +293,138 @@ async def auth_page():
 @app.get("/admin")
 async def admin_page():
     return FileResponse(os.path.join(_APP_DIR, "admin.html"))
+
+@app.get("/agent-dashboard")
+async def agent_dashboard_page():
+    return FileResponse(os.path.join(_APP_DIR, "agent_dashboard.html"))
+
+
+# ── Human handoff session endpoints ──────────────────────────────────────────
+
+_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "insurehub2026")
+
+
+@app.post("/session/create")
+async def session_create():
+    """Create a monitored chat session for human handoff tracking."""
+    sid = _agent_hub.create_session()
+    return {"session_id": sid}
+
+
+@app.get("/agents/status")
+async def agents_status():
+    """Returns how many human agents are currently online."""
+    return {"online": _agent_hub.online_count()}
+
+
+@app.delete("/session/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    """Delete a session (triggered from agent dashboard)."""
+    deleted = await _agent_hub.delete_session(session_id)
+    return {"deleted": deleted}
+
+
+@app.post("/session/{session_id}/request-handoff")
+async def session_request_handoff(session_id: str):
+    """HTTP fallback for handoff when the user WebSocket has dropped."""
+    assigned = await _agent_hub.request_handoff(session_id)
+    session = _agent_hub.get_session(session_id)
+    return {"assigned": assigned, "status": session.status if session else "unknown"}
+
+
+@app.get("/session/{session_id}/poll")
+async def session_poll(session_id: str, after: int = 0):
+    """
+    Polling fallback for human-agent messages.
+    Returns session status + all messages after the given index.
+    Used when WebSocket is unavailable (e.g. Cloudflare timeout).
+    """
+    session = _agent_hub.get_session(session_id)
+    if not session:
+        return {"status": "ai", "agent_name": "", "messages": [], "total": 0}
+    msgs = [
+        {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+        for m in session.history[after:]
+    ]
+    agent_name = ""
+    if session.agent_id and session.agent_id in _agent_hub._agents:
+        agent_name = _agent_hub._agents[session.agent_id].name
+    return {
+        "status": session.status,
+        "agent_name": agent_name,
+        "messages": msgs,
+        "total": len(session.history),
+    }
+
+
+@app.websocket("/ws/agent")
+async def ws_agent_endpoint(websocket: WebSocket):
+    """WebSocket for human agents — login, monitor sessions, take over chats."""
+    await websocket.accept()
+    agent_id: str | None = None
+    try:
+        data = await asyncio.wait_for(websocket.receive_json(), timeout=30)
+        if data.get("type") != "login":
+            await websocket.close(code=1008)
+            return
+        name = (data.get("name") or "Agent").strip() or "Agent"
+        if data.get("password") != _ADMIN_PASSWORD:
+            await websocket.send_json({"type": "error", "message": "Invalid password."})
+            await websocket.close(code=1008)
+            return
+        agent_id = uuid.uuid4().hex[:8]
+        _agent_hub.register_agent(agent_id, name, websocket)
+        await websocket.send_json({"type": "logged_in", "agent_id": agent_id, "name": name})
+        await websocket.send_json({"type": "sessions_update", "sessions": _agent_hub.list_sessions()})
+        while True:
+            msg = await websocket.receive_json()
+            t = msg.get("type", "")
+            if t == "monitor":
+                await _agent_hub.agent_monitor(agent_id, msg.get("session_id", ""))
+            elif t == "takeover":
+                await _agent_hub.agent_takeover(agent_id, msg.get("session_id", ""))
+            elif t == "message":
+                await _agent_hub.agent_send_message(agent_id, msg.get("session_id", ""), msg.get("content", ""))
+            elif t == "release":
+                await _agent_hub.agent_release(agent_id)
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    except Exception:
+        logger.exception("Agent WebSocket error")
+    finally:
+        if agent_id:
+            await _agent_hub.unregister_agent(agent_id)
+
+
+@app.websocket("/ws/user/{session_id}")
+async def ws_user_endpoint(websocket: WebSocket, session_id: str):
+    """
+    WebSocket for users — always open as a notification channel.
+    Handoff is triggered explicitly by the client sending {"type":"request_handoff"},
+    not automatically on connect.
+    """
+    session = _agent_hub.get_or_create_session(session_id)
+    await websocket.accept()
+    session.user_ws = websocket
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            msg_type = msg.get("type", "")
+            if msg_type == "request_handoff":
+                assigned = await _agent_hub.request_handoff(session_id)
+                if not assigned:
+                    await websocket.send_json({
+                        "type": "waiting",
+                        "message": "Hang tight! Looking for an available agent for you...",
+                    })
+            elif msg_type == "message":
+                content = (msg.get("content") or "").strip()
+                if content and session.status == "human":
+                    await _agent_hub.user_message_to_agent(session_id, content)
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        session.user_ws = None
 
 @app.on_event("startup")
 async def _init_async_lock():
@@ -1111,13 +1244,37 @@ async def ask_stream(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    # Block AI while a human agent is handling this session
+    if req.session_id and req.session_id != "default":
+        _hub_sess = _agent_hub.get_session(req.session_id)
+        if _hub_sess and _hub_sess.status == "human":
+            _agent_name = ""
+            if _hub_sess.agent_id:
+                _ag = next((a for a in _agent_hub._agents.values() if a.agent_id == _hub_sess.agent_id), None)
+                if _ag:
+                    _agent_name = f" with {_ag.name}"
+            _block_msg = f"You're connected{_agent_name} right now — please use the chat above to message the agent directly."
+            async def _blocked_gen():
+                yield _block_msg
+                yield "\n\n" + _json.dumps({"sources": [], "done": True})
+            return StreamingResponse(
+                _blocked_gen(),
+                media_type="text/plain",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
+            )
+
     # Fast-path: greetings bypass the LLM entirely — instant reply
     greeting_reply = _greeting_reply(req.question)
     if greeting_reply:
-        import json as _json
+        _sid = req.session_id
         async def _greeting_gen():
             yield greeting_reply
             yield "\n\n" + _json.dumps({"sources": [], "done": True})
+            # Log to hub so agents can see greeting exchanges too
+            if _sid and _sid != "default":
+                _agent_hub.get_or_create_session(_sid)
+                asyncio.create_task(_agent_hub.log_message(_sid, "user", req.question))
+                asyncio.create_task(_agent_hub.log_message(_sid, "ai", greeting_reply))
         return StreamingResponse(
             _greeting_gen(),
             media_type="text/plain",
@@ -1131,25 +1288,44 @@ async def ask_stream(req: AskRequest):
     async def generate():
         from multi_source_rag import _strip_markdown
         multi = _get_multi_rag()
+        full_text = ""
         try:
             buf = ""
             async for token in multi.ask_stream(req.question, document_filter=None):
                 if token.startswith('\n\n{'):
-                    # Final sources JSON — flush any remaining buffer then send it
                     if buf:
-                        yield _strip_markdown(buf)
+                        stripped = _strip_markdown(buf)
+                        full_text += stripped
+                        yield stripped
                         await asyncio.sleep(0)
-                    yield token
+                    try:
+                        final_data = _json.loads(token.strip())
+                    except Exception:
+                        final_data = {"sources": [], "done": True}
+                    sources = final_data.get("sources", [])
+                    needs_human = (
+                        _agent_hub.response_needs_human(full_text, sources)
+                        and _agent_hub.online_count() > 0
+                    )
+                    final_data["needs_human"] = needs_human
+                    # Log to hub — auto-create session if missing (handles backend restarts)
+                    if req.session_id and req.session_id != "default":
+                        _agent_hub.get_or_create_session(req.session_id)
+                        asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
+                        asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", full_text))
+                    yield "\n\n" + _json.dumps(final_data)
                     return
                 buf += token
-                # Flush whenever we have a complete word boundary (space or newline)
-                # so the user sees words appear live, not character by character
                 if ' ' in buf or '\n' in buf:
-                    yield _strip_markdown(buf)
+                    stripped = _strip_markdown(buf)
+                    full_text += stripped
+                    yield stripped
                     buf = ""
                     await asyncio.sleep(0)
             if buf:
-                yield _strip_markdown(buf)
+                stripped = _strip_markdown(buf)
+                full_text += stripped
+                yield stripped
         except asyncio.TimeoutError:
             yield "\n\nError: The AI model server is taking too long. Please try again."
         except Exception as exc:

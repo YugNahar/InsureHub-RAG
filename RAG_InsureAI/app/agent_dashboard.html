@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InsureHub — Agent Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+/* ── Login ── */
+#login-screen { display: flex; align-items: center; justify-content: center; height: 100vh; }
+.login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 16px; padding: 32px; width: 360px; }
+.logo { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; }
+.logo-icon { width: 36px; height: 36px; border-radius: 8px; background: #4f46e5; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+.logo-text { font-size: 1rem; font-weight: 600; }
+.login-box h1 { font-size: 1.15rem; font-weight: 600; }
+.login-box p { font-size: 0.8rem; color: #718096; margin-top: 4px; margin-bottom: 24px; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 0.78rem; font-weight: 500; margin-bottom: 6px; color: #a0aec0; }
+.field input { width: 100%; padding: 10px 12px; background: #0f1117; border: 1px solid #2d3748; border-radius: 8px; color: #e2e8f0; font-size: 0.875rem; outline: none; transition: border 0.15s; }
+.field input:focus { border-color: #6366f1; }
+.submit-btn { width: 100%; padding: 10px; background: #6366f1; color: white; border: none; border-radius: 8px; font-size: 0.875rem; font-weight: 500; cursor: pointer; transition: background 0.15s; }
+.submit-btn:hover { background: #5153cc; }
+.login-error { color: #fc8181; font-size: 0.8rem; margin-top: 10px; display: none; }
+
+/* ── Dashboard layout ── */
+#dashboard { display: none; flex: 1; flex-direction: column; overflow: hidden; height: 100vh; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: #111827; border-bottom: 1px solid #1f2937; flex-shrink: 0; z-index: 10; }
+.header-left { display: flex; align-items: center; gap: 12px; }
+.header-logo { width: 30px; height: 30px; border-radius: 6px; background: #4f46e5; display: flex; align-items: center; justify-content: center; font-size: 15px; }
+.header-title { font-size: 0.9rem; font-weight: 600; }
+.header-sub { font-size: 0.68rem; color: #6b7280; margin-top: 1px; }
+.online-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.75rem; padding: 4px 10px; border-radius: 20px; background: #1f2937; border: 1px solid #374151; }
+.green-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; animation: pulse 2s infinite; }
+.yellow-dot { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
+.disconnect-btn { background: none; border: 1px solid #374151; border-radius: 6px; color: #6b7280; font-size: 0.75rem; padding: 5px 12px; cursor: pointer; transition: all 0.15s; }
+.disconnect-btn:hover { color: #e2e8f0; border-color: #6b7280; }
+
+.body-wrap { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Sidebar toggle button (always visible) ── */
+.sidebar-toggle {
+  position: absolute;
+  left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 20px; height: 48px;
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  color: #6b7280;
+  font-size: 11px;
+  z-index: 20;
+  transition: background 0.15s, color 0.15s;
+  user-select: none;
+}
+.sidebar-toggle:hover { background: #374151; color: #e2e8f0; }
+
+/* ── History sidebar (ChatGPT-style) ── */
+.history-sidebar {
+  width: 280px;
+  background: #111827;
+  border-right: 1px solid #1f2937;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+  transition: width 0.25s ease, opacity 0.2s ease;
+  position: relative;
+}
+.history-sidebar.collapsed {
+  width: 0;
+  opacity: 0;
+  pointer-events: none;
+  border-right: none;
+}
+
+.sidebar-top {
+  padding: 12px 12px 8px;
+  border-bottom: 1px solid #1f2937;
+  flex-shrink: 0;
+}
+
+.sidebar-agent-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: #1f2937;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+.agent-avatar {
+  width: 32px; height: 32px; border-radius: 50%;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.75rem; font-weight: 700; color: white; flex-shrink: 0;
+}
+.agent-name { font-size: 0.82rem; font-weight: 600; color: #e2e8f0; }
+.agent-role { font-size: 0.68rem; color: #6b7280; }
+
+.search-bar {
+  position: relative;
+}
+.search-bar input {
+  width: 100%;
+  padding: 8px 12px 8px 34px;
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  color: #e2e8f0;
+  font-size: 0.8rem;
+  outline: none;
+  transition: border 0.15s;
+}
+.search-bar input:focus { border-color: #6366f1; }
+.search-bar input::placeholder { color: #4b5563; }
+.search-icon {
+  position: absolute;
+  left: 10px; top: 50%;
+  transform: translateY(-50%);
+  color: #4b5563;
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.history-scroll { flex: 1; overflow-y: auto; padding: 4px 0; }
+.history-scroll::-webkit-scrollbar { width: 4px; }
+.history-scroll::-webkit-scrollbar-track { background: transparent; }
+.history-scroll::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+
+.date-group-label {
+  padding: 10px 14px 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: #4b5563;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.conv-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  cursor: pointer;
+  border-radius: 8px;
+  margin: 0 6px 1px;
+  transition: background 0.1s;
+  position: relative;
+}
+.conv-item:hover { background: #1f2937; }
+.conv-item.selected { background: #1e2840; }
+.conv-item.selected::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 8px; bottom: 8px;
+  width: 3px;
+  background: #6366f1;
+  border-radius: 0 3px 3px 0;
+}
+
+.conv-icon {
+  width: 30px; height: 30px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; flex-shrink: 0; margin-top: 1px;
+}
+.conv-icon.ai   { background: #1e1b4b; }
+.conv-icon.human { background: #064e3b; }
+.conv-icon.waiting { background: #451a03; }
+
+.conv-info { flex: 1; min-width: 0; }
+.conv-title-text {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #d1d5db;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.3;
+}
+.conv-meta { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+.conv-time { font-size: 0.65rem; color: #4b5563; }
+.conv-msg-count { font-size: 0.65rem; color: #374151; }
+.status-dot {
+  width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+}
+.status-dot.ai      { background: #3b82f6; }
+.status-dot.human   { background: #10b981; }
+.status-dot.waiting { background: #f59e0b; }
+
+.unread-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #6366f1;
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+
+.no-history { padding: 24px 16px; text-align: center; font-size: 0.78rem; color: #4b5563; line-height: 1.6; }
+
+.conv-delete {
+  position: absolute;
+  right: 7px; top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+  padding: 3px 6px;
+  background: transparent;
+  border: none;
+  color: #6b7280;
+  cursor: pointer;
+  border-radius: 5px;
+  font-size: 13px;
+  line-height: 1;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  z-index: 2;
+}
+.conv-item:hover .conv-delete { opacity: 1; }
+.conv-delete:hover { background: rgba(239,68,68,0.15); color: #f87171; }
+
+/* ── Main conversation panel ── */
+.conv-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #0f1117; }
+
+.conv-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 18px;
+  border-bottom: 1px solid #1f2937;
+  background: #111827;
+  flex-shrink: 0; min-height: 52px;
+}
+.conv-header-left { display: flex; flex-direction: column; gap: 2px; }
+.conv-title { font-size: 0.88rem; font-weight: 600; color: #e2e8f0; }
+.conv-subtitle { font-size: 0.68rem; color: #6b7280; }
+.conv-actions { display: flex; gap: 8px; }
+.action-btn { padding: 6px 13px; border-radius: 7px; font-size: 0.78rem; font-weight: 500; cursor: pointer; border: none; transition: all 0.15s; }
+.monitor-btn  { background: #1f2937; color: #9ca3af; }
+.monitor-btn:hover  { background: #374151; color: #e2e8f0; }
+.takeover-btn { background: #6366f1; color: white; }
+.takeover-btn:hover { background: #5153cc; }
+.release-btn  { background: transparent; color: #f87171; border: 1px solid #f87171 !important; }
+.release-btn:hover  { background: rgba(248,113,113,0.1); }
+.action-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.messages-area { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+.messages-area::-webkit-scrollbar { width: 4px; }
+.messages-area::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+.empty-conv { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #4b5563; font-size: 0.85rem; text-align: center; gap: 10px; }
+.empty-conv-icon { font-size: 2.5rem; opacity: 0.4; }
+
+/* ── Message bubbles ── */
+.msg-row { display: flex; gap: 10px; align-items: flex-start; }
+.msg-row.user { flex-direction: row-reverse; }
+.avatar { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700; flex-shrink: 0; margin-top: 2px; }
+.avatar.user   { background: #1e3a5f; color: #93c5fd; }
+.avatar.ai     { background: #2e1065; color: #c4b5fd; }
+.avatar.agent  { background: #064e3b; color: #6ee7b7; }
+.avatar.system { background: #1f2937; color: #6b7280; }
+.msg-body { display: flex; flex-direction: column; max-width: 72%; }
+.msg-row.user .msg-body { align-items: flex-end; }
+.role-label { font-size: 0.63rem; font-weight: 600; color: #6b7280; margin-bottom: 4px; }
+.bubble { padding: 9px 13px; border-radius: 14px; font-size: 0.84rem; line-height: 1.6; word-break: break-word; }
+.user  .bubble { background: #1e3a5f; color: #e2e8f0; border-radius: 14px 4px 14px 14px; }
+.ai    .bubble { background: #2e1065; color: #e2e8f0; border-radius: 4px 14px 14px 14px; }
+.agent .bubble { background: #064e3b; color: #d1fae5; border-radius: 4px 14px 14px 14px; }
+.system .bubble { background: #1f2937; color: #6b7280; font-style: italic; border-radius: 10px; font-size: 0.78rem; }
+.msg-meta { font-size: 0.62rem; color: #374151; margin-top: 3px; }
+
+/* ── Input bar ── */
+.input-bar { padding: 14px 18px; border-top: 1px solid #1f2937; background: #111827; display: flex; gap: 8px; flex-shrink: 0; align-items: center; }
+.input-bar input { flex: 1; padding: 10px 14px; background: #1f2937; border: 1px solid #374151; border-radius: 10px; color: #e2e8f0; font-size: 0.85rem; outline: none; transition: border 0.15s; }
+.input-bar input:focus { border-color: #6366f1; }
+.input-bar input:disabled { opacity: 0.35; cursor: not-allowed; }
+.send-btn { padding: 10px 18px; background: #6366f1; color: white; border: none; border-radius: 10px; font-size: 0.85rem; cursor: pointer; font-weight: 500; transition: background 0.15s; }
+.send-btn:hover { background: #5153cc; }
+.send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* ── Sidebar toggle button position tracking ── */
+.body-wrap { position: relative; }
+#sidebar-toggle {
+  left: 280px;   /* matches sidebar open width */
+  transition: left 0.25s ease;
+}
+.history-sidebar.collapsed ~ * #sidebar-toggle,
+body.sidebar-closed #sidebar-toggle { left: 0; }
+
+/* ── Reconnect banner ── */
+#reconnect-banner {
+  display: none; position: fixed; top: 0; left: 0; right: 0;
+  background: #7c2d12; color: #fed7aa;
+  font-size: 0.78rem; text-align: center; padding: 6px; z-index: 999;
+}
+</style>
+</head>
+<body>
+
+<div id="reconnect-banner">⚠ Connection lost — reconnecting automatically…</div>
+
+<!-- Login Screen -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="logo">
+      <div class="logo-icon">🛡</div>
+      <span class="logo-text">InsureHub</span>
+    </div>
+    <h1>Agent Dashboard</h1>
+    <p>Sign in to monitor and assist users live.</p>
+    <div class="field">
+      <label>Your name</label>
+      <input id="inp-name" type="text" placeholder="e.g. Sarah" autofocus autocomplete="off" />
+    </div>
+    <div class="field">
+      <label>Admin password</label>
+      <input id="inp-pass" type="password" placeholder="••••••••" autocomplete="current-password" />
+    </div>
+    <button class="submit-btn" id="login-btn">Connect →</button>
+    <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- Dashboard -->
+<div id="dashboard">
+  <header>
+    <div class="header-left">
+      <div class="header-logo">🛡</div>
+      <div>
+        <div class="header-title">InsureHub · Agent Dashboard</div>
+        <div class="header-sub">Live monitor &amp; conversation history</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <div class="online-badge" id="conn-badge">
+        <span class="green-dot" id="conn-dot"></span>
+        <span id="status-label">Connecting…</span>
+      </div>
+      <button class="disconnect-btn" id="disconnect-btn">Disconnect</button>
+    </div>
+  </header>
+
+  <div class="body-wrap" style="position:relative">
+
+    <!-- Sidebar toggle tab — sticks to the right edge of the sidebar -->
+    <div class="sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle history panel">‹</div>
+
+    <!-- History Sidebar -->
+    <div class="history-sidebar" id="history-sidebar">
+
+      <div class="sidebar-top">
+        <!-- Agent info pill -->
+        <div class="sidebar-agent-info">
+          <div class="agent-avatar" id="agent-avatar">?</div>
+          <div>
+            <div class="agent-name" id="agent-name-label">—</div>
+            <div class="agent-role">Human Agent · Online</div>
+          </div>
+        </div>
+        <!-- Search -->
+        <div class="search-bar">
+          <span class="search-icon">🔍</span>
+          <input id="search-input" type="text" placeholder="Search conversations…" oninput="filterHistory(this.value)" />
+        </div>
+      </div>
+
+      <div class="history-scroll" id="history-scroll">
+        <div class="no-history">
+          <div style="font-size:1.8rem;margin-bottom:8px">💬</div>
+          No conversations yet.<br>Waiting for users to start chatting.
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Conversation panel -->
+    <div class="conv-panel">
+      <div class="conv-header">
+        <div class="conv-header-left">
+          <span class="conv-title" id="conv-title">Select a conversation</span>
+          <span class="conv-subtitle" id="conv-subtitle"></span>
+        </div>
+        <div class="conv-actions" id="conv-actions" style="display:none">
+          <button class="action-btn monitor-btn" id="monitor-btn" onclick="doMonitor()">👁 Monitor</button>
+          <button class="action-btn takeover-btn" id="takeover-btn" onclick="doTakeover()">↗ Take Over</button>
+          <button class="action-btn release-btn" id="release-btn" onclick="doRelease()" style="display:none">🤖 Hand back to AI</button>
+        </div>
+      </div>
+
+      <div class="messages-area" id="messages-area">
+        <div class="empty-conv">
+          <div class="empty-conv-icon">🗂</div>
+          Select a conversation from the history panel<br>to view its full transcript and monitor it live.
+        </div>
+      </div>
+
+      <div class="input-bar">
+        <input type="text" id="msg-input" placeholder="Take over a conversation first to reply…"
+               disabled onkeydown="if(event.key==='Enter')sendMsg()" />
+        <button class="send-btn" id="send-btn" onclick="sendMsg()" disabled>Send</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+let ws = null;
+let myAgentId = null;
+let myName = "";
+let savedPass = "";
+let activeSessionId = null;
+let myActiveSession = null;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let intentionalDisconnect = false;
+let allSessions = [];          // full list from last sessions_update
+let unreadSessions = new Set(); // session ids with new msgs while not selected
+
+// ── Login ───────────────────────────────────────────────────────────────────
+document.getElementById("login-btn").addEventListener("click", doLogin);
+document.getElementById("inp-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+
+async function doLogin() {
+  const name = document.getElementById("inp-name").value.trim();
+  const pass = document.getElementById("inp-pass").value;
+  if (!name) return showErr("Please enter your name.");
+  if (!pass) return showErr("Please enter the admin password.");
+  clearErr();
+
+  try {
+    const r = await fetch(`${location.origin}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: pass }),
+    });
+    if (!r.ok) return showErr("Wrong password. Please try again.");
+  } catch {
+    return showErr("Cannot reach the server.");
+  }
+
+  myName = name;
+  savedPass = pass;
+  intentionalDisconnect = false;
+  openWebSocket();
+}
+
+function showErr(msg) {
+  const el = document.getElementById("login-error");
+  el.textContent = msg;
+  el.style.display = "block";
+}
+function clearErr() { document.getElementById("login-error").style.display = "none"; }
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+function openWebSocket() {
+  if (ws) { try { ws.close(); } catch(_) {} }
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws/agent`);
+
+  ws.onopen = () => {
+    reconnectAttempt = 0;
+    document.getElementById("reconnect-banner").style.display = "none";
+    ws.send(JSON.stringify({ type: "login", name: myName, password: savedPass }));
+  };
+
+  ws.onmessage = ev => handle(JSON.parse(ev.data));
+
+  ws.onclose = () => {
+    if (intentionalDisconnect) return;
+    scheduleReconnect();
+  };
+}
+
+function scheduleReconnect() {
+  const onDashboard = document.getElementById("dashboard").style.display !== "none";
+  if (!onDashboard) return;
+  document.getElementById("reconnect-banner").style.display = "block";
+  setConnStatus(false);
+  clearTimeout(reconnectTimer);
+  const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempt), 15000);
+  reconnectAttempt++;
+  reconnectTimer = setTimeout(openWebSocket, delay);
+}
+
+function handle(msg) {
+  switch (msg.type) {
+    case "logged_in":
+      myAgentId = msg.agent_id;
+      showDashboard(true);
+      setConnStatus(true);
+      if (activeSessionId && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "monitor", session_id: activeSessionId }));
+      }
+      break;
+
+    case "error":
+      if (!myAgentId) { showErr(msg.message || "Connection error."); if (ws) ws.close(); }
+      break;
+
+    case "sessions_update":
+      allSessions = msg.sessions || [];
+      renderHistory(allSessions, document.getElementById("search-input").value);
+      break;
+
+    case "history":
+      if (msg.session_id === activeSessionId) {
+        renderMessages(msg.history || []);
+        updateConvHeader();
+      }
+      break;
+
+    case "new_message":
+      if (msg.session_id === activeSessionId) {
+        appendBubble(msg.role, msg.content, msg.timestamp);
+      } else {
+        unreadSessions.add(msg.session_id);
+        renderHistory(allSessions, document.getElementById("search-input").value);
+      }
+      // Update the session's preview in allSessions
+      const s = allSessions.find(x => x.session_id === msg.session_id);
+      if (s) { s.last_message = msg.content.slice(0, 80); s.message_count = (s.message_count || 0) + 1; }
+      renderHistory(allSessions, document.getElementById("search-input").value);
+      break;
+
+    case "assigned":
+      myActiveSession = msg.session_id;
+      if (msg.session_id === activeSessionId) {
+        renderMessages(msg.history || []);
+        updateButtons();
+        updateConvHeader();
+      }
+      setInputEnabled(true);
+      break;
+  }
+}
+
+function setConnStatus(online) {
+  document.getElementById("conn-dot").className = online ? "green-dot" : "yellow-dot";
+  document.getElementById("status-label").textContent = online ? `${myName} · Online` : "Reconnecting…";
+}
+
+// ── Dashboard visibility ─────────────────────────────────────────────────────
+function showDashboard(show) {
+  document.getElementById("login-screen").style.display = show ? "none" : "flex";
+  document.getElementById("dashboard").style.display = show ? "flex" : "none";
+  if (show) {
+    document.getElementById("agent-name-label").textContent = myName;
+    document.getElementById("agent-avatar").textContent = myName[0]?.toUpperCase() || "A";
+  }
+}
+
+document.getElementById("disconnect-btn").addEventListener("click", () => {
+  intentionalDisconnect = true;
+  clearTimeout(reconnectTimer);
+  if (ws) ws.close();
+  document.getElementById("reconnect-banner").style.display = "none";
+  showDashboard(false);
+  myAgentId = null; myActiveSession = null; activeSessionId = null;
+  reconnectAttempt = 0; allSessions = []; unreadSessions.clear();
+  document.getElementById("inp-pass").value = "";
+  document.getElementById("search-input").value = "";
+  clearErr();
+  resetConvPanel();
+  setInputEnabled(false);
+});
+
+function resetConvPanel() {
+  document.getElementById("messages-area").innerHTML = `
+    <div class="empty-conv">
+      <div class="empty-conv-icon">🗂</div>
+      Select a conversation from the history panel<br>to view its full transcript and monitor it live.
+    </div>`;
+  document.getElementById("conv-actions").style.display = "none";
+  document.getElementById("conv-title").textContent = "Select a conversation";
+  document.getElementById("conv-subtitle").textContent = "";
+}
+
+// ── History sidebar ───────────────────────────────────────────────────────────
+
+function getDateGroup(createdAt) {
+  if (!createdAt) return "Unknown";
+  let date;
+  // New format: "2026-06-24 14:30", old format: "14:30"
+  if (/^\d{4}-\d{2}-\d{2}/.test(createdAt)) {
+    date = new Date(createdAt.replace(" ", "T") + ":00Z");
+  } else {
+    return "Today"; // old sessions with no date default to today
+  }
+  if (isNaN(date.getTime())) return "Unknown";
+
+  const now = new Date();
+  const today     = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(+today - 86400000);
+  const weekAgo   = new Date(+today - 6 * 86400000);
+  const monthAgo  = new Date(+today - 29 * 86400000);
+  const sessDate  = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+  if (+sessDate >= +today)     return "Today";
+  if (+sessDate >= +yesterday) return "Yesterday";
+  if (+sessDate >= +weekAgo)   return "Previous 7 Days";
+  if (+sessDate >= +monthAgo)  return "Previous 30 Days";
+  return "Older";
+}
+
+function formatTime(createdAt) {
+  if (!createdAt) return "";
+  if (/^\d{4}-\d{2}-\d{2}/.test(createdAt)) {
+    // Return just the time part HH:MM
+    return createdAt.split(" ")[1] || createdAt;
+  }
+  return createdAt; // already HH:MM
+}
+
+function renderHistory(sessions, query = "") {
+  const scroll = document.getElementById("history-scroll");
+  const q = (query || "").toLowerCase().trim();
+
+  let filtered = q
+    ? sessions.filter(s =>
+        s.session_id.toLowerCase().includes(q) ||
+        (s.title || "").toLowerCase().includes(q) ||
+        (s.last_message || "").toLowerCase().includes(q)
+      )
+    : sessions;
+
+  if (!filtered.length) {
+    scroll.innerHTML = `<div class="no-history">${
+      q ? `<div style="font-size:1.5rem;margin-bottom:8px">🔍</div>No results for "<b>${esc(q)}</b>"`
+        : `<div style="font-size:1.8rem;margin-bottom:8px">💬</div>No conversations yet.<br>Waiting for users to start chatting.`
+    }</div>`;
+    return;
+  }
+
+  // Group by date
+  const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Older", "Unknown"];
+  const groups = {};
+  for (const s of filtered) {
+    const g = getDateGroup(s.created_at);
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(s);
+  }
+
+  let html = "";
+  for (const groupName of GROUP_ORDER) {
+    const items = groups[groupName];
+    if (!items?.length) continue;
+    html += `<div class="date-group-label">${groupName}</div>`;
+    for (const s of items) {
+      const isSelected = s.session_id === activeSessionId;
+      const hasUnread  = unreadSessions.has(s.session_id) && !isSelected;
+      const iconMap    = { human: "👤", waiting: "⏳", ai: "🤖" };
+      const icon       = iconMap[s.status] || "🤖";
+      const timeStr    = formatTime(s.created_at);
+      const title      = s.title || `Session #${s.session_id}`;
+      html += `
+        <div class="conv-item${isSelected ? " selected" : ""}" onclick="selectSession('${s.session_id}')">
+          <div class="conv-icon ${s.status}">${icon}</div>
+          <div class="conv-info">
+            <div class="conv-title-text">${esc(title)}</div>
+            <div class="conv-meta">
+              <span class="status-dot ${s.status}"></span>
+              <span class="conv-time">${timeStr}</span>
+              ${s.message_count ? `<span class="conv-msg-count">· ${s.message_count} msgs</span>` : ""}
+            </div>
+          </div>
+          ${hasUnread ? `<div class="unread-dot" title="New messages"></div>` : ""}
+          <button class="conv-delete" onclick="deleteSession('${s.session_id}',event)" title="Delete conversation">🗑</button>
+        </div>`;
+    }
+  }
+
+  scroll.innerHTML = html;
+}
+
+function filterHistory(query) {
+  renderHistory(allSessions, query);
+}
+
+async function deleteSession(sid, event) {
+  event.stopPropagation();
+  if (!confirm('Delete this conversation? This cannot be undone.')) return;
+  try {
+    const r = await fetch(`${location.origin}/session/${sid}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error('Server error');
+    allSessions = allSessions.filter(s => s.session_id !== sid);
+    unreadSessions.delete(sid);
+    if (activeSessionId === sid) {
+      activeSessionId = null;
+      if (myActiveSession === sid) { myActiveSession = null; setInputEnabled(false); }
+      resetConvPanel();
+    }
+    renderHistory(allSessions, document.getElementById('search-input').value);
+  } catch {
+    alert('Failed to delete conversation. Please try again.');
+  }
+}
+
+function selectSession(sid) {
+  activeSessionId = sid;
+  unreadSessions.delete(sid);
+  renderHistory(allSessions, document.getElementById("search-input").value);
+
+  const session = allSessions.find(s => s.session_id === sid);
+  document.getElementById("conv-title").textContent = session?.title || `Conversation #${sid}`;
+  document.getElementById("conv-subtitle").textContent = `#${sid} · ${session?.message_count || 0} messages`;
+  document.getElementById("conv-actions").style.display = "flex";
+  updateButtons();
+
+  document.getElementById("messages-area").innerHTML =
+    '<div class="empty-conv"><div class="empty-conv-icon" style="font-size:1.2rem">⏳</div>Loading history…</div>';
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "monitor", session_id: sid }));
+  }
+}
+
+function updateConvHeader() {
+  const s = allSessions.find(x => x.session_id === activeSessionId);
+  if (!s) return;
+  document.getElementById("conv-title").textContent = s.title || `Conversation #${activeSessionId}`;
+  document.getElementById("conv-subtitle").textContent = `#${activeSessionId} · ${s.message_count || 0} messages`;
+}
+
+// ── Action buttons ────────────────────────────────────────────────────────────
+function updateButtons() {
+  const mine = myActiveSession === activeSessionId;
+  document.getElementById("monitor-btn").style.display  = mine ? "none" : "";
+  document.getElementById("takeover-btn").style.display = mine ? "none" : "";
+  document.getElementById("release-btn").style.display  = mine ? "" : "none";
+}
+
+function doMonitor() {
+  if (!activeSessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "monitor", session_id: activeSessionId }));
+}
+function doTakeover() {
+  if (!activeSessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "takeover", session_id: activeSessionId }));
+}
+function doRelease() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "release" }));
+  myActiveSession = null;
+  setInputEnabled(false);
+  updateButtons();
+}
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+function renderMessages(history) {
+  const el = document.getElementById("messages-area");
+  el.innerHTML = "";
+  if (!history.length) {
+    el.innerHTML = '<div class="empty-conv"><div class="empty-conv-icon">💬</div>No messages yet.</div>';
+    return;
+  }
+  history.forEach(m => appendBubble(m.role, m.content, m.timestamp));
+}
+
+function appendBubble(role, content, ts) {
+  const el = document.getElementById("messages-area");
+  const empty = el.querySelector(".empty-conv");
+  if (empty) el.innerHTML = "";
+
+  const avatarText = { user: "U", ai: "AI", agent: "AG", system: "•" };
+  const roleLabel  = { user: "User", ai: "Layla (AI)", agent: "Agent", system: "System" };
+
+  const row = document.createElement("div");
+  row.className = `msg-row ${role}`;
+  const bodyHtml = `
+    <div class="msg-body">
+      <div class="role-label">${roleLabel[role] || role}</div>
+      <div class="bubble">${esc(content)}</div>
+      ${ts ? `<div class="msg-meta">${ts}</div>` : ""}
+    </div>`;
+  row.innerHTML = role === "user"
+    ? bodyHtml + `<div class="avatar user">${avatarText.user}</div>`
+    : `<div class="avatar ${role}">${avatarText[role] || "?"}</div>` + bodyHtml;
+
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Send ──────────────────────────────────────────────────────────────────────
+function sendMsg() {
+  const inp = document.getElementById("msg-input");
+  const content = inp.value.trim();
+  if (!content || !myActiveSession || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "message", session_id: myActiveSession, content }));
+  inp.value = "";
+  inp.focus();
+}
+
+function setInputEnabled(on) {
+  const inp = document.getElementById("msg-input");
+  const btn = document.getElementById("send-btn");
+  inp.disabled = !on;
+  btn.disabled = !on;
+  inp.placeholder = on ? "Type your reply to the user…" : "Take over a conversation first to reply…";
+}
+
+// ── Sidebar toggle ────────────────────────────────────────────────────────────
+let sidebarOpen = true;
+
+function toggleSidebar() {
+  const sidebar = document.getElementById("history-sidebar");
+  const btn     = document.getElementById("sidebar-toggle");
+  sidebarOpen = !sidebarOpen;
+  sidebar.classList.toggle("collapsed", !sidebarOpen);
+  btn.textContent = sidebarOpen ? "‹" : "›";
+  btn.title       = sidebarOpen ? "Close history panel" : "Open history panel";
+  btn.style.left  = sidebarOpen ? "280px" : "0px";
+}
+
+// ── Util ──────────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>");
+}
+</script>
+</body>
+</html>
