@@ -692,11 +692,13 @@ class MultiSourceRAG:
         if len(full_context) > self.max_context_chars:
             full_context = full_context[:self.max_context_chars] + "... (truncated)"
 
+        import json as _json_s
         if not full_context.strip():
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it — they'll be able to help you better! 😊"
             )
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
         else:
             ctx_covered = _context_covers_query(question, all_chunks)
@@ -705,6 +707,7 @@ class MultiSourceRAG:
                     "Hmm, I don't have that specific information in my knowledge base right now. "
                     "Let me get one of our agents on it — they'll be able to help you better! 😊"
                 )
+                yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
             prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
