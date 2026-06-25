@@ -264,8 +264,7 @@
   <span>Tunnel:</span>
   <a id="tunnel-link" href="#" target="_blank">detecting…</a>
   <button id="tunnel-copy-btn" onclick="copyTunnelUrl()">copy</button>
-  <span style="margin-left:12px;color:#475569">Agent panel: <a id="agent-link" href="#" target="_blank">—</a></span>
-  <span style="margin-left:auto;color:#475569">Chat: <a href="https://insurehub-your-ai-insurance-advisor.vercel.app" target="_blank" style="color:#818cf8">insurehub-your-ai-insurance-advisor.vercel.app</a></span>
+  <span style="margin-left:auto;color:#475569">Agent panel: <a id="agent-link" href="#" target="_blank">—</a></span>
 </div>
 
 <!-- Top bar -->
@@ -358,11 +357,37 @@
 <div class="toast" id="toast"></div>
 
 <script>
-const API = window.location.origin;
+// ── Backend URL — __API_URL__ is replaced by build.js at deploy time ──────────
+const _BUILT_IN_API = '__API_URL__';
+function getBackendUrl() {
+  const stored = localStorage.getItem('insure_backend_url') || '';
+  return (stored || _BUILT_IN_API).replace(/\/$/, '');
+}
+const API = getBackendUrl();
 
 // ── Auth guard ────────────────────────────────────────────────────────────────
 const token = localStorage.getItem('insure_token');
-if (!token) { window.location.href = '/auth'; }
+if (!token || !API) { window.location.href = '/auth'; }
+
+// Show backend host in topbar so admin always knows which server is connected
+(function() {
+  try {
+    const host = new URL(API).hostname;
+    const pill = document.getElementById('userPill');
+    if (pill) pill.title = 'Backend: ' + API;
+    const bar = document.getElementById('tunnel-bar');
+    if (bar) {
+      const span = document.createElement('span');
+      span.style.cssText = 'color:#475569;font-size:0.72rem;margin-right:8px';
+      span.textContent = 'Backend: ';
+      const a = document.createElement('a');
+      a.href = API; a.target = '_blank';
+      a.style.color = '#818cf8';
+      a.textContent = host;
+      bar.prepend(a); bar.prepend(span);
+    }
+  } catch(_) {}
+})();
 
 fetch(`${API}/auth/verify`, { headers: { Authorization: 'Bearer ' + token } })
   .then(r => { if (r.status === 401) { localStorage.clear(); window.location.href = '/auth'; } })
@@ -474,8 +499,6 @@ async function uploadFile(file) {
 
 async function pollJob(job_id, fill) {
   const bar = document.getElementById('progressBar');
-  // Poll every 1.5 s for up to 15 minutes. Large PDFs can take several minutes
-  // to embed — we never show a hard error just because polling stopped.
   for (let i = 0; i < 600; i++) {
     await new Promise(r => setTimeout(r, 1500));
     try {
@@ -497,9 +520,6 @@ async function pollJob(job_id, fill) {
       return;
     }
   }
-  // Loop ended without a 'done' — the document is still indexing in the
-  // background. Don't show an error; just refresh the list so the user
-  // can see it once it appears.
   bar.classList.remove('active');
   fill.style.width = '0%';
   showToast('Large document is still indexing — it will appear in the list once ready.', 'info');

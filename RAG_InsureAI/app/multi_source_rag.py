@@ -20,40 +20,297 @@ _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
 # Domain-generic terms that appear in virtually every insurance chunk and
 # therefore give no signal about whether a chunk covers the specific query topic.
 _QUERY_STOP_WORDS = {
+    # English function words
     'what', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'how', 'does',
     'do', 'i', 'my', 'me', 'by', 'with', 'under', 'about', 'can', 'will',
     'which', 'when', 'where', 'to', 'and', 'or', 'at', 'this', 'that', 'it',
     'its', 'be', 'been', 'has', 'have', 'had', 'any', 'all', 'from', 'on',
-    # domain-generic insurance terms that appear in almost every chunk
+    # Conversational intent words — appear in questions but never in KB chunks
+    'tell', 'you', 'your', 'give', 'explain', 'know', 'say', 'get', 'let',
+    'show', 'help', 'talk', 'discuss', 'find', 'see', 'our', 'their', 'use',
+    'used', 'using', 'work', 'works', 'mean', 'means', 'please', 'want',
+    'need', 'like', 'just', 'also', 'more', 'some', 'very', 'well', 'good',
+    'different', 'types', 'type', 'kind', 'kinds', 'various', 'general',
+    'basic', 'main', 'key', 'between', 'difference', 'example', 'examples',
+    # Domain-generic insurance terms that appear in almost every chunk
     'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
     'plan', 'claim', 'claims', 'benefits', 'benefit',
-    # generic time/measurement words — too common to indicate topic coverage
+    # Generic time/measurement words — too common to indicate topic coverage
     'period', 'time', 'duration', 'date', 'days', 'year', 'month', 'months',
 }
 
-def _context_covers_query(query: str, docs: list) -> bool:
-    """True if ≥1 retrieved chunk contains at least one discriminating query keyword.
 
-    Guards against cross-encoder false positives where a chunk scores highly but
-    doesn't actually contain any query-specific term (e.g. a 'Duty of Assured'
-    chunk scoring 0.87 for 'What is a deductible?').
-    """
-    query_terms = {
+def _extract_topic_terms(query: str) -> set[str]:
+    """Return discriminating topic words from a query after stop-word filtering."""
+    return {
         w for w in re.findall(r'\b[a-z]{3,}\b', query.lower())
         if w not in _QUERY_STOP_WORDS
     }
-    if not query_terms:
-        return True  # no discriminating terms — assume covered
+
+
+def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
+    """True if ≥1 retrieved chunk contains at least one topic keyword.
+
+    Accepts an optional `llm_topics` set (from _extract_intent_topics).
+    When provided those override the regex extraction, giving much better
+    intent recognition for conversational questions.
+
+    Falls back to regex for compound "X and Y" splitting when llm_topics
+    is absent.
+    """
+    if llm_topics:
+        # LLM already identified the exact topic words — just check any chunk
+        # mentions at least one of them.
+        for doc in docs:
+            text = (
+                doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
+            ).lower()
+            chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
+            if chunk_terms & llm_topics:
+                return True
+        return False
+
+    # Regex fallback: split compound questions on "and"/"or" so each part is
+    # checked independently.
+    sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
+    all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
+    all_term_sets = [t for t in all_term_sets if t]
+    if not all_term_sets:
+        return True
+
     for doc in docs:
         text = (
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
         chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
+<<<<<<< HEAD
         if query_terms & chunk_terms:
             return True
     return False
 
 
+=======
+        for topic_terms in all_term_sets:
+            if chunk_terms & topic_terms:
+                return True
+    return False
+
+
+_DETAIL_SIGNALS = {
+    'in detail', 'step by step', 'step-by-step', 'in steps', 'procedure',
+    'process', 'how to', 'explain', 'elaborate', 'describe', 'walk me through',
+    'in depth', 'thoroughly', 'fully explain', 'all about', 'everything about',
+    'comprehensive', 'complete', 'what are all', 'list all', 'list the',
+    'what all', 'how does it work', 'all the steps', 'entire process',
+    'tell me everything', 'give me a full', 'give me the full',
+}
+
+
+def _needs_detailed_answer(question: str) -> bool:
+    """True when the question expects a comprehensive, multi-part, or procedural answer."""
+    q = question.lower()
+    if any(sig in q for sig in _DETAIL_SIGNALS):
+        return True
+    # Long questions (>20 words) almost always need more than 4 sentences
+    if len(question.split()) > 20:
+        return True
+    # Multiple sub-questions joined by "and" — e.g. "how does X work and what are its Y and Z"
+    if q.count(' and ') >= 2:
+        return True
+    return False
+
+
+_FOLLOWUP_SIGNALS = {
+    'it', 'its', 'that', 'this', 'them', 'those', 'they', 'their', 'which', 'these',
+}
+_FOLLOWUP_OPENERS = (
+    'what about', 'how about', 'and what', 'also ', 'tell me more',
+    'what does it', 'how does it', 'what is it', 'is it ', 'can it ',
+)
+
+
+def _is_likely_followup(question: str) -> bool:
+    """Heuristic: is this question likely a follow-up referencing a previous topic?"""
+    words = question.strip().split()
+    if len(words) > 12:
+        return False  # long questions are usually self-contained
+    tokens = {w.lower().strip('?.,!') for w in words}
+    q_lower = question.lower().strip()
+    return bool(tokens & _FOLLOWUP_SIGNALS) or any(q_lower.startswith(op) for op in _FOLLOWUP_OPENERS)
+
+
+async def _reformulate_query(question: str, history: str) -> str:
+    """Rewrite a follow-up question as a standalone search query using conversation history.
+
+    Examples:
+      history: "User: tell me about life insurance\\nLayla: Life insurance ..."
+      question: "what about premiums?"
+      returns: "life insurance premiums"
+
+    Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
+    Falls back to the original question on any error.
+    """
+    import aiohttp as _aiohttp
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+    if _active_backend() != "vllm" or not VLLM_HOST:
+        return question
+    # Use only the last 6 lines (3 turns) of history to keep the prompt short
+    recent = '\n'.join(history.strip().split('\n')[-6:])
+    prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
+Output ONLY the search query — no quotes, no explanation, nothing else.
+
+Examples:
+  Context: "User: tell me about life insurance\\nLayla: Life insurance pays out..."
+  Follow-up: "what about premiums?" → "life insurance premiums"
+
+  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers..."
+  Follow-up: "is it legally required?" → "reinsurance legal requirement"
+
+  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer..."
+  Follow-up: "give me an example" → "subrogation example"
+
+Conversation:
+{recent}
+
+Follow-up: {question}
+Search query:"""
+    try:
+        payload = {
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 30,
+            "temperature": 0,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        }
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{VLLM_HOST}/v1/chat/completions",
+                json=payload, headers=headers,
+                timeout=_aiohttp.ClientTimeout(total=4),
+            ) as resp:
+                data = await resp.json()
+                reformulated = data["choices"][0]["message"]["content"].strip().strip('"\'')
+                if reformulated and len(reformulated) >= 3:
+                    logger.info("[REFORM] %r → %r", question, reformulated)
+                    return reformulated
+    except Exception as exc:
+        logger.debug("[REFORM] failed (%s) — using original question", exc)
+    return question
+
+
+_INTENT_PROMPT = """\
+Extract the core insurance topic keywords from the question below.
+Output ONLY 2-5 comma-separated words or short phrases — nothing else.
+
+Patterns (question format → output):
+"tell me about X"              → X
+"can you explain X"            → X
+"how does X work"              → X
+"what is X and Y"              → X, Y
+"X and its Y"                  → X, Y
+"difference between X and Y"   → X, Y
+
+Examples:
+"can you tell me about life insurance"                        → life
+"how does reinsurance work and what is its legal significance" → reinsurance, legal
+"explain what a deductible is"                                → deductible
+"tell me about motor policy claims"                           → motor, claims
+"what is nomination"                                          → nomination
+"give me info about health cover"                             → health
+"how are premiums calculated for fire insurance"              → premiums, fire
+"can you explain the principle of subrogation"                → subrogation
+"what is the difference between term and whole life"          → term life, whole life
+
+Question: {question}
+Keywords:"""
+
+
+async def _extract_intent_topics(question: str) -> set[str]:
+    """Fast LLM call (runs in parallel with retrieval) to extract core topic words.
+
+    Uses vLLM with max_tokens=30 so the round-trip is <1 s on an idle server.
+    Falls back to an empty set on any error — caller uses regex fallback.
+    """
+    import aiohttp as _aiohttp
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+    if _active_backend() != "vllm" or not VLLM_HOST:
+        return set()
+    try:
+        prompt = _INTENT_PROMPT.format(question=question)
+        payload = {
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 30,
+            "temperature": 0,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        }
+        timeout = _aiohttp.ClientTimeout(total=5)
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(f"{VLLM_HOST}/v1/chat/completions",
+                                    json=payload, headers=headers,
+                                    timeout=timeout) as resp:
+                data = await resp.json()
+                raw = data["choices"][0]["message"]["content"].strip().lower()
+                # Parse "word1, word2, phrase three" into individual tokens
+                topics: set[str] = set()
+                for phrase in raw.split(","):
+                    phrase = phrase.strip()
+                    if phrase:
+                        for word in re.findall(r'\b[a-z]{3,}\b', phrase):
+                            topics.add(word)
+                logger.debug("[INTENT] %r → topics=%s", question, topics)
+                return topics
+    except Exception as exc:
+        logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
+        return set()
+
+
+_HANDOFF_MSG = (
+    "I don't have that in my knowledge base right now — "
+    "let me get a human agent to help you! 😊"
+)
+
+# Phrases that indicate the model answered from general training knowledge
+# rather than from the retrieved context. If ANY of these appear in the
+# LLM response, we discard the response and return the handoff message.
+_GENERAL_KNOWLEDGE_TELLS = [
+    "generally speaking",
+    "in general,",
+    "typically,",
+    "typically ",
+    "usually,",
+    "usually ",
+    "as a general rule",
+    "in most cases",
+    "commonly,",
+    "commonly ",
+    "standard practice",
+    "based on my knowledge",
+    "from my training",
+    "most insurance policies",
+    "most insurers",
+    "it is important to note",
+    "one should ",
+    "you should note",
+    "please note that",
+]
+
+
+def _llm_used_general_knowledge(response: str) -> bool:
+    """Return True if the LLM response contains general-knowledge tells."""
+    lower = response.lower()
+    return any(tell in lower for tell in _GENERAL_KNOWLEDGE_TELLS)
+
+
+>>>>>>> ed6158d9809deb43f83e4f6ab5dd75e4a4a876f4
 def _strip_markdown(text: str) -> str:
     """Convert markdown-formatted LLM output to plain conversational prose.
 
@@ -299,7 +556,10 @@ from router import get_insurance_llm
 from video_store import VideoVectorStore
 from webpage_store import WebpageVectorStore
 from calculator import compute_insurance_benefits, _is_calculation_question
-from prompt_template import STRICT_GROUNDED_PROMPT, CALCULATION_PROMPT, CONVERSATIONAL_RAG_PROMPT
+from prompt_template import (
+    STRICT_GROUNDED_PROMPT, DETAILED_GROUNDED_PROMPT,
+    CALCULATION_PROMPT, CONVERSATIONAL_RAG_PROMPT,
+)
 from context_compressor import ContextCompressor
 from rag import LLM_CONTEXT_WINDOW_CHARS
 
@@ -603,23 +863,42 @@ class MultiSourceRAG:
             conditions = [{"source": {"$contains": doc}} for doc in document_filter]
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
 
-        # Streaming path uses a pool of 8 candidates (vs 30 in ask()) so the
-        # cross-encoder rerank takes ~2-3s on CPU instead of ~9s, keeping
-        # first-token latency under 5s while still reordering by relevance.
-        # ── Parallel retrieval across all sources ─────────────────────────────
+        # ── Follow-up reformulation ───────────────────────────────────────────
+        # For short/pronoun-heavy questions ("what about premiums?", "is it legal?")
+        # rewrite into a standalone search query using conversation history.
+        # This runs sequentially BEFORE retrieval (~0.4 s for follow-ups only;
+        # skipped instantly for long self-contained questions via heuristic).
+        if history and _is_likely_followup(question):
+            retrieval_query = await _reformulate_query(question, history)
+
+        # Detailed/specific questions need more chunks to cover all aspects.
+        # Simple conversational questions keep the smaller pool to stay fast.
+        detailed = _needs_detailed_answer(question)
+        _doc_top_k    = 14 if detailed else 8
+        _chunk_limit  = 12 if detailed else 8
+        _media_top_k  = 5  if detailed else 4
+
+        # Streaming path: parallel retrieval + LLM intent extraction.
+        # _extract_intent_topics runs concurrently so it adds zero latency.
         if not document_filter:
-            doc_chunks, video_chunks, webpage_chunks = await asyncio.gather(
-                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
-                asyncio.to_thread(self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
-                asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
+            (doc_chunks, video_chunks, webpage_chunks), llm_topics = await asyncio.gather(
+                asyncio.gather(
+                    self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
+                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
+                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
+                ),
+                _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
-            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3)
+            doc_chunks, llm_topics = await asyncio.gather(
+                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
+                _extract_intent_topics(question),
+            )
             all_chunks = self._merge_chunks(doc_chunks)
 
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
-        all_chunks = all_chunks[:8]
+        all_chunks = all_chunks[:_chunk_limit]
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > LLM_CONTEXT_WINDOW_CHARS:
@@ -662,7 +941,7 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
         else:
-            ctx_covered = _context_covers_query(question, all_chunks)
+            ctx_covered = _context_covers_query(question, all_chunks, llm_topics=llm_topics or None)
             if not ctx_covered and not document_filter:
                 yield (
                     "Hmm, I don't have that specific information in my knowledge base right now. "
@@ -670,6 +949,7 @@ class MultiSourceRAG:
                 )
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
+<<<<<<< HEAD
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
                 llm = get_insurance_llm(temperature=0)
@@ -680,6 +960,11 @@ class MultiSourceRAG:
                     question=question,
                 )
                 llm = get_insurance_llm(temperature=0.3)
+=======
+            prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
+            prompt = prompt_tmpl.format(history=history, context=full_context, question=question)
+            llm = get_insurance_llm(temperature=0)
+>>>>>>> ed6158d9809deb43f83e4f6ab5dd75e4a4a876f4
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
