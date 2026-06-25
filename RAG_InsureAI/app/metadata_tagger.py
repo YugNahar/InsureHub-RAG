@@ -227,6 +227,11 @@ def tag_document(
     need_policy_llm = best_policy == "general" or policy_confidence < 0.7
     is_non_policy_doc = doc_type != "policy_document"
 
+    # Skip expensive LLM calls for handbooks/regulatory docs — they will always
+    # produce UNKNOWN insurer + general policy type, wasting 60–120 s per upload.
+    if is_non_policy_doc:
+        llm = None
+
     if llm is not None:
         # LLM insurer refinement
         if need_insurer_llm or is_non_policy_doc:
