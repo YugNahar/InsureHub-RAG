@@ -20,42 +20,64 @@ _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
 # Domain-generic terms that appear in virtually every insurance chunk and
 # therefore give no signal about whether a chunk covers the specific query topic.
 _QUERY_STOP_WORDS = {
+    # English function words
     'what', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'how', 'does',
     'do', 'i', 'my', 'me', 'by', 'with', 'under', 'about', 'can', 'will',
     'which', 'when', 'where', 'to', 'and', 'or', 'at', 'this', 'that', 'it',
     'its', 'be', 'been', 'has', 'have', 'had', 'any', 'all', 'from', 'on',
-    # domain-generic insurance terms that appear in almost every chunk
+    # Conversational intent words — appear in questions but never in KB chunks
+    'tell', 'you', 'your', 'give', 'explain', 'know', 'say', 'get', 'let',
+    'show', 'help', 'talk', 'discuss', 'find', 'see', 'our', 'their', 'use',
+    'used', 'using', 'work', 'works', 'mean', 'means', 'please', 'want',
+    'need', 'like', 'just', 'also', 'more', 'some', 'very', 'well', 'good',
+    'different', 'types', 'type', 'kind', 'kinds', 'various', 'general',
+    'basic', 'main', 'key', 'between', 'difference', 'example', 'examples',
+    # Domain-generic insurance terms that appear in almost every chunk
     'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
     'plan', 'claim', 'claims', 'benefits', 'benefit',
-    # generic time/measurement words — too common to indicate topic coverage
+    # Generic time/measurement words — too common to indicate topic coverage
     'period', 'time', 'duration', 'date', 'days', 'year', 'month', 'months',
 }
 
-def _context_covers_query(query: str, docs: list) -> bool:
-    """True if ≥1 retrieved chunk contains at least one discriminating query keyword.
 
-    Guards against cross-encoder false positives where a chunk scores highly but
-    doesn't actually contain any query-specific term (e.g. a 'Duty of Assured'
-    chunk scoring 0.87 for 'What is a deductible?').
-    """
-    query_terms = {
+def _extract_topic_terms(query: str) -> set[str]:
+    """Return discriminating topic words from a query after stop-word filtering."""
+    return {
         w for w in re.findall(r'\b[a-z]{3,}\b', query.lower())
         if w not in _QUERY_STOP_WORDS
     }
-    if not query_terms:
-        return True  # no discriminating terms — assume covered
-    # Scale threshold with query length so short queries (e.g. "what is nomination?"
-    # → only 1 meaningful term after stop-word filtering) are not permanently blocked.
-    # With a fixed threshold of 3, single-concept questions could never pass because
-    # the query only has 1 discriminating term.
-    threshold = min(len(query_terms), 2)
+
+
+def _context_covers_query(query: str, docs: list) -> bool:
+    """True if ≥1 retrieved chunk contains at least one topic keyword from the query.
+
+    For compound questions ("X and Y?") each sub-clause is checked independently
+    so that a chunk covering only one part still passes.
+
+    Guards against cross-encoder false positives where a chunk scores highly but
+    doesn't actually contain any query-specific term.
+    """
+    # Split compound questions on "and"/"or" so each part is checked separately.
+    # E.g. "how does reinsurance work and what is its legal significance?" →
+    #   sub-queries: ["how does reinsurance work", "what is its legal significance"]
+    sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
+    all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
+    # Merge — if any sub-query has no topic terms, treat full query as covered.
+    all_term_sets = [t for t in all_term_sets if t]
+    if not all_term_sets:
+        return True
+
+    # A single chunk match on ANY topic word from ANY sub-query is enough.
+    # The semantic retrieval + reranker already handle relevance scoring;
+    # this guard just ensures the chunk literally mentions at least one topic word.
     for doc in docs:
         text = (
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
         chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-        if len(query_terms & chunk_terms) >= threshold:
-            return True
+        for topic_terms in all_term_sets:
+            if chunk_terms & topic_terms:
+                return True
     return False
 
 
