@@ -48,8 +48,38 @@ def _extract_topic_terms(query: str) -> set[str]:
     }
 
 
+def _word_matches(topic: str, chunk_word: str) -> bool:
+    """True if topic and chunk_word are the same root.
+
+    Uses a 5-character shared-prefix heuristic to handle common inflections
+    without a full stemmer, e.g.:
+      "deductible" / "deduction" / "deducted"  → share "deduct" ✓
+      "nominate"   / "nomination"               → share "nomin"  ✓
+      "tax"        / "taxation"                 → share "tax"    ✓ (exact)
+    """
+    if topic == chunk_word:
+        return True
+    # Require at least 5 chars in both to avoid spurious short-word matches
+    min_len = 5
+    prefix = min(len(topic), len(chunk_word), min_len)
+    return prefix >= min_len and topic[:prefix] == chunk_word[:prefix]
+
+
+def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
+    """True if any topic word matches (exactly or by root prefix) any chunk term."""
+    # Fast exact intersection first
+    if topics & chunk_terms:
+        return True
+    # Stem-based fallback for inflection mismatches
+    for t in topics:
+        for c in chunk_terms:
+            if _word_matches(t, c):
+                return True
+    return False
+
+
 def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
-    """True if ≥1 retrieved chunk contains at least one topic keyword.
+    """True if ≥1 retrieved chunk contains at least one topic keyword (root-aware).
 
     Accepts an optional `llm_topics` set (from _extract_intent_topics).
     When provided those override the regex extraction, giving much better
@@ -59,19 +89,16 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     is absent.
     """
     if llm_topics:
-        # LLM already identified the exact topic words — just check any chunk
-        # mentions at least one of them.
         for doc in docs:
             text = (
                 doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
             ).lower()
             chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-            if chunk_terms & llm_topics:
+            if _topics_hit_chunk(llm_topics, chunk_terms):
                 return True
         return False
 
-    # Regex fallback: split compound questions on "and"/"or" so each part is
-    # checked independently.
+    # Regex fallback: split compound questions on "and"/"or".
     sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
     all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
     all_term_sets = [t for t in all_term_sets if t]
@@ -91,7 +118,7 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
 
 =======
         for topic_terms in all_term_sets:
-            if chunk_terms & topic_terms:
+            if _topics_hit_chunk(topic_terms, chunk_terms):
                 return True
     return False
 
@@ -156,18 +183,25 @@ async def _reformulate_query(question: str, history: str) -> str:
         return question
     # Use only the last 6 lines (3 turns) of history to keep the prompt short
     recent = '\n'.join(history.strip().split('\n')[-6:])
-    prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
+    prompt = f"""Rewrite the follow-up question as a standalone search query using the conversation context.
+Use precise insurance/legal terms that would appear in a textbook (not casual phrasing).
 Output ONLY the search query — no quotes, no explanation, nothing else.
 
 Examples:
   Context: "User: tell me about life insurance\\nLayla: Life insurance pays out..."
-  Follow-up: "what about premiums?" → "life insurance premiums"
+  Follow-up: "what about premiums?" → "life insurance premium amount"
 
-  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers..."
+  Context: "User: explain life insurance\\nLayla: Life insurance protects your family..."
+  Follow-up: "is it tax deductible?" → "life insurance premium tax deduction income tax"
+
+  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers share risk..."
   Follow-up: "is it legally required?" → "reinsurance legal requirement"
 
-  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer..."
-  Follow-up: "give me an example" → "subrogation example"
+  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer steps in..."
+  Follow-up: "give me an example" → "subrogation example case"
+
+  Context: "User: what is a deductible\\nLayla: A deductible is what you pay first..."
+  Follow-up: "how is it calculated?" → "deductible calculation formula method"
 
 Conversation:
 {recent}
