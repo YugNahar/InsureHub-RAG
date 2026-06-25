@@ -110,13 +110,6 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
         chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-<<<<<<< HEAD
-        if query_terms & chunk_terms:
-            return True
-    return False
-
-
-=======
         for topic_terms in all_term_sets:
             if _topics_hit_chunk(topic_terms, chunk_terms):
                 return True
@@ -344,7 +337,6 @@ def _llm_used_general_knowledge(response: str) -> bool:
     return any(tell in lower for tell in _GENERAL_KNOWLEDGE_TELLS)
 
 
->>>>>>> ed6158d9809deb43f83e4f6ab5dd75e4a4a876f4
 def _strip_markdown(text: str) -> str:
     """Convert markdown-formatted LLM output to plain conversational prose.
 
@@ -983,22 +975,9 @@ class MultiSourceRAG:
                 )
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
-<<<<<<< HEAD
-            if document_filter:
-                prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
-                llm = get_insurance_llm(temperature=0)
-            else:
-                prompt = CONVERSATIONAL_RAG_PROMPT.format(
-                    history=history,
-                    context=full_context,
-                    question=question,
-                )
-                llm = get_insurance_llm(temperature=0.3)
-=======
             prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
             prompt = prompt_tmpl.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
->>>>>>> ed6158d9809deb43f83e4f6ab5dd75e4a4a876f4
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
