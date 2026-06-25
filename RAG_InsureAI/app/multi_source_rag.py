@@ -48,28 +48,36 @@ def _extract_topic_terms(query: str) -> set[str]:
     }
 
 
-def _context_covers_query(query: str, docs: list) -> bool:
-    """True if ≥1 retrieved chunk contains at least one topic keyword from the query.
+def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
+    """True if ≥1 retrieved chunk contains at least one topic keyword.
 
-    For compound questions ("X and Y?") each sub-clause is checked independently
-    so that a chunk covering only one part still passes.
+    Accepts an optional `llm_topics` set (from _extract_intent_topics).
+    When provided those override the regex extraction, giving much better
+    intent recognition for conversational questions.
 
-    Guards against cross-encoder false positives where a chunk scores highly but
-    doesn't actually contain any query-specific term.
+    Falls back to regex for compound "X and Y" splitting when llm_topics
+    is absent.
     """
-    # Split compound questions on "and"/"or" so each part is checked separately.
-    # E.g. "how does reinsurance work and what is its legal significance?" →
-    #   sub-queries: ["how does reinsurance work", "what is its legal significance"]
+    if llm_topics:
+        # LLM already identified the exact topic words — just check any chunk
+        # mentions at least one of them.
+        for doc in docs:
+            text = (
+                doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
+            ).lower()
+            chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
+            if chunk_terms & llm_topics:
+                return True
+        return False
+
+    # Regex fallback: split compound questions on "and"/"or" so each part is
+    # checked independently.
     sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
     all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
-    # Merge — if any sub-query has no topic terms, treat full query as covered.
     all_term_sets = [t for t in all_term_sets if t]
     if not all_term_sets:
         return True
 
-    # A single chunk match on ANY topic word from ANY sub-query is enough.
-    # The semantic retrieval + reranker already handle relevance scoring;
-    # this guard just ensures the chunk literally mentions at least one topic word.
     for doc in docs:
         text = (
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
@@ -79,6 +87,77 @@ def _context_covers_query(query: str, docs: list) -> bool:
             if chunk_terms & topic_terms:
                 return True
     return False
+
+
+_INTENT_PROMPT = """\
+Extract the core insurance topic keywords from the question below.
+Output ONLY 2-5 comma-separated words or short phrases — nothing else.
+
+Patterns (question format → output):
+"tell me about X"              → X
+"can you explain X"            → X
+"how does X work"              → X
+"what is X and Y"              → X, Y
+"X and its Y"                  → X, Y
+"difference between X and Y"   → X, Y
+
+Examples:
+"can you tell me about life insurance"                        → life
+"how does reinsurance work and what is its legal significance" → reinsurance, legal
+"explain what a deductible is"                                → deductible
+"tell me about motor policy claims"                           → motor, claims
+"what is nomination"                                          → nomination
+"give me info about health cover"                             → health
+"how are premiums calculated for fire insurance"              → premiums, fire
+"can you explain the principle of subrogation"                → subrogation
+"what is the difference between term and whole life"          → term life, whole life
+
+Question: {question}
+Keywords:"""
+
+
+async def _extract_intent_topics(question: str) -> set[str]:
+    """Fast LLM call (runs in parallel with retrieval) to extract core topic words.
+
+    Uses vLLM with max_tokens=30 so the round-trip is <1 s on an idle server.
+    Falls back to an empty set on any error — caller uses regex fallback.
+    """
+    import aiohttp as _aiohttp
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+    if _active_backend() != "vllm" or not VLLM_HOST:
+        return set()
+    try:
+        prompt = _INTENT_PROMPT.format(question=question)
+        payload = {
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 30,
+            "temperature": 0,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        }
+        timeout = _aiohttp.ClientTimeout(total=5)
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(f"{VLLM_HOST}/v1/chat/completions",
+                                    json=payload, headers=headers,
+                                    timeout=timeout) as resp:
+                data = await resp.json()
+                raw = data["choices"][0]["message"]["content"].strip().lower()
+                # Parse "word1, word2, phrase three" into individual tokens
+                topics: set[str] = set()
+                for phrase in raw.split(","):
+                    phrase = phrase.strip()
+                    if phrase:
+                        for word in re.findall(r'\b[a-z]{3,}\b', phrase):
+                            topics.add(word)
+                logger.debug("[INTENT] %r → topics=%s", question, topics)
+                return topics
+    except Exception as exc:
+        logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
+        return set()
 
 
 _HANDOFF_MSG = (
@@ -669,16 +748,24 @@ class MultiSourceRAG:
         # Streaming path uses a pool of 8 candidates (vs 30 in ask()) so the
         # cross-encoder rerank takes ~2-3s on CPU instead of ~9s, keeping
         # first-token latency under 5s while still reordering by relevance.
-        # ── Parallel retrieval across all sources ─────────────────────────────
+        # ── Parallel retrieval + LLM intent extraction ────────────────────────
+        # _extract_intent_topics runs a tiny LLM call (max_tokens=30, ~0.5s)
+        # concurrently with the retrieval gather so it adds zero latency.
         if not document_filter:
-            doc_chunks, video_chunks, webpage_chunks = await asyncio.gather(
-                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
-                asyncio.to_thread(self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
-                asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
+            (doc_chunks, video_chunks, webpage_chunks), llm_topics = await asyncio.gather(
+                asyncio.gather(
+                    self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
+                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
+                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
+                ),
+                _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
-            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3)
+            doc_chunks, llm_topics = await asyncio.gather(
+                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
+                _extract_intent_topics(question),
+            )
             all_chunks = self._merge_chunks(doc_chunks)
 
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
@@ -725,7 +812,7 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
         else:
-            ctx_covered = _context_covers_query(question, all_chunks)
+            ctx_covered = _context_covers_query(question, all_chunks, llm_topics=llm_topics or None)
             if not ctx_covered and not document_filter:
                 yield (
                     "Hmm, I don't have that specific information in my knowledge base right now. "
