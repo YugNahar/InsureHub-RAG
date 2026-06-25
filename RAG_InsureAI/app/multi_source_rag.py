@@ -89,6 +89,88 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     return False
 
 
+_FOLLOWUP_SIGNALS = {
+    'it', 'its', 'that', 'this', 'them', 'those', 'they', 'their', 'which', 'these',
+}
+_FOLLOWUP_OPENERS = (
+    'what about', 'how about', 'and what', 'also ', 'tell me more',
+    'what does it', 'how does it', 'what is it', 'is it ', 'can it ',
+)
+
+
+def _is_likely_followup(question: str) -> bool:
+    """Heuristic: is this question likely a follow-up referencing a previous topic?"""
+    words = question.strip().split()
+    if len(words) > 12:
+        return False  # long questions are usually self-contained
+    tokens = {w.lower().strip('?.,!') for w in words}
+    q_lower = question.lower().strip()
+    return bool(tokens & _FOLLOWUP_SIGNALS) or any(q_lower.startswith(op) for op in _FOLLOWUP_OPENERS)
+
+
+async def _reformulate_query(question: str, history: str) -> str:
+    """Rewrite a follow-up question as a standalone search query using conversation history.
+
+    Examples:
+      history: "User: tell me about life insurance\\nLayla: Life insurance ..."
+      question: "what about premiums?"
+      returns: "life insurance premiums"
+
+    Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
+    Falls back to the original question on any error.
+    """
+    import aiohttp as _aiohttp
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+    if _active_backend() != "vllm" or not VLLM_HOST:
+        return question
+    # Use only the last 6 lines (3 turns) of history to keep the prompt short
+    recent = '\n'.join(history.strip().split('\n')[-6:])
+    prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
+Output ONLY the search query — no quotes, no explanation, nothing else.
+
+Examples:
+  Context: "User: tell me about life insurance\\nLayla: Life insurance pays out..."
+  Follow-up: "what about premiums?" → "life insurance premiums"
+
+  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers..."
+  Follow-up: "is it legally required?" → "reinsurance legal requirement"
+
+  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer..."
+  Follow-up: "give me an example" → "subrogation example"
+
+Conversation:
+{recent}
+
+Follow-up: {question}
+Search query:"""
+    try:
+        payload = {
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 30,
+            "temperature": 0,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        }
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{VLLM_HOST}/v1/chat/completions",
+                json=payload, headers=headers,
+                timeout=_aiohttp.ClientTimeout(total=4),
+            ) as resp:
+                data = await resp.json()
+                reformulated = data["choices"][0]["message"]["content"].strip().strip('"\'')
+                if reformulated and len(reformulated) >= 3:
+                    logger.info("[REFORM] %r → %r", question, reformulated)
+                    return reformulated
+    except Exception as exc:
+        logger.debug("[REFORM] failed (%s) — using original question", exc)
+    return question
+
+
 _INTENT_PROMPT = """\
 Extract the core insurance topic keywords from the question below.
 Output ONLY 2-5 comma-separated words or short phrases — nothing else.
@@ -744,6 +826,14 @@ class MultiSourceRAG:
         if document_filter:
             conditions = [{"source": {"$contains": doc}} for doc in document_filter]
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
+
+        # ── Follow-up reformulation ───────────────────────────────────────────
+        # For short/pronoun-heavy questions ("what about premiums?", "is it legal?")
+        # rewrite into a standalone search query using conversation history.
+        # This runs sequentially BEFORE retrieval (~0.4 s for follow-ups only;
+        # skipped instantly for long self-contained questions via heuristic).
+        if history and _is_likely_followup(question):
+            retrieval_query = await _reformulate_query(question, history)
 
         # Streaming path uses a pool of 8 candidates (vs 30 in ask()) so the
         # cross-encoder rerank takes ~2-3s on CPU instead of ~9s, keeping

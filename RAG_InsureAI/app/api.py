@@ -1390,10 +1390,19 @@ async def ask_stream(req: AskRequest):
     async def generate():
         from multi_source_rag import _strip_markdown
         multi = _get_multi_rag()
+
+        # Load conversation history so ask_stream can use it for context-aware
+        # retrieval and follow-up question reformulation.
+        history_list = await _get_conversation_history(req.session_id)
+        history_str = "\n".join(
+            f"{t['role'].capitalize()}: {t['content']}"
+            for t in history_list[-_MAX_HISTORY_TURNS * 2:]
+        )
+
         full_text = ""
         try:
             buf = ""
-            async for token in multi.ask_stream(req.question, document_filter=None):
+            async for token in multi.ask_stream(req.question, history=history_str, document_filter=None):
                 if token.startswith('\n\n{'):
                     if buf:
                         stripped = _strip_markdown(buf)
@@ -1440,6 +1449,13 @@ async def ask_stream(req: AskRequest):
                                 # BEFORE the final JSON reaches the frontend. This guarantees
                                 # the question text is included and no race with frontend WS.
                                 await _agent_hub.request_handoff(req.session_id, req.question)
+                    # Persist this turn so the next question sees it as history
+                    if req.session_id and req.session_id != "default" and full_text:
+                        new_hist = history_list + [
+                            {"role": "user", "content": req.question},
+                            {"role": "assistant", "content": full_text},
+                        ]
+                        asyncio.create_task(_save_conversation_history(req.session_id, new_hist))
                     yield "\n\n" + _json.dumps(final_data)
                     return
                 buf += token
