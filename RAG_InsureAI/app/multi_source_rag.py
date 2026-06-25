@@ -49,49 +49,9 @@ def _context_covers_query(query: str, docs: list) -> bool:
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
         chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-        # Require at least 3 overlapping keywords — 2 was too loose and let
-        # tangentially related chunks pass to the LLM, which then answered from
-        # training knowledge instead of refusing.
-        if len(query_terms & chunk_terms) >= 3:
+        if query_terms & chunk_terms:
             return True
     return False
-
-
-_HANDOFF_MSG = (
-    "I don't have that in my knowledge base right now — "
-    "let me get a human agent to help you! 😊"
-)
-
-# Phrases that indicate the model answered from general training knowledge
-# rather than from the retrieved context. If ANY of these appear in the
-# LLM response, we discard the response and return the handoff message.
-_GENERAL_KNOWLEDGE_TELLS = [
-    "generally speaking",
-    "in general,",
-    "typically,",
-    "typically ",
-    "usually,",
-    "usually ",
-    "as a general rule",
-    "in most cases",
-    "commonly,",
-    "commonly ",
-    "standard practice",
-    "based on my knowledge",
-    "from my training",
-    "most insurance policies",
-    "most insurers",
-    "it is important to note",
-    "one should ",
-    "you should note",
-    "please note that",
-]
-
-
-def _llm_used_general_knowledge(response: str) -> bool:
-    """Return True if the LLM response contains general-knowledge tells."""
-    lower = response.lower()
-    return any(tell in lower for tell in _GENERAL_KNOWLEDGE_TELLS)
 
 
 def _strip_markdown(text: str) -> str:
@@ -465,15 +425,14 @@ class MultiSourceRAG:
         all_chunks = all_chunks[:8]
 
         # --- Determine whether retrieved content is relevant enough to ground the answer ---
-        # If the top chunk has similarity <= 0.30, the retrieval found nothing
-        # meaningfully relevant (typical unrelated content scores 0.1–0.3).
-        # Flag needs_human so the caller can trigger a human handoff.
+        # If the top chunk has similarity <= 0.05, the retrieval found nothing
+        # meaningfully relevant. Flag needs_human so the caller can trigger a human handoff.
         # 
         # Short follow-ups with available history bypass raw-similarity detection:
         # the reformulated query should retrieve meaningful context, and even if
         # scores are low the conversation history provides enough grounding.
         top_similarity = all_chunks[0].metadata.get("similarity", 0) if all_chunks else 0
-        needs_human = (top_similarity <= 0.30)
+        needs_human = (top_similarity <= 0.05)
         if is_short and has_history:
             needs_human = False
 
@@ -577,10 +536,16 @@ class MultiSourceRAG:
                 is_off_topic,
             )
 
-        # Always use STRICT_GROUNDED_PROMPT — CONVERSATIONAL_RAG_PROMPT with a
-        # small 7B model is unreliable at honouring "no training knowledge" rules.
-        prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
-        llm = get_insurance_llm(temperature=0)
+        if document_filter:
+            prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
+            llm = get_insurance_llm(temperature=0)
+        else:
+            prompt = CONVERSATIONAL_RAG_PROMPT.format(
+                history=history,
+                context=full_context,
+                question=question,
+            )
+            llm = get_insurance_llm(temperature=0.3)
 
         # ── LLM invocation with backend-error guard ───────────────────────────
         # When the context does NOT cover the query (out-of-KB question) and the
@@ -609,10 +574,6 @@ class MultiSourceRAG:
                     "Please try again in a moment!"
                 )
         answer = _strip_markdown(_strip_model_preamble(answer))
-        if _llm_used_general_knowledge(answer):
-            logger.info("[MultiSourceRAG] LLM used general knowledge — replacing with handoff message")
-            answer = _HANDOFF_MSG
-            needs_human = True
         return answer, list(dict.fromkeys(sources)), needs_human, is_off_topic
 
     async def ask_stream(
@@ -709,8 +670,16 @@ class MultiSourceRAG:
                 )
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
-            prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
-            llm = get_insurance_llm(temperature=0)
+            if document_filter:
+                prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
+                llm = get_insurance_llm(temperature=0)
+            else:
+                prompt = CONVERSATIONAL_RAG_PROMPT.format(
+                    history=history,
+                    context=full_context,
+                    question=question,
+                )
+                llm = get_insurance_llm(temperature=0.3)
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.

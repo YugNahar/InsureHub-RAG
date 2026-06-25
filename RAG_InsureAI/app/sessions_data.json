@@ -130,5 +130,91 @@
         "timestamp": "11:59"
       }
     ]
+  },
+  "a02955fb": {
+    "created_at": "2026-06-25 06:02",
+    "history": []
+  },
+  "7e460cc9": {
+    "created_at": "2026-06-25 06:02",
+    "history": []
+  },
+  "4b098a75": {
+    "created_at": "2026-06-25 06:03",
+    "history": [
+      {
+        "role": "user",
+        "content": "hi",
+        "timestamp": "06:03"
+      },
+      {
+        "role": "ai",
+        "content": "Hello! What can I help you with today?",
+        "timestamp": "06:03"
+      },
+      {
+        "role": "user",
+        "content": "what are the diff types of insurances",
+        "timestamp": "06:04"
+      },
+      {
+        "role": "ai",
+        "content": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it — they'll be able to help you better! 😊",
+        "timestamp": "06:04"
+      },
+      {
+        "role": "user",
+        "content": "what are the different types of insurance",
+        "timestamp": "06:27"
+      },
+      {
+        "role": "ai",
+        "content": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it — they'll be able to help you better! 😊",
+        "timestamp": "06:27"
+      },
+      {
+        "role": "user",
+        "content": "what can you do/",
+        "timestamp": "06:39"
+      },
+      {
+        "role": "ai",
+        "content": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it — they'll be able to help you better! 😊",
+        "timestamp": "06:39"
+      }
+    ]
+  },
+  "6bd02263": {
+    "created_at": "2026-06-25 06:48",
+    "history": []
+  },
+  "86c5c70b": {
+    "created_at": "2026-06-25 06:48",
+    "history": []
+  },
+  "4786508c": {
+    "created_at": "2026-06-25 06:48",
+    "history": [
+      {
+        "role": "user",
+        "content": "what are the different types of insurances",
+        "timestamp": "06:49"
+      },
+      {
+        "role": "ai",
+        "content": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it — they'll be able to help you better! 😊",
+        "timestamp": "06:49"
+      },
+      {
+        "role": "user",
+        "content": "what are the different types of insurance?",
+        "timestamp": "07:12"
+      },
+      {
+        "role": "ai",
+        "content": "Sure, let's dive into the main types of insurance! There are two big categories: life insurance and general insurance.\n\nLife insurance includes things like term life, whole life, and universal life. It's designed to protect your loved ones financially if something happens to you.\n\nGeneral insurance covers a wider range of things and includes:\n- **Marine insurance**: Protects ships and cargoes.\n- **Fire insurance**: Covers damage from fire.\n- **Motor vehicle insurance**: Protects cars, motorcycles, and other vehicles.\n- **Miscellaneous insurance**: Includes things like travel insurance, health insurance, and personal accident insurance.\n\nEach type has its own specifics and can help cover different risks in your life!",
+        "timestamp": "07:12"
+      }
+    ]
   }
 }
