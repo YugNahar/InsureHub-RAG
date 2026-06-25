@@ -1448,7 +1448,11 @@ async def ask_stream(req: AskRequest):
                     yield "\n\n" + _json.dumps(final_data)
                     return
                 buf += token
-                if ' ' in buf or '\n' in buf:
+                should_flush = (
+                    any(buf.endswith(p) for p in ('.', '?', '!', '\n', '.\n', '!\n', '?\n'))
+                    or len(buf) >= 150
+                )
+                if should_flush:
                     stripped = _strip_markdown(buf)
                     full_text += stripped
                     yield stripped
