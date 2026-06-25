@@ -44,15 +44,17 @@ def _context_covers_query(query: str, docs: list) -> bool:
     }
     if not query_terms:
         return True  # no discriminating terms — assume covered
+    # Scale threshold with query length so short queries (e.g. "what is nomination?"
+    # → only 1 meaningful term after stop-word filtering) are not permanently blocked.
+    # With a fixed threshold of 3, single-concept questions could never pass because
+    # the query only has 1 discriminating term.
+    threshold = min(len(query_terms), 2)
     for doc in docs:
         text = (
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
         chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-        # Require at least 3 overlapping keywords — 2 was too loose and let
-        # tangentially related chunks pass to the LLM, which then answered from
-        # training knowledge instead of refusing.
-        if len(query_terms & chunk_terms) >= 3:
+        if len(query_terms & chunk_terms) >= threshold:
             return True
     return False
 
