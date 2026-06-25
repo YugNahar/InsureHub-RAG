@@ -26,9 +26,14 @@ METRICS_URL        = "http://localhost:20241/metrics"
 # Written into the Docker-mounted app/ dir so the backend container can read it
 TUNNEL_URL_FILE    = os.path.join(os.path.dirname(__file__), "RAG_InsureAI", "app", "tunnel_url.txt")
 LOG_FILE           = os.path.expanduser("~/.cloudflare_tunnel.log")
+
+# Main Layla chat frontend (Vite/React project)
 VERCEL_PROJECT_DIR = os.path.expanduser(
     "~/Downloads/insurehub-RAG-frontend/insurehub-your-ai-insurance-advisor"
 )
+# Admin + Agent panels (plain HTML, deployed separately to Vercel)
+PANELS_PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panels")
+
 POLL_INTERVAL      = 10   # seconds between URL checks
 STARTUP_WAIT       = 20   # seconds to wait after starting cloudflared before polling
 
@@ -74,31 +79,44 @@ def start_cloudflared():
     return proc
 
 
-def update_vercel(url: str):
-    """Push new URL to both Vercel env vars and trigger a production redeploy."""
-    log.info("Updating Vercel env vars → %s", url)
-    for var in ("VITE_API_BASE_URL", "VITE_API_URL"):
+def _vercel_set_env(project_dir: str, url: str, vars: tuple):
+    """Set env vars and trigger a prod redeploy for a single Vercel project."""
+    if not os.path.isdir(project_dir):
+        log.warning("  Skipping %s — directory not found", project_dir)
+        return
+    label = os.path.basename(project_dir)
+    for var in vars:
         result = subprocess.run(
             ["vercel", "env", "add", var, "production", "--force"],
             input=url.encode(),
-            cwd=VERCEL_PROJECT_DIR,
+            cwd=project_dir,
             env=_ENV,
             capture_output=True,
         )
         if result.returncode == 0:
-            log.info("  ✓ %s updated", var)
+            log.info("  ✓ [%s] %s updated", label, var)
         else:
-            log.warning("  ✗ %s failed: %s", var, result.stderr.decode().strip())
+            log.warning("  ✗ [%s] %s failed: %s", label, var, result.stderr.decode().strip())
 
-    log.info("Triggering Vercel redeploy…")
     subprocess.Popen(
         ["vercel", "--prod"],
-        cwd=VERCEL_PROJECT_DIR,
+        cwd=project_dir,
         env=_ENV,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    log.info("Redeploy queued (runs in background).")
+    log.info("  Redeploy queued for [%s].", label)
+
+
+def update_vercel(url: str):
+    """Push new tunnel URL to all Vercel projects and trigger redeployments."""
+    log.info("Updating Vercel deployments → %s", url)
+
+    # 1. Main Layla chat frontend (uses both VITE_API_BASE_URL and VITE_API_URL)
+    _vercel_set_env(VERCEL_PROJECT_DIR, url, ("VITE_API_BASE_URL", "VITE_API_URL"))
+
+    # 2. Admin + Agent panels (only VITE_API_BASE_URL — build.js reads this)
+    _vercel_set_env(PANELS_PROJECT_DIR, url, ("VITE_API_BASE_URL",))
 
 
 def write_url_file(url: str):
@@ -110,13 +128,31 @@ def write_url_file(url: str):
             pass
 
 
+def _read_panels_vercel_url() -> str:
+    """Try to read the panels Vercel deployment URL from .vercel/project.json."""
+    try:
+        import json
+        proj_file = os.path.join(PANELS_PROJECT_DIR, ".vercel", "project.json")
+        with open(proj_file) as f:
+            data = json.load(f)
+        # Vercel project.json contains {"projectId":..., "orgId":..., "settings":{...}}
+        # The live URL is not stored here, so we construct a best-guess from the project name
+        name = data.get("projectName") or data.get("name", "")
+        if name:
+            return f"https://{name}.vercel.app"
+    except Exception:
+        pass
+    return "(deploy panels/ to Vercel first — see README)"
+
+
 def print_links(url: str):
-    line = "─" * 62
+    panels_url = _read_panels_vercel_url()
+    line = "─" * 66
     print(f"\n{line}")
-    print(f"  Tunnel      : {url}")
-    print(f"  User chat   : https://insurehub-your-ai-insurance-advisor.vercel.app")
-    print(f"  Admin panel : {url}/admin")
-    print(f"  Agent panel : {url}/agent-dashboard")
+    print(f"  Tunnel (backend) : {url}")
+    print(f"  User chat        : https://insurehub-your-ai-insurance-advisor.vercel.app")
+    print(f"  Admin panel      : {panels_url}/admin")
+    print(f"  Agent dashboard  : {panels_url}/agent-dashboard")
     print(f"{line}\n")
 
 

@@ -19,15 +19,8 @@ x-common: &common
         memory: 4G
       reservations:
         memory: 1G
-  environment:
-    - EMBED_MODEL=BAAI/bge-base-en-v1.5
-    - VLLM_HOST=http://123.253.124.14:7000
-    - VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
-    - ADMIN_USERNAME=admin
-    - ADMIN_PASSWORD=insurehub2026
-    - GMAIL_SENDER=lavishdevpura6@gmail.com
-    - GMAIL_APP_PASSWORD=dsye jnzz lphq vrtu
-    - AGENT_EMAIL=lavishdevpura6@gmail.com
+  env_file:
+    - .env
   volumes:
     - insurehub_data:/root/.insurehub
     - insurehub_tmp:/root/.insurehub_tmp

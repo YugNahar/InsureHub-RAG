@@ -1101,7 +1101,9 @@ ANSWER (with citations):"""
         return response.content if hasattr(response, "content") else str(response)
 
     def general_query(self, question: str) -> str:
-        llm = get_general_llm(temperature=0.7)
+        # Use temperature=0 to reduce hallucination; GENERAL_PROMPT now enforces
+        # insurance-only scope and forbids answering from training knowledge.
+        llm = get_general_llm(temperature=0)
         response = llm.invoke(GENERAL_PROMPT.format(question=question))
         return response.content if hasattr(response, "content") else str(response)
 
