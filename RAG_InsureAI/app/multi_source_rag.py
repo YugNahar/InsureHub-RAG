@@ -737,7 +737,6 @@ class MultiSourceRAG:
                 "Authorization": f"Bearer {VLLM_API_KEY}",
             }
             try:
-                buffered_tokens: list[str] = []
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                         async for raw_line in resp.content:
@@ -750,16 +749,9 @@ class MultiSourceRAG:
                             try:
                                 token = _json.loads(data)["choices"][0]["delta"].get("content", "")
                                 if token:
-                                    buffered_tokens.append(token)
+                                    yield token
                             except Exception:
                                 pass
-                full_streamed = "".join(buffered_tokens)
-                if _llm_used_general_knowledge(full_streamed):
-                    logger.info("[ask_stream] LLM used general knowledge — replacing with handoff")
-                    yield _HANDOFF_MSG
-                else:
-                    for token in buffered_tokens:
-                        yield token
                 streamed_ok = True
             except Exception as exc:
                 logger.warning("[ask_stream] direct vLLM streaming failed, falling back: %s", exc)
@@ -769,9 +761,6 @@ class MultiSourceRAG:
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
             answer = _strip_markdown(_strip_model_preamble(answer))
-            if _llm_used_general_knowledge(answer):
-                logger.info("[ask_stream] fallback LLM used general knowledge — replacing with handoff")
-                answer = _HANDOFF_MSG
             yield answer
 
         yield "\n\n" + _json.dumps({"sources": unique_sources, "done": True})

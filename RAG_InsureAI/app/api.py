@@ -1397,6 +1397,17 @@ async def ask_stream(req: AskRequest):
                     except Exception:
                         final_data = {"sources": [], "done": True}
                     sources = final_data.get("sources", [])
+                    # If the LLM answered from general training knowledge, append
+                    # a correction and force the human handoff so the user gets
+                    # accurate help. Detection runs here (not in ask_stream) so
+                    # tokens stream in real-time without buffering.
+                    from multi_source_rag import _llm_used_general_knowledge
+                    if _llm_used_general_knowledge(full_text):
+                        logger.info("[ask-stream] general-knowledge response detected — appending correction")
+                        correction = "\n\nHmm, I realise that answer came from my general knowledge rather than your documents — let me get a human agent to give you accurate information! 😊"
+                        full_text += correction
+                        yield correction
+                        sources = []
                     ai_cant_answer = _agent_hub.response_needs_human(full_text, sources)
                     agents_online  = _agent_hub.online_count() > 0
                     needs_human         = ai_cant_answer and agents_online
