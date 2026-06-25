@@ -83,13 +83,6 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
         chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-<<<<<<< HEAD
-        if query_terms & chunk_terms:
-            return True
-    return False
-
-
-=======
         for topic_terms in all_term_sets:
             if chunk_terms & topic_terms:
                 return True
@@ -143,7 +136,7 @@ async def _reformulate_query(question: str, history: str) -> str:
     """Rewrite a follow-up question as a standalone search query using conversation history.
 
     Examples:
-      history: "User: tell me about life insurance\\nLayla: Life insurance ..."
+      history: "User: tell me about life insurance\nLayla: Life insurance ..."
       question: "what about premiums?"
       returns: "life insurance premiums"
 
@@ -160,13 +153,13 @@ async def _reformulate_query(question: str, history: str) -> str:
 Output ONLY the search query — no quotes, no explanation, nothing else.
 
 Examples:
-  Context: "User: tell me about life insurance\\nLayla: Life insurance pays out..."
+  Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
   Follow-up: "what about premiums?" → "life insurance premiums"
 
-  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers..."
+  Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers..."
   Follow-up: "is it legally required?" → "reinsurance legal requirement"
 
-  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer..."
+  Context: "User: what is subrogation\nLayla: Subrogation means the insurer..."
   Follow-up: "give me an example" → "subrogation example"
 
 Conversation:
@@ -278,39 +271,7 @@ _HANDOFF_MSG = (
     "let me get a human agent to help you! 😊"
 )
 
-# Phrases that indicate the model answered from general training knowledge
-# rather than from the retrieved context. If ANY of these appear in the
-# LLM response, we discard the response and return the handoff message.
-_GENERAL_KNOWLEDGE_TELLS = [
-    "generally speaking",
-    "in general,",
-    "typically,",
-    "typically ",
-    "usually,",
-    "usually ",
-    "as a general rule",
-    "in most cases",
-    "commonly,",
-    "commonly ",
-    "standard practice",
-    "based on my knowledge",
-    "from my training",
-    "most insurance policies",
-    "most insurers",
-    "it is important to note",
-    "one should ",
-    "you should note",
-    "please note that",
-]
 
-
-def _llm_used_general_knowledge(response: str) -> bool:
-    """Return True if the LLM response contains general-knowledge tells."""
-    lower = response.lower()
-    return any(tell in lower for tell in _GENERAL_KNOWLEDGE_TELLS)
-
-
->>>>>>> ed6158d9809deb43f83e4f6ab5dd75e4a4a876f4
 def _strip_markdown(text: str) -> str:
     """Convert markdown-formatted LLM output to plain conversational prose.
 
@@ -949,9 +910,11 @@ class MultiSourceRAG:
                 )
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
-<<<<<<< HEAD
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
+                llm = get_insurance_llm(temperature=0)
+            elif detailed:
+                prompt = DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
                 llm = get_insurance_llm(temperature=0)
             else:
                 prompt = CONVERSATIONAL_RAG_PROMPT.format(
@@ -960,11 +923,6 @@ class MultiSourceRAG:
                     question=question,
                 )
                 llm = get_insurance_llm(temperature=0.3)
-=======
-            prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
-            prompt = prompt_tmpl.format(history=history, context=full_context, question=question)
-            llm = get_insurance_llm(temperature=0)
->>>>>>> ed6158d9809deb43f83e4f6ab5dd75e4a4a876f4
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
