@@ -328,6 +328,61 @@ class MultiSourceRAG:
                 seen[h] = chunk
         return list(seen.values())
 
+    async def _retrieve_doc_chunks(
+        self,
+        retrieval_query: str,
+        filter_meta: Optional[dict],
+        document_filter: Optional[List[str]],
+        doc_top_k: int = 30,
+        summary_top_k: int = 5,
+        rerank_top_k: int = 8,
+    ) -> List[Document]:
+        """Run doc-vector search, stage-1 summary-boost loop, and rerank.
+
+        Returns the final reranked list of document chunks.
+        The summary-boost loop (stage-1 source guarantee) only runs when
+        *document_filter* is falsy and the SummaryStore is non-empty.
+        """
+        doc_chunks = await asyncio.to_thread(
+            self.doc_pipeline._vector_store.search,
+            retrieval_query, top_k=doc_top_k, use_hybrid=True, use_reranker=False,
+            filter_metadata=filter_meta
+        )
+
+        if not document_filter and self.doc_pipeline._summary_store.count() > 0:
+            try:
+                relevant_summaries = await asyncio.to_thread(
+                    self.doc_pipeline._summary_store.search, retrieval_query, summary_top_k
+                )
+                in_pool_srcs = {d.metadata.get("source", "") for d in doc_chunks}
+                for summary_doc in relevant_summaries:
+                    src = summary_doc.metadata.get("source", "")
+                    if src and src not in in_pool_srcs:
+                        boost = await asyncio.to_thread(
+                            self.doc_pipeline._vector_store.search,
+                            retrieval_query, 2, {"source": {"$eq": src}}, True, False,
+                        )
+                        if boost:
+                            existing = {d.page_content[:80] for d in doc_chunks}
+                            doc_chunks = doc_chunks + [
+                                d for d in boost if d.page_content[:80] not in existing
+                            ]
+                            in_pool_srcs.add(src)
+                            logger.info(
+                                "[MultiSourceRAG] stage-1 boost: added %d chunk(s) from %r",
+                                len(boost), src,
+                            )
+            except Exception as _exc:
+                logger.debug("[MultiSourceRAG] stage-1 guarantee skipped: %s", _exc)
+
+        if doc_chunks:
+            doc_chunks = await asyncio.to_thread(
+                self.doc_pipeline._vector_store.rerank_documents,
+                retrieval_query, doc_chunks, rerank_top_k,
+            )
+
+        return doc_chunks
+
     async def ask(self, question: str, history: str = "", document_filter: Optional[List[str]] = None) -> Tuple[str, List[str], bool, bool]:
         """
         Returns (answer, sources, needs_human, is_off_topic).
@@ -354,65 +409,16 @@ class MultiSourceRAG:
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
             logger.info(f"Document filter: {document_filter}")
 
-        # ── Stage-2 candidate retrieval ───────────────────────────────────────
-        # Use a wider pre-rerank pool (30 candidates) so the cross-encoder has
-        # enough choices.  Reranking happens after the pool is assembled below.
-        doc_chunks = await asyncio.to_thread(
-            self.doc_pipeline._vector_store.search,
-            retrieval_query, top_k=30, use_hybrid=True, use_reranker=False,
-            filter_metadata=filter_meta
-        )
-
-        # ── Stage-1 source guarantee ──────────────────────────────────────────
-        # The main ANN search is capped at top-30 across ALL chunks in the store.
-        # When the store has hundreds of PDF chunks, a small YouTube transcript
-        # (only 2–5 chunks) can fall entirely below that ceiling even though its
-        # document-level summary IS semantically relevant.
-        # Fix: query the SummaryStore for the top-N relevant *sources*, then for
-        # each source absent from the candidate pool run a tiny targeted search
-        # (top_k=2) to guarantee at least one representative chunk.
-        if not document_filter and self.doc_pipeline._summary_store.count() > 0:
-            try:
-                relevant_summaries = await asyncio.to_thread(
-                    self.doc_pipeline._summary_store.search, retrieval_query, 5
-                )
-                in_pool_srcs = {d.metadata.get("source", "") for d in doc_chunks}
-                for summary_doc in relevant_summaries:
-                    src = summary_doc.metadata.get("source", "")
-                    if src and src not in in_pool_srcs:
-                        boost = await asyncio.to_thread(
-                            self.doc_pipeline._vector_store.search,
-                            retrieval_query, 2, {"source": {"$eq": src}}, True, False,
-                        )
-                        if boost:
-                            existing = {d.page_content[:80] for d in doc_chunks}
-                            doc_chunks = doc_chunks + [
-                                d for d in boost if d.page_content[:80] not in existing
-                            ]
-                            in_pool_srcs.add(src)
-                            logger.info(
-                                "[MultiSourceRAG] stage-1 boost: added %d chunk(s) from %r",
-                                len(boost), src,
-                            )
-            except Exception as _exc:
-                logger.debug("[MultiSourceRAG] stage-1 guarantee skipped: %s", _exc)
-
-        # Rerank the assembled candidate pool once (avoids per-source rerank calls)
-        if doc_chunks:
-            doc_chunks = await asyncio.to_thread(
-                self.doc_pipeline._vector_store.rerank_documents,
-                retrieval_query, doc_chunks, 8,
-            )
-
+        # ── Parallel retrieval across all sources ─────────────────────────────
         if not document_filter:
-            video_chunks = await asyncio.to_thread(
-                self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=True
-            )
-            webpage_chunks = await asyncio.to_thread(
-                self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=True
+            doc_chunks, video_chunks, webpage_chunks = await asyncio.gather(
+                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter),
+                asyncio.to_thread(self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=True),
+                asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=True),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
+            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter)
             all_chunks = self._merge_chunks(doc_chunks)
 
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
@@ -603,49 +609,16 @@ class MultiSourceRAG:
         # Streaming path uses a pool of 8 candidates (vs 30 in ask()) so the
         # cross-encoder rerank takes ~2-3s on CPU instead of ~9s, keeping
         # first-token latency under 5s while still reordering by relevance.
-        doc_chunks = await asyncio.to_thread(
-            self.doc_pipeline._vector_store.search,
-            retrieval_query, top_k=8, use_hybrid=True, use_reranker=False,
-            filter_metadata=filter_meta
-        )
-
-        if not document_filter and self.doc_pipeline._summary_store.count() > 0:
-            try:
-                relevant_summaries = await asyncio.to_thread(
-                    self.doc_pipeline._summary_store.search, retrieval_query, 3
-                )
-                in_pool_srcs = {d.metadata.get("source", "") for d in doc_chunks}
-                for summary_doc in relevant_summaries:
-                    src = summary_doc.metadata.get("source", "")
-                    if src and src not in in_pool_srcs:
-                        boost = await asyncio.to_thread(
-                            self.doc_pipeline._vector_store.search,
-                            retrieval_query, 2, {"source": {"$eq": src}}, True, False,
-                        )
-                        if boost:
-                            existing = {d.page_content[:80] for d in doc_chunks}
-                            doc_chunks = doc_chunks + [
-                                d for d in boost if d.page_content[:80] not in existing
-                            ]
-                            in_pool_srcs.add(src)
-            except Exception:
-                pass
-
-        if doc_chunks:
-            doc_chunks = await asyncio.to_thread(
-                self.doc_pipeline._vector_store.rerank_documents,
-                retrieval_query, doc_chunks, 8,
-            )
-
+        # ── Parallel retrieval across all sources ─────────────────────────────
         if not document_filter:
-            video_chunks = await asyncio.to_thread(
-                self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False
-            )
-            webpage_chunks = await asyncio.to_thread(
-                self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False
+            doc_chunks, video_chunks, webpage_chunks = await asyncio.gather(
+                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
+                asyncio.to_thread(self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
+                asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
+            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3)
             all_chunks = self._merge_chunks(doc_chunks)
 
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
