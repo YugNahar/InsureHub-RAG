@@ -89,6 +89,30 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     return False
 
 
+_DETAIL_SIGNALS = {
+    'in detail', 'step by step', 'step-by-step', 'in steps', 'procedure',
+    'process', 'how to', 'explain', 'elaborate', 'describe', 'walk me through',
+    'in depth', 'thoroughly', 'fully explain', 'all about', 'everything about',
+    'comprehensive', 'complete', 'what are all', 'list all', 'list the',
+    'what all', 'how does it work', 'all the steps', 'entire process',
+    'tell me everything', 'give me a full', 'give me the full',
+}
+
+
+def _needs_detailed_answer(question: str) -> bool:
+    """True when the question expects a comprehensive, multi-part, or procedural answer."""
+    q = question.lower()
+    if any(sig in q for sig in _DETAIL_SIGNALS):
+        return True
+    # Long questions (>20 words) almost always need more than 4 sentences
+    if len(question.split()) > 20:
+        return True
+    # Multiple sub-questions joined by "and" — e.g. "how does X work and what are its Y and Z"
+    if q.count(' and ') >= 2:
+        return True
+    return False
+
+
 _FOLLOWUP_SIGNALS = {
     'it', 'its', 'that', 'this', 'them', 'those', 'they', 'their', 'which', 'these',
 }
@@ -524,7 +548,10 @@ from router import get_insurance_llm
 from video_store import VideoVectorStore
 from webpage_store import WebpageVectorStore
 from calculator import compute_insurance_benefits, _is_calculation_question
-from prompt_template import STRICT_GROUNDED_PROMPT, CALCULATION_PROMPT, CONVERSATIONAL_RAG_PROMPT
+from prompt_template import (
+    STRICT_GROUNDED_PROMPT, DETAILED_GROUNDED_PROMPT,
+    CALCULATION_PROMPT, CONVERSATIONAL_RAG_PROMPT,
+)
 from context_compressor import ContextCompressor
 from rag import LLM_CONTEXT_WINDOW_CHARS
 
@@ -835,31 +862,34 @@ class MultiSourceRAG:
         if history and _is_likely_followup(question):
             retrieval_query = await _reformulate_query(question, history)
 
-        # Streaming path uses a pool of 8 candidates (vs 30 in ask()) so the
-        # cross-encoder rerank takes ~2-3s on CPU instead of ~9s, keeping
-        # first-token latency under 5s while still reordering by relevance.
-        # ── Parallel retrieval + LLM intent extraction ────────────────────────
-        # _extract_intent_topics runs a tiny LLM call (max_tokens=30, ~0.5s)
-        # concurrently with the retrieval gather so it adds zero latency.
+        # Detailed/specific questions need more chunks to cover all aspects.
+        # Simple conversational questions keep the smaller pool to stay fast.
+        detailed = _needs_detailed_answer(question)
+        _doc_top_k    = 14 if detailed else 8
+        _chunk_limit  = 12 if detailed else 8
+        _media_top_k  = 5  if detailed else 4
+
+        # Streaming path: parallel retrieval + LLM intent extraction.
+        # _extract_intent_topics runs concurrently so it adds zero latency.
         if not document_filter:
             (doc_chunks, video_chunks, webpage_chunks), llm_topics = await asyncio.gather(
                 asyncio.gather(
-                    self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
-                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
-                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=4, use_hybrid=True, use_reranker=False),
+                    self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
+                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
+                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
                 ),
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
             doc_chunks, llm_topics = await asyncio.gather(
-                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=8, summary_top_k=3),
+                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
 
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
-        all_chunks = all_chunks[:8]
+        all_chunks = all_chunks[:_chunk_limit]
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > LLM_CONTEXT_WINDOW_CHARS:
@@ -910,7 +940,8 @@ class MultiSourceRAG:
                 )
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
-            prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
+            prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
+            prompt = prompt_tmpl.format(history=history, context=full_context, question=question)
             llm = get_insurance_llm(temperature=0)
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
