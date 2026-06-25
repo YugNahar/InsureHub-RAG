@@ -1455,8 +1455,10 @@ async def ask_stream(req: AskRequest):
         generate(),
         media_type="text/plain",
         headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",          # nginx: disable proxy buffering
+            "X-Vercel-Skip-Buffering": "1",      # Vercel Edge: stream chunks immediately
+            "Cache-Control": "no-cache, no-store, no-transform",
+            "Content-Encoding": "identity",      # disable gzip so Vercel can't buffer to compress
             "X-Content-Type-Options": "nosniff",
         },
     )
