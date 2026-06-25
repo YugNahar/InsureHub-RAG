@@ -271,5 +271,20 @@
         "timestamp": "09:24"
       }
     ]
+  },
+  "2b047ccb": {
+    "created_at": "2026-06-25 09:57",
+    "history": [
+      {
+        "role": "user",
+        "content": "what is life insurance",
+        "timestamp": "09:57"
+      },
+      {
+        "role": "ai",
+        "content": "Life insurance is a contract where the insurance company agrees to pay a certain amount to the person you choose if the policyholder passes away. It helps protect your family financially in case of your unexpected death.",
+        "timestamp": "09:57"
+      }
+    ]
   }
 }
