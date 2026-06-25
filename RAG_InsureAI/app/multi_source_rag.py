@@ -79,7 +79,7 @@ def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
 
 
 def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
-    """True if ≥1 retrieved chunk contains at least one topic keyword (root-aware).
+    """True if >=1 retrieved chunk contains at least one topic keyword (root-aware).
 
     Accepts an optional `llm_topics` set (from _extract_intent_topics).
     When provided those override the regex extraction, giving much better
@@ -176,36 +176,25 @@ async def _reformulate_query(question: str, history: str) -> str:
         return question
     # Use only the last 6 lines (3 turns) of history to keep the prompt short
     recent = '\n'.join(history.strip().split('\n')[-6:])
-    prompt = f"""Rewrite the follow-up question as a standalone search query using the conversation context.
+    prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
 Use precise insurance/legal terms that would appear in a textbook (not casual phrasing).
 Output ONLY the search query — no quotes, no explanation, nothing else.
 
 Examples:
-<<<<<<< HEAD
   Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
-  Follow-up: "what about premiums?" → "life insurance premiums"
-
-  Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers..."
-  Follow-up: "is it legally required?" → "reinsurance legal requirement"
-
-  Context: "User: what is subrogation\nLayla: Subrogation means the insurer..."
-  Follow-up: "give me an example" → "subrogation example"
-=======
-  Context: "User: tell me about life insurance\\nLayla: Life insurance pays out..."
   Follow-up: "what about premiums?" → "life insurance premium amount"
 
-  Context: "User: explain life insurance\\nLayla: Life insurance protects your family..."
+  Context: "User: explain life insurance\nLayla: Life insurance protects your family..."
   Follow-up: "is it tax deductible?" → "life insurance premium tax deduction income tax"
 
-  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers share risk..."
+  Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers share risk..."
   Follow-up: "is it legally required?" → "reinsurance legal requirement"
 
-  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer steps in..."
+  Context: "User: what is subrogation\nLayla: Subrogation means the insurer steps in..."
   Follow-up: "give me an example" → "subrogation example case"
 
-  Context: "User: what is a deductible\\nLayla: A deductible is what you pay first..."
+  Context: "User: what is a deductible\nLayla: A deductible is what you pay first..."
   Follow-up: "how is it calculated?" → "deductible calculation formula method"
->>>>>>> 01b5b56ca235ec5a2f563b30c8b6b36f1baafe00
 
 Conversation:
 {recent}
@@ -233,7 +222,7 @@ Search query:"""
                 data = await resp.json()
                 reformulated = data["choices"][0]["message"]["content"].strip().strip('"\'')
                 if reformulated and len(reformulated) >= 3:
-                    logger.info("[REFORM] %r → %r", question, reformulated)
+                    logger.info("[REFORM] %r -> %r", question, reformulated)
                     return reformulated
     except Exception as exc:
         logger.debug("[REFORM] failed (%s) — using original question", exc)
@@ -244,24 +233,24 @@ _INTENT_PROMPT = """\
 Extract the core insurance topic keywords from the question below.
 Output ONLY 2-5 comma-separated words or short phrases — nothing else.
 
-Patterns (question format → output):
-"tell me about X"              → X
-"can you explain X"            → X
-"how does X work"              → X
-"what is X and Y"              → X, Y
-"X and its Y"                  → X, Y
-"difference between X and Y"   → X, Y
+Patterns (question format -> output):
+"tell me about X"              -> X
+"can you explain X"            -> X
+"how does X work"              -> X
+"what is X and Y"              -> X, Y
+"X and its Y"                  -> X, Y
+"difference between X and Y"   -> X, Y
 
 Examples:
-"can you tell me about life insurance"                        → life
-"how does reinsurance work and what is its legal significance" → reinsurance, legal
-"explain what a deductible is"                                → deductible
-"tell me about motor policy claims"                           → motor, claims
-"what is nomination"                                          → nomination
-"give me info about health cover"                             → health
-"how are premiums calculated for fire insurance"              → premiums, fire
-"can you explain the principle of subrogation"                → subrogation
-"what is the difference between term and whole life"          → term life, whole life
+"can you tell me about life insurance"                        -> life
+"how does reinsurance work and what is its legal significance" -> reinsurance, legal
+"explain what a deductible is"                                -> deductible
+"tell me about motor policy claims"                           -> motor, claims
+"what is nomination"                                          -> nomination
+"give me info about health cover"                             -> health
+"how are premiums calculated for fire insurance"              -> premiums, fire
+"can you explain the principle of subrogation"                -> subrogation
+"what is the difference between term and whole life"          -> term life, whole life
 
 Question: {question}
 Keywords:"""
@@ -304,7 +293,7 @@ async def _extract_intent_topics(question: str) -> set[str]:
                     if phrase:
                         for word in re.findall(r'\b[a-z]{3,}\b', phrase):
                             topics.add(word)
-                logger.debug("[INTENT] %r → topics=%s", question, topics)
+                logger.debug("[INTENT] %r -> topics=%s", question, topics)
                 return topics
     except Exception as exc:
         logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
@@ -317,16 +306,6 @@ _HANDOFF_MSG = (
 )
 
 
-<<<<<<< HEAD
-=======
-
-def _llm_used_general_knowledge(response: str) -> bool:
-    """Return True if the LLM response contains general-knowledge tells."""
-    lower = response.lower()
-    return any(tell in lower for tell in _GENERAL_KNOWLEDGE_TELLS)
-
-
->>>>>>> 01b5b56ca235ec5a2f563b30c8b6b36f1baafe00
 def _strip_markdown(text: str) -> str:
     """Convert markdown-formatted LLM output to plain conversational prose.
 
@@ -338,16 +317,16 @@ def _strip_markdown(text: str) -> str:
     import re
     # Remove bold/italic markers
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
-    # Remove ATX headers (## Heading → Heading)
+    # Remove ATX headers (## Heading -> Heading)
     text = re.sub(r'^#{1,4}\s+', '', text, flags=re.MULTILINE)
-    # Convert bullet list items to flowing prose: "- item" or "* item" → "item, "
+    # Convert bullet list items to flowing prose: "- item" or "* item" -> "item, "
     # First item on a new line: replace "\n- " with ", "
     text = re.sub(r'\n\s*[-*]\s+', ' ', text)
-    # Numbered list items: "\n1. " → " "
+    # Numbered list items: "\n1. " -> " "
     text = re.sub(r'\n\s*\d+\.\s+', ' ', text)
     # Inline code backticks
     text = re.sub(r'`([^`]+)`', r'\1', text)
-    # Collapse 3+ newlines → 2
+    # Collapse 3+ newlines -> 2
     text = re.sub(r'\n{3,}', '\n\n', text)
     # Strip leftover leading/trailing whitespace per line
     lines = [l.rstrip() for l in text.split('\n')]
@@ -586,7 +565,7 @@ class MultiSourceRAG:
         self.doc_pipeline = RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = 4000   # ~8 × 500-char semantic chunks
+        self.max_context_chars = 4000   # ~8 x 500-char semantic chunks
         # Share the embed model already loaded by doc_pipeline — no duplicate memory.
         self._compressor = ContextCompressor(
             embed_model=self.doc_pipeline.vector_store.embed_model,
@@ -965,7 +944,6 @@ class MultiSourceRAG:
                 )
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
-<<<<<<< HEAD
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
                 llm = get_insurance_llm(temperature=0)
@@ -979,11 +957,6 @@ class MultiSourceRAG:
                     question=question,
                 )
                 llm = get_insurance_llm(temperature=0.3)
-=======
-            prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
-            prompt = prompt_tmpl.format(history=history, context=full_context, question=question)
-            llm = get_insurance_llm(temperature=0)
->>>>>>> 01b5b56ca235ec5a2f563b30c8b6b36f1baafe00
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
