@@ -1450,7 +1450,7 @@ async def ask_stream(req: AskRequest):
                 buf += token
                 should_flush = (
                     any(buf.endswith(p) for p in ('.', '?', '!', '\n', '.\n', '!\n', '?\n'))
-                    or len(buf) >= 150
+                    or len(buf) >= 80
                 )
                 if should_flush:
                     stripped = _strip_markdown(buf)
