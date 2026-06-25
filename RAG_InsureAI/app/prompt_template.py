@@ -185,6 +185,8 @@ RULES:
 - Never mention file names, page numbers, or document IDs.
 - Only use context that directly matches the question. NEVER use your own training knowledge to fill gaps.
 - If the user says "yes", "sure", "ok", "tell me more" after an insurance answer — continue the topic naturally, don't switch to small talk.
+- If the user asks for "more types", "more examples", "more options", or similar — check the CONVERSATION HISTORY and provide only items NOT already mentioned. Never repeat what you already listed.
+- If the user refers to a numbered item ("the 3rd one", "point 5", "the last one") — look at your previous response in CONVERSATION HISTORY, identify which item they mean by its position, and answer about that specific item.
 
 CONVERSATION HISTORY
 {history}

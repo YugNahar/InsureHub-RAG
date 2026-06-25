@@ -1366,6 +1366,39 @@ async def ask_stream(req: AskRequest):
             )
 
     # Fast-path: greetings bypass the LLM entirely — instant reply
+    # Fast-path: ILLEGAL content — firm refusal, no RAG, no handoff
+    _ILLEGAL_PATTERNS = re.compile(
+        r"\b(bomb|explosive|kill|murder|suicide|weapon|poison|terror|"
+        r"rape|porn|naked|drugs|cocaine|heroin|meth|steal|robbery|"
+        r"fraud|scam|forge|launder|hack|malware|ransomware)\b"
+    )
+    if _ILLEGAL_PATTERNS.search(req.question.lower()):
+        async def _illegal_gen():
+            yield "I'm only here to help with insurance questions — please keep our conversation focused on insurance. 😊"
+            yield "\n\n" + _json.dumps({"sources": [], "done": True, "needs_human": False})
+        return StreamingResponse(
+            _illegal_gen(),
+            media_type="text/plain",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
+        )
+
+    # Fast-path: OFF_TOPIC — casual refusal, no RAG, no handoff
+    _OFF_TOPIC_PATTERNS = re.compile(
+        r"\b(what is the date|today.s date|current date|what day is it|"
+        r"what time is it|current time|weather today|temperature today|"
+        r"who is the president|who won the|capital of|population of|"
+        r"how to cook|recipe for|"
+        r"chatgpt|gpt-4|openai|gemini)\b"
+    )
+    if _OFF_TOPIC_PATTERNS.search(req.question.lower()):
+        async def _offtopic_gen():
+            yield "That's a bit outside what I do! I'm Layla, your insurance advisor — happy to help with anything insurance-related. 😊"
+            yield "\n\n" + _json.dumps({"sources": [], "done": True, "needs_human": False})
+        return StreamingResponse(
+            _offtopic_gen(),
+            media_type="text/plain",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
+        )
     greeting_reply = _greeting_reply(req.question)
     if greeting_reply:
         _sid = req.session_id

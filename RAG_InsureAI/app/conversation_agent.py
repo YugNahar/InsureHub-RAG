@@ -116,6 +116,27 @@ class ConversationAgent:
             "knowledge base", "what have you been trained on", "what are you trained on",
             "what files", "what can you help with", "what can i ask",
         ]
+        # ── ILLEGAL: harmful, violent, or profane content ──
+        _ILLEGAL_PATTERNS = re.compile(
+            r"\b(bomb|explosive|kill|murder|suicide|weapon|poison|hack|terror|"
+            r"rape|porn|naked|sex|drugs|cocaine|heroin|meth|weed|cannabis|"
+            r"steal|robbery|fraud|scam|cheat|fake|forge|launder)\b"
+        )
+        if _ILLEGAL_PATTERNS.search(q):
+            return "ILLEGAL"
+
+        # ── OFF_TOPIC: general knowledge questions with no insurance relevance ──
+        _OFF_TOPIC_PATTERNS = re.compile(
+            r"\b(what is the date|today's date|current date|what day is it|"
+            r"what time is it|current time|weather|temperature|forecast|"
+            r"who is the president|who won|capital of|population of|"
+            r"how to cook|recipe|ingredients|"
+            r"movie|actor|actress|singer|song|album|"
+            r"python|javascript|programming|coding|algorithm|"
+            r"chatgpt|claude|gpt-4|openai|gemini)\b"
+        )
+        if _OFF_TOPIC_PATTERNS.search(q):
+            return "OFF_TOPIC"
         if any(phrase in q for phrase in knowledge_base_phrases):
             return "KNOWLEDGE_BASE"
 
@@ -382,6 +403,31 @@ class ConversationAgent:
         logger.info(f"Intent: {intent} | Message: {user_message}")
 
         # ----- KNOWLEDGE_BASE: user asking about capabilities / what I know / how I work -----
+        # ----- ILLEGAL: harmful or dangerous content -----
+        if intent == "ILLEGAL":
+            illegal_msg = "I'm only here to help with insurance questions. Please keep our conversation focused on insurance — I'm happy to help with policies, coverage, claims, and more! 😊"
+            self._append_turn(session_id, user_message, illegal_msg)
+            return {
+                "message": illegal_msg,
+                "options": [],
+                "multi_select": False,
+                "next_question": "",
+                "intent": "illegal",
+                "stage": "details",
+            }, True
+
+        # ----- OFF_TOPIC: general knowledge questions -----
+        if intent == "OFF_TOPIC":
+            off_topic_msg = "That's a bit outside what I do! I'm Layla, your insurance advisor — happy to help with anything insurance-related. 😊"
+            self._append_turn(session_id, user_message, off_topic_msg)
+            return {
+                "message": off_topic_msg,
+                "options": [],
+                "multi_select": False,
+                "next_question": "",
+                "intent": "off_topic",
+                "stage": "details",
+            }, True
         if intent == "KNOWLEDGE_BASE":
             kb_msg = (
                 "I'm loaded up with insurance knowledge across health, life, motor, travel, home "
