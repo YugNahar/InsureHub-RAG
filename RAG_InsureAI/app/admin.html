@@ -474,7 +474,9 @@ async function uploadFile(file) {
 
 async function pollJob(job_id, fill) {
   const bar = document.getElementById('progressBar');
-  for (let i = 0; i < 400; i++) {
+  // Poll every 1.5 s for up to 15 minutes. Large PDFs can take several minutes
+  // to embed — we never show a hard error just because polling stopped.
+  for (let i = 0; i < 600; i++) {
     await new Promise(r => setTimeout(r, 1500));
     try {
       const res = await fetch(`${API}/upload/${job_id}`, { headers: authHeaders() });
@@ -488,15 +490,20 @@ async function pollJob(job_id, fill) {
       if (job.status === 'error') {
         throw new Error(job.error || 'Ingestion failed.');
       }
-      fill.style.width = Math.min(40 + i * 2, 90) + '%';
+      fill.style.width = Math.min(40 + i * 0.5, 90) + '%';
     } catch (e) {
       showToast(e.message, 'error');
       bar.classList.remove('active');
       return;
     }
   }
-  showToast('Timed out waiting for job to complete.', 'error');
+  // Loop ended without a 'done' — the document is still indexing in the
+  // background. Don't show an error; just refresh the list so the user
+  // can see it once it appears.
   bar.classList.remove('active');
+  fill.style.width = '0%';
+  showToast('Large document is still indexing — it will appear in the list once ready.', 'info');
+  loadDocs();
 }
 
 // ── Docs list ─────────────────────────────────────────────────────────────────

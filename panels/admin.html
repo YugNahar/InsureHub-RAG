@@ -499,7 +499,7 @@ async function uploadFile(file) {
 
 async function pollJob(job_id, fill) {
   const bar = document.getElementById('progressBar');
-  for (let i = 0; i < 400; i++) {
+  for (let i = 0; i < 600; i++) {
     await new Promise(r => setTimeout(r, 1500));
     try {
       const res = await fetch(`${API}/upload/${job_id}`, { headers: authHeaders() });
@@ -513,15 +513,17 @@ async function pollJob(job_id, fill) {
       if (job.status === 'error') {
         throw new Error(job.error || 'Ingestion failed.');
       }
-      fill.style.width = Math.min(40 + i * 2, 90) + '%';
+      fill.style.width = Math.min(40 + i * 0.5, 90) + '%';
     } catch (e) {
       showToast(e.message, 'error');
       bar.classList.remove('active');
       return;
     }
   }
-  showToast('Timed out waiting for job to complete.', 'error');
   bar.classList.remove('active');
+  fill.style.width = '0%';
+  showToast('Large document is still indexing — it will appear in the list once ready.', 'info');
+  loadDocs();
 }
 
 // ── Docs list ─────────────────────────────────────────────────────────────────

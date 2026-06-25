@@ -607,7 +607,15 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
 
     pipeline.vector_store.add_documents(chunks)
     doc_meta = {"filename": filename, "doc_type": doc_type, **doc_tags}
-    pipeline._upsert_summary(chunks, unique_source, doc_meta, llm)
+    # Run summary generation in a daemon thread so it doesn't block the job
+    # from completing. The summary is optional — retrieval degrades gracefully
+    # without it, so a failure or slow LLM response is not critical.
+    import threading as _threading
+    _threading.Thread(
+        target=pipeline._upsert_summary,
+        args=(chunks, unique_source, doc_meta, llm),
+        daemon=True,
+    ).start()
     return len(chunks)
 
 

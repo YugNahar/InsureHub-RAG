@@ -363,7 +363,7 @@ class TurboVecStore:
 
     def _embed(self, texts: List[str]) -> np.ndarray:
         return self.embed_model.encode(
-            texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False,
+            texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False,
         )
 
     # ------------------------------------------------------------------
