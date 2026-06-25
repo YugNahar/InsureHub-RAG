@@ -284,6 +284,99 @@
         "role": "ai",
         "content": "Life insurance is a contract where the insurance company agrees to pay a certain amount to the person you choose if the policyholder passes away. It helps protect your family financially in case of your unexpected death.",
         "timestamp": "09:57"
+      },
+      {
+        "role": "user",
+        "content": "hi",
+        "timestamp": "10:50"
+      },
+      {
+        "role": "ai",
+        "content": "Hi there! Got an insurance question? I'm all ears. 😊",
+        "timestamp": "10:50"
+      },
+      {
+        "role": "user",
+        "content": "tell me about the types of insurances",
+        "timestamp": "10:51"
+      },
+      {
+        "role": "ai",
+        "content": "Sure thing! There are a few main types of insurance:\n\n1. Life insurance protects your family if something happens to you. It pays out a sum of money to the people you choose.\n2. Health insurance covers medical expenses, so you don't have to worry about huge bills if you get sick.\n3. Auto insurance protects you in case of accidents or damage to your car. It usually includes liability coverage and collision coverage.\n4. Home insurance covers your house and its contents in case of damage or theft.\n5. Travel insurance helps protect you while you're away, covering things like trip cancellations and lost luggage.\n\nEach type has different options and features, so it's good to look into what fits your needs best.",
+        "timestamp": "10:51"
+      },
+      {
+        "role": "user",
+        "content": "more types",
+        "timestamp": "10:52"
+      },
+      {
+        "role": "ai",
+        "content": "Sure thing! Let's dive into more types of insurance:\n\n1. Life insurance still protects your family if you pass away.\n2. Health insurance covers medical costs.\n3. Auto insurance includes liability, collision, and comprehensive coverage.\n4. Home insurance covers your house and belongings.\n5. Travel insurance helps with trip cancellations and lost luggage.\n6. Marine insurance protects ships and cargos.\n7. Fire insurance specifically covers damage from fires.\n8. Motor vehicle insurance is similar to auto insurance but focuses on vehicles.\n9. Miscellaneous insurance covers various risks not covered by the above.\n\nEach type has its own focus, so pick the ones that fit your needs best!",
+        "timestamp": "10:52"
+      },
+      {
+        "role": "user",
+        "content": "tell me amore about the 9th one",
+        "timestamp": "10:53"
+      },
+      {
+        "role": "ai",
+        "content": "Oh, you're asking about marine insurance! It's pretty cool because it covers ships and the cargo they carry. Think of it like protecting your floating business—whether you're sailing across the ocean or navigating rivers. It's especially useful if you're involved in shipping goods or if you own a boat. Want to know more about how it works or if it might be something you need?",
+        "timestamp": "10:53"
+      }
+    ]
+  },
+  "612c4f55": {
+    "created_at": "2026-06-25 10:26",
+    "history": []
+  },
+  "8634efb2": {
+    "created_at": "2026-06-25 10:26",
+    "history": []
+  },
+  "333128a8": {
+    "created_at": "2026-06-25 10:26",
+    "history": [
+      {
+        "role": "user",
+        "content": "hello",
+        "timestamp": "10:26"
+      },
+      {
+        "role": "ai",
+        "content": "Hi there! Got an insurance question? I'm all ears. 😊",
+        "timestamp": "10:26"
+      },
+      {
+        "role": "user",
+        "content": "what are the types of insurances",
+        "timestamp": "10:26"
+      },
+      {
+        "role": "ai",
+        "content": "Sure, let's dive into the main types of insurance! There are two big categories: life insurance and general insurance.\n\nLife insurance includes things like term life, whole life, and universal life — these protect your family financially if you pass away.\n\nGeneral insurance covers a bunch of different things:\n\n1. **Marine insurance** protects ships and cargo while they're at sea.\n2. **Fire insurance** covers damage from fires in buildings.\n3. **Motor vehicle insurance** includes car, motorcycle, and other vehicle coverage.\n4. **Miscellaneous insurance** covers various other risks, like travel insurance, pet insurance, and more.\n\nEach type has its own specifics, so it's good to know exactly what you need!",
+        "timestamp": "10:26"
+      },
+      {
+        "role": "user",
+        "content": "tell me more about the second one",
+        "timestamp": "10:29"
+      },
+      {
+        "role": "ai",
+        "content": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it — they'll be able to help you better! 😊",
+        "timestamp": "10:29"
+      },
+      {
+        "role": "user",
+        "content": "tell me about fire insurance",
+        "timestamp": "10:30"
+      },
+      {
+        "role": "ai",
+        "content": "Sure thing! Fire insurance covers damage to your property caused by fire. It's basically a safety net to help you rebuild or repair your home if a fire happens. So, if you have this type of insurance and a fire damages your house, the insurance company will help cover the costs to fix or replace what was damaged. It's a good idea to make sure your coverage matches the value of your home and its contents.",
+        "timestamp": "10:30"
       }
     ]
   }

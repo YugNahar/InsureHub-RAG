@@ -858,13 +858,37 @@ class MultiSourceRAG:
             conditions = [{"source": {"$contains": doc}} for doc in document_filter]
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
 
-        # ── Follow-up reformulation ───────────────────────────────────────────
-        # For short/pronoun-heavy questions ("what about premiums?", "is it legal?")
-        # rewrite into a standalone search query using conversation history.
-        # This runs sequentially BEFORE retrieval (~0.4 s for follow-ups only;
-        # skipped instantly for long self-contained questions via heuristic).
-        if history and _is_likely_followup(question):
-            retrieval_query = await _reformulate_query(question, history)
+        # ── Pure conversational replies — no retrieval needed ─────────────────
+        # "yes", "no", "ok", "thanks" etc. have zero retrieval value.
+        # Respond conversationally using only history, skip vector search entirely.
+        _PURE_CONV = frozenset({
+            "yes", "no", "ok", "okay", "sure", "alright", "nope", "nah",
+            "thanks", "thank you", "got it", "i see", "understood", "right",
+            "cool", "great", "nice", "fine", "good", "perfect", "awesome",
+            "no thanks", "no thank you", "not really", "never mind", "nevermind",
+        })
+        _q_stripped = question.strip().lower().strip("!.,?;:")
+        if _q_stripped in _PURE_CONV:
+            if _q_stripped in {"yes", "sure", "ok", "okay", "alright", "cool", "great", "perfect", "awesome"}:
+                conv_reply = "Great! Let me know if you have any other questions about insurance. 😊"
+            elif _q_stripped in {"no", "nope", "nah", "no thanks", "no thank you", "not really"}:
+                conv_reply = "No problem! Feel free to ask me anything else about your insurance. 😊"
+            elif _q_stripped in {"thanks", "thank you"}:
+                conv_reply = "You're welcome! Let me know if there's anything else I can help you with. 😊"
+            else:
+                conv_reply = "Sure! Let me know if you have any other questions. 😊"
+            import json as _json_s
+            yield conv_reply
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+            return
+
+        # ── Follow-up reformulation — always enrich query with history ──────
+        if history:
+            # Always enrich the retrieval query with the last assistant turn.
+            # This handles ALL follow-up patterns without needing to detect them:
+            # "tell me about the third one", "explain point 10", "what about premiums?"
+            # all get the previous topic prepended so vector search finds relevant chunks.
+            retrieval_query = _reformulate_with_history(question, history)
 
         # Detailed/specific questions need more chunks to cover all aspects.
         # Simple conversational questions keep the smaller pool to stay fast.
@@ -936,7 +960,7 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
         else:
-            ctx_covered = _context_covers_query(question, all_chunks, llm_topics=llm_topics or None)
+            ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=llm_topics or None)
             if not ctx_covered and not document_filter:
                 yield (
                     "Hmm, I don't have that specific information in my knowledge base right now. "
