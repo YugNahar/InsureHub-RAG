@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 tunnel_watcher.py — keeps cloudflared alive and auto-updates Vercel when the URL changes.
+Falls back to localtunnel (npx localtunnel) when cloudflared is rate-limited (HTTP 429).
 
 Run once on startup:
     python3 tunnel_watcher.py
@@ -34,8 +35,12 @@ VERCEL_PROJECT_DIR = os.path.expanduser(
 # Admin + Agent panels (plain HTML, deployed separately to Vercel)
 PANELS_PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panels")
 
-POLL_INTERVAL      = 10   # seconds between URL checks
-STARTUP_WAIT       = 20   # seconds to wait after starting cloudflared before polling
+POLL_INTERVAL      = 15   # seconds between URL checks
+STARTUP_WAIT       = 25   # seconds to wait after starting cloudflared before polling
+
+# Fallback tunnel: localtunnel is used automatically when cloudflared is rate-limited.
+LOCALTUNNEL_CMD    = ["npx", "-y", "localtunnel", "--port", str(BACKEND_PORT)]
+LT_STARTUP_WAIT    = 12  # seconds to wait for localtunnel to print its URL
 
 _ENV = {**os.environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")}
 
@@ -55,7 +60,7 @@ def get_tunnel_url() -> str | None:
     try:
         with urllib.request.urlopen(METRICS_URL, timeout=3) as r:
             text = r.read().decode()
-        m = re.search(r'userHostname="(https://[^"]+trycloudflare\.com)"', text)
+        m = re.search(r'userHostname="(https://[^"]+(?:trycloudflare\.com|loca\.lt))"', text)
         return m.group(1) if m else None
     except Exception:
         return None
@@ -65,10 +70,26 @@ def cf_is_running(proc) -> bool:
     return proc is not None and proc.poll() is None
 
 
+def _is_rate_limited() -> bool:
+    """Do a quick trial run to detect Cloudflare 429 before a full restart attempt."""
+    try:
+        result = subprocess.run(
+            CLOUDFLARED_CMD,
+            capture_output=True,
+            timeout=8,
+        )
+        combined = (result.stdout + result.stderr).decode(errors="replace")
+        return "429" in combined or "error code: 1015" in combined
+    except subprocess.TimeoutExpired:
+        return False  # it's running (good), kill it so start_cloudflared can take over
+    except Exception:
+        return False
+
+
 def start_cloudflared():
     """Kill any stray cloudflared processes, then start a fresh one."""
     subprocess.run(["pkill", "-f", "cloudflared tunnel --url"], capture_output=True)
-    time.sleep(1)
+    time.sleep(2)
     proc = subprocess.Popen(
         CLOUDFLARED_CMD,
         stdout=subprocess.DEVNULL,
@@ -77,6 +98,38 @@ def start_cloudflared():
     log.info("cloudflared started (pid=%d) — waiting %ds for URL…", proc.pid, STARTUP_WAIT)
     time.sleep(STARTUP_WAIT)
     return proc
+
+
+def start_localtunnel() -> tuple:
+    """Start localtunnel as a fallback and return (proc, url). Returns (None, None) on failure."""
+    subprocess.run(["pkill", "-f", "localtunnel --port"], capture_output=True)
+    time.sleep(1)
+    log.info("cloudflared is rate-limited — starting localtunnel fallback…")
+    try:
+        proc = subprocess.Popen(
+            LOCALTUNNEL_CMD,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_ENV,
+        )
+        deadline = time.time() + LT_STARTUP_WAIT
+        url = None
+        while time.time() < deadline:
+            line = proc.stdout.readline().decode(errors="replace").strip()
+            if line:
+                log.info("  [localtunnel] %s", line)
+            m = re.search(r"your url is:\s*(https://\S+)", line, re.IGNORECASE)
+            if m:
+                url = m.group(1)
+                break
+        if url:
+            log.info("localtunnel URL: %s", url)
+        else:
+            log.warning("localtunnel started but could not parse URL within %ds", LT_STARTUP_WAIT)
+        return proc, url
+    except Exception as e:
+        log.error("Failed to start localtunnel: %s", e)
+        return None, None
 
 
 def _vercel_set_env(project_dir: str, url: str, vars: tuple):
@@ -161,6 +214,7 @@ def print_links(url: str):
 def run():
     current_url = None
     proc = None
+    _lt_proc = None  # tracks active localtunnel fallback process
 
     log.info("Tunnel watcher started.")
 
@@ -189,13 +243,59 @@ def run():
             except ValueError:
                 proc = None
     else:
-        proc = start_cloudflared()
+        # Pre-check for rate-limit before first cloudflared attempt
+        if _is_rate_limited():
+            log.warning("Cloudflare 429 at startup — launching localtunnel fallback immediately…")
+            _lt_proc_startup, lt_url_startup = start_localtunnel()
+            if lt_url_startup:
+                current_url = lt_url_startup
+                write_url_file(current_url)
+                print_links(current_url)
+                update_vercel(current_url)
+            # Use a dummy dead proc so the main loop knows to restart cloudflared
+            proc = None
+        else:
+            proc = start_cloudflared()
+
+    _restart_count  = 0
+    # Start conservative — Cloudflare quick-tunnels have a strict rate-limit.
+    # If we hammer the API we get HTTP 429 which can last 5-15 minutes.
+    _BACKOFF_DELAYS = [120, 180, 300, 600]  # seconds between retries (caps at 10 min)
+    _RATE_LIMIT_EXTRA_WAIT = 180  # extra seconds to wait when 429 is detected
 
     while True:
-        # Restart cloudflared if it died
+        # Restart cloudflared if it died, with exponential backoff so we don't
+        # hammer Cloudflare's rate-limit when they reject tunnel creation.
         if not cf_is_running(proc):
-            log.warning("cloudflared is down — restarting…")
+            delay = _BACKOFF_DELAYS[min(_restart_count, len(_BACKOFF_DELAYS) - 1)]
+            log.warning("cloudflared is down — waiting %ds before restarting… (attempt %d)",
+                        delay, _restart_count + 1)
+            time.sleep(delay)
+            # Pre-check: if Cloudflare is still rate-limiting us, spin up localtunnel
+            # as a live fallback so the backend stays reachable while we wait.
+            if _is_rate_limited():
+                log.warning("Cloudflare 429 detected — holding off %ds before next attempt…",
+                            _RATE_LIMIT_EXTRA_WAIT)
+                if _lt_proc is None or _lt_proc.poll() is not None:
+                    _lt_proc, lt_url = start_localtunnel()
+                    if lt_url and lt_url != current_url:
+                        current_url = lt_url
+                        write_url_file(current_url)
+                        print_links(current_url)
+                        update_vercel(current_url)
+                time.sleep(_RATE_LIMIT_EXTRA_WAIT)
+                # Skip incrementing restart_count — rate-limit doesn't count as a real attempt
+                time.sleep(POLL_INTERVAL)
+                continue
+            # Rate limit cleared — kill fallback and switch back to cloudflared
+            if _lt_proc and _lt_proc.poll() is None:
+                log.info("cloudflared available again — stopping localtunnel fallback")
+                _lt_proc.terminate()
+                _lt_proc = None
             proc = start_cloudflared()
+            _restart_count += 1
+        else:
+            _restart_count = 0  # reset backoff once tunnel is stable
 
         url = get_tunnel_url()
         if url and url != current_url:

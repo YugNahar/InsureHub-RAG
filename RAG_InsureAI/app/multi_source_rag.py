@@ -79,24 +79,42 @@ def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
 
 
 def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
-    """True if ≥1 retrieved chunk contains at least one topic keyword (root-aware).
+    """True if the retrieved chunks collectively cover all topic keywords.
 
-    Accepts an optional `llm_topics` set (from _extract_intent_topics).
-    When provided those override the regex extraction, giving much better
-    intent recognition for conversational questions.
+    When llm_topics is provided, checks that every topic word appears in at
+    least one retrieved chunk (distributed coverage across chunks). This is
+    intentionally lenient: the LLM receives all chunks as context, so info
+    spread across chunks is still usable. The only hard block is when a
+    specific term (e.g. 'IDV', 'no-claim bonus') doesn't appear ANYWHERE in
+    the retrieved pool, which reliably indicates the KB has no relevant content.
 
-    Falls back to regex for compound "X and Y" splitting when llm_topics
-    is absent.
+    Falls back to regex (OR logic) when llm_topics is absent.
     """
     if llm_topics:
+        # Build a combined term set across ALL retrieved chunks.
+        all_terms: set[str] = set()
         for doc in docs:
             text = (
                 doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
             ).lower()
-            chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-            if _topics_hit_chunk(llm_topics, chunk_terms):
-                return True
-        return False
+            all_terms.update(re.findall(r'\b[a-z]{3,}\b', text))
+
+        # Also pass if the top chunk has a high rerank score — the cross-encoder
+        # has validated relevance and the keyword check should not override it.
+        top_rerank = max(
+            (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
+            default=0,
+        )
+        if top_rerank >= 0.7:
+            return True
+
+        for topic in llm_topics:
+            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3]
+            if not words:
+                continue
+            if not all(any(_word_matches(w, c) for c in all_terms) for w in words):
+                return False
+        return True
 
     # Regex fallback: split compound questions on "and"/"or".
     sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
@@ -118,26 +136,91 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
 
 _DETAIL_SIGNALS = {
     'in detail', 'step by step', 'step-by-step', 'in steps', 'procedure',
-    'process', 'how to', 'explain', 'elaborate', 'describe', 'walk me through',
+    'how to', 'elaborate', 'walk me through',
     'in depth', 'thoroughly', 'fully explain', 'all about', 'everything about',
-    'comprehensive', 'complete', 'what are all', 'list all', 'list the',
+    'comprehensive', 'what are all', 'list all',
     'what all', 'how does it work', 'all the steps', 'entire process',
     'tell me everything', 'give me a full', 'give me the full',
+}
+
+_SIMPLE_SIGNALS = {
+    'in simple', 'in short', 'in brief', 'briefly', 'short answer',
+    'simple answer', 'quick answer', 'simple terms', 'layman', 'easy way',
+    'just briefly', 'keep it short', 'keep it simple', 'just tell me',
+    'just give me', 'just explain', 'just say',
 }
 
 
 def _needs_detailed_answer(question: str) -> bool:
     """True when the question expects a comprehensive, multi-part, or procedural answer."""
     q = question.lower()
+    if any(sig in q for sig in _SIMPLE_SIGNALS):
+        return False  # user explicitly wants brief — short-circuit before detail check
     if any(sig in q for sig in _DETAIL_SIGNALS):
         return True
-    # Long questions (>20 words) almost always need more than 4 sentences
-    if len(question.split()) > 20:
+    # Long questions (>25 words) almost always need more than 4 sentences
+    if len(question.split()) > 25:
         return True
-    # Multiple sub-questions joined by "and" — e.g. "how does X work and what are its Y and Z"
-    if q.count(' and ') >= 2:
+    # Three or more sub-questions joined by "and"
+    if q.count(' and ') >= 3:
         return True
     return False
+
+
+async def _llm_classify_intent(question: str) -> bool:
+    """Classify whether a question needs a detailed answer (True) or brief (False).
+
+    Fast path: keyword signals handle the obvious cases with zero latency.
+    LLM path: a non-blocking aiohttp call (max 5 tokens, 5 s timeout) for
+    ambiguous questions. Falls back to False (brief) on any error or timeout.
+    Designed to run in parallel with retrieval — adds zero wall-clock latency.
+    """
+    q = question.lower()
+    # Fast path — explicit simple/brief signal overrides everything
+    if any(sig in q for sig in _SIMPLE_SIGNALS):
+        return False
+    # Fast path — unambiguously detailed
+    if any(sig in q for sig in _DETAIL_SIGNALS):
+        return True
+    if len(question.split()) > 25:
+        return True
+    if q.count(' and ') >= 3:
+        return True
+
+    # LLM path — non-blocking aiohttp call, same pattern as _extract_intent_topics
+    try:
+        import aiohttp as _aiohttp
+        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+        if _active_backend() != "vllm" or not VLLM_HOST:
+            return False
+        prompt = (
+            "Classify this insurance question with ONE word only.\n"
+            "Reply 'detailed' if it needs steps, a list, or multiple parts.\n"
+            "Reply 'brief' if 2-3 sentences would fully answer it.\n\n"
+            f"Question: {question}\n\nAnswer:"
+        )
+        payload = {
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 5,
+            "temperature": 0,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        }
+        timeout = _aiohttp.ClientTimeout(total=5)
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{VLLM_HOST}/v1/chat/completions",
+                json=payload, headers=headers, timeout=timeout,
+            ) as resp:
+                data = await resp.json()
+                result = data["choices"][0]["message"]["content"].strip().lower()
+                return "detailed" in result
+    except Exception:
+        return False  # safe default: brief
 
 
 _FOLLOWUP_SIGNALS = {
@@ -185,16 +268,16 @@ Examples:
   Follow-up: "what about premiums?" → "life insurance premium amount"
 
   Context: "User: explain life insurance\\nLayla: Life insurance protects your family..."
-  Follow-up: "is it tax deductible?" → "life insurance premium tax deduction income tax"
+  Follow-up: "is it tax deductible?" → "life insurance premiums tax deductible section 80C income"
 
   Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers share risk..."
-  Follow-up: "is it legally required?" → "reinsurance legal requirement"
+  Follow-up: "is it legally required?" → "reinsurance legal requirement regulation"
 
   Context: "User: what is subrogation\\nLayla: Subrogation means the insurer steps in..."
-  Follow-up: "give me an example" → "subrogation example case"
+  Follow-up: "give me an example" → "subrogation example real case"
 
   Context: "User: what is a deductible\\nLayla: A deductible is what you pay first..."
-  Follow-up: "how is it calculated?" → "deductible calculation formula method"
+  Follow-up: "how is it calculated?" → "deductible calculation formula percentage"
 
 Conversation:
 {recent}
@@ -230,30 +313,23 @@ Search query:"""
 
 
 _INTENT_PROMPT = """\
-Extract the core insurance topic keywords from the question below.
-Output ONLY 2-5 comma-separated words or short phrases — nothing else.
-
-Patterns (question format → output):
-"tell me about X"              → X
-"can you explain X"            → X
-"how does X work"              → X
-"what is X and Y"              → X, Y
-"X and its Y"                  → X, Y
-"difference between X and Y"   → X, Y
+Extract the specific insurance topic from the question below.
+Output ONLY the topic as 1-3 comma-separated words or short phrases — nothing else.
+Keep compound terms together (e.g. "no-claim bonus", "free look period", "sum assured").
 
 Examples:
-"can you tell me about life insurance"                        → life
-"how does reinsurance work and what is its legal significance" → reinsurance, legal
-"explain what a deductible is"                                → deductible
-"tell me about motor policy claims"                           → motor, claims
-"what is nomination"                                          → nomination
-"give me info about health cover"                             → health
-"how are premiums calculated for fire insurance"              → premiums, fire
-"can you explain the principle of subrogation"                → subrogation
-"what is the difference between term and whole life"          → term life, whole life
+"what is life insurance"                                       → life insurance
+"what is a no-claim bonus"                                     → no-claim bonus
+"what is a free look period"                                   → free look period
+"what is a deductible"                                         → deductible
+"explain reinsurance"                                          → reinsurance
+"how are premiums calculated for fire insurance"               → fire insurance, premium
+"what is the difference between term and whole life"           → term life, whole life
+"how to file a motor insurance claim"                          → motor claim
+"what documents are needed for health insurance claim"         → health claim, documents
 
 Question: {question}
-Keywords:"""
+Topic:"""
 
 
 async def _extract_intent_topics(question: str) -> set[str]:
@@ -286,13 +362,13 @@ async def _extract_intent_topics(question: str) -> set[str]:
                                     timeout=timeout) as resp:
                 data = await resp.json()
                 raw = data["choices"][0]["message"]["content"].strip().lower()
-                # Parse "word1, word2, phrase three" into individual tokens
+                # Parse phrases like "no-claim bonus, deductible" keeping
+                # multi-word/hyphenated compounds intact for phrase matching.
                 topics: set[str] = set()
                 for phrase in raw.split(","):
-                    phrase = phrase.strip()
+                    phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
                     if phrase:
-                        for word in re.findall(r'\b[a-z]{3,}\b', phrase):
-                            topics.add(word)
+                        topics.add(phrase)  # keep compound e.g. "no-claim bonus"
                 logger.debug("[INTENT] %r → topics=%s", question, topics)
                 return topics
     except Exception as exc:
@@ -350,18 +426,13 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
     # Remove ATX headers (## Heading → Heading)
     text = re.sub(r'^#{1,4}\s+', '', text, flags=re.MULTILINE)
-    # Convert bullet list items to flowing prose: "- item" or "* item" → "item, "
-    # First item on a new line: replace "\n- " with ", "
-    text = re.sub(r'\n\s*[-*]\s+', ' ', text)
-    # Numbered list items: "\n1. " → " "
-    text = re.sub(r'\n\s*\d+\.\s+', ' ', text)
+    # Remove bare bullet markers ("- " or "* " at start of line) but keep the content
+    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
     # Inline code backticks
     text = re.sub(r'`([^`]+)`', r'\1', text)
     # Collapse 3+ newlines → 2
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Strip leftover leading/trailing whitespace per line
-    lines = [l.rstrip() for l in text.split('\n')]
-    return '\n'.join(lines)
+    return text
 
 
 def _strip_model_preamble(text: str) -> str:
@@ -538,7 +609,7 @@ def _is_insurance_related(question: str) -> bool:
         r"\bmovie\b|\bactor\b|\bactress\b|\bsinger\b|\bsong\b|\balbum\b|"
         r"\bpython\b|\bjavascript\b|\bjava\b|\bc\+\+\b|\bprogramming\b|\bcode\b|\balgorithm\b|"
         r"\bweather\b|\btemperature\b|\bforecast\b|"
-        r"\btranslate\b|\bmeaning\s+of\b"
+        r"\btranslate\b"
         r")"
     )
     if _OFF_TOPIC_PATTERNS.search(q):
@@ -596,7 +667,7 @@ class MultiSourceRAG:
         self.doc_pipeline = RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = 4000   # ~8 × 500-char semantic chunks
+        self.max_context_chars = LLM_CONTEXT_WINDOW_CHARS  # kept in sync with compress_to_budget budget
         # Share the embed model already loaded by doc_pipeline — no duplicate memory.
         self._compressor = ContextCompressor(
             embed_model=self.doc_pipeline.vector_store.embed_model,
@@ -610,8 +681,16 @@ class MultiSourceRAG:
         seen = {}
         for chunk in chunks:
             h = hash(chunk.page_content[:200])
-            if h not in seen or chunk.metadata.get("similarity", 0) > seen[h].metadata.get("similarity", 0):
+            if h not in seen:
                 seen[h] = chunk
+            else:
+                # Prefer the version with the higher relevance score.
+                # rerank_score (from BGE cross-encoder) is more informative than
+                # the raw retrieval similarity, so use it when available.
+                def _best_score(d):
+                    return d.metadata.get("rerank_score", d.metadata.get("similarity", 0))
+                if _best_score(chunk) > _best_score(seen[h]):
+                    seen[h] = chunk
         return list(seen.values())
 
     async def _retrieve_doc_chunks(
@@ -640,23 +719,32 @@ class MultiSourceRAG:
                 relevant_summaries = await asyncio.to_thread(
                     self.doc_pipeline._summary_store.search, retrieval_query, summary_top_k
                 )
-                in_pool_srcs = {d.metadata.get("source", "") for d in doc_chunks}
+                seen_summary_srcs: set = set()
                 for summary_doc in relevant_summaries:
                     src = summary_doc.metadata.get("source", "")
-                    if src and src not in in_pool_srcs:
-                        boost = await asyncio.to_thread(
-                            self.doc_pipeline._vector_store.search,
-                            retrieval_query, 2, {"source": {"$eq": src}}, True, False,
-                        )
-                        if boost:
-                            existing = {d.page_content[:80] for d in doc_chunks}
-                            doc_chunks = doc_chunks + [
-                                d for d in boost if d.page_content[:80] not in existing
-                            ]
-                            in_pool_srcs.add(src)
+                    if not src or src in seen_summary_srcs:
+                        continue
+                    seen_summary_srcs.add(src)
+                    # Always boost from summary-identified documents even if
+                    # they are already partially in the pool.  The initial top-k
+                    # may have fetched the wrong sections of that document; the
+                    # boost fetches the 2 chunks most relevant to THIS query.
+                    boost = await asyncio.to_thread(
+                        self.doc_pipeline._vector_store.search,
+                        retrieval_query, 5, {"source": {"$eq": src}}, True, False,
+                    )
+                    if boost:
+                        existing = {d.page_content[:80] for d in doc_chunks}
+                        new_boost = [
+                            d for d in boost if d.page_content[:80] not in existing
+                        ]
+                        for d in new_boost:
+                            d.metadata["stage1_boost"] = True
+                        doc_chunks = doc_chunks + new_boost
+                        if new_boost:
                             logger.info(
                                 "[MultiSourceRAG] stage-1 boost: added %d chunk(s) from %r",
-                                len(boost), src,
+                                len(new_boost), src,
                             )
             except Exception as _exc:
                 logger.debug("[MultiSourceRAG] stage-1 guarantee skipped: %s", _exc)
@@ -889,6 +977,30 @@ class MultiSourceRAG:
             conditions = [{"source": {"$contains": doc}} for doc in document_filter]
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
 
+        # ── User-statement fast path ──────────────────────────────────────────
+        # "I have a health plan", "I got term insurance last month", etc. are
+        # statements, not questions. KB retrieval will find nothing specific.
+        # Acknowledge warmly and ask what they'd like to know.
+        _stmt = re.match(
+            r"^\s*i\s+(have|got|have\s+got|purchased|bought|own|took|taken|recently\s+got|just\s+got"
+            r"|am\s+covered|am\s+insured|enrolled|signed\s+up)\b",
+            question.lower(),
+        )
+        if _stmt and _is_insurance_related(question):
+            _plan_word = next(
+                (w for w in ("health", "life", "motor", "car", "travel", "home", "term", "ulip", "vehicle")
+                 if w in question.lower()), "insurance"
+            )
+            _warm = (
+                f"That's great that you have a {_plan_word} plan! "
+                f"I'm here to help you understand it better. "
+                f"What would you like to know about your coverage, claims, premiums, or anything else?"
+            )
+            import json as _json_s
+            yield _warm
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+            return
+
         # ── Follow-up reformulation ───────────────────────────────────────────
         # For short/pronoun-heavy questions ("what about premiums?", "is it legal?")
         # rewrite into a standalone search query using conversation history.
@@ -897,39 +1009,108 @@ class MultiSourceRAG:
         if history and _is_likely_followup(question):
             retrieval_query = await _reformulate_query(question, history)
 
-        # Detailed/specific questions need more chunks to cover all aspects.
-        # Simple conversational questions keep the smaller pool to stay fast.
-        detailed = _needs_detailed_answer(question)
-        _doc_top_k    = 14 if detailed else 8
-        _chunk_limit  = 12 if detailed else 8
-        _media_top_k  = 5  if detailed else 4
+        # ── KV cache lookup ───────────────────────────────────────────────────
+        # Check before any retrieval so a cache hit skips embedding + reranking.
+        # Key is built on the (possibly reformulated) retrieval_query so that
+        # paraphrased follow-ups that normalise to the same query share a hit.
+        _kv = self.doc_pipeline._cache
+        _kv_sources = self.doc_pipeline._vector_store.list_sources()
+        _kv_key = _kv.make_key(
+            query=retrieval_query,
+            top_k=8,
+            use_hybrid=True,
+            use_reranker=True,
+            generate_answer=True,
+            run_ragas=False,
+            sources=_kv_sources,
+        )
+        _kv_q_emb = None
+        _kv_hit = _kv.get(_kv_key)
+        if _kv_hit is None:
+            try:
+                _kv_q_emb = await asyncio.to_thread(
+                    lambda: self.doc_pipeline._vector_store.embed_model.encode(
+                        [retrieval_query], normalize_embeddings=True, show_progress_bar=False
+                    )[0]
+                )
+                _kv_hit = _kv.semantic_get(_kv_q_emb)
+            except Exception:
+                _kv_q_emb = None
+        if _kv_hit is not None:
+            import json as _json_s
+            logger.info("[ask_stream] KV cache hit for query=%r", retrieval_query[:80])
+            yield _kv_hit.get("answer", "")
+            yield "\n\n" + _json_s.dumps({
+                "sources": _kv_hit.get("sources", []),
+                "done": True,
+                "needs_human": False,
+            })
+            return
 
-        # Streaming path: parallel retrieval + LLM intent extraction.
-        # _extract_intent_topics runs concurrently so it adds zero latency.
+        # Use keyword check to configure retrieval size (fast, instant).
+        # LLM-based intent classification runs in parallel with retrieval below.
+        _keyword_detailed = _needs_detailed_answer(question)
+        _is_followup = bool(history and _is_likely_followup(question) and retrieval_query != question)
+        _doc_top_k    = 14 if _keyword_detailed else 8
+        _chunk_limit  = 12 if _keyword_detailed else 8
+        _media_top_k  = 5  if _keyword_detailed else 4
+
+        # Streaming path: parallel retrieval + LLM intent extraction + LLM intent classification.
+        # All three run concurrently — LLM classification adds zero wall-clock latency.
         if not document_filter:
-            (doc_chunks, video_chunks, webpage_chunks), llm_topics = await asyncio.gather(
+            (doc_chunks, video_chunks, webpage_chunks), llm_topics, detailed = await asyncio.gather(
                 asyncio.gather(
                     self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                     asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
                     asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
                 ),
                 _extract_intent_topics(question),
+                _llm_classify_intent(question),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
-            doc_chunks, llm_topics = await asyncio.gather(
+            doc_chunks, llm_topics, detailed = await asyncio.gather(
                 self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                 _extract_intent_topics(question),
+                _llm_classify_intent(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
 
-        all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
+        # Prefer BGE rerank_score when available (set by rerank_documents).
+        # Fall back to the raw retrieval similarity so non-reranked sources
+        # (video, webpage) are still ordered reasonably.
+        # Stage-1 boost chunks break ties upward: when two chunks share the
+        # same rerank_score, the boost chunk (added because its document was
+        # explicitly matched by the summary search) should win.
+        all_chunks.sort(
+            key=lambda x: (
+                x.metadata.get("rerank_score", x.metadata.get("similarity", 0)),
+                1 if x.metadata.get("stage1_boost") else 0,
+            ),
+            reverse=True,
+        )
         all_chunks = all_chunks[:_chunk_limit]
 
+        # Run coverage check on the pre-compression chunks so that video/webpage
+        # chunks filling the budget first don't cause doc-chunk terms to go missing.
+        import json as _json_s
+        topics_for_coverage = None if _is_followup else (llm_topics or None)
+        ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
+        if not ctx_covered and not document_filter:
+            yield (
+                "Hmm, I don't have that specific information in my knowledge base right now. "
+                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+            )
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
+            return
+
+        # Only compress when context exceeds the budget — avoids CPU-heavy
+        # sentence embedding on every query when chunks already fit comfortably.
+        _context_budget = 6000
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
-        if total_retrieved_chars > LLM_CONTEXT_WINDOW_CHARS:
+        if total_retrieved_chars > _context_budget:
             all_chunks = self._compressor.compress_to_budget(
-                question, all_chunks, max_total_chars=LLM_CONTEXT_WINDOW_CHARS
+                retrieval_query, all_chunks, max_total_chars=_context_budget
             )
 
         _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
@@ -955,10 +1136,7 @@ class MultiSourceRAG:
             context_parts.append(f"[{label}]\n{chunk.page_content}")
 
         full_context = "\n\n".join(context_parts)
-        if len(full_context) > self.max_context_chars:
-            full_context = full_context[:self.max_context_chars] + "... (truncated)"
 
-        import json as _json_s
         if not full_context.strip():
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
@@ -966,18 +1144,13 @@ class MultiSourceRAG:
             )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
-        else:
-            ctx_covered = _context_covers_query(question, all_chunks, llm_topics=llm_topics or None)
-            if not ctx_covered and not document_filter:
-                yield (
-                    "Hmm, I don't have that specific information in my knowledge base right now. "
-                    "Let me get one of our agents on it — they'll be able to help you better! 😊"
-                )
-                yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
-                return
-            prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
-            prompt = prompt_tmpl.format(history=history, context=full_context, question=question)
-            llm = get_insurance_llm(temperature=0)
+
+        prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
+        # For follow-ups, pass the reformulated query (e.g. "life insurance premiums")
+        # as the question so the LLM knows the exact topic from the history.
+        prompt_question = retrieval_query if _is_followup else question
+        prompt = prompt_tmpl.format(history=history, context=full_context, question=prompt_question)
+        llm = get_insurance_llm(temperature=0)
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
@@ -989,6 +1162,7 @@ class MultiSourceRAG:
 
         unique_sources = list(dict.fromkeys(sources))
         streamed_ok = False
+        _kv_reply = ""  # buffer for cache write
 
         if _active_backend() == "vllm" and VLLM_HOST:
             model = _resolve_vllm_model()
@@ -996,7 +1170,7 @@ class MultiSourceRAG:
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1024")),
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1500" if detailed else "700")),
                 "stream": True,
             }
             headers = {
@@ -1006,19 +1180,32 @@ class MultiSourceRAG:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                        async for raw_line in resp.content:
-                            line = raw_line.decode().strip()
-                            if not line.startswith("data:"):
-                                continue
-                            data = line[5:].strip()
-                            if data == "[DONE]":
+                        # vLLM SSE chunks may contain multiple "data: ..." lines.
+                        # Reading resp.content by chunk (default) silently drops
+                        # events when json.loads sees multi-line text. Buffer and
+                        # split by newline to handle any chunk boundary correctly.
+                        buf = ""
+                        done = False
+                        async for raw_chunk in resp.content:
+                            buf += raw_chunk.decode("utf-8", errors="replace")
+                            while "\n" in buf:
+                                raw_line, buf = buf.split("\n", 1)
+                                line = raw_line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    done = True
+                                    break
+                                try:
+                                    token = _json.loads(data)["choices"][0]["delta"].get("content", "") or ""
+                                    if token:
+                                        _kv_reply += token
+                                        yield token
+                                except Exception:
+                                    pass
+                            if done:
                                 break
-                            try:
-                                token = _json.loads(data)["choices"][0]["delta"].get("content", "")
-                                if token:
-                                    yield token
-                            except Exception:
-                                pass
                 streamed_ok = True
             except Exception as exc:
                 logger.warning("[ask_stream] direct vLLM streaming failed, falling back: %s", exc)
@@ -1028,7 +1215,23 @@ class MultiSourceRAG:
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
             answer = _strip_markdown(_strip_model_preamble(answer))
+            _kv_reply = answer
             yield answer
+
+        # ── KV cache write ────────────────────────────────────────────────────
+        # Only cache real answers, not handoff/fallback messages.
+        _handoff_phrases = ("let me get one of our agents", "let me get a human agent")
+        if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases):
+            try:
+                _kv.put(
+                    _kv_key,
+                    {"answer": _kv_reply, "is_general": False, "sources": unique_sources},
+                    query_embedding=_kv_q_emb,
+                    query_text=retrieval_query,
+                )
+                logger.info("[ask_stream] KV cache stored for query=%r", retrieval_query[:80])
+            except Exception as _exc:
+                logger.debug("[ask_stream] KV cache write failed: %s", _exc)
 
         yield "\n\n" + _json.dumps({"sources": unique_sources, "done": True})
 

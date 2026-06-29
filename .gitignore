@@ -32,3 +32,11 @@ RAG_InsureAI/app/video/
 
 # Logs
 *.log
+
+# Runtime / generated files (not source code)
+RAG_InsureAI/app/frontend_dist/
+RAG_InsureAI/app/tunnel_url.txt
+RAG_InsureAI/app/sessions_data.json
+
+# Panels build output
+panels/dist/

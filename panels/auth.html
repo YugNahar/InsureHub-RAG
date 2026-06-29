@@ -180,22 +180,12 @@
 </div>
 
 <script>
-  // On tunnel/localhost: same-origin, use current window.location.origin.
-  // On Vercel static host: use the baked-in tunnel URL from build time.
-  (function () {
-    const built = 'https://digest-tile-coupons-kijiji.trycloudflare.com'.replace(/\/$/, '');
-    const h = window.location.hostname;
-    if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
-      window.__BACKEND_URL = window.location.origin.replace(/\/$/, '');
-    } else {
-      window.__BACKEND_URL = (built && !built.startsWith('__')) ? built : 'http://localhost:8501';
-    }
-  })();
-  const API = window.__BACKEND_URL;
+  // __API_URL__ is replaced by the Vite build plugin with VITE_API_BASE_URL at deploy time.
+  const API = '__API_URL__'.replace(/\/$/, '');
 
   // If already logged in, verify and go straight to admin
   const _existingToken = localStorage.getItem('insure_token');
-  if (_existingToken) {
+  if (_existingToken && API) {
     fetch(`${API}/auth/verify`, {
       headers: { Authorization: 'Bearer ' + _existingToken }
     }).then(r => { if (r.ok) window.location.href = '/admin'; }).catch(() => {});

@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +30,66 @@ def _now_full() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+_ABUSE_WORDS = frozenset({
+    "fuck", "fucking", "fucked", "shit", "shitty", "bitch", "bitches",
+    "bastard", "bastards", "asshole", "assholes", "idiot", "idiots",
+    "moron", "morons", "stupid", "damn", "crap", "piss", "dick",
+    "jerk", "dumb", "scam", "fraud", "useless", "garbage", "trash",
+    "pathetic", "disgusting", "horrible", "awful", "scammer", "liar",
+    "cheat", "ridiculous", "bullshit", "nonsense", "incompetent",
+    "worthless", "terrible", "worst", "clueless", "rubbish", "crook",
+})
+
+async def _analyze_tone(text: str) -> str:
+    """Return 'happy', 'angry', or 'neutral'. Abuse words fast-path before LLM call."""
+    words = set(re.findall(r'\b[a-z]+\b', text.lower()))
+    if words & _ABUSE_WORDS:
+        return "angry"
+    if len(text.strip()) < 15:
+        return "neutral"
+    try:
+        import aiohttp
+        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+        if not VLLM_HOST:
+            return "neutral"
+        prompt = (
+            "You are a tone classifier for customer service. Read the user message below and reply "
+            "with exactly one word — nothing else.\n"
+            "  happy   — user sounds satisfied, pleased, grateful, or positive\n"
+            "  angry   — user sounds upset, frustrated, complaining, or demanding\n"
+            "  neutral — anything else\n\n"
+            f"Message: {text[:300]}\n"
+            "Tone:"
+        )
+        payload = {
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "stream": False,
+        }
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{VLLM_HOST}/v1/chat/completions",
+                json=payload,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {VLLM_API_KEY}"},
+                timeout=timeout,
+            ) as resp:
+                if resp.status != 200:
+                    return "neutral"
+                data = await resp.json()
+                result = data["choices"][0]["message"]["content"].strip().lower()
+                if "happy" in result or "satisf" in result or "positive" in result:
+                    return "happy"
+                if "angry" in result or "upset" in result or "frustrat" in result:
+                    return "angry"
+                return "neutral"
+    except Exception:
+        return "neutral"
+
+
 @dataclass
 class ChatMessage:
     role: str   # "user" | "ai" | "agent" | "system"
@@ -44,6 +105,9 @@ class ChatSession:
     agent_id: Optional[str] = None
     user_ws: Optional[WebSocket] = None
     created_at: str = field(default_factory=_now_full)
+    tone: str = "neutral"       # "happy" | "neutral" | "angry"
+    tone_from_red: bool = False  # True if agent took over because tone was "angry"
+    handoff_exhausted: bool = False  # True after handoff timed-out/all-declined; resets on next AI turn
 
 
 @dataclass
@@ -53,6 +117,7 @@ class HumanAgent:
     ws: WebSocket
     active_session: Optional[str] = None
     monitoring: Set[str] = field(default_factory=set)
+    declined_sessions: Set[str] = field(default_factory=set)  # sessions this agent explicitly dismissed
 
 
 _HANDOFF_TIMEOUT = 30  # seconds agents have to accept before email is sent
@@ -156,6 +221,8 @@ class AgentHub:
                 "created_at": s.created_at,
                 "last_message": last,
                 "title": first_user or f"Session #{s.session_id}",
+                "tone": s.tone,
+                "tone_from_red": s.tone_from_red,
             })
         return out
 
@@ -165,9 +232,13 @@ class AgentHub:
             return
         msg = ChatMessage(role=role, content=content)
         session.history.append(msg)
+        if role == "ai":
+            session.handoff_exhausted = False  # fresh AI turn — allow handoff again if needed
         self._save_sessions()
         await self._broadcast_new_message(session_id, msg)
         await self._broadcast_sessions_update()
+        if role == "user":
+            asyncio.create_task(self._analyze_and_broadcast_tone(session_id, content))
 
     # ── Agent registration ────────────────────────────────────────────────────
 
@@ -185,6 +256,7 @@ class AgentHub:
             if session:
                 session.status = "ai"
                 session.agent_id = None
+                session.tone_from_red = False
                 self._save_sessions()
                 if session.user_ws:
                     try:
@@ -215,9 +287,15 @@ class AgentHub:
         if session.status == "human":
             return True  # already has an agent
         if session_id in self._pending_handoffs:
-            return True  # popup already sent
+            return True  # popup already sent, still waiting
+        if session.handoff_exhausted:
+            return False  # already timed-out or all-declined this turn — don't re-popup
 
-        free = [a for a in self._agents.values() if a.active_session is None]
+        # Agents who already declined this session don't count as "free"
+        free = [
+            a for a in self._agents.values()
+            if a.active_session is None and session_id not in a.declined_sessions
+        ]
         logger.info("request_handoff: session=%s agents_total=%d free=%d",
                     session_id, len(self._agents), len(free))
         if not free:
@@ -264,13 +342,14 @@ class AgentHub:
         session = self._sessions.get(session_id)
         if session and session.status == "waiting":
             session.status = "ai"
+            session.handoff_exhausted = True
             self._save_sessions()
             # Notify user that no agent took over
             if session.user_ws:
                 try:
                     await session.user_ws.send_json({
                         "type": "handoff_timeout",
-                        "message": "No agent was available right now. We've emailed our support team and someone will reach out to you soon.",
+                        "message": "No agent is available right now. We've emailed our support team and someone will reach out to you soon.",
                     })
                 except Exception:
                     pass
@@ -303,8 +382,9 @@ class AgentHub:
 
         await self._assign_agent(session, agent)
 
-        # Tell all other agents the request was fulfilled
+        # Tell all other agents the request was fulfilled and clear their declined record
         for a in self._agents.values():
+            a.declined_sessions.discard(session_id)
             if a.agent_id != agent_id:
                 try:
                     await a.ws.send_json({"type": "handoff_fulfilled", "session_id": session_id})
@@ -312,8 +392,49 @@ class AgentHub:
                     pass
 
     async def decline_handoff(self, agent_id: str, session_id: str):
-        """Agent dismissed the popup — do nothing (timer still running for others)."""
-        pass
+        """Agent dismissed the popup. If no other free agents remain, send email immediately."""
+        agent = self._agents.get(agent_id)
+        if agent:
+            agent.declined_sessions.add(session_id)
+
+        # Check whether any connected agent can still accept this session
+        can_still_accept = [
+            a for a in self._agents.values()
+            if a.active_session is None and session_id not in a.declined_sessions
+        ]
+        if can_still_accept:
+            return  # others may still accept — let the timer keep running
+
+        # Nobody left — cancel the timeout and escalate immediately
+        task = self._pending_handoffs.pop(session_id, None)
+        if task:
+            task.cancel()
+
+        session = self._sessions.get(session_id)
+        if not session or session.status != "waiting":
+            return
+
+        session.status = "ai"
+        session.agent_id = None
+        session.handoff_exhausted = True
+        self._save_sessions()
+
+        if session.user_ws:
+            try:
+                await session.user_ws.send_json({
+                    "type": "handoff_timeout",
+                    "message": "No agent is available right now. We've notified our support team and someone will follow up with you shortly.",
+                })
+            except Exception:
+                pass
+
+        unanswerable = next(
+            (m.content for m in reversed(session.history) if m.role == "user"), ""
+        )
+        history_snapshot = list(session.history)
+        import asyncio as _aio
+        await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable)
+        await self._broadcast_sessions_update()
 
     async def trigger_offline_escalation(self, session_id: str, unanswerable_query: str):
         """Called directly when NO agents are online at the time the AI can't answer."""
@@ -341,12 +462,14 @@ class AgentHub:
 
         session.status = "human"
         session.agent_id = agent.agent_id
+        if session.tone == "angry":
+            session.tone_from_red = True
         agent.active_session = session.session_id
         agent.monitoring.add(session.session_id)
         self._save_sessions()
         history_payload = [
             {"role": m.role, "content": m.content, "timestamp": m.timestamp}
-            for m in session.history
+            for m in session.history[-100:]
         ]
         try:
             await agent.ws.send_json({
@@ -374,9 +497,10 @@ class AgentHub:
         if not agent or not session:
             return
         agent.monitoring.add(session_id)
+        # Cap at last 100 messages so the WebSocket payload stays manageable
         history_payload = [
             {"role": m.role, "content": m.content, "timestamp": m.timestamp}
-            for m in session.history
+            for m in session.history[-100:]
         ]
         try:
             await agent.ws.send_json({
@@ -397,6 +521,15 @@ class AgentHub:
             if old:
                 old.status = "ai"
                 old.agent_id = None
+                self._save_sessions()
+                if old.user_ws:
+                    try:
+                        await old.user_ws.send_json({
+                            "type": "agent_left",
+                            "message": "The agent has stepped away. Layla is back to help!",
+                        })
+                    except Exception:
+                        pass
         await self._assign_agent(session, agent)
 
     async def agent_release(self, agent_id: str):
@@ -407,6 +540,7 @@ class AgentHub:
         if session:
             session.status = "ai"
             session.agent_id = None
+            session.tone_from_red = False
             self._save_sessions()
             if session.user_ws:
                 try:
@@ -449,6 +583,7 @@ class AgentHub:
         self._save_sessions()
         await self._broadcast_new_message(session_id, msg)
         await self._broadcast_sessions_update()
+        asyncio.create_task(self._analyze_and_broadcast_tone(session_id, content))
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -459,6 +594,29 @@ class AgentHub:
             "role": msg.role,
             "content": msg.content,
             "timestamp": msg.timestamp,
+        }
+        for agent in list(self._agents.values()):
+            if session_id in agent.monitoring or agent.active_session == session_id:
+                try:
+                    await agent.ws.send_json(payload)
+                except Exception:
+                    pass
+
+    async def _analyze_and_broadcast_tone(self, session_id: str, content: str):
+        tone = await _analyze_tone(content)
+        session = self._sessions.get(session_id)
+        if not session:
+            return
+        session.tone = tone
+        await self._broadcast_tone_update(session_id, tone, session.tone_from_red)
+        await self._broadcast_sessions_update()
+
+    async def _broadcast_tone_update(self, session_id: str, tone: str, from_red: bool = False):
+        payload = {
+            "type": "tone_update",
+            "session_id": session_id,
+            "tone": tone,
+            "from_red": from_red,
         }
         for agent in list(self._agents.values()):
             if session_id in agent.monitoring or agent.active_session == session_id:

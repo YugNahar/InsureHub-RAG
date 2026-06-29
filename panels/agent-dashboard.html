@@ -523,20 +523,17 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 </div>
 
 <script>
-// ── Backend URL — https://digest-tile-coupons-kijiji.trycloudflare.com is replaced by build.js at deploy time ──────────
+// ── Backend URL — __API_URL__ is replaced by build.js at deploy time ──────────
+const _BUILT_IN_API = '__API_URL__';
 function getBackendUrl() {
-  // On the backend's own domain (tunnel / localhost): use current origin so
-  // the dashboard survives tunnel restarts without a stale baked-in URL.
-  // On Vercel (static hosting): use the tunnel URL baked in at build time,
-  // because window.location.origin would be the Vercel domain, not the backend.
-  const built = 'https://digest-tile-coupons-kijiji.trycloudflare.com'.replace(/\/$/, '');
-  const h = window.location.hostname;
-  if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
-    return window.location.origin.replace(/\/$/, '');
-  }
-  return (built && !built.startsWith('__')) ? built : 'http://localhost:8501';
+  const stored = localStorage.getItem('insure_backend_url') || '';
+  // _BUILT_IN_API stays as the literal '__API_URL__' when not replaced at build time
+  const builtIn = _BUILT_IN_API.startsWith('http') ? _BUILT_IN_API : 'http://123.253.124.14:8501';
+  return (stored || builtIn).replace(/\/$/, '');
 }
-function setBackendUrl(url) { /* no-op */ }
+function setBackendUrl(url) {
+  localStorage.setItem('insure_backend_url', url.replace(/\/$/, ''));
+}
 
 
 let ws = null;

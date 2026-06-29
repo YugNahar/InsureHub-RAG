@@ -50,7 +50,7 @@ SUMMARY_MAX_CHARS = 20000
 # How many candidate sources Stage 1 (summary search) hands to Stage 2
 # (chunk search) in knowledge_query()'s two-stage retrieval.
 SUMMARY_STAGE1_TOP_K = 5
-LLM_CONTEXT_WINDOW_CHARS = 12000
+LLM_CONTEXT_WINDOW_CHARS = 9000  # ~2250 tokens of context; prompt template ~300 + output 600 = ~3150 total, under Qwen's 4096
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION DETECTION (doc-type aware)

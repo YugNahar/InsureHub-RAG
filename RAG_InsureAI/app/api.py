@@ -82,6 +82,7 @@ def _get_async_lock() -> asyncio.Lock:
 
 _DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
+    "http://localhost:4000",
     "http://localhost:5173",
     "http://localhost:8000",
     "http://localhost:8001",
@@ -98,8 +99,11 @@ _DEFAULT_CORS_ORIGINS = [
     "https://insureai-chat.lovable.app",
     "https://id-preview--1f3edfb5-f351-48b6-baff-3a69cba3ed88.lovable.app",
     "https://insurehub-rag-frontend-zqp6.vercel.app",
+    "https://insurehub-your-ai-insurance-advisor.vercel.app",
     # Admin + Agent panels on Vercel — update these after deploying panels/
     "https://insurehub-panels.vercel.app",
+    # Direct IP access
+    "http://123.253.124.14:8501",
 ]
 
 
@@ -285,9 +289,23 @@ async def _get_job(job_id: str) -> dict | None:
 app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc")
 create_login_endpoint(app)
 
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_FRONTEND_DIST = os.path.join(_APP_DIR, "frontend_dist")
+
+# Serve the React app's static assets (/assets/*, /favicon.ico, etc.)
+if os.path.isdir(_FRONTEND_DIST):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
+
+@app.get("/")
+async def root():
+    """Serve the React chat frontend if built, otherwise redirect to /auth."""
+    _index = os.path.join(_FRONTEND_DIST, "index.html")
+    if os.path.isfile(_index):
+        return FileResponse(_index)
+    return RedirectResponse(url="/auth", status_code=302)
 
 @app.get("/auth")
 async def auth_page():
@@ -445,24 +463,37 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
             msg = await websocket.receive_json()
             msg_type = msg.get("type", "")
             if msg_type == "request_handoff":
-                notified = await _agent_hub.request_handoff(session_id)
-                if notified:
-                    await websocket.send_json({
-                        "type": "waiting",
-                        "message": "Hang tight! An agent has been notified and will join shortly...",
-                    })
-                else:
-                    # No agents online — trigger email and tell user
-                    unanswerable = next(
-                        (m.content for m in reversed(session.history) if m.role == "user"), ""
-                    )
-                    asyncio.create_task(
-                        _agent_hub.trigger_offline_escalation(session_id, unanswerable)
-                    )
+                # Fast-path: if handoff already resolved this turn, tell the frontend immediately
+                if session.handoff_exhausted:
                     await websocket.send_json({
                         "type": "handoff_timeout",
-                        "message": "No agents are available right now. We've emailed our support team — someone will reach out to you soon!",
+                        "message": "No agent is available right now. We've emailed our support team — someone will reach out to you soon!",
                     })
+                elif session.status == "human":
+                    # Agent already joined before WS connected
+                    agent_name = ""
+                    if session.agent_id and session.agent_id in _agent_hub._agents:
+                        agent_name = _agent_hub._agents[session.agent_id].name
+                    await websocket.send_json({"type": "agent_joined", "agent_name": agent_name})
+                else:
+                    notified = await _agent_hub.request_handoff(session_id)
+                    if notified:
+                        await websocket.send_json({
+                            "type": "waiting",
+                            "message": "Hang tight! An agent has been notified and will join shortly...",
+                        })
+                    else:
+                        # No agents available (all offline or all declined this session)
+                        unanswerable = next(
+                            (m.content for m in reversed(session.history) if m.role == "user"), ""
+                        )
+                        asyncio.create_task(
+                            _agent_hub.trigger_offline_escalation(session_id, unanswerable)
+                        )
+                        await websocket.send_json({
+                            "type": "handoff_timeout",
+                            "message": "No agent is available right now. We've emailed our support team — someone will reach out to you soon!",
+                        })
             elif msg_type == "message":
                 content = (msg.get("content") or "").strip()
                 if content and session.status == "human":
@@ -567,12 +598,6 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     pipeline = _get_pipeline()
     raw_docs = load_document(tmp_path, filename)
 
-    llm = None
-    try:
-        llm = pipeline._get_llm()
-    except Exception:
-        pass
-
     # Use a unique source key per upload so identical filenames don't collide.
     upload_id = uuid.uuid4().hex[:12]
     unique_source = f"{upload_id}_{filename}"
@@ -586,8 +611,10 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     doc_type = classify_document_type(filename, preview, extra_text)
     logger.info("Document type for '%s': %s", filename, doc_type)
 
-    # ── Step 2: Tag document (skips keyword matching for non-policy docs) ──────
-    doc_tags = tag_document(filename, preview, extra_text=extra_text, doc_type=doc_type, llm=llm)
+    # ── Step 2: Tag document — use regex only (llm=None) so ingest never
+    # blocks on slow LLM calls. Regex tagging is fast and reliable enough
+    # for metadata; LLM refinement can take 60-120s and causes job timeouts.
+    doc_tags = tag_document(filename, preview, extra_text=extra_text, doc_type=doc_type, llm=None)
 
     # ── Step 3: Annotate raw docs so the chunker inherits doc_type ────────────
     for raw_doc in raw_docs:
@@ -772,7 +799,12 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
         raise
     except Exception as exc:
         logger.exception("Video upload failed")
-        raise HTTPException(status_code=500, detail="Video ingestion failed unexpectedly.") from exc
+        msg = str(exc)
+        if "Video unavailable" in msg or "unavailable" in msg.lower():
+            raise HTTPException(status_code=400, detail="Video is unavailable or private. Please check the URL and try again.") from exc
+        if "no subtitles" in msg.lower() or "transcript" in msg.lower():
+            raise HTTPException(status_code=400, detail="No transcript found for this video. Try a video with captions enabled.") from exc
+        raise HTTPException(status_code=500, detail=f"Video ingestion failed: {msg[:200]}") from exc
 
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
@@ -1356,7 +1388,11 @@ async def ask_stream(req: AskRequest):
                 if _ag:
                     _agent_name = f" with {_ag.name}"
             _block_msg = f"You're connected{_agent_name} right now — please use the chat above to message the agent directly."
+            # Forward user's message to the agent so they can see it
+            _q = req.question
+            _sid = req.session_id
             async def _blocked_gen():
+                asyncio.create_task(_agent_hub.log_message(_sid, "user", _q))
                 yield _block_msg
                 yield "\n\n" + _json.dumps({"sources": [], "done": True})
             return StreamingResponse(

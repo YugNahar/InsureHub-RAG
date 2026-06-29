@@ -211,15 +211,78 @@
   .doc-item {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: 10px;
     padding: 10px 0;
     border-bottom: 1px solid var(--border);
     font-size: 13px;
   }
   .doc-item:last-child { border-bottom: none; }
-  .doc-name { color: var(--text); flex: 1; }
-  .doc-meta { color: var(--muted); font-size: 12px; margin-right: 12px; }
+  .doc-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--surface2);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .doc-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    background: rgba(79,142,247,0.12);
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .doc-body { flex: 1; min-width: 0; }
+  .doc-name { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .doc-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .doc-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .empty-state { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
+  .no-results { color: var(--muted); font-size: 13px; text-align: center; padding: 16px; display: none; }
+  .list-summary {
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--muted);
+    text-align: right;
+    display: none;
+  }
+
+  /* ── Search bar ── */
+  .search-wrap {
+    position: relative;
+    margin-bottom: 16px;
+  }
+  .search-icon {
+    position: absolute;
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    font-size: 14px;
+    pointer-events: none;
+  }
+  .search-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px 9px 34px;
+    font-size: 13px;
+    color: var(--text);
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .search-input:focus { border-color: var(--accent); }
+  .search-input::placeholder { color: var(--muted); }
 
   /* ── Spinner ── */
   .spinner {
@@ -309,8 +372,13 @@
     <div class="card">
       <div class="card-title">Uploaded Documents</div>
       <div class="card-sub">All documents currently in the knowledge base.</div>
+      <div class="search-wrap">
+        <span class="search-icon">🔍</span>
+        <input type="text" class="search-input" id="docSearch" placeholder="Search documents by name…" oninput="renderDocList()" />
+      </div>
       <button class="btn" onclick="loadDocs()" style="margin-bottom:4px;">↻ Refresh</button>
       <div class="doc-list" id="docList"><div class="empty-state">Click refresh to load.</div></div>
+      <div class="list-summary" id="docSummary"></div>
     </div>
   </div>
 
@@ -328,8 +396,14 @@
     <div class="card">
       <div class="card-title">Stored Videos</div>
       <div class="card-sub">Video transcripts in the knowledge base.</div>
+      <div class="search-wrap">
+        <span class="search-icon">🔍</span>
+        <input type="text" class="search-input" id="videoSearch" placeholder="Search videos by title or URL…" oninput="renderVideoList()" />
+      </div>
       <button class="btn" onclick="loadVideos()" style="margin-bottom:4px;">↻ Refresh</button>
       <div class="doc-list" id="videoList"><div class="empty-state">Click refresh to load.</div></div>
+      <div class="no-results" id="videoNoResults">No results match your search.</div>
+      <div class="list-summary" id="videoSummary"></div>
     </div>
   </div>
 
@@ -347,8 +421,14 @@
     <div class="card">
       <div class="card-title">Stored Webpages</div>
       <div class="card-sub">Webpages currently in the knowledge base.</div>
+      <div class="search-wrap">
+        <span class="search-icon">🔍</span>
+        <input type="text" class="search-input" id="webSearch" placeholder="Search webpages by URL…" oninput="renderWebList()" />
+      </div>
       <button class="btn" onclick="loadWebpages()" style="margin-bottom:4px;">↻ Refresh</button>
       <div class="doc-list" id="webList"><div class="empty-state">Click refresh to load.</div></div>
+      <div class="no-results" id="webNoResults">No results match your search.</div>
+      <div class="list-summary" id="webSummary"></div>
     </div>
   </div>
 </div>
@@ -357,13 +437,8 @@
 <div class="toast" id="toast"></div>
 
 <script>
-// ── Backend URL — __API_URL__ is replaced by build.js at deploy time ──────────
-const _BUILT_IN_API = '__API_URL__';
-function getBackendUrl() {
-  const stored = localStorage.getItem('insure_backend_url') || '';
-  return (stored || _BUILT_IN_API).replace(/\/$/, '');
-}
-const API = getBackendUrl();
+// ── Backend URL ────────────────────────────────────────────────────────────────
+const API = '__API_URL__'.replace(/\/$/, '');
 
 // ── Auth guard ────────────────────────────────────────────────────────────────
 const token = localStorage.getItem('insure_token');
@@ -402,6 +477,11 @@ function _pollHealth() {
       if (_backendDown) {
         _backendDown = false;
         document.getElementById("reconnect-banner").style.display = "none";
+        // Refresh all data lists automatically after reconnect
+        loadDocs();
+        loadVideos();
+        loadWebpages();
+        refreshTunnelUrl();
       }
       _healthTimer = setTimeout(_pollHealth, 15000);
     } else { _scheduleHealthRetry(); }
@@ -448,6 +528,25 @@ function showToast(msg, type = 'info') {
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ── Search / filter helpers ───────────────────────────────────────────────────
+function filterItems(items, query) {
+  if (!query.trim()) return items;
+  const q = query.trim().toLowerCase();
+  return items.filter(it => {
+    const text = [it.filename, it.name, it.title, it.url, String(it.id)].filter(Boolean).join(' ').toLowerCase();
+    return text.includes(q);
+  });
+}
+
+function renderSummary(containerId, items, kind) {
+  const el = document.getElementById(containerId);
+  const hasChunks = items.some(it => it.chunks != null);
+  if (!hasChunks || items.length === 0) { el.style.display = 'none'; return; }
+  const totalChunks = items.reduce((s, it) => s + (it.chunks || 0), 0);
+  el.style.display = 'block';
+  el.textContent = `Showing ${items.length} ${kind}${items.length !== 1 ? 's' : ''} · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''}`;
 }
 
 // ── File upload ───────────────────────────────────────────────────────────────
@@ -499,7 +598,7 @@ async function uploadFile(file) {
 
 async function pollJob(job_id, fill) {
   const bar = document.getElementById('progressBar');
-  for (let i = 0; i < 600; i++) {
+  for (let i = 0; i < 120; i++) {
     await new Promise(r => setTimeout(r, 1500));
     try {
       const res = await fetch(`${API}/upload/${job_id}`, { headers: authHeaders() });
@@ -513,39 +612,84 @@ async function pollJob(job_id, fill) {
       if (job.status === 'error') {
         throw new Error(job.error || 'Ingestion failed.');
       }
-      fill.style.width = Math.min(40 + i * 0.5, 90) + '%';
+      fill.style.width = Math.min(40 + i * 2, 90) + '%';
     } catch (e) {
       showToast(e.message, 'error');
       bar.classList.remove('active');
       return;
     }
   }
+  showToast('Timed out waiting for job to complete.', 'error');
   bar.classList.remove('active');
-  fill.style.width = '0%';
-  showToast('Large document is still indexing — it will appear in the list once ready.', 'info');
-  loadDocs();
 }
 
 // ── Docs list ─────────────────────────────────────────────────────────────────
+let _allDocs = [];
+let _docSearchQuery = '';
+
 async function loadDocs() {
   const list = document.getElementById('docList');
   list.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
     const res = await fetch(`${API}/docs`, { headers: authHeaders() });
-    const { documents } = await res.json();
-    if (!documents.length) { list.innerHTML = '<div class="empty-state">No documents yet.</div>'; return; }
-    list.innerHTML = documents.map(d => {
-      const name = d.filename || d;
-      const meta = d.chunks ? `${d.chunks} chunks` : '';
-      return `<div class="doc-item">
-        <span class="doc-name">📄 ${escHtml(name)}</span>
-        <span class="doc-meta">${meta}</span>
-        <button class="btn-danger" onclick="removeDoc('${escHtml(name)}')">Remove</button>
-      </div>`;
-    }).join('');
+    const data = await res.json();
+    const raw = data.documents || data.items || data.results || data.docs || [];
+    _allDocs = raw.map(d => {
+      if (typeof d === 'string') return { id: d, filename: d, name: d, chunks: undefined };
+      const obj = d;
+      return {
+        id: obj.filename || obj.id || obj.name || String(Math.random()),
+        filename: obj.filename || obj.name || obj.id,
+        name: obj.name,
+        chunks: obj.chunks,
+      };
+    });
+    renderDocList();
   } catch (e) {
     list.innerHTML = '<div class="empty-state">Failed to load.</div>';
   }
+}
+
+function renderDocList() {
+  _docSearchQuery = document.getElementById('docSearch').value;
+  const list = document.getElementById('docList');
+  const noResults = list.parentElement.querySelector('.no-results');
+  const filtered = filterItems(_allDocs, _docSearchQuery);
+
+  if (_allDocs.length === 0) {
+    list.innerHTML = '<div class="empty-state">No documents yet.</div>';
+    list.style.display = '';
+    if (noResults) noResults.style.display = 'none';
+    document.getElementById('docSummary').style.display = 'none';
+    return;
+  }
+
+  if (filtered.length === 0) {
+    list.innerHTML = '';
+    list.style.display = 'none';
+    if (noResults) noResults.style.display = '';
+    document.getElementById('docSummary').style.display = 'none';
+    return;
+  }
+
+  list.style.display = '';
+  if (noResults) noResults.style.display = 'none';
+  list.innerHTML = filtered.map((d, idx) => {
+    const name = d.filename || d.name || String(d.id);
+    const meta = d.chunks != null ? `${d.chunks} chunks` : '';
+    return `<div class="doc-item">
+      <span class="doc-num">${idx + 1}</span>
+      <span class="doc-icon">📄</span>
+      <div class="doc-body">
+        <div class="doc-name" title="${escHtml(name)}">${escHtml(name)}</div>
+        ${meta ? `<div class="doc-meta">${meta}</div>` : ''}
+      </div>
+      <div class="doc-actions">
+        <button class="btn-danger" onclick="removeDoc('${escHtml(name)}')">Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+  renderSummary('docSummary', filtered, 'document');
 }
 
 async function removeDoc(name) {
@@ -562,51 +706,98 @@ async function removeDoc(name) {
   }
 }
 
-// ── Videos ────────────────────────────────────────────────────────────────────
+// ── Upload Video ──────────────────────────────────────────────────────────────
 async function uploadVideo() {
   const url = document.getElementById('videoUrl').value.trim();
-  if (!url) { showToast('Enter a video URL.', 'error'); return; }
+  if (!url) { showToast('Please enter a YouTube URL.', 'error'); return; }
   const btn = document.getElementById('videoBtn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Processing…';
-  showToast('Extracting transcript — this may take a minute…', 'info');
+  btn.textContent = 'Adding…';
   try {
     const res = await fetch(`${API}/upload-video`, {
       method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
     if (res.status === 401) { logout(); return; }
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.detail || 'Video upload failed.');
-    if (d.status === 'already_exists') { showToast('Video already in knowledge base.', 'info'); }
-    else showToast(`✓ Video added — ${d.chunks} chunks`, 'success');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Video upload failed.');
+    showToast(data.status === 'already_exists' ? 'Video already in knowledge base.' : '✓ Video added successfully!', 'success');
     document.getElementById('videoUrl').value = '';
     loadVideos();
   } catch (e) {
     showToast(e.message, 'error');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = 'Add Video';
+    btn.textContent = 'Add Video';
   }
 }
+
+// ── Videos ────────────────────────────────────────────────────────────────────
+let _allVideos = [];
+let _videoSearchQuery = '';
 
 async function loadVideos() {
   const list = document.getElementById('videoList');
   list.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
     const res = await fetch(`${API}/videos`, { headers: authHeaders() });
-    const { videos } = await res.json();
-    if (!videos.length) { list.innerHTML = '<div class="empty-state">No videos yet.</div>'; return; }
-    list.innerHTML = videos.map(v => {
-      const url = v.url || v;
-      const title = v.title && v.title !== url ? v.title : url;
-      return `<div class="doc-item">
-        <span class="doc-name">🎬 ${escHtml(title)}</span>
-        <button class="btn-danger" onclick="removeVideo('${escHtml(url)}')">Remove</button>
-      </div>`;
-    }).join('');
+    const data = await res.json();
+    const raw = data.videos || data.items || data.results || [];
+    _allVideos = raw.map(v => {
+      if (typeof v === 'string') return { id: v, url: v, title: v, chunks: undefined };
+      const obj = v;
+      return {
+        id: obj.url || obj.id || String(Math.random()),
+        url: obj.url || '',
+        title: obj.title || obj.url || String(obj.id),
+        chunks: obj.chunks,
+      };
+    });
+    renderVideoList();
   } catch { list.innerHTML = '<div class="empty-state">Failed to load.</div>'; }
+}
+
+function renderVideoList() {
+  _videoSearchQuery = document.getElementById('videoSearch').value;
+  const list = document.getElementById('videoList');
+  const noResults = document.getElementById('videoNoResults');
+  const filtered = filterItems(_allVideos, _videoSearchQuery);
+
+  if (_allVideos.length === 0) {
+    list.innerHTML = '<div class="empty-state">No videos yet.</div>';
+    list.style.display = '';
+    noResults.style.display = 'none';
+    document.getElementById('videoSummary').style.display = 'none';
+    return;
+  }
+
+  if (filtered.length === 0) {
+    list.innerHTML = '';
+    list.style.display = 'none';
+    noResults.style.display = '';
+    document.getElementById('videoSummary').style.display = 'none';
+    return;
+  }
+
+  list.style.display = '';
+  noResults.style.display = 'none';
+  list.innerHTML = filtered.map((v, idx) => {
+    const title = v.title && v.title !== v.url ? v.title : v.url;
+    const meta = v.chunks != null ? `${v.chunks} chunks` : '';
+    return `<div class="doc-item">
+      <span class="doc-num">${idx + 1}</span>
+      <span class="doc-icon">🎬</span>
+      <div class="doc-body">
+        <div class="doc-name" title="${escHtml(title)}">${escHtml(title)}</div>
+        ${meta ? `<div class="doc-meta">${meta}</div>` : ''}
+      </div>
+      <div class="doc-actions">
+        <button class="btn-danger" onclick="removeVideo('${escHtml(v.url)}')">Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+  renderSummary('videoSummary', filtered, 'video');
 }
 
 async function removeVideo(url) {
@@ -622,46 +813,98 @@ async function removeVideo(url) {
   } catch { showToast('Failed to remove.', 'error'); }
 }
 
-// ── Webpages ──────────────────────────────────────────────────────────────────
+// ── Upload Webpage ────────────────────────────────────────────────────────────
 async function uploadWebpage() {
   const url = document.getElementById('webUrl').value.trim();
-  if (!url) { showToast('Enter a URL.', 'error'); return; }
+  if (!url) { showToast('Please enter a webpage URL.', 'error'); return; }
   const btn = document.getElementById('webBtn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Fetching…';
+  btn.textContent = 'Adding…';
   try {
     const res = await fetch(`${API}/upload-webpage`, {
       method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
     if (res.status === 401) { logout(); return; }
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.detail || 'Failed.');
-    if (d.status === 'already_exists') showToast('Webpage already stored.', 'info');
-    else showToast(`✓ Webpage added — ${d.chunks} chunks`, 'success');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Webpage upload failed.');
+    showToast('✓ Webpage added successfully!', 'success');
     document.getElementById('webUrl').value = '';
     loadWebpages();
   } catch (e) {
     showToast(e.message, 'error');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = 'Add Page';
+    btn.textContent = 'Add Page';
   }
 }
+
+// ── Webpages ──────────────────────────────────────────────────────────────────
+let _allWebs = [];
+let _webSearchQuery = '';
 
 async function loadWebpages() {
   const list = document.getElementById('webList');
   list.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
     const res = await fetch(`${API}/webpages`, { headers: authHeaders() });
-    const { webpages } = await res.json();
-    if (!webpages.length) { list.innerHTML = '<div class="empty-state">No webpages yet.</div>'; return; }
-    list.innerHTML = webpages.map(url => `<div class="doc-item">
-      <span class="doc-name">🌐 ${escHtml(url)}</span>
-      <button class="btn-danger" onclick="removeWebpage('${escHtml(url)}')">Remove</button>
-    </div>`).join('');
+    const data = await res.json();
+    const raw = data.webpages || data.items || data.results || [];
+    _allWebs = raw.map(w => {
+      if (typeof w === 'string') return { id: w, url: w, title: w, chunks: undefined };
+      const obj = w;
+      return {
+        id: obj.url || obj.id || String(Math.random()),
+        url: obj.url || '',
+        title: obj.title || obj.url || String(obj.id),
+        chunks: obj.chunks,
+      };
+    });
+    renderWebList();
   } catch { list.innerHTML = '<div class="empty-state">Failed to load.</div>'; }
+}
+
+function renderWebList() {
+  _webSearchQuery = document.getElementById('webSearch').value;
+  const list = document.getElementById('webList');
+  const noResults = document.getElementById('webNoResults');
+  const filtered = filterItems(_allWebs, _webSearchQuery);
+
+  if (_allWebs.length === 0) {
+    list.innerHTML = '<div class="empty-state">No webpages yet.</div>';
+    list.style.display = '';
+    noResults.style.display = 'none';
+    document.getElementById('webSummary').style.display = 'none';
+    return;
+  }
+
+  if (filtered.length === 0) {
+    list.innerHTML = '';
+    list.style.display = 'none';
+    noResults.style.display = '';
+    document.getElementById('webSummary').style.display = 'none';
+    return;
+  }
+
+  list.style.display = '';
+  noResults.style.display = 'none';
+  list.innerHTML = filtered.map((w, idx) => {
+    const title = w.title && w.title !== w.url ? w.title : w.url;
+    const meta = w.chunks != null ? `${w.chunks} chunks` : '';
+    return `<div class="doc-item">
+      <span class="doc-num">${idx + 1}</span>
+      <span class="doc-icon">🌐</span>
+      <div class="doc-body">
+        <div class="doc-name" title="${escHtml(title)}">${escHtml(title)}</div>
+        ${meta ? `<div class="doc-meta">${meta}</div>` : ''}
+      </div>
+      <div class="doc-actions">
+        <button class="btn-danger" onclick="removeWebpage('${escHtml(w.url)}')">Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+  renderSummary('webSummary', filtered, 'webpage');
 }
 
 async function removeWebpage(url) {
@@ -677,7 +920,7 @@ async function removeWebpage(url) {
 }
 
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return s.replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"');
 }
 
 // ── Tunnel URL bar ────────────────────────────────────────────────────────────
@@ -698,8 +941,8 @@ function refreshTunnelUrl() {
       link.textContent = url.replace('https://', '');
       link.href = url;
       const agentLink = document.getElementById('agent-link');
-      agentLink.textContent = url.replace('https://', '') + '/agent-dashboard';
-      agentLink.href = url + '/agent-dashboard';
+      agentLink.textContent = 'insurehub-your-ai-insurance-advisor.vercel.app/agent-dashboard';
+      agentLink.href = 'https://insurehub-your-ai-insurance-advisor.vercel.app/agent-dashboard';
     }
   }).catch(() => {});
 }
