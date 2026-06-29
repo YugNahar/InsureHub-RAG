@@ -79,7 +79,7 @@ def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
 
 
 def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
-    """True if the retrieved chunks collectively cover all topic keywords.
+    """True if >=1 retrieved chunk contains at least one topic keyword (root-aware).
 
     When llm_topics is provided, checks that every topic word appears in at
     least one retrieved chunk (distributed coverage across chunks). This is
@@ -246,7 +246,7 @@ async def _reformulate_query(question: str, history: str) -> str:
     """Rewrite a follow-up question as a standalone search query using conversation history.
 
     Examples:
-      history: "User: tell me about life insurance\\nLayla: Life insurance ..."
+      history: "User: tell me about life insurance\nLayla: Life insurance ..."
       question: "what about premiums?"
       returns: "life insurance premiums"
 
@@ -259,24 +259,24 @@ async def _reformulate_query(question: str, history: str) -> str:
         return question
     # Use only the last 6 lines (3 turns) of history to keep the prompt short
     recent = '\n'.join(history.strip().split('\n')[-6:])
-    prompt = f"""Rewrite the follow-up question as a standalone search query using the conversation context.
+    prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
 Use precise insurance/legal terms that would appear in a textbook (not casual phrasing).
 Output ONLY the search query — no quotes, no explanation, nothing else.
 
 Examples:
-  Context: "User: tell me about life insurance\\nLayla: Life insurance pays out..."
+  Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
   Follow-up: "what about premiums?" → "life insurance premium amount"
 
-  Context: "User: explain life insurance\\nLayla: Life insurance protects your family..."
+  Context: "User: explain life insurance\nLayla: Life insurance protects your family..."
   Follow-up: "is it tax deductible?" → "life insurance premiums tax deductible section 80C income"
 
-  Context: "User: explain reinsurance\\nLayla: Reinsurance is when insurers share risk..."
+  Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers share risk..."
   Follow-up: "is it legally required?" → "reinsurance legal requirement regulation"
 
-  Context: "User: what is subrogation\\nLayla: Subrogation means the insurer steps in..."
+  Context: "User: what is subrogation\nLayla: Subrogation means the insurer steps in..."
   Follow-up: "give me an example" → "subrogation example real case"
 
-  Context: "User: what is a deductible\\nLayla: A deductible is what you pay first..."
+  Context: "User: what is a deductible\nLayla: A deductible is what you pay first..."
   Follow-up: "how is it calculated?" → "deductible calculation formula percentage"
 
 Conversation:
@@ -305,7 +305,7 @@ Search query:"""
                 data = await resp.json()
                 reformulated = data["choices"][0]["message"]["content"].strip().strip('"\'')
                 if reformulated and len(reformulated) >= 3:
-                    logger.info("[REFORM] %r → %r", question, reformulated)
+                    logger.info("[REFORM] %r -> %r", question, reformulated)
                     return reformulated
     except Exception as exc:
         logger.debug("[REFORM] failed (%s) — using original question", exc)
@@ -314,7 +314,7 @@ Search query:"""
 
 _INTENT_PROMPT = """\
 Extract the specific insurance topic from the question below.
-Output ONLY the topic as 1-3 comma-separated words or short phrases — nothing else.
+Output ONLY the topic as 1-5 comma-separated words or short phrases — nothing else.
 Keep compound terms together (e.g. "no-claim bonus", "free look period", "sum assured").
 
 Examples:
@@ -327,6 +327,8 @@ Examples:
 "what is the difference between term and whole life"           → term life, whole life
 "how to file a motor insurance claim"                          → motor claim
 "what documents are needed for health insurance claim"         → health claim, documents
+"how does reinsurance work and what is its legal significance" → reinsurance, legal
+"tell me about motor policy claims"                            → motor, claims
 
 Question: {question}
 Topic:"""
@@ -381,37 +383,6 @@ _HANDOFF_MSG = (
     "let me get a human agent to help you! 😊"
 )
 
-# Phrases that indicate the model answered from general training knowledge
-# rather than from the retrieved context. If ANY of these appear in the
-# LLM response, we discard the response and return the handoff message.
-_GENERAL_KNOWLEDGE_TELLS = [
-    "generally speaking",
-    "in general,",
-    "typically,",
-    "typically ",
-    "usually,",
-    "usually ",
-    "as a general rule",
-    "in most cases",
-    "commonly,",
-    "commonly ",
-    "standard practice",
-    "based on my knowledge",
-    "from my training",
-    "most insurance policies",
-    "most insurers",
-    "it is important to note",
-    "one should ",
-    "you should note",
-    "please note that",
-]
-
-
-def _llm_used_general_knowledge(response: str) -> bool:
-    """Return True if the LLM response contains general-knowledge tells."""
-    lower = response.lower()
-    return any(tell in lower for tell in _GENERAL_KNOWLEDGE_TELLS)
-
 
 def _strip_markdown(text: str) -> str:
     """Convert markdown-formatted LLM output to plain conversational prose.
@@ -424,13 +395,15 @@ def _strip_markdown(text: str) -> str:
     import re
     # Remove bold/italic markers
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
-    # Remove ATX headers (## Heading → Heading)
+    # Remove ATX headers (## Heading -> Heading)
     text = re.sub(r'^#{1,4}\s+', '', text, flags=re.MULTILINE)
-    # Remove bare bullet markers ("- " or "* " at start of line) but keep the content
-    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+    # Convert bullet list items to flowing prose: "- item" or "* item" -> "item, "
+    text = re.sub(r'\n\s*[-*]\s+', ' ', text)
+    # Numbered list items: "\n1. " -> " "
+    text = re.sub(r'\n\s*\d+\.\s+', ' ', text)
     # Inline code backticks
     text = re.sub(r'`([^`]+)`', r'\1', text)
-    # Collapse 3+ newlines → 2
+    # Collapse 3+ newlines -> 2
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text
 
@@ -977,10 +950,31 @@ class MultiSourceRAG:
             conditions = [{"source": {"$contains": doc}} for doc in document_filter]
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
 
+        # ── Pure conversational replies — no retrieval needed ─────────────────
+        # "yes", "no", "ok", "thanks" etc. have zero retrieval value.
+        _PURE_CONV = frozenset({
+            "yes", "no", "ok", "okay", "sure", "alright", "nope", "nah",
+            "thanks", "thank you", "got it", "i see", "understood", "right",
+            "cool", "great", "nice", "fine", "good", "perfect", "awesome",
+            "no thanks", "no thank you", "not really", "never mind", "nevermind",
+        })
+        _q_stripped = question.strip().lower().strip("!.,?;:")
+        if _q_stripped in _PURE_CONV:
+            if _q_stripped in {"yes", "sure", "ok", "okay", "alright", "cool", "great", "perfect", "awesome"}:
+                conv_reply = "Great! Let me know if you have any other questions about insurance. 😊"
+            elif _q_stripped in {"no", "nope", "nah", "no thanks", "no thank you", "not really"}:
+                conv_reply = "No problem! Feel free to ask me anything else about your insurance. 😊"
+            elif _q_stripped in {"thanks", "thank you"}:
+                conv_reply = "You're welcome! Let me know if there's anything else I can help you with. 😊"
+            else:
+                conv_reply = "Sure! Let me know if you have any other questions. 😊"
+            import json as _json_s
+            yield conv_reply
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+            return
+
         # ── User-statement fast path ──────────────────────────────────────────
-        # "I have a health plan", "I got term insurance last month", etc. are
-        # statements, not questions. KB retrieval will find nothing specific.
-        # Acknowledge warmly and ask what they'd like to know.
+        # "I have a health plan", "I got term insurance last month" → acknowledge warmly.
         _stmt = re.match(
             r"^\s*i\s+(have|got|have\s+got|purchased|bought|own|took|taken|recently\s+got|just\s+got"
             r"|am\s+covered|am\s+insured|enrolled|signed\s+up)\b",
@@ -991,38 +985,45 @@ class MultiSourceRAG:
                 (w for w in ("health", "life", "motor", "car", "travel", "home", "term", "ulip", "vehicle")
                  if w in question.lower()), "insurance"
             )
-            _warm = (
+            import json as _json_s
+            yield (
                 f"That's great that you have a {_plan_word} plan! "
                 f"I'm here to help you understand it better. "
                 f"What would you like to know about your coverage, claims, premiums, or anything else?"
             )
-            import json as _json_s
-            yield _warm
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
         # ── Follow-up reformulation ───────────────────────────────────────────
-        # For short/pronoun-heavy questions ("what about premiums?", "is it legal?")
-        # rewrite into a standalone search query using conversation history.
-        # This runs sequentially BEFORE retrieval (~0.4 s for follow-ups only;
-        # skipped instantly for long self-contained questions via heuristic).
-        if history and _is_likely_followup(question):
+        # For short/vague follow-ups ("what about premiums?", "give me in detail",
+        # "is it legal?") rewrite into a full standalone query using history.
+        _is_followup = bool(history and _is_likely_followup(question))
+        if _is_followup:
             retrieval_query = await _reformulate_query(question, history)
+            _is_followup = retrieval_query != question
+
+        # ── Keyword detailed check — must run BEFORE cache ───────────────────
+        # So the cache key correctly separates brief vs. detailed for the same
+        # topic ("what is health insurance" vs "explain health insurance in detail").
+        _keyword_detailed = _needs_detailed_answer(question)
+        _doc_top_k   = 14 if _keyword_detailed else 8
+        _chunk_limit = 12 if _keyword_detailed else 8
+        _media_top_k =  5 if _keyword_detailed else 4
 
         # ── KV cache lookup ───────────────────────────────────────────────────
-        # Check before any retrieval so a cache hit skips embedding + reranking.
-        # Key is built on the (possibly reformulated) retrieval_query so that
-        # paraphrased follow-ups that normalise to the same query share a hit.
+        # Key includes reformulated query + detailed flag so two "in detail"
+        # requests on different topics never share a cache entry.
         _kv = self.doc_pipeline._cache
         _kv_sources = self.doc_pipeline._vector_store.list_sources()
         _kv_key = _kv.make_key(
             query=retrieval_query,
-            top_k=8,
+            top_k=_doc_top_k,
             use_hybrid=True,
             use_reranker=True,
             generate_answer=True,
             run_ragas=False,
             sources=_kv_sources,
+            detailed=_keyword_detailed,
         )
         _kv_q_emb = None
         _kv_hit = _kv.get(_kv_key)
@@ -1033,12 +1034,17 @@ class MultiSourceRAG:
                         [retrieval_query], normalize_embeddings=True, show_progress_bar=False
                     )[0]
                 )
-                _kv_hit = _kv.semantic_get(_kv_q_emb)
+                # Higher threshold for detailed queries so "life insurance in detail"
+                # doesn't hit "health insurance in detail" just because topics are close.
+                _sem_thr = 0.90 if _keyword_detailed else None
+                _kv_hit = _kv.semantic_get(_kv_q_emb, threshold=_sem_thr)
+                if _kv_hit is not None and _kv_hit.get("detailed") != _keyword_detailed:
+                    _kv_hit = None
             except Exception:
                 _kv_q_emb = None
         if _kv_hit is not None:
             import json as _json_s
-            logger.info("[ask_stream] KV cache hit for query=%r", retrieval_query[:80])
+            logger.info("[ask_stream] KV cache hit  query=%r detailed=%s", retrieval_query[:80], _keyword_detailed)
             yield _kv_hit.get("answer", "")
             yield "\n\n" + _json_s.dumps({
                 "sources": _kv_hit.get("sources", []),
@@ -1047,18 +1053,10 @@ class MultiSourceRAG:
             })
             return
 
-        # Use keyword check to configure retrieval size (fast, instant).
-        # LLM-based intent classification runs in parallel with retrieval below.
-        _keyword_detailed = _needs_detailed_answer(question)
-        _is_followup = bool(history and _is_likely_followup(question) and retrieval_query != question)
-        _doc_top_k    = 14 if _keyword_detailed else 8
-        _chunk_limit  = 12 if _keyword_detailed else 8
-        _media_top_k  = 5  if _keyword_detailed else 4
-
         # Streaming path: parallel retrieval + LLM intent extraction + LLM intent classification.
-        # All three run concurrently — LLM classification adds zero wall-clock latency.
+        # _keyword_detailed is already computed above; OR with LLM result for final flag.
         if not document_filter:
-            (doc_chunks, video_chunks, webpage_chunks), llm_topics, detailed = await asyncio.gather(
+            (doc_chunks, video_chunks, webpage_chunks), llm_topics, _llm_detailed = await asyncio.gather(
                 asyncio.gather(
                     self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                     asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
@@ -1069,12 +1067,13 @@ class MultiSourceRAG:
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
-            doc_chunks, llm_topics, detailed = await asyncio.gather(
+            doc_chunks, llm_topics, _llm_detailed = await asyncio.gather(
                 self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                 _extract_intent_topics(question),
                 _llm_classify_intent(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
+        detailed = _keyword_detailed or _llm_detailed
 
         # Prefer BGE rerank_score when available (set by rerank_documents).
         # Fall back to the raw retrieval similarity so non-reranked sources
@@ -1144,13 +1143,32 @@ class MultiSourceRAG:
             )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
-
-        prompt_tmpl = DETAILED_GROUNDED_PROMPT if detailed else STRICT_GROUNDED_PROMPT
-        # For follow-ups, pass the reformulated query (e.g. "life insurance premiums")
-        # as the question so the LLM knows the exact topic from the history.
-        prompt_question = retrieval_query if _is_followup else question
-        prompt = prompt_tmpl.format(history=history, context=full_context, question=prompt_question)
-        llm = get_insurance_llm(temperature=0)
+        else:
+            ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=llm_topics or None)
+            if not ctx_covered and not document_filter:
+                yield (
+                    "Hmm, I don't have that specific information in my knowledge base right now. "
+                    "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                )
+                yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
+                return
+            # Use reformulated query as LLM question for follow-ups ("give me in detail"
+            # → retrieval_query = "life insurance coverage details") so the model answers
+            # the actual topic, not the vague follow-up phrase.
+            prompt_question = retrieval_query if _is_followup else question
+            if document_filter:
+                prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                llm = get_insurance_llm(temperature=0)
+            elif detailed:
+                prompt = DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                llm = get_insurance_llm(temperature=0)
+            else:
+                prompt = CONVERSATIONAL_RAG_PROMPT.format(
+                    history=history,
+                    context=full_context,
+                    question=prompt_question,
+                )
+                llm = get_insurance_llm(temperature=0.3)
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
@@ -1225,7 +1243,7 @@ class MultiSourceRAG:
             try:
                 _kv.put(
                     _kv_key,
-                    {"answer": _kv_reply, "is_general": False, "sources": unique_sources},
+                    {"answer": _kv_reply, "is_general": False, "sources": unique_sources, "detailed": _keyword_detailed},
                     query_embedding=_kv_q_emb,
                     query_text=retrieval_query,
                 )

@@ -155,14 +155,23 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 }
 .conv-item:hover { background: #1f2937; }
 .conv-item.selected { background: #1e2840; }
-.conv-item.selected::before {
+/* Left border colour reflects agent status */
+.conv-item::before {
   content: "";
   position: absolute;
   left: 0; top: 8px; bottom: 8px;
   width: 3px;
-  background: #6366f1;
+  background: transparent;
   border-radius: 0 3px 3px 0;
+  transition: background 0.2s;
 }
+.conv-item.selected::before               { background: #6366f1; }
+.conv-item.status-human.selected::before  { background: #10b981; }
+.conv-item.status-waiting.selected::before{ background: #f59e0b; }
+.conv-item.status-ai.selected::before     { background: #3b82f6; }
+.conv-item.status-human::before  { background: rgba(16,185,129,0.35); }
+.conv-item.status-waiting::before{ background: rgba(245,158,11,0.35); }
+.conv-item.status-ai::before     { background: rgba(59,130,246,0.2); }
 
 .conv-icon {
   width: 30px; height: 30px; border-radius: 8px;
@@ -869,7 +878,7 @@ function renderHistory(sessions, query = "") {
       const title      = s.title || `Session #${s.session_id}`;
       const needsAttention = s.tone === "angry" && s.status !== "human";
       html += `
-        <div class="conv-item${isSelected ? " selected" : ""}${needsAttention ? " needs-attention" : ""}" onclick="selectSession('${s.session_id}')">
+        <div class="conv-item status-${s.status}${isSelected ? " selected" : ""}${needsAttention ? " needs-attention" : ""}" onclick="selectSession('${s.session_id}')">
           <div class="conv-icon ${s.status}">${icon}</div>
           <div class="conv-info">
             <div class="conv-title-text">${esc(title)}</div>

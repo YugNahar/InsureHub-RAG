@@ -12,7 +12,7 @@ A document-aware Q&A agent built for insurance policy analysis. Upload policy PD
 User / Frontend
       │
       ▼
-FastAPI (REST API — port 8502)
+FastAPI (REST API — port 8501)
       │
       ├── Document Ingestion → TurboVec Index (Vector Store)
       │                         └── 4-bit quantization, ~4GB RAM, no GPU
@@ -83,6 +83,31 @@ FastAPI (REST API — port 8502)
 | **Web URLs**                | Jina Reader API → `readability-lxml` → `trafilatura` + `BeautifulSoup`              |
 | **YouTube**                 | `youtube-transcript-api` — pulls transcript directly                                |
 
+### Human Handoff
+
+| Component          | Detail                                                                                |
+| ------------------ | ------------------------------------------------------------------------------------- |
+| **Agent Dashboard** | Admin interface for live session monitoring and takeover                               |
+| **WebSocket**       | Real-time bidirectional communication between user and agent during handoff            |
+| **Session Management** | Track active chat sessions, transfer control, and restore context on takeover        |
+
+### Multi-source RAG
+
+| Source              | Library / Method                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| **Documents**        | PDF, Word, Excel, PowerPoint, CSV via `pdfplumber`, `python-docx`, `pandas`, etc.    |
+| **Webpages**         | `trafilatura` + `readability-lxml` + `BeautifulSoup` for HTML extraction             |
+| **YouTube**          | `yt-dlp` + `youtube-transcript-api` for video transcript ingestion                   |
+
+### Conversation Intelligence
+
+| Feature                     | Detail                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------- |
+| **SMALL_TALK intent bypass** | Detects greetings, thanks, and chit-chat; answers directly without retrieval    |
+| **Three-way prompt selection** | Chooses between `STRICT_GROUNDED`, `DETAILED_GROUNDED`, and `CONVERSATIONAL_RAG` based on query type and user preference |
+| **Off-topic detection**     | Identifies out-of-domain questions and responds with a graceful fallback         |
+| **Follow-up reformulation** | Rewrites conversational follow-ups into standalone queries for better retrieval  |
+
 ### Voice Transcription
 
 | Component          | Detail                                                                                |
@@ -93,8 +118,9 @@ FastAPI (REST API — port 8502)
 
 | Component          | Detail                                                                                          |
 | ------------------ | ----------------------------------------------------------------------------------------------- |
-| **Docker**         | Entire app runs in a container                                                                  |
-| **Docker Compose** | Orchestrates the API container with volumes for TurboVec data, Whisper cache, HuggingFace cache |
+| **Docker Compose** | Two services: `api` (port 8501) and `eval` (port 8002)                                          |
+| **Remote GPU**     | vLLM LLM server deployed on a remote GPU server for inference                                    |
+| **Volumes**        | TurboVec data, Whisper cache, HuggingFace cache, upload temp storage                            |
 | **Python 3.11**    | Base runtime                                                                                    |
 | **Auth**           | JWT-based login via `/auth` — protects upload and delete endpoints                              |
 
@@ -103,7 +129,7 @@ FastAPI (REST API — port 8502)
 ## Key Design Decisions
 
 * **No cloud LLM dependency** — vLLM runs on a private GPU server; no data leaves your infrastructure to a third-party AI provider.
-* **TurboVec over ChromaDB** — switched to TurboQuantIndex for the dense ANN store. 4-bit quantization brings memory from ~31GB down to ~4GB, with no GPU required and full ARM compatibility. Ideal for air-gapped and privacy-sensitive deployments.
+* **TurboVec as primary vector store** — TurboQuantIndex provides 4-bit quantized dense ANN storage, reducing memory from ~31GB to ~4GB with no GPU required and full ARM compatibility. Ideal for air-gapped and privacy-sensitive deployments.
 * **Hybrid retrieval** — pure semantic search misses exact policy numbers and clause references; BM25 catches those.
 * **Reranking** — retrieval returns many candidates; the cross-encoder reranker picks the most relevant ones before sending to the LLM, reducing hallucination.
 * **Grounding check** — after the LLM answers, the system verifies that every number in the answer exists in the retrieved context. Unverified figures trigger a warning.

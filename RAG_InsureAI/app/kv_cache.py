@@ -79,6 +79,7 @@ class QueryKVCache:
         generate_answer: bool,
         run_ragas: bool,
         sources: List[str],
+        detailed: bool = False,
     ) -> str:
         """Deterministic exact-match key.  Changing any parameter gives a new key."""
         payload = json.dumps(
@@ -90,6 +91,7 @@ class QueryKVCache:
                 "a": generate_answer,
                 "g": run_ragas,
                 "s": sorted(sources),
+                "d": detailed,
             },
             sort_keys=True,
         )

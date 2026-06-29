@@ -9,7 +9,7 @@ This guide walks you through setting up InsureAI from scratch on your machine. F
 InsureAI is a local Q&A agent built for insurance documents. You upload your policy PDFs, Word files, or even YouTube links and URLs, and then ask it questions in plain English. It finds the relevant parts of your documents and answers based only on what's actually in them — no hallucinations, no guessing.
 
 The system has two main pieces:
-- **The app** — runs locally in Docker on your machine (port 8502)
+- **The app** — runs locally in Docker on your machine (port 8501)
 - **The LLM server** — a remote vLLM server that does the actual text generation (you need this to be running separately)
 
 ---
@@ -134,7 +134,7 @@ docker compose ps
 You should see the `rag_api` container listed with status `Up`. Then hit the health endpoint:
 
 ```
-curl http://localhost:8502/health
+curl http://localhost:8501/health
 ```
 
 Expected response:
@@ -153,14 +153,14 @@ You can upload documents through the frontend UI, or directly via the API.
 **Via API (curl):**
 
 ```
-curl -X POST http://localhost:8502/upload \
+curl -X POST http://localhost:8501/upload \
   -F "file=@/path/to/your/policy.pdf"
 ```
 
 This returns immediately with a `job_id`. The actual processing happens in the background. Check progress with:
 
 ```
-curl http://localhost:8502/upload/<job_id>
+curl http://localhost:8501/upload/<job_id>
 ```
 
 When `status` says `done`, the document is in the knowledge base and ready to query.
@@ -173,7 +173,7 @@ PDF, Word (.docx/.doc), Excel (.xlsx/.xls), PowerPoint (.pptx/.ppt), CSV, plain 
 ## Step 5 — Ask Questions
 
 ```
-curl -X POST http://localhost:8502/ask \
+curl -X POST http://localhost:8501/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "What is the hospitalization limit?", "session_id": "my-session"}'
 ```
@@ -188,14 +188,14 @@ Beyond documents, you can also feed it YouTube video transcripts and webpages.
 
 **Add a YouTube video:**
 ```
-curl -X POST http://localhost:8502/upload-video \
+curl -X POST http://localhost:8501/upload-video \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.youtube.com/watch?v=..."}'
 ```
 
 **Add a webpage:**
 ```
-curl -X POST http://localhost:8502/upload-webpage \
+curl -X POST http://localhost:8501/upload-webpage \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com/policy-page"}'
 ```
@@ -208,19 +208,19 @@ Once added, these are included in every `/ask` query alongside your documents.
 
 ```
 # See what's in the knowledge base
-curl http://localhost:8502/docs
+curl http://localhost:8501/docs
 
 # Remove a specific document
-curl -X DELETE "http://localhost:8502/docs/policy.pdf"
+curl -X DELETE "http://localhost:8501/docs/policy.pdf"
 
 # Wipe everything and start fresh
-curl -X DELETE http://localhost:8502/docs
+curl -X DELETE http://localhost:8501/docs
 
 # List uploaded videos
-curl http://localhost:8502/videos
+curl http://localhost:8501/videos
 
 # Remove a video
-curl -X DELETE "http://localhost:8502/videos/https://youtube.com/watch?v=..."
+curl -X DELETE "http://localhost:8501/videos/https://youtube.com/watch?v=..."
 ```
 
 ---
@@ -230,7 +230,7 @@ curl -X DELETE "http://localhost:8502/videos/https://youtube.com/watch?v=..."
 The full list of endpoints with request/response schemas is available at:
 
 ```
-http://localhost:8502/swagger
+http://localhost:8501/swagger
 ```
 
 Open that in a browser and you can try every endpoint interactively without writing any curl commands.
@@ -258,24 +258,24 @@ docker compose logs -f api
 
 ---
 
-## A Note on Hot-Reload
+## Server Deployment
 
-The `app/` folder is mounted directly into the container as a volume. This means if you edit any Python file in `app/`, uvicorn picks it up automatically within a couple of seconds — no rebuild needed. The only time you need to rebuild is when you add new Python packages to `requirements.txt` or change the `Dockerfile`.
+For production or remote GPU server deployments, start only the API service:
 
----
+```bash
+docker compose up -d api
+```
 
-## Troubleshooting
+This is useful when:
+- The `eval` service is not needed in production
+- You want to minimize resource usage on the deployment server
+- The vLLM server runs on a separate remote GPU host
 
-**Container exits immediately after starting**
-Run `docker compose logs api` to see the error. The most common cause is port 8502 already being in use by something else. Change the port mapping in `docker-compose.yml` if that's the case.
+To start all services (API + eval), use the standard:
 
-**Answers are very slow on first query**
-Normal. The embedding and reranker models are loaded into memory on the first request. After that, things speed up significantly.
-
-**Getting "could not connect to model server" errors**
-The vLLM server is unreachable. Test with `curl http://<vllm-host>:7000/v1/models` and check that the host/port in `docker-compose.yml` is correct.
-
-**Knowledge base appears empty after a restart**
+```bash
+docker compose up -d
+```
 If you ran `docker compose down -v`, that deletes the volumes including your document store. Use `docker compose down` (without `-v`) to preserve data between restarts.
 
 **Voice transcription isn't working**
