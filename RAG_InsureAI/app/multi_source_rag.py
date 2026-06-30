@@ -14,7 +14,63 @@ except ImportError:
     _APITimeoutError = Exception
     _APIStatusError = Exception
 
+from rapidfuzz import fuzz, process
+
 _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
+
+# ── Typo-tolerant insurance vocabulary ──────────────────────────────────────────
+# Correctly-spelled insurance-domain terms used by _correct_typos() to
+# fix common typos before vector retrieval.
+_INSURANCE_VOCAB = [
+    "insurance", "policy", "premium", "deductible", "coverage", "claim", "claims",
+    "insured", "insurer", "underwriting", "underwrite", "renewal", "nominee",
+    "beneficiary", "cashless", "reimbursement", "rider", "liability", "copay",
+    "endorsement", "subrogation", "exclusion", "maturity", "surrender",
+    "vehicle", "comprehensive", "third party", "cover", "covered", "co-pay",
+    "deductibles", "premiums", "health", "medical", "hospital", "surgery",
+    "prescription", "medication", "accident", "disability", "critical illness",
+    "maternity", "dental", "vision", "agent", "broker", "benefit", "benefits",
+    "term life", "whole life", "endowment", "annuity", "pension", "retirement",
+    "investment", "savings", "finance", "financial", "limit", "limits",
+    "no-claim bonus", "sum insured", "sum assured", "grace period",
+    "waiting period", "free look period", "cancellation", "protection",
+    "calculation", "formula", "amount", "documents", "process", "settlement",
+]
+
+
+# ── Casual greetings (fuzzy-matched) ─────────────────────────────────────────────
+_CASUAL_GREETINGS = frozenset({
+    "hi", "hello", "hey", "yo", "sup", "what's up", "whats up",
+    "good morning", "good evening", "good afternoon",
+    "howdy", "hiya", "dude", "bro", "hii", "heya",
+})
+
+
+def _correct_typos(text: str) -> str:
+    """Fix common typos in insurance-domain terms using fuzzy matching.
+
+    Splits *text* into words. For each word of length >= 4, finds the best
+    match in ``_INSURANCE_VOCAB`` using ``rapidfuzz`` with ``fuzz.ratio``.
+    If the best match score >= 80 and is not already exact, replaces the
+    word with the correctly-spelled vocabulary term. Returns the corrected
+    sentence with original word order preserved.
+    """
+    words = text.split()
+    corrected = []
+    for w in words:
+        stripped = w.strip(".,!?;:()[]{}'\"")
+        if len(stripped) >= 4:
+            result = process.extractOne(stripped, _INSURANCE_VOCAB, scorer=fuzz.ratio)
+            if result is not None:
+                best_match, score, _ = result
+                if score >= 80 and best_match != stripped:
+                    prefix = w[:len(w) - len(w.lstrip(".,!?;:()[]{}'\""))]
+                    suffix = w[len(w.rstrip(".,!?;:()[]{}'\"") or len(w)):]
+                    corrected.append(f"{prefix}{best_match}{suffix}")
+                    continue
+        corrected.append(w)
+    return " ".join(corrected)
+
 
 # ── Context coverage check ────────────────────────────────────────────────────
 # Domain-generic terms that appear in virtually every insurance chunk and
@@ -973,6 +1029,19 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
+        # ── Casual greeting / small talk — fuzzy match ────────────────────────
+        # If the stripped/lowercased question is <= 3 words, fuzzy match against
+        # _CASUAL_GREETINGS.  If score >= 75, treat as greeting and skip retrieval.
+        _q_lower = question.strip().lower()
+        _q_words = _q_lower.split()
+        if len(_q_words) <= 3:
+            _greeting_result = process.extractOne(_q_lower, _CASUAL_GREETINGS, scorer=fuzz.ratio)
+            if _greeting_result is not None and _greeting_result[1] >= 75:
+                import json as _json_s
+                yield "Hey there! 👋 I'm Layla, your insurance assistant. How can I help you today?"
+                yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+                return
+
         # ── User-statement fast path ──────────────────────────────────────────
         # "I have a health plan", "I got term insurance last month" → acknowledge warmly.
         _stmt = re.match(
@@ -994,6 +1063,13 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
+        # ── Typo correction for retrieval query ───────────────────────────────
+        # Apply _correct_typos() to build a corrected question used ONLY for
+        # the retrieval_query, not for the final LLM prompt (original question
+        # is preserved).  This ensures typos like "deductable" → "deductible"
+        # before vector search.
+        corrected_question = _correct_typos(question)
+
         # ── Follow-up reformulation ───────────────────────────────────────────
         # For short/vague follow-ups ("what about premiums?", "give me in detail",
         # "is it legal?") rewrite into a full standalone query using history.
@@ -1001,6 +1077,8 @@ class MultiSourceRAG:
         if _is_followup:
             retrieval_query = await _reformulate_query(question, history)
             _is_followup = retrieval_query != question
+        else:
+            retrieval_query = corrected_question
 
         # ── Keyword detailed check — must run BEFORE cache ───────────────────
         # So the cache key correctly separates brief vs. detailed for the same
@@ -1009,6 +1087,9 @@ class MultiSourceRAG:
         _doc_top_k   = 14 if _keyword_detailed else 8
         _chunk_limit = 12 if _keyword_detailed else 8
         _media_top_k =  5 if _keyword_detailed else 4
+
+        # Apply typo correction to the retrieval_query before KV cache and retrieval
+        retrieval_query = _correct_typos(retrieval_query)
 
         # ── KV cache lookup ───────────────────────────────────────────────────
         # Key includes reformulated query + detailed flag so two "in detail"
