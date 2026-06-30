@@ -1399,7 +1399,7 @@ class MultiSourceRAG:
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "600") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "160")),
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "600") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "300")),
                 "stream": True,
             }
             headers = {
@@ -1477,9 +1477,9 @@ class MultiSourceRAG:
                 _cap_src = (_corrected_text or _reply_stripped).strip()
                 if _cap_src:
                     # Simple split: find positions of sentence-ending punctuation
-                    # followed by whitespace, then take first 3 chunks.
+                    # followed by whitespace, then take first 4 chunks.
                     _sent_parts = _re.split(r'(?<=[.!?])\s+', _cap_src)
-                    _MAX_SENTENCES = 3
+                    _MAX_SENTENCES = 4
                     if len(_sent_parts) > _MAX_SENTENCES:
                         _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
                         # Ensure it ends cleanly

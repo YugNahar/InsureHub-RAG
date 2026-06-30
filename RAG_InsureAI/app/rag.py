@@ -542,7 +542,7 @@ class RAGPipeline:
             cache_path=_cache_path,
             ttl_seconds=int(os.getenv("KV_CACHE_TTL", "3600")),
             max_entries=int(os.getenv("KV_CACHE_MAX_ENTRIES", "500")),
-            sem_threshold=float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.78")),
+            sem_threshold=float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92")),
         )
         logger.info("[RAGPipeline] KV cache ready — path=%s", _cache_path)
 
