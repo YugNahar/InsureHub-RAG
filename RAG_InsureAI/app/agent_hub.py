@@ -213,9 +213,16 @@ class AgentHub:
         for s in sorted(self._sessions.values(), key=lambda x: x.created_at, reverse=True):
             last = s.history[-1].content[:80] if s.history else ""
             first_user = next((m.content[:60] for m in s.history if m.role == "user"), None)
+            # For live sessions the status is authoritative ("human", "waiting", "ai").
+            # For historical sessions loaded from disk (always "ai"), derive a richer
+            # display status from history so the sidebar shows meaningful colors:
+            # sessions where a human agent ever responded show green (human).
+            display_status = s.status
+            if display_status == "ai" and any(m.role == "agent" for m in s.history):
+                display_status = "human"
             out.append({
                 "session_id": s.session_id,
-                "status": s.status,
+                "status": display_status,
                 "agent_id": s.agent_id,
                 "message_count": len(s.history),
                 "created_at": s.created_at,

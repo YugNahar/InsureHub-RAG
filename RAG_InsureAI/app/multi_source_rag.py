@@ -1231,7 +1231,10 @@ class MultiSourceRAG:
                 _llm_classify_intent(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
-        detailed = _keyword_detailed or _llm_detailed
+        # Only trigger detailed mode on explicit user signals ("in detail", "step by step", etc.)
+        # _llm_detailed is intentionally excluded — the LLM over-classifies insurance questions
+        # (which often have lists/procedures) as "detailed", making every answer verbose.
+        detailed = _keyword_detailed
 
         # Prefer BGE rerank_score when available (set by rerank_documents).
         # Fall back to the raw retrieval similarity so non-reranked sources
