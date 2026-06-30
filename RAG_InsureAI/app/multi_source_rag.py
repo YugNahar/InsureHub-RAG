@@ -1264,9 +1264,19 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
 
-        # Only compress when context exceeds the budget — avoids CPU-heavy
-        # sentence embedding on every query when chunks already fit comfortably.
-        _context_budget = 6000
+        # Dynamic context budget — scale back when history is long so the total
+        # prompt (template + history + context + answer) stays within the model's
+        # context window (~4096 tokens for Qwen2.5-7B; use 3900 as safe ceiling).
+        # 4 chars ≈ 1 token (Qwen SentencePiece approximation).
+        _MAX_INPUT_TOKENS = 3900
+        _PROMPT_TEMPLATE_TOKENS = 700       # boilerplate across all prompt templates
+        _output_reserve = 1500 if detailed else 300
+        _history_tokens_est = len(history) // 4 if history else 0
+        _context_token_budget = max(
+            300,  # always keep at least a bit of context
+            _MAX_INPUT_TOKENS - _PROMPT_TEMPLATE_TOKENS - _history_tokens_est - _output_reserve,
+        )
+        _context_budget = min(6000, _context_token_budget * 4)  # tokens → chars
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
             all_chunks = self._compressor.compress_to_budget(
@@ -1343,7 +1353,10 @@ class MultiSourceRAG:
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1500" if detailed else "220")),
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1500" if detailed else "300")),
+                # Stop at double newline for brief answers — prevents the model from
+                # starting a second paragraph / list that would overflow the token budget.
+                "stop": [] if detailed else ["\n\n"],
                 "stream": True,
             }
             headers = {
@@ -1391,6 +1404,26 @@ class MultiSourceRAG:
             _kv_reply = answer
             yield answer
 
+        # ── Truncation detection ─────────────────────────────────────────────
+        # If the stream hit max_tokens mid-sentence, trim to the last complete
+        # sentence and tell the frontend to replace the displayed text.
+        _reply_stripped = (_kv_reply or "").rstrip()
+        _corrected_text = None
+        _SENT_ENDERS = frozenset('.!?…')
+        if _reply_stripped and _reply_stripped[-1] not in _SENT_ENDERS:
+            # Response doesn't end at a sentence boundary — find the last one
+            _last_sent = max(
+                _reply_stripped.rfind('. '),
+                _reply_stripped.rfind('! '),
+                _reply_stripped.rfind('? '),
+                _reply_stripped.rfind('.\n'),
+                _reply_stripped.rfind('!\n'),
+                _reply_stripped.rfind('?\n'),
+            )
+            if _last_sent > len(_reply_stripped) // 3:
+                _corrected_text = _reply_stripped[:_last_sent + 1].strip()
+                _kv_reply = _corrected_text  # cache the clean version
+
         # ── KV cache write ────────────────────────────────────────────────────
         # Only cache real answers, not handoff/fallback messages.
         _handoff_phrases = ("let me get one of our agents", "let me get a human agent")
@@ -1406,7 +1439,10 @@ class MultiSourceRAG:
             except Exception as _exc:
                 logger.debug("[ask_stream] KV cache write failed: %s", _exc)
 
-        yield "\n\n" + _json.dumps({"sources": unique_sources, "done": True})
+        _final_payload: dict = {"sources": unique_sources, "done": True}
+        if _corrected_text:
+            _final_payload["corrected_text"] = _corrected_text
+        yield "\n\n" + _json.dumps(_final_payload)
 
     # Management methods (keep as before)
     def video_exists(self, url: str) -> bool:
