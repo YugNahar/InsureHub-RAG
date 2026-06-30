@@ -34,7 +34,7 @@ import re
 from urllib.parse import unquote
 from bs4 import BeautifulSoup
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from auth import create_login_endpoint, require_auth
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -319,6 +319,10 @@ async def admin_page():
 async def agent_dashboard_page():
     return FileResponse(os.path.join(_APP_DIR, "agent_dashboard.html"))
 
+@app.get("/super-admin")
+async def super_admin_page():
+    return FileResponse(os.path.join(_APP_DIR, "super_admin.html"))
+
 
 @app.get("/tunnel-url")
 async def tunnel_url_endpoint():
@@ -350,6 +354,86 @@ async def tunnel_url_endpoint():
 # ── Human handoff session endpoints ──────────────────────────────────────────
 
 _ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "insurehub2026")
+_SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "superadmin2026")
+
+
+# ── Super-admin API ────────────────────────────────────────────────────────────
+
+def _check_super_admin(x_super_admin_token: str = Header(None)):
+    if not x_super_admin_token or x_super_admin_token not in _agent_hub._super_admin_tokens:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return x_super_admin_token
+
+
+@app.post("/super-admin/login")
+async def super_admin_login(request: Request):
+    data = await request.json()
+    if data.get("password") != _SUPER_ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = uuid.uuid4().hex
+    _agent_hub._super_admin_tokens.add(token)
+    return {"token": token}
+
+
+@app.get("/super-admin/data")
+async def super_admin_data(token: str = Depends(_check_super_admin)):
+    return _agent_hub.get_super_admin_data()
+
+
+@app.get("/super-admin/agent/{name}/chats")
+async def super_admin_agent_chats(name: str, token: str = Depends(_check_super_admin)):
+    rec = _agent_hub._agent_records.get(name)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"name": name, "chats": rec.get("chats", [])}
+
+
+@app.post("/super-admin/agent/{name}/block")
+async def super_admin_block(name: str, token: str = Depends(_check_super_admin)):
+    ok = _agent_hub.block_agent(name)
+    await _agent_hub._broadcast_super_admin_update()
+    await _agent_hub._broadcast_sessions_update()
+    return {"ok": ok}
+
+
+@app.post("/super-admin/agent/{name}/unblock")
+async def super_admin_unblock(name: str, token: str = Depends(_check_super_admin)):
+    ok = _agent_hub.unblock_agent(name)
+    await _agent_hub._broadcast_super_admin_update()
+    await _agent_hub._broadcast_sessions_update()
+    return {"ok": ok}
+
+
+@app.post("/super-admin/assign")
+async def super_admin_assign(request: Request, token: str = Depends(_check_super_admin)):
+    data = await request.json()
+    ok = await _agent_hub.super_admin_assign_session(
+        data.get("session_id", ""), data.get("agent_name", "")
+    )
+    return {"ok": ok}
+
+
+@app.websocket("/ws/super-admin")
+async def ws_super_admin(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=15)
+        if auth_msg.get("token") not in _agent_hub._super_admin_tokens:
+            await websocket.send_json({"type": "error", "message": "Unauthorized"})
+            await websocket.close(code=1008)
+            return
+        _agent_hub.register_super_admin(websocket)
+        await websocket.send_json({"type": "connected", **_agent_hub.get_super_admin_data()})
+        while True:
+            msg = await websocket.receive_json()
+            if msg.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    except Exception:
+        logger.exception("Super-admin WebSocket error")
+    finally:
+        _agent_hub.unregister_super_admin(websocket)
 
 
 @app.post("/session/create")

@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>InsureHub — Super Admin</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #222636;
+    --border: #2d3148;
+    --accent: #6c63ff;
+    --accent2: #8b83ff;
+    --text: #e4e6f0;
+    --muted: #7b809a;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --white: #ffffff;
+    --sidebar-w: 270px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden}
+
+  /* ── Login ── */
+  #login-screen{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:999}
+  .login-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px 36px;width:360px;display:flex;flex-direction:column;gap:20px}
+  .login-card h1{font-size:1.4rem;font-weight:700;text-align:center}
+  .login-card p{color:var(--muted);font-size:.85rem;text-align:center}
+  .login-card input{background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:11px 14px;font-size:.95rem;outline:none;width:100%}
+  .login-card input:focus{border-color:var(--accent)}
+  .login-card button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:12px;font-size:.95rem;font-weight:600;cursor:pointer}
+  .login-card button:hover{background:var(--accent2)}
+  #login-error{color:var(--red);font-size:.83rem;text-align:center;display:none}
+
+  /* ── Layout ── */
+  #app{display:flex;flex:1;height:100vh;overflow:hidden}
+
+  /* ── Sidebar ── */
+  #sidebar{width:var(--sidebar-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+  #sidebar-header{padding:18px 16px 14px;border-bottom:1px solid var(--border)}
+  #sidebar-header .brand{font-size:.78rem;color:var(--muted);font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px}
+  #sidebar-header h2{font-size:1.05rem;font-weight:700}
+  #sidebar-tabs{display:flex;padding:10px 12px 0;gap:6px}
+  .s-tab{flex:1;background:transparent;border:none;color:var(--muted);padding:7px 4px;border-radius:6px;font-size:.8rem;font-weight:600;cursor:pointer;transition:.15s}
+  .s-tab.active{background:var(--surface2);color:var(--text)}
+  #agent-list{flex:1;overflow-y:auto;padding:10px 8px}
+  .agent-item{display:flex;align-items:center;gap:10px;padding:10px 10px;border-radius:8px;cursor:pointer;transition:.15s;margin-bottom:2px}
+  .agent-item:hover{background:var(--surface2)}
+  .agent-item.selected{background:var(--surface2);border:1px solid var(--border)}
+  .status-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+  .dot-online{background:var(--green)}
+  .dot-offline{background:var(--red)}
+  .dot-chatting{background:var(--white);animation:blink-dot 1s ease-in-out infinite}
+  @keyframes blink-dot{0%,100%{opacity:1}50%{opacity:.2}}
+  .agent-meta{flex:1;min-width:0}
+  .agent-name{font-size:.88rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agent-sub{font-size:.73rem;color:var(--muted);margin-top:1px}
+  .badge-blocked{font-size:.65rem;background:var(--red);color:#fff;border-radius:4px;padding:1px 5px;margin-left:4px;vertical-align:middle}
+
+  #live-sessions-tab{flex:1;overflow-y:auto;padding:10px 8px;display:none}
+  .ls-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px;cursor:pointer;transition:.15s}
+  .ls-item:hover{border-color:var(--accent)}
+  .ls-title{font-size:.83rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ls-meta{font-size:.72rem;color:var(--muted);margin-top:3px;display:flex;gap:8px}
+  .ls-status{padding:1px 6px;border-radius:4px;font-size:.68rem;font-weight:700;text-transform:uppercase}
+  .ls-status.human{background:#16a34a22;color:var(--green)}
+  .ls-status.waiting{background:#d9770622;color:var(--yellow)}
+  .ls-status.ai{background:#6c63ff22;color:var(--accent2)}
+
+  /* ── Main ── */
+  #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  #main-header{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+  #main-header h3{font-size:1.1rem;font-weight:700}
+  #conn-badge{font-size:.73rem;display:flex;align-items:center;gap:5px;color:var(--muted)}
+  #conn-dot{width:7px;height:7px;border-radius:50%;background:var(--red)}
+  #conn-dot.live{background:var(--green)}
+
+  #main-content{flex:1;overflow-y:auto;padding:24px}
+
+  /* ── Welcome ── */
+  #welcome-view{text-align:center;margin-top:80px;color:var(--muted)}
+  #welcome-view h2{font-size:1.5rem;color:var(--text);margin-bottom:8px}
+
+  /* ── Agent Detail ── */
+  #agent-detail{display:none}
+  .detail-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+  .detail-header h2{font-size:1.2rem;font-weight:700;display:flex;align-items:center;gap:10px}
+  .detail-actions{display:flex;gap:8px}
+  .btn{border:none;border-radius:8px;padding:9px 18px;font-size:.83rem;font-weight:600;cursor:pointer;transition:.15s}
+  .btn-block{background:#ef444422;color:var(--red);border:1px solid var(--red)}
+  .btn-block:hover{background:var(--red);color:#fff}
+  .btn-unblock{background:#22c55e22;color:var(--green);border:1px solid var(--green)}
+  .btn-unblock:hover{background:var(--green);color:#fff}
+  .btn-assign{background:var(--accent);color:#fff}
+  .btn-assign:hover{background:var(--accent2)}
+
+  /* Tabs */
+  .tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px}
+  .tab{background:transparent;border:none;color:var(--muted);padding:10px 18px;font-size:.85rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s}
+  .tab.active{color:var(--text);border-bottom-color:var(--accent)}
+
+  /* Stats cards */
+  .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+  .stat-label{font-size:.73rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
+  .stat-val{font-size:1.5rem;font-weight:700}
+
+  /* Login history */
+  .section-title{font-size:.8rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+  table{width:100%;border-collapse:collapse;font-size:.82rem}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  .table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:22px}
+
+  /* Chat list */
+  .chat-item{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden}
+  .chat-item-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;cursor:pointer;user-select:none}
+  .chat-item-header:hover{background:var(--surface2)}
+  .chat-info{flex:1;min-width:0}
+  .chat-sid{font-size:.82rem;font-weight:600;margin-bottom:2px}
+  .chat-meta{font-size:.72rem;color:var(--muted)}
+  .chat-toggle{color:var(--muted);font-size:.8rem;flex-shrink:0;margin-left:10px}
+  .chat-transcript{display:none;padding:0 16px 14px;border-top:1px solid var(--border)}
+  .chat-transcript.open{display:block}
+  .msg{display:flex;flex-direction:column;margin-bottom:8px}
+  .msg-role{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px}
+  .msg-role.user{color:var(--accent2)}
+  .msg-role.agent{color:var(--green)}
+  .msg-role.ai{color:var(--muted)}
+  .msg-bubble{font-size:.82rem;line-height:1.5;background:var(--surface2);border-radius:6px;padding:8px 10px;max-width:480px}
+
+  /* Live Sessions assign panel */
+  .assign-row{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
+  .assign-row .session-info{flex:1;min-width:0}
+  .assign-row .session-title{font-size:.85rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .assign-row .session-meta{font-size:.72rem;color:var(--muted);margin-top:2px}
+  .assign-row select{background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:.8rem;min-width:140px}
+  .assign-row .btn-assign{padding:7px 14px;font-size:.8rem}
+
+  /* Empty states */
+  .empty{color:var(--muted);font-size:.83rem;padding:20px;text-align:center}
+  .tag-online{color:var(--green);font-weight:700}
+  .tag-chatting{color:var(--white);font-weight:700}
+  .tag-offline{color:var(--red);font-weight:700}
+  .tag-blocked{color:var(--red)}
+</style>
+</head>
+<body>
+
+<!-- ── Login ── -->
+<div id="login-screen">
+  <div class="login-card">
+    <h1>Super Admin</h1>
+    <p>InsureHub &mdash; Agent Management Console</p>
+    <input type="password" id="pw-input" placeholder="Super admin password" />
+    <div id="login-error">Incorrect password. Try again.</div>
+    <button onclick="doLogin()">Sign in</button>
+  </div>
+</div>
+
+<!-- ── App ── -->
+<div id="app" style="display:none">
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <div class="brand">InsureHub</div>
+      <h2>Super Admin</h2>
+    </div>
+    <div id="sidebar-tabs">
+      <button class="s-tab active" id="s-tab-agents" onclick="switchSidebarTab('agents')">Agents</button>
+      <button class="s-tab" id="s-tab-sessions" onclick="switchSidebarTab('sessions')">Sessions</button>
+    </div>
+    <div id="agent-list"></div>
+    <div id="live-sessions-tab"></div>
+  </div>
+
+  <div id="main">
+    <div id="main-header">
+      <h3 id="main-title">Overview</h3>
+      <div id="conn-badge"><div id="conn-dot"></div><span id="conn-label">Connecting…</span></div>
+    </div>
+    <div id="main-content">
+      <div id="welcome-view">
+        <h2>Welcome, Super Admin</h2>
+        <p>Select an agent from the sidebar to view their activity and manage permissions.</p>
+      </div>
+      <div id="agent-detail"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = window.location.origin;
+let token = sessionStorage.getItem('sa_token') || '';
+let ws = null;
+let allData = { agents: [], live_sessions: [] };
+let selectedAgent = null;
+let sidebarTab = 'agents';
+let pingInterval = null;
+
+// ── Login ──────────────────────────────────────────────────────────────────
+if (token) initApp();
+
+async function doLogin() {
+  const pw = document.getElementById('pw-input').value;
+  const err = document.getElementById('login-error');
+  err.style.display = 'none';
+  try {
+    const r = await fetch('/super-admin/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ password: pw }),
+    });
+    if (!r.ok) { err.style.display = 'block'; return; }
+    const d = await r.json();
+    token = d.token;
+    sessionStorage.setItem('sa_token', token);
+    initApp();
+  } catch(e) { err.style.display = 'block'; }
+}
+document.getElementById('pw-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// ── Init ───────────────────────────────────────────────────────────────────
+function initApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  connectWS();
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/super-admin`);
+  ws.onopen = () => ws.send(JSON.stringify({ token }));
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'error') { sessionStorage.removeItem('sa_token'); location.reload(); return; }
+    if (msg.type === 'connected' || msg.type === 'update') {
+      allData = { agents: msg.agents || [], live_sessions: msg.live_sessions || [] };
+      renderAll();
+      setConn(true);
+    }
+  };
+  ws.onclose = () => {
+    setConn(false);
+    setTimeout(connectWS, 4000);
+  };
+  ws.onerror = () => ws.close();
+  if (pingInterval) clearInterval(pingInterval);
+  pingInterval = setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'ping'})); }, 25000);
+}
+
+function setConn(live) {
+  document.getElementById('conn-dot').className = live ? 'live' : '';
+  document.getElementById('conn-label').textContent = live ? 'Live' : 'Reconnecting…';
+}
+
+// ── Sidebar ────────────────────────────────────────────────────────────────
+function switchSidebarTab(tab) {
+  sidebarTab = tab;
+  document.getElementById('agent-list').style.display = tab === 'agents' ? '' : 'none';
+  document.getElementById('live-sessions-tab').style.display = tab === 'sessions' ? '' : 'none';
+  document.getElementById('s-tab-agents').classList.toggle('active', tab === 'agents');
+  document.getElementById('s-tab-sessions').classList.toggle('active', tab === 'sessions');
+  if (tab === 'sessions') renderSidebarSessions();
+}
+
+function renderAll() {
+  renderSidebarAgents();
+  if (sidebarTab === 'sessions') renderSidebarSessions();
+  if (selectedAgent) {
+    const fresh = allData.agents.find(a => a.name === selectedAgent);
+    if (fresh) showAgentDetail(fresh, false);
+  }
+}
+
+function renderSidebarAgents() {
+  const list = document.getElementById('agent-list');
+  if (!allData.agents.length) { list.innerHTML = '<div class="empty">No agents yet.</div>'; return; }
+  const sorted = [...allData.agents].sort((a,b) => {
+    const rank = s => s === 'chatting' ? 0 : s === 'online' ? 1 : 2;
+    return rank(a.status) - rank(b.status) || a.name.localeCompare(b.name);
+  });
+  list.innerHTML = sorted.map(a => `
+    <div class="agent-item${a.name === selectedAgent ? ' selected' : ''}" onclick="showAgentDetail(${JSON.stringify(a)}, true)">
+      <div class="status-dot ${dotClass(a.status)}"></div>
+      <div class="agent-meta">
+        <div class="agent-name">${esc(a.name)}${a.blocked ? '<span class="badge-blocked">BLOCKED</span>' : ''}</div>
+        <div class="agent-sub">${statusLabel(a.status)} · ${a.today_queries} replies today</div>
+      </div>
+    </div>`).join('');
+}
+
+function renderSidebarSessions() {
+  const el = document.getElementById('live-sessions-tab');
+  if (!allData.live_sessions.length) { el.innerHTML = '<div class="empty">No sessions.</div>'; return; }
+  el.innerHTML = allData.live_sessions.map(s => `
+    <div class="ls-item" onclick="switchMainToLiveSessions()">
+      <div class="ls-title">${esc(s.title || s.session_id)}</div>
+      <div class="ls-meta">
+        <span class="ls-status ${s.status}">${s.status}</span>
+        <span>${s.message_count} msgs</span>
+      </div>
+    </div>`).join('');
+}
+
+function dotClass(status) {
+  if (status === 'chatting') return 'dot-chatting';
+  if (status === 'online') return 'dot-online';
+  return 'dot-offline';
+}
+function statusLabel(status) {
+  if (status === 'chatting') return '🔵 Chatting';
+  if (status === 'online') return '🟢 Online';
+  return '🔴 Offline';
+}
+
+// ── Agent Detail ───────────────────────────────────────────────────────────
+let detailTab = 'overview';
+
+function showAgentDetail(agent, updateSelected) {
+  if (updateSelected) { selectedAgent = agent.name; renderSidebarAgents(); }
+  document.getElementById('welcome-view').style.display = 'none';
+  document.getElementById('main-title').textContent = agent.name;
+  const el = document.getElementById('agent-detail');
+  el.style.display = 'block';
+
+  const blockBtn = agent.blocked
+    ? `<button class="btn btn-unblock" onclick="toggleBlock('${esc(agent.name)}', false)">Unblock Agent</button>`
+    : `<button class="btn btn-block" onclick="toggleBlock('${esc(agent.name)}', true)">Block Agent</button>`;
+
+  el.innerHTML = `
+    <div class="detail-header">
+      <h2>
+        <div class="status-dot ${dotClass(agent.status)}"></div>
+        <span class="${'tag-'+agent.status}">${statusLabel(agent.status)}</span>
+      </h2>
+      <div class="detail-actions">${blockBtn}</div>
+    </div>
+    <div class="tabs">
+      <button class="tab${detailTab==='overview'?' active':''}" onclick="switchDetailTab('overview','${esc(agent.name)}')">Overview</button>
+      <button class="tab${detailTab==='chats'?' active':''}" onclick="switchDetailTab('chats','${esc(agent.name)}')">Chat History</button>
+      <button class="tab${detailTab==='assign'?' active':''}" onclick="switchDetailTab('assign','${esc(agent.name)}')">Assign Session</button>
+    </div>
+    <div id="detail-body"></div>
+  `;
+
+  renderDetailTab(agent);
+}
+
+function switchDetailTab(tab, name) {
+  detailTab = tab;
+  const agent = allData.agents.find(a => a.name === name);
+  if (agent) renderDetailTabFor(agent, name);
+}
+
+function renderDetailTab(agent) {
+  renderDetailTabFor(agent, agent.name);
+}
+
+async function renderDetailTabFor(agent, name) {
+  const body = document.getElementById('detail-body');
+  if (!body) return;
+
+  if (detailTab === 'overview') {
+    const today = new Date().toISOString().slice(0, 10);
+    const todaySessions = (agent.login_sessions || []).filter(s => (s.login_time || '').startsWith(today));
+    const totalHours = agent.login_sessions.reduce((a,s) => a + (s.duration_minutes || 0), 0) / 60;
+
+    body.innerHTML = `
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-label">Total Replies</div><div class="stat-val">${agent.total_queries_answered}</div></div>
+        <div class="stat-card"><div class="stat-label">Today Replies</div><div class="stat-val">${agent.today_queries}</div></div>
+        <div class="stat-card"><div class="stat-label">Today Hours</div><div class="stat-val">${agent.today_hours}h</div></div>
+        <div class="stat-card"><div class="stat-label">Total Sessions</div><div class="stat-val">${agent.login_sessions.length}</div></div>
+      </div>
+      ${agent.current_login_time ? `<p style="color:var(--green);font-size:.82rem;margin-bottom:14px">● Online since ${agent.current_login_time} UTC</p>` : ''}
+      <div class="section-title">Login / Logout History</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Login (UTC)</th><th>Logout (UTC)</th><th>Duration</th></tr></thead>
+          <tbody>
+            ${(agent.login_sessions || []).length
+              ? [...agent.login_sessions].reverse().slice(0, 50).map(s => `
+                <tr>
+                  <td>${s.login_time || '—'}</td>
+                  <td>${s.logout_time || '<span style="color:var(--green)">Still online</span>'}</td>
+                  <td>${s.duration_minutes != null ? s.duration_minutes + ' min' : (s.logout_time ? '—' : '<span style="color:var(--green)">Active</span>')}</td>
+                </tr>`).join('')
+              : '<tr><td colspan="3" class="empty">No history yet.</td></tr>'}
+          </tbody>
+        </table>
+      </div>`;
+
+  } else if (detailTab === 'chats') {
+    body.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+      const r = await fetch(`/super-admin/agent/${encodeURIComponent(name)}/chats`, { headers:{'X-Super-Admin-Token':token} });
+      if (!r.ok) throw new Error();
+      const d = await r.json();
+      const chats = (d.chats || []).slice().reverse();
+      if (!chats.length) { body.innerHTML = '<div class="empty">No chats recorded yet.</div>'; return; }
+      body.innerHTML = chats.map((c, i) => `
+        <div class="chat-item">
+          <div class="chat-item-header" onclick="toggleChat(${i})">
+            <div class="chat-info">
+              <div class="chat-sid">Session #${esc(c.session_id)} &mdash; ${c.reply_count || 0} agent replies</div>
+              <div class="chat-meta">${c.started_at || ''} → ${c.ended_at || '<span style="color:var(--green)">Ongoing</span>'}</div>
+            </div>
+            <span class="chat-toggle" id="chat-toggle-${i}">▼</span>
+          </div>
+          <div class="chat-transcript" id="chat-transcript-${i}">
+            ${(c.messages || []).map(m => `
+              <div class="msg">
+                <div class="msg-role ${m.role}">${m.role.toUpperCase()} &nbsp;${m.timestamp || ''}</div>
+                <div class="msg-bubble">${esc(m.content)}</div>
+              </div>`).join('') || '<div class="empty">No messages.</div>'}
+          </div>
+        </div>`).join('');
+    } catch(e) {
+      body.innerHTML = '<div class="empty">Failed to load chat history.</div>';
+    }
+
+  } else if (detailTab === 'assign') {
+    const sessions = allData.live_sessions.filter(s => s.status !== 'human' || !s.agent_id);
+    if (!sessions.length) { body.innerHTML = '<div class="empty">No sessions available to assign.</div>'; return; }
+    body.innerHTML = `
+      <p style="font-size:.82rem;color:var(--muted);margin-bottom:14px">Assign an active session directly to <strong>${esc(name)}</strong>. The agent must be online and not blocked.</p>
+      ${sessions.map(s => `
+        <div class="assign-row">
+          <div class="session-info">
+            <div class="session-title">${esc(s.title || s.session_id)}</div>
+            <div class="session-meta"><span class="ls-status ${s.status}">${s.status}</span> · ${s.message_count} msgs</div>
+          </div>
+          <button class="btn btn-assign" onclick="assignSession('${esc(s.session_id)}','${esc(name)}')">Assign</button>
+        </div>`).join('')}`;
+  }
+}
+
+function toggleChat(i) {
+  const t = document.getElementById(`chat-transcript-${i}`);
+  const arrow = document.getElementById(`chat-toggle-${i}`);
+  const open = t.classList.toggle('open');
+  arrow.textContent = open ? '▲' : '▼';
+}
+
+// ── Live Sessions main view ────────────────────────────────────────────────
+function switchMainToLiveSessions() {
+  selectedAgent = null;
+  detailTab = 'assign';
+  document.getElementById('main-title').textContent = 'Live Sessions';
+  document.getElementById('welcome-view').style.display = 'none';
+  const el = document.getElementById('agent-detail');
+  el.style.display = 'block';
+  const onlineAgents = allData.agents.filter(a => a.status !== 'offline' && !a.blocked);
+  el.innerHTML = `
+    <div class="tabs">
+      <button class="tab active">All Live Sessions</button>
+    </div>
+    <div id="detail-body">
+      ${!allData.live_sessions.length ? '<div class="empty">No active sessions.</div>' : allData.live_sessions.map(s => `
+        <div class="assign-row">
+          <div class="session-info">
+            <div class="session-title">${esc(s.title || s.session_id)}</div>
+            <div class="session-meta">
+              <span class="ls-status ${s.status}">${s.status}</span>
+              · ${s.message_count} msgs
+              ${s.agent_id ? `· Agent on call` : ''}
+            </div>
+          </div>
+          ${onlineAgents.length
+            ? `<select id="sel-${esc(s.session_id)}">
+                <option value="">— pick agent —</option>
+                ${onlineAgents.map(a=>`<option value="${esc(a.name)}">${esc(a.name)}</option>`).join('')}
+              </select>
+              <button class="btn btn-assign" onclick="assignFromSel('${esc(s.session_id)}')">Assign</button>`
+            : `<span style="color:var(--muted);font-size:.8rem">No agents online</span>`}
+        </div>`).join('')}
+    </div>`;
+}
+
+async function assignFromSel(sid) {
+  const el = document.getElementById(`sel-${sid}`);
+  if (!el || !el.value) return;
+  await assignSession(sid, el.value);
+}
+
+// ── Actions ────────────────────────────────────────────────────────────────
+async function toggleBlock(name, shouldBlock) {
+  const url = `/super-admin/agent/${encodeURIComponent(name)}/${shouldBlock ? 'block' : 'unblock'}`;
+  await fetch(url, { method:'POST', headers:{'X-Super-Admin-Token':token} });
+}
+
+async function assignSession(sessionId, agentName) {
+  const r = await fetch('/super-admin/assign', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-Super-Admin-Token':token},
+    body: JSON.stringify({ session_id: sessionId, agent_name: agentName }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    showToast(`Session assigned to ${agentName}`);
+  } else {
+    showToast('Failed — agent may be offline or blocked.', true);
+  }
+}
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function showToast(msg, err=false) {
+  const t = document.createElement('div');
+  t.style.cssText = `position:fixed;bottom:24px;right:24px;background:${err?'var(--red)':'var(--green)'};color:#fff;padding:10px 18px;border-radius:8px;font-size:.83rem;font-weight:600;z-index:9999;opacity:0;transition:.3s`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => { t.style.opacity = '1'; });
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3000);
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+</script>
+</body>
+</html>

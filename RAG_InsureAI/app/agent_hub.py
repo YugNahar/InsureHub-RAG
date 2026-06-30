@@ -21,6 +21,7 @@ from fastapi import WebSocket
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SESSIONS_FILE = os.path.join(_HERE, "sessions_data.json")
+_AGENT_ACTIVITY_FILE = os.path.join(_HERE, "agent_activity.json")
 
 
 def _now() -> str:
@@ -119,7 +120,9 @@ class HumanAgent:
     ws: WebSocket
     active_session: Optional[str] = None
     monitoring: Set[str] = field(default_factory=set)
-    declined_sessions: Set[str] = field(default_factory=set)  # sessions this agent explicitly dismissed
+    declined_sessions: Set[str] = field(default_factory=set)
+    login_time: str = field(default_factory=_now_full)
+    blocked: bool = False
 
 
 _HANDOFF_TIMEOUT = 30  # seconds agents have to accept before email is sent
@@ -130,8 +133,12 @@ class AgentHub:
     def __init__(self):
         self._sessions: Dict[str, ChatSession] = {}
         self._agents: Dict[str, HumanAgent] = {}
-        self._pending_handoffs: Dict[str, asyncio.Task] = {}  # session_id → timeout task
+        self._pending_handoffs: Dict[str, asyncio.Task] = {}
+        self._agent_records: Dict[str, dict] = {}   # name → persistent activity record
+        self._super_admin_ws: List[WebSocket] = []  # connected super-admin sockets
+        self._super_admin_tokens: set = set()       # valid super-admin session tokens
         self._load_sessions()
+        self._load_agent_records()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -178,6 +185,36 @@ class AgentHub:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    # ── Agent-activity persistence ────────────────────────────────────────────
+
+    def _load_agent_records(self):
+        if not os.path.exists(_AGENT_ACTIVITY_FILE):
+            return
+        try:
+            with open(_AGENT_ACTIVITY_FILE, "r", encoding="utf-8") as f:
+                self._agent_records = json.load(f)
+        except Exception:
+            self._agent_records = {}
+
+    def _save_agent_records(self):
+        try:
+            tmp = _AGENT_ACTIVITY_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._agent_records, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _AGENT_ACTIVITY_FILE)
+        except Exception:
+            pass
+
+    def _ensure_agent_record(self, name: str) -> dict:
+        if name not in self._agent_records:
+            self._agent_records[name] = {
+                "blocked": False,
+                "login_sessions": [],
+                "chats": [],
+                "total_queries_answered": 0,
+            }
+        return self._agent_records[name]
 
     # ── Sessions ──────────────────────────────────────────────────────────────
 
@@ -262,8 +299,19 @@ class AgentHub:
     # ── Agent registration ────────────────────────────────────────────────────
 
     def register_agent(self, agent_id: str, name: str, ws: WebSocket) -> "HumanAgent":
-        agent = HumanAgent(agent_id=agent_id, name=name, ws=ws)
+        rec = self._ensure_agent_record(name)
+        agent = HumanAgent(
+            agent_id=agent_id, name=name, ws=ws,
+            login_time=_now_full(), blocked=rec.get("blocked", False),
+        )
         self._agents[agent_id] = agent
+        rec["login_sessions"].append({
+            "agent_id": agent_id,
+            "login_time": agent.login_time,
+            "logout_time": None,
+            "duration_minutes": None,
+        })
+        self._save_agent_records()
         return agent
 
     async def unregister_agent(self, agent_id: str):
@@ -285,7 +333,28 @@ class AgentHub:
                         })
                     except Exception:
                         pass
+        # Record logout time + duration
+        rec = self._agent_records.get(agent.name)
+        if rec:
+            now_str = _now_full()
+            fmt = "%Y-%m-%d %H:%M"
+            for sess in reversed(rec["login_sessions"]):
+                if sess.get("agent_id") == agent_id and sess.get("logout_time") is None:
+                    sess["logout_time"] = now_str
+                    try:
+                        login_dt = datetime.strptime(sess["login_time"], fmt).replace(tzinfo=timezone.utc)
+                        logout_dt = datetime.strptime(now_str, fmt).replace(tzinfo=timezone.utc)
+                        sess["duration_minutes"] = round((logout_dt - login_dt).total_seconds() / 60, 1)
+                    except Exception:
+                        pass
+                    break
+            # Close any open chat record for this agent
+            for chat in rec["chats"]:
+                if chat.get("agent_id") == agent_id and chat.get("ended_at") is None:
+                    chat["ended_at"] = now_str
+            self._save_agent_records()
         await self._broadcast_sessions_update()
+        await self._broadcast_super_admin_update()
 
     def online_count(self) -> int:
         return len(self._agents)
@@ -390,7 +459,7 @@ class AgentHub:
         """Agent accepted the popup — assign and cancel the timeout."""
         session = self._sessions.get(session_id)
         agent   = self._agents.get(agent_id)
-        if not session or not agent:
+        if not session or not agent or agent.blocked:
             return
 
         # Cancel the timeout task if still running (may be missing after server restart)
@@ -497,12 +566,27 @@ class AgentHub:
 
         session.status = "human"
         session.agent_id = agent.agent_id
-        session.email_sent = False  # agent arrived — clear the red email-alert indicator
+        session.email_sent = False
         if session.tone == "angry":
             session.tone_from_red = True
         agent.active_session = session.session_id
         agent.monitoring.add(session.session_id)
         self._save_sessions()
+        # Open a new chat record in agent activity
+        rec = self._ensure_agent_record(agent.name)
+        snapshot_msgs = [
+            {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+            for m in session.history
+        ]
+        rec["chats"].append({
+            "session_id": session.session_id,
+            "agent_id": agent.agent_id,
+            "started_at": _now_full(),
+            "ended_at": None,
+            "messages": snapshot_msgs,
+            "reply_count": 0,
+        })
+        self._save_agent_records()
         history_payload = [
             {"role": m.role, "content": m.content, "timestamp": m.timestamp}
             for m in session.history[-100:]
@@ -550,7 +634,7 @@ class AgentHub:
     async def agent_takeover(self, agent_id: str, session_id: str):
         agent = self._agents.get(agent_id)
         session = self._sessions.get(session_id)
-        if not agent or not session:
+        if not agent or not session or agent.blocked:
             return
         if agent.active_session and agent.active_session != session_id:
             old = self._sessions.get(agent.active_session)
@@ -572,7 +656,8 @@ class AgentHub:
         agent = self._agents.get(agent_id)
         if not agent or not agent.active_session:
             return
-        session = self._sessions.get(agent.active_session)
+        released_sid = agent.active_session
+        session = self._sessions.get(released_sid)
         if session:
             session.status = "ai"
             session.agent_id = None
@@ -586,8 +671,17 @@ class AgentHub:
                     })
                 except Exception:
                     pass
+        # Close the chat record
+        rec = self._agent_records.get(agent.name)
+        if rec:
+            for chat in reversed(rec["chats"]):
+                if chat.get("session_id") == released_sid and chat.get("agent_id") == agent_id and chat.get("ended_at") is None:
+                    chat["ended_at"] = _now_full()
+                    break
+            self._save_agent_records()
         agent.active_session = None
         await self._broadcast_sessions_update()
+        await self._broadcast_super_admin_update()
 
     async def agent_send_message(self, agent_id: str, session_id: str, content: str):
         agent = self._agents.get(agent_id)
@@ -597,8 +691,19 @@ class AgentHub:
         msg = ChatMessage(role="agent", content=content)
         session.history.append(msg)
         self._save_sessions()
+        # Record the reply in agent activity
+        rec = self._agent_records.get(agent.name)
+        if rec:
+            for chat in reversed(rec["chats"]):
+                if chat.get("session_id") == session_id and chat.get("agent_id") == agent_id and chat.get("ended_at") is None:
+                    chat["reply_count"] = chat.get("reply_count", 0) + 1
+                    chat["messages"].append({"role": "agent", "content": content, "timestamp": msg.timestamp})
+                    rec["total_queries_answered"] = rec.get("total_queries_answered", 0) + 1
+                    break
+            self._save_agent_records()
         await self._broadcast_new_message(session_id, msg)
         await self._broadcast_sessions_update()
+        await self._broadcast_super_admin_update()
         if session.user_ws:
             try:
                 await session.user_ws.send_json({
@@ -617,6 +722,17 @@ class AgentHub:
         msg = ChatMessage(role="user", content=content)
         session.history.append(msg)
         self._save_sessions()
+        # Append user message to the active agent's chat record
+        if session.agent_id:
+            agent = self._agents.get(session.agent_id)
+            if agent:
+                rec = self._agent_records.get(agent.name)
+                if rec:
+                    for chat in reversed(rec["chats"]):
+                        if chat.get("session_id") == session_id and chat.get("ended_at") is None:
+                            chat["messages"].append({"role": "user", "content": content, "timestamp": msg.timestamp})
+                            break
+                    self._save_agent_records()
         await self._broadcast_new_message(session_id, msg)
         await self._broadcast_sessions_update()
         asyncio.create_task(self._analyze_and_broadcast_tone(session_id, content))
@@ -668,6 +784,96 @@ class AgentHub:
                 await agent.ws.send_json({"type": "sessions_update", "sessions": sessions})
             except Exception:
                 pass
+
+    # ── Super-admin support ───────────────────────────────────────────────────
+
+    def register_super_admin(self, ws: WebSocket):
+        self._super_admin_ws.append(ws)
+
+    def unregister_super_admin(self, ws: WebSocket):
+        self._super_admin_ws = [w for w in self._super_admin_ws if w is not ws]
+
+    async def _broadcast_super_admin_update(self):
+        if not self._super_admin_ws:
+            return
+        payload = {"type": "update", **self.get_super_admin_data()}
+        for ws in list(self._super_admin_ws):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
+
+    def get_super_admin_data(self) -> dict:
+        online_names = {a.name for a in self._agents.values()}
+        chatting_names = {a.name for a in self._agents.values() if a.active_session}
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        agents_out = []
+        for name, rec in self._agent_records.items():
+            if name in chatting_names:
+                status = "chatting"
+            elif name in online_names:
+                status = "online"
+            else:
+                status = "offline"
+            today_logins = [s for s in rec.get("login_sessions", []) if s.get("login_time", "").startswith(today)]
+            today_hours = round(sum(s.get("duration_minutes") or 0 for s in today_logins) / 60, 2)
+            today_replies = sum(c.get("reply_count", 0) for c in rec.get("chats", []) if c.get("started_at", "").startswith(today))
+            cur_login = next((s for s in reversed(rec.get("login_sessions", [])) if s.get("logout_time") is None), None)
+            agents_out.append({
+                "name": name,
+                "status": status,
+                "blocked": rec.get("blocked", False),
+                "total_queries_answered": rec.get("total_queries_answered", 0),
+                "today_queries": today_replies,
+                "today_hours": today_hours,
+                "current_login_time": cur_login.get("login_time") if cur_login else None,
+                "login_sessions": rec.get("login_sessions", []),
+            })
+        # Add online agents not yet in records (first login race)
+        known = {a["name"] for a in agents_out}
+        for agent in self._agents.values():
+            if agent.name not in known:
+                agents_out.append({
+                    "name": agent.name,
+                    "status": "chatting" if agent.active_session else "online",
+                    "blocked": agent.blocked,
+                    "total_queries_answered": 0,
+                    "today_queries": 0,
+                    "today_hours": 0,
+                    "current_login_time": agent.login_time,
+                    "login_sessions": [],
+                })
+        return {"agents": agents_out, "live_sessions": self.list_sessions()}
+
+    def block_agent(self, name: str) -> bool:
+        rec = self._ensure_agent_record(name)
+        rec["blocked"] = True
+        self._save_agent_records()
+        for agent in self._agents.values():
+            if agent.name == name:
+                agent.blocked = True
+        return True
+
+    def unblock_agent(self, name: str) -> bool:
+        rec = self._agent_records.get(name)
+        if rec is None:
+            return False
+        rec["blocked"] = False
+        self._save_agent_records()
+        for agent in self._agents.values():
+            if agent.name == name:
+                agent.blocked = False
+        return True
+
+    async def super_admin_assign_session(self, session_id: str, agent_name: str) -> bool:
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        target = next((a for a in self._agents.values() if a.name == agent_name and not a.blocked), None)
+        if not target:
+            return False
+        await self._assign_agent(session, target)
+        return True
 
     @staticmethod
     def response_needs_human(response: str, sources: list) -> bool:
