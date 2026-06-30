@@ -109,6 +109,7 @@ class ChatSession:
     tone_from_red: bool = False  # True if agent took over because tone was "angry"
     handoff_exhausted: bool = False  # True after handoff timed-out/all-declined; resets on next AI turn
     email_sent: bool = False    # True after escalation email sent; cleared when agent takes over
+    pending_ws_message: Optional[dict] = None  # buffered for when WS reconnects after timeout
 
 
 @dataclass
@@ -354,20 +355,25 @@ class AgentHub:
             return  # already accepted — task was cancelled
         self._pending_handoffs.pop(session_id, None)
         session = self._sessions.get(session_id)
+        _timeout_msg = {
+            "type": "handoff_timeout",
+            "message": "No agent is available right now. We've emailed our support team and someone will reach out to you soon.",
+        }
         if session and session.status == "waiting":
             session.status = "ai"
             session.handoff_exhausted = True
             session.email_sent = True
-            self._save_sessions()
-            # Notify user that no agent took over
+            delivered = False
             if session.user_ws:
                 try:
-                    await session.user_ws.send_json({
-                        "type": "handoff_timeout",
-                        "message": "No agent is available right now. We've emailed our support team and someone will reach out to you soon.",
-                    })
+                    await session.user_ws.send_json(_timeout_msg)
+                    delivered = True
                 except Exception:
                     pass
+            if not delivered:
+                # WS disconnected — buffer so it's sent on next reconnect
+                session.pending_ws_message = _timeout_msg
+            self._save_sessions()
         # Send escalation email in a thread so we don't block the event loop
         import asyncio as _aio
         history_snapshot = list(session.history) if session else []
@@ -432,16 +438,20 @@ class AgentHub:
         session.status = "ai"
         session.agent_id = None
         session.handoff_exhausted = True
-        self._save_sessions()
-
+        _decline_msg = {
+            "type": "handoff_timeout",
+            "message": "No agent is available right now. We've notified our support team and someone will follow up with you shortly.",
+        }
+        delivered = False
         if session.user_ws:
             try:
-                await session.user_ws.send_json({
-                    "type": "handoff_timeout",
-                    "message": "No agent is available right now. We've notified our support team and someone will follow up with you shortly.",
-                })
+                await session.user_ws.send_json(_decline_msg)
+                delivered = True
             except Exception:
                 pass
+        if not delivered:
+            session.pending_ws_message = _decline_msg
+        self._save_sessions()
 
         unanswerable = next(
             (m.content for m in reversed(session.history) if m.role == "user"), ""

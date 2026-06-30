@@ -458,6 +458,15 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
     session = _agent_hub.get_or_create_session(session_id)
     await websocket.accept()
     session.user_ws = websocket
+
+    # Deliver any buffered message that was produced while the WS was disconnected
+    if session.pending_ws_message:
+        try:
+            await websocket.send_json(session.pending_ws_message)
+        except Exception:
+            pass
+        session.pending_ws_message = None
+
     try:
         while True:
             msg = await websocket.receive_json()
@@ -494,6 +503,27 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
                             "type": "handoff_timeout",
                             "message": "No agent is available right now. We've emailed our support team — someone will reach out to you soon!",
                         })
+            elif msg_type == "cancel_handoff":
+                # User explicitly cancelled waiting — send email and release back to AI
+                if session.status == "waiting":
+                    task = _agent_hub._pending_handoffs.pop(session_id, None)
+                    if task:
+                        task.cancel()
+                    session.status = "ai"
+                    session.handoff_exhausted = True
+                    session.email_sent = True
+                    _agent_hub._save_sessions()
+                    unanswerable = next(
+                        (m.content for m in reversed(session.history) if m.role == "user"), ""
+                    )
+                    asyncio.create_task(
+                        _agent_hub.trigger_offline_escalation(session_id, unanswerable)
+                    )
+                    await websocket.send_json({
+                        "type": "handoff_timeout",
+                        "message": "No problem! I've sent your question to our support team — someone will follow up with you soon. You can keep chatting with me in the meantime! 😊",
+                    })
+                    await _agent_hub._broadcast_sessions_update()
             elif msg_type == "message":
                 content = (msg.get("content") or "").strip()
                 if content and session.status == "human":
