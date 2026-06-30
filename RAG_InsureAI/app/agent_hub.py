@@ -144,8 +144,11 @@ class AgentHub:
             for sid, s in data.items():
                 session = ChatSession(
                     session_id=sid,
-                    status="ai",  # always start as "ai" on load; no agents connected yet
+                    status="ai",  # always "ai" on load; no agents connected yet
                     created_at=s.get("created_at", _now_full()),
+                    tone=s.get("tone", "neutral"),
+                    handoff_exhausted=s.get("handoff_exhausted", False),
+                    email_sent=s.get("email_sent", False),
                 )
                 for m in s.get("history", []):
                     session.history.append(ChatMessage(
@@ -163,6 +166,9 @@ class AgentHub:
             for sid, s in self._sessions.items():
                 data[sid] = {
                     "created_at": s.created_at,
+                    "tone": s.tone,
+                    "handoff_exhausted": s.handoff_exhausted,
+                    "email_sent": s.email_sent,
                     "history": [
                         {"role": m.role, "content": m.content, "timestamp": m.timestamp}
                         for m in s.history
