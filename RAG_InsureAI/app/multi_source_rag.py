@@ -287,6 +287,16 @@ _FOLLOWUP_OPENERS = (
     'what does it', 'how does it', 'what is it', 'is it ', 'can it ',
 )
 
+# Standalone keywords that strongly signal a follow-up when the message is short
+# and has no standalone insurance topic. These words refer back to a prior topic
+# (e.g. "justify more", "explain further", "why though") rather than introducing
+# a new self-contained question.
+_FOLLOWUP_KEYWORDS = frozenset({
+    "more", "further", "why", "justify", "expand", "deeper", "elaborate",
+    "explain", "details", "detail", "reason", "reasons", "example", "examples",
+    "though", "still", "again", "anyway",
+})
+
 
 def _is_likely_followup(question: str) -> bool:
     """Heuristic: is this question likely a follow-up referencing a previous topic?"""
@@ -295,7 +305,57 @@ def _is_likely_followup(question: str) -> bool:
         return False  # long questions are usually self-contained
     tokens = {w.lower().strip('?.,!') for w in words}
     q_lower = question.lower().strip()
-    return bool(tokens & _FOLLOWUP_SIGNALS) or any(q_lower.startswith(op) for op in _FOLLOWUP_OPENERS)
+
+    # Existing checks: pronoun-like tokens and fixed opener phrases
+    if bool(tokens & _FOLLOWUP_SIGNALS) or any(q_lower.startswith(op) for op in _FOLLOWUP_OPENERS):
+        return True
+
+    # Additional keyword check: short messages (<= 6 words) that contain a
+    # follow-up keyword but NO actual insurance vocabulary are likely referential
+    # follow-ups ("explain further", "why though", "expand on that").
+    if len(words) <= 6:
+        stripped_tokens = {w.strip(".,!?;:()[]{}'\"") for w in words}
+        if stripped_tokens & _FOLLOWUP_KEYWORDS:
+            # If the question contains real insurance vocabulary it's
+            # self-contained, not a follow-up.
+            from re import compile as _re_compile
+            _INSURANCE_INDICATORS_LOCAL = _re_compile(
+                r"\b("
+                r"insurance|policy|premium|deductible|coverage|claim|claims|"
+                r"insure|insured|insurer|underwriting|underwrite|"
+                r"cover|covered|covers|covers? (?:for|against|up to|of|on)|"
+                r"premiums|co-pay|copay|deductibles|"
+                r"health|medical|hospital|surgery|prescription|medication|"
+                r"vehicle|car|motor|auto|bike|two-wheeler|four-wheeler|"
+                r"travel|trip|flight|baggage|luggage|cancellation|"
+                r"life|term life|whole life|endowment|ulip|"
+                r"home|house|property|rental|landlord|tenant|"
+                r"accident|disability|critical illness|cancer|"
+                r"liability|third.party|comprehensive|"
+                r"limit|limits|sum insured|sum.assured|"
+                r"maternity|dental|vision|"
+                r"agent|broker|renewal|grace period|waiting period|"
+                r"no.claim|ncb|bonus|"
+                r"nominee|beneficiary|"
+                r"claim (?:form|process|settlement|rejection|approval)|"
+                r"cashless|reimbursement|"
+                r"roadside assistance|towing|"
+                r"personal accident|"
+                r"retirement|pension|annuity|"
+                r"finance|financial|investment|savings|"
+                r"hdfc ergo|icici|bajaj|tata aig|reliance|"
+                r"new india|oriental|national|united india|"
+                r"irda|regulator|"
+                r"cover note|certi.* of insurance|"
+                r"aog|marine|cargo|"
+                r"group insurance|corporate|"
+                r"rider|add.on"
+                r")\b"
+            )
+            if not _INSURANCE_INDICATORS_LOCAL.search(q_lower):
+                return True
+
+    return False
 
 
 async def _reformulate_query(question: str, history: str) -> str:
