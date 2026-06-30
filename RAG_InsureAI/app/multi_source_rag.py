@@ -1234,6 +1234,7 @@ class MultiSourceRAG:
             has_simple=_kv_has_simple,
         )
         _kv_q_emb = None
+        _kv_related_ctx = ""   # supplementary context from related cache entries
         _kv_hit = _kv.get(_kv_key)
         if _kv_hit is None:
             try:
@@ -1245,15 +1246,41 @@ class MultiSourceRAG:
                 # Higher threshold for detailed queries so "life insurance in detail"
                 # doesn't hit "health insurance in detail" just because topics are close.
                 _sem_thr = 0.90 if _keyword_detailed else None
+                _sem_thr_actual = _sem_thr if _sem_thr is not None else 0.92
+
+                # ── Semantic exact hit: same intent → serve directly ──────────
                 _kv_hit = _kv.semantic_get(_kv_q_emb, threshold=_sem_thr)
-                # Invalidate if cached intent flags don't match the current question —
-                # same topic but different requirements must not share a cache entry.
                 if _kv_hit is not None and _kv_hit.get("detailed") != _keyword_detailed:
                     _kv_hit = None
                 if _kv_hit is not None and _kv_hit.get("has_example") != _kv_has_example:
                     _kv_hit = None
                 if _kv_hit is not None and _kv_hit.get("has_simple") != _kv_has_simple:
                     _kv_hit = None
+
+                # ── Semantic related: different question, overlapping topic ───
+                # Collect entries in [0.60, sem_threshold) — related but not
+                # identical.  Feed them to the LLM as supplementary context
+                # alongside fresh KB chunks; never short-circuit the answer.
+                if _kv_hit is None:
+                    _related = _kv.semantic_get_related(
+                        _kv_q_emb,
+                        lower_threshold=0.60,
+                        upper_threshold=_sem_thr_actual,
+                        top_k=2,
+                    )
+                    _rel_parts = []
+                    _no_ans_phrases = (
+                        "i don't have that", "don't have that specific",
+                        "let me get one of our agents", "i can get one of our agents",
+                        "i can get a human agent", "let me get a human agent",
+                    )
+                    for _rel in _related:
+                        _q_txt = (_rel.get("query_text") or "").strip()
+                        _a_txt = (_rel.get("answer") or "").strip()
+                        if _q_txt and _a_txt and not any(p in _a_txt.lower() for p in _no_ans_phrases):
+                            _rel_parts.append(f"Q: {_q_txt}\nA: {_a_txt}")
+                    if _rel_parts:
+                        _kv_related_ctx = "\n\n".join(_rel_parts)
             except Exception:
                 _kv_q_emb = None
         if _kv_hit is not None:
@@ -1362,6 +1389,17 @@ class MultiSourceRAG:
             context_parts.append(f"[{label}]\n{chunk.page_content}")
 
         full_context = "\n\n".join(context_parts)
+
+        # Prepend semantically related prior Q&A as supplementary context.
+        # These are cached answers for related (but not identical) questions —
+        # they enrich the context the LLM sees without replacing fresh retrieval.
+        if _kv_related_ctx and full_context.strip():
+            full_context = (
+                "[Related prior answers — use as supporting context]\n"
+                + _kv_related_ctx
+                + "\n\n[Knowledge base chunks]\n"
+                + full_context
+            )
 
         if not full_context.strip():
             yield (

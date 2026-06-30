@@ -183,6 +183,60 @@ class QueryKVCache:
         )
         return self.get(best_key)   # goes through TTL check + hit counter
 
+    def semantic_get_related(
+        self,
+        query_embedding: np.ndarray,
+        lower_threshold: float = 0.60,
+        upper_threshold: float = 0.92,
+        top_k: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return up to top_k cached entries whose similarity to query_embedding
+        falls in [lower_threshold, upper_threshold).
+
+        Entries at or above upper_threshold are reserved for semantic_get (direct
+        serving).  This method only collects entries that are *related but not
+        identical* — used as supplementary context for the LLM rather than as
+        direct answers.  Returns a list of (value_dict, query_text) pairs sorted
+        by similarity descending.
+        """
+        if not self._data:
+            return []
+        self._rebuild_emb_matrix()
+        if self._emb_matrix is None or self._emb_matrix.shape[0] == 0:
+            return []
+
+        qe = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
+        sims: np.ndarray = self._emb_matrix @ qe
+
+        now = time.time()
+        results = []
+        for idx in np.argsort(sims)[::-1]:
+            sim = float(sims[idx])
+            if sim >= upper_threshold:
+                continue        # leave these for semantic_get (direct serve)
+            if sim < lower_threshold:
+                break           # sorted descending — nothing below this matters
+            key = self._emb_keys[idx]
+            entry = self._data.get(key)
+            if entry is None or now - entry["ts"] > self._ttl:
+                continue
+            value = entry["value"]
+            results.append({
+                **value,
+                "query_text": entry.get("query_text", ""),
+                "_sim": sim,
+            })
+            if len(results) >= top_k:
+                break
+
+        if results:
+            logger.info(
+                "[KVCache] semantic_related: %d entries in [%.2f, %.2f) for query",
+                len(results), lower_threshold, upper_threshold,
+            )
+        return results
+
     # ──────────────────────────────────────────────────────────────────────────
     # Public API — maintenance
     # ──────────────────────────────────────────────────────────────────────────
