@@ -310,16 +310,21 @@ _FOLLOWUP_KEYWORDS = frozenset({
 })
 
 
-async def _generate_suggestions(question: str, answer: str) -> list:
-    """Generate 2-3 short follow-up question chips from the Q&A pair."""
+async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
+    """Generate 2-3 follow-up question chips grounded in the retrieved KB context."""
     try:
         import aiohttp as _ah
         from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
         if _active_backend() != "vllm" or not VLLM_HOST:
             return []
+        ctx_snippet = context[:500].strip() if context else ""
         prompt = (
-            f"Question: {question}\nAnswer: {answer[:250]}\n\n"
-            "Write exactly 3 short follow-up questions (max 8 words each) a user might ask next about this insurance topic.\n"
+            f"Knowledge base content:\n{ctx_snippet}\n\n"
+            f"User asked: {question}\n"
+            f"Answer given: {answer[:200]}\n\n"
+            "Write exactly 3 short follow-up questions (max 8 words each) that a user could ask next "
+            "and that can be answered from the knowledge base content above.\n"
+            "Only ask about topics present in the knowledge base content. Do not invent topics.\n"
             "Output only the 3 questions, one per line, no numbering, no bullets:"
         )
         async with _ah.ClientSession() as _s:
@@ -1492,7 +1497,18 @@ class MultiSourceRAG:
 
         # ── KV cache write ────────────────────────────────────────────────────
         # Only cache real answers, not handoff/fallback messages.
-        _handoff_phrases = ("let me get one of our agents", "let me get a human agent")
+        _handoff_phrases = (
+            "let me get one of our agents",
+            "let me get a human agent",
+            "i can get one of our agents",
+            "i can get a human agent",
+            "i don't have that specific info",
+            "don't have that specific info",
+            "i don't have that info",
+            "don't have all the details",
+            "don't have that right now",
+            "i don't have that right now",
+        )
         if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases):
             try:
                 _kv.put(
@@ -1509,9 +1525,8 @@ class MultiSourceRAG:
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
         _reply_for_chips = (_corrected_text or _kv_reply or "").strip()
-        _needs_h = _final_payload.get("needs_human", False)
-        if _reply_for_chips and not _needs_h and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
-            _sugg = await _generate_suggestions(question, _reply_for_chips)
+        if _reply_for_chips and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
+            _sugg = await _generate_suggestions(question, _reply_for_chips, context=full_context)
             if _sugg:
                 _final_payload["suggested_questions"] = _sugg
         yield "\n\n" + _json.dumps(_final_payload)
