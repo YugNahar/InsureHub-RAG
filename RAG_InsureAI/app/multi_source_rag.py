@@ -1343,7 +1343,7 @@ class MultiSourceRAG:
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1500" if detailed else "700")),
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1500" if detailed else "220")),
                 "stream": True,
             }
             headers = {
