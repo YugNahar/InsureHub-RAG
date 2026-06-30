@@ -155,15 +155,12 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 }
 .conv-item:hover { background: #1f2937; }
 .conv-item.selected { background: #1e2840; }
-/* Left border colour reflects agent status */
+/* Left border colour reflects session status */
 .conv-item::before {
-  content: "";
-  position: absolute;
+  content: ""; position: absolute;
   left: 0; top: 8px; bottom: 8px;
-  width: 3px;
-  background: transparent;
-  border-radius: 0 3px 3px 0;
-  transition: background 0.2s;
+  width: 3px; background: transparent;
+  border-radius: 0 3px 3px 0; transition: background 0.2s;
 }
 .conv-item.selected::before               { background: #6366f1; }
 .conv-item.status-human.selected::before  { background: #10b981; }
@@ -172,7 +169,6 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .conv-item.status-human::before  { background: rgba(16,185,129,0.35); }
 .conv-item.status-waiting::before{ background: rgba(245,158,11,0.35); }
 .conv-item.status-ai::before     { background: rgba(59,130,246,0.2); }
-
 .conv-icon {
   width: 30px; height: 30px; border-radius: 8px;
   display: flex; align-items: center; justify-content: center;
@@ -532,13 +528,13 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 </div>
 
 <script>
-// ── Backend URL — https://digest-tile-coupons-kijiji.trycloudflare.com is replaced by build.js at deploy time ──────────
+// ── Backend URL — https://union-gbp-regulated-booth.trycloudflare.com is replaced by build.js at deploy time ──────────
 function getBackendUrl() {
   // On the backend's own domain (tunnel / localhost): use current origin so
   // the dashboard survives tunnel restarts without a stale baked-in URL.
   // On Vercel (static hosting): use the tunnel URL baked in at build time,
   // because window.location.origin would be the Vercel domain, not the backend.
-  const built = 'https://digest-tile-coupons-kijiji.trycloudflare.com'.replace(/\/$/, '');
+  const built = 'https://union-gbp-regulated-booth.trycloudflare.com'.replace(/\/$/, '');
   const h = window.location.hostname;
   if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
     return window.location.origin.replace(/\/$/, '');

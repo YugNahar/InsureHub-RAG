@@ -291,15 +291,17 @@ class AgentHub:
         if session.handoff_exhausted:
             return False  # already timed-out or all-declined this turn — don't re-popup
 
-        # Agents who already declined this session don't count as "free"
-        free = [
+        # Notify all connected agents who haven't declined this session.
+        # Busy agents (with active_session) are still included — accept_handoff
+        # already handles releasing their current session on accept.
+        notifiable = [
             a for a in self._agents.values()
-            if a.active_session is None and session_id not in a.declined_sessions
+            if session_id not in a.declined_sessions
         ]
-        logger.info("request_handoff: session=%s agents_total=%d free=%d",
-                    session_id, len(self._agents), len(free))
-        if not free:
-            logger.warning("request_handoff: no free agents — falling back to email")
+        logger.info("request_handoff: session=%s agents_total=%d notifiable=%d",
+                    session_id, len(self._agents), len(notifiable))
+        if not notifiable:
+            logger.warning("request_handoff: no agents online — falling back to email")
             return False  # caller sends email
 
         session.status = "waiting"
@@ -311,7 +313,7 @@ class AgentHub:
         )
         title = session.history[0].content[:60] if session.history else f"Session #{session_id}"
 
-        # Send popup to every free agent
+        # Send popup to every available agent (including those handling another session)
         popup_msg = {
             "type": "handoff_request",
             "session_id": session_id,
@@ -320,7 +322,7 @@ class AgentHub:
             "message_count": len(session.history),
             "timeout": _HANDOFF_TIMEOUT,
         }
-        for agent in free:
+        for agent in notifiable:
             try:
                 await agent.ws.send_json(popup_msg)
             except Exception:
@@ -397,10 +399,10 @@ class AgentHub:
         if agent:
             agent.declined_sessions.add(session_id)
 
-        # Check whether any connected agent can still accept this session
+        # Check whether any connected agent (including busy ones) can still accept
         can_still_accept = [
             a for a in self._agents.values()
-            if a.active_session is None and session_id not in a.declined_sessions
+            if session_id not in a.declined_sessions
         ]
         if can_still_accept:
             return  # others may still accept — let the timer keep running

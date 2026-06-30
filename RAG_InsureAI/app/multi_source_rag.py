@@ -161,16 +161,19 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
             default=0,
         )
-        if top_rerank >= 0.7:
+        if top_rerank >= 0.5:
             return True
 
+        # OR-logic: pass if AT LEAST ONE topic phrase is fully covered.
+        # The original AND-logic (all topics must match) was too strict —
+        # a single missing synonym killed answers that were clearly in the KB.
         for topic in llm_topics:
             words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3]
             if not words:
                 continue
-            if not all(any(_word_matches(w, c) for c in all_terms) for w in words):
-                return False
-        return True
+            if all(any(_word_matches(w, c) for c in all_terms) for w in words):
+                return True  # at least one topic fully covered → adequate context
+        return False
 
     # Regex fallback: split compound questions on "and"/"or".
     sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
@@ -1133,10 +1136,24 @@ class MultiSourceRAG:
         # ── Follow-up reformulation ───────────────────────────────────────────
         # For short/vague follow-ups ("what about premiums?", "give me in detail",
         # "is it legal?") rewrite into a full standalone query using history.
-        _is_followup = bool(history and _is_likely_followup(question))
-        if _is_followup:
+        _detected_as_followup = bool(history and _is_likely_followup(question))
+        _is_followup = False
+        if _detected_as_followup:
             retrieval_query = await _reformulate_query(question, history)
-            _is_followup = retrieval_query != question
+            if retrieval_query != question:
+                _is_followup = True
+            else:
+                # LLM reformulation failed (timeout / vLLM busy) — fall back to the
+                # last user question from history so "give me in detail" maps to the
+                # actual topic instead of colliding with every other detail request.
+                _last_user_q = next(
+                    (ln[len("User:"):].strip() for ln in reversed(history.split("\n"))
+                     if ln.startswith("User:")),
+                    None,
+                )
+                if _last_user_q and _last_user_q.lower() != question.lower():
+                    retrieval_query = _last_user_q
+                    _is_followup = True
         else:
             retrieval_query = corrected_question
 
@@ -1234,7 +1251,7 @@ class MultiSourceRAG:
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
         import json as _json_s
-        topics_for_coverage = None if _is_followup else (llm_topics or None)
+        topics_for_coverage = None if _detected_as_followup else (llm_topics or None)
         ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
         if not ctx_covered and not document_filter:
             yield (
@@ -1285,18 +1302,12 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
         else:
-            ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=llm_topics or None)
-            if not ctx_covered and not document_filter:
-                yield (
-                    "Hmm, I don't have that specific information in my knowledge base right now. "
-                    "Let me get one of our agents on it — they'll be able to help you better! 😊"
-                )
-                yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
-                return
-            # Use reformulated query as LLM question for follow-ups ("give me in detail"
-            # → retrieval_query = "life insurance coverage details") so the model answers
-            # the actual topic, not the vague follow-up phrase.
-            prompt_question = retrieval_query if _is_followup else question
+            # Use reformulated query as LLM question for detected follow-ups
+            # ("give me in detail" → retrieval_query = "life insurance coverage details")
+            # so the model sees the actual topic, not the vague follow-up phrase.
+            # _detected_as_followup is used (not _is_followup) so the fix applies
+            # even when we fell back to history-based topic extraction.
+            prompt_question = retrieval_query if _detected_as_followup else question
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
                 llm = get_insurance_llm(temperature=0)
