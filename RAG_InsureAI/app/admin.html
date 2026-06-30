@@ -447,7 +447,7 @@
   if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
     window.__BACKEND_URL = window.location.origin.replace(/\/$/, '');
   } else {
-    window.__BACKEND_URL = (built && !built.startsWith('__')) ? built : 'http://localhost:8501';
+    window.__BACKEND_URL = (built && !built.startsWith('__')) ? built : '';
   }
 })();
 const API = window.__BACKEND_URL;
@@ -962,8 +962,8 @@ function refreshTunnelUrl() {
       link.textContent = url.replace('https://', '');
       link.href = url;
       const agentLink = document.getElementById('agent-link');
-      agentLink.textContent = 'insurehub-your-ai-insurance-advisor.vercel.app/agent-dashboard';
-      agentLink.href = 'https://insurehub-your-ai-insurance-advisor.vercel.app/agent-dashboard';
+      agentLink.textContent = '/agent-dashboard';
+      agentLink.href = '/agent-dashboard';
     }
   }).catch(() => {});
 }
