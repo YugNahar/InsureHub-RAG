@@ -1212,10 +1212,15 @@ class MultiSourceRAG:
         retrieval_query = _correct_typos(retrieval_query)
 
         # ── KV cache lookup ───────────────────────────────────────────────────
-        # Key includes reformulated query + detailed flag so two "in detail"
-        # requests on different topics never share a cache entry.
+        # Key includes reformulated query + intent flags so "why is X compulsory"
+        # and "why is X compulsory, explain with example" never share a cache entry —
+        # even though their retrieval_query is identical (example is a prompt modifier,
+        # not a retrieval term, so it doesn't survive reformulation).
         _kv = self.doc_pipeline._cache
         _kv_sources = self.doc_pipeline._vector_store.list_sources()
+        _q_lower_intent = question.lower()
+        _kv_has_example = any(sig in _q_lower_intent for sig in _EXAMPLE_SIGNALS)
+        _kv_has_simple  = any(sig in _q_lower_intent for sig in _SIMPLE_SIGNALS)
         _kv_key = _kv.make_key(
             query=retrieval_query,
             top_k=_doc_top_k,
@@ -1225,6 +1230,8 @@ class MultiSourceRAG:
             run_ragas=False,
             sources=_kv_sources,
             detailed=_keyword_detailed,
+            has_example=_kv_has_example,
+            has_simple=_kv_has_simple,
         )
         _kv_q_emb = None
         _kv_hit = _kv.get(_kv_key)
@@ -1239,7 +1246,13 @@ class MultiSourceRAG:
                 # doesn't hit "health insurance in detail" just because topics are close.
                 _sem_thr = 0.90 if _keyword_detailed else None
                 _kv_hit = _kv.semantic_get(_kv_q_emb, threshold=_sem_thr)
+                # Invalidate if cached intent flags don't match the current question —
+                # same topic but different requirements must not share a cache entry.
                 if _kv_hit is not None and _kv_hit.get("detailed") != _keyword_detailed:
+                    _kv_hit = None
+                if _kv_hit is not None and _kv_hit.get("has_example") != _kv_has_example:
+                    _kv_hit = None
+                if _kv_hit is not None and _kv_hit.get("has_simple") != _kv_has_simple:
                     _kv_hit = None
             except Exception:
                 _kv_q_emb = None
@@ -1513,7 +1526,14 @@ class MultiSourceRAG:
             try:
                 _kv.put(
                     _kv_key,
-                    {"answer": _kv_reply, "is_general": False, "sources": unique_sources, "detailed": _keyword_detailed},
+                    {
+                        "answer": _kv_reply,
+                        "is_general": False,
+                        "sources": unique_sources,
+                        "detailed": _keyword_detailed,
+                        "has_example": _kv_has_example,
+                        "has_simple": _kv_has_simple,
+                    },
                     query_embedding=_kv_q_emb,
                     query_text=retrieval_query,
                 )
