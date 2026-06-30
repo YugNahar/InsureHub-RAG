@@ -1277,6 +1277,13 @@ class MultiSourceRAG:
                     for _rel in _related:
                         _q_txt = (_rel.get("query_text") or "").strip()
                         _a_txt = (_rel.get("answer") or "").strip()
+                        # Skip entries whose intent flags differ from the current
+                        # question — an example-based answer must not bleed into a
+                        # simple-language request and vice versa.
+                        if _rel.get("has_example") != _kv_has_example:
+                            continue
+                        if _rel.get("has_simple") != _kv_has_simple:
+                            continue
                         if _q_txt and _a_txt and not any(p in _a_txt.lower() for p in _no_ans_phrases):
                             _rel_parts.append(f"Q: {_q_txt}\nA: {_a_txt}")
                     if _rel_parts:
