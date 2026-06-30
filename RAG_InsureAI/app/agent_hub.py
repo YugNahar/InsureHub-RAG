@@ -108,6 +108,7 @@ class ChatSession:
     tone: str = "neutral"       # "happy" | "neutral" | "angry"
     tone_from_red: bool = False  # True if agent took over because tone was "angry"
     handoff_exhausted: bool = False  # True after handoff timed-out/all-declined; resets on next AI turn
+    email_sent: bool = False    # True after escalation email sent; cleared when agent takes over
 
 
 @dataclass
@@ -218,7 +219,10 @@ class AgentHub:
             # display status from history so the sidebar shows meaningful colors:
             # sessions where a human agent ever responded show green (human).
             display_status = s.status
-            if display_status == "ai" and any(m.role == "agent" for m in s.history):
+            # Only override to "human" if an agent is ACTIVELY assigned right now.
+            # Without this guard, released sessions (agent_id=None, status="ai") were
+            # incorrectly shown as "human" because history contained agent messages.
+            if display_status == "ai" and s.agent_id and any(m.role == "agent" for m in s.history):
                 display_status = "human"
             out.append({
                 "session_id": s.session_id,
@@ -230,6 +234,7 @@ class AgentHub:
                 "title": first_user or f"Session #{s.session_id}",
                 "tone": s.tone,
                 "tone_from_red": s.tone_from_red,
+                "email_sent": getattr(s, "email_sent", False),
             })
         return out
 
@@ -352,6 +357,7 @@ class AgentHub:
         if session and session.status == "waiting":
             session.status = "ai"
             session.handoff_exhausted = True
+            session.email_sent = True
             self._save_sessions()
             # Notify user that no agent took over
             if session.user_ws:
@@ -449,8 +455,12 @@ class AgentHub:
         """Called directly when NO agents are online at the time the AI can't answer."""
         import asyncio as _aio
         session = self._sessions.get(session_id)
+        if session:
+            session.email_sent = True
+            self._save_sessions()
         history_snapshot = list(session.history) if session else []
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
+        await self._broadcast_sessions_update()
 
     async def _assign_agent(self, session: "ChatSession", agent: "HumanAgent"):
         # ── Release the agent's existing session first (if any) ────────────────
@@ -471,6 +481,7 @@ class AgentHub:
 
         session.status = "human"
         session.agent_id = agent.agent_id
+        session.email_sent = False  # agent arrived — clear the red email-alert indicator
         if session.tone == "angry":
             session.tone_from_red = True
         agent.active_session = session.session_id

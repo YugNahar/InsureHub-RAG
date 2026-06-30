@@ -207,6 +207,15 @@ _SIMPLE_SIGNALS = {
     'simple answer', 'quick answer', 'simple terms', 'layman', 'easy way',
     'just briefly', 'keep it short', 'keep it simple', 'just tell me',
     'just give me', 'just explain', 'just say',
+    'simple language', 'simple words', 'easy language', 'easy words',
+    'meaning of', 'meaning of this', 'what do you mean',
+}
+
+_EXAMPLE_SIGNALS = {
+    'with example', 'with an example', 'give me an example', 'give an example',
+    'show me an example', 'show an example', 'can you give example',
+    'explain with example', 'example please', 'real life example',
+    'real example', 'for example', 'use example',
 }
 
 
@@ -299,6 +308,35 @@ _FOLLOWUP_KEYWORDS = frozenset({
     "explain", "details", "detail", "reason", "reasons", "example", "examples",
     "though", "still", "again", "anyway",
 })
+
+
+async def _generate_suggestions(question: str, answer: str) -> list:
+    """Generate 2-3 short follow-up question chips from the Q&A pair."""
+    try:
+        import aiohttp as _ah
+        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
+        if _active_backend() != "vllm" or not VLLM_HOST:
+            return []
+        prompt = (
+            f"Question: {question}\nAnswer: {answer[:250]}\n\n"
+            "Write exactly 3 short follow-up questions (max 8 words each) a user might ask next about this insurance topic.\n"
+            "Output only the 3 questions, one per line, no numbering, no bullets:"
+        )
+        async with _ah.ClientSession() as _s:
+            async with _s.post(
+                f"{VLLM_HOST}/v1/chat/completions",
+                json={"model": _resolve_vllm_model(), "messages": [{"role": "user", "content": prompt}], "max_tokens": 80, "stream": False},
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+                timeout=_ah.ClientTimeout(total=5),
+            ) as _r:
+                if _r.status == 200:
+                    _data = await _r.json()
+                    _text = _data["choices"][0]["message"]["content"].strip()
+                    _qs = [q.strip().lstrip("0123456789.-) ").strip() for q in _text.split("\n") if q.strip()]
+                    return [q for q in _qs if 2 <= len(q.split()) <= 10][:3]
+    except Exception:
+        pass
+    return []
 
 
 def _is_likely_followup(question: str) -> bool:
@@ -1321,6 +1359,14 @@ class MultiSourceRAG:
             # _detected_as_followup is used (not _is_followup) so the fix applies
             # even when we fell back to history-based topic extraction.
             prompt_question = retrieval_query if _detected_as_followup else question
+            # If user asked for an example, append explicit instruction so the LLM
+            # generates a concrete illustrative scenario even if not in the KB.
+            _q_lower = question.lower()
+            if any(sig in _q_lower for sig in _EXAMPLE_SIGNALS):
+                prompt_question = (
+                    prompt_question.rstrip(" .?") +
+                    " — please include a concrete real-life example to illustrate this concept clearly."
+                )
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
                 llm = get_insurance_llm(temperature=0)
@@ -1353,10 +1399,7 @@ class MultiSourceRAG:
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "1500" if detailed else "300")),
-                # Stop at double newline for brief answers — prevents the model from
-                # starting a second paragraph / list that would overflow the token budget.
-                "stop": [] if detailed else ["\n\n"],
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "600") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "160")),
                 "stream": True,
             }
             headers = {
@@ -1424,6 +1467,29 @@ class MultiSourceRAG:
                 _corrected_text = _reply_stripped[:_last_sent + 1].strip()
                 _kv_reply = _corrected_text  # cache the clean version
 
+        # ── Hard sentence cap (brief / conversational mode) ──────────────────
+        # Conversational prompts instruct the model to write 3 sentences max.
+        # This enforcer guarantees it regardless of model compliance.
+        # Wrapped in try/except so any edge-case failure keeps the original reply.
+        if not _keyword_detailed:
+            try:
+                import re as _re
+                _cap_src = (_corrected_text or _reply_stripped).strip()
+                if _cap_src:
+                    # Simple split: find positions of sentence-ending punctuation
+                    # followed by whitespace, then take first 3 chunks.
+                    _sent_parts = _re.split(r'(?<=[.!?])\s+', _cap_src)
+                    _MAX_SENTENCES = 3
+                    if len(_sent_parts) > _MAX_SENTENCES:
+                        _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
+                        # Ensure it ends cleanly
+                        if _capped and _capped[-1] not in '.!?':
+                            _capped += '.'
+                        _corrected_text = _capped
+                        _kv_reply = _capped
+            except Exception as _cap_exc:
+                logger.debug("[ask_stream] sentence cap skipped: %s", _cap_exc)
+
         # ── KV cache write ────────────────────────────────────────────────────
         # Only cache real answers, not handoff/fallback messages.
         _handoff_phrases = ("let me get one of our agents", "let me get a human agent")
@@ -1442,6 +1508,12 @@ class MultiSourceRAG:
         _final_payload: dict = {"sources": unique_sources, "done": True}
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
+        _reply_for_chips = (_corrected_text or _kv_reply or "").strip()
+        _needs_h = _final_payload.get("needs_human", False)
+        if _reply_for_chips and not _needs_h and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
+            _sugg = await _generate_suggestions(question, _reply_for_chips)
+            if _sugg:
+                _final_payload["suggested_questions"] = _sugg
         yield "\n\n" + _json.dumps(_final_payload)
 
     # Management methods (keep as before)

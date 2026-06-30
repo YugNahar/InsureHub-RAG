@@ -29,7 +29,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _CACHE_VERSION = 2          # bumped because entry schema changed (added query_embedding)
-_SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.78"))
+_SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
 
 
 class QueryKVCache:

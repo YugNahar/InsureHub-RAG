@@ -32,8 +32,9 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .header-title { font-size: 0.9rem; font-weight: 600; }
 .header-sub { font-size: 0.68rem; color: #6b7280; margin-top: 1px; }
 .online-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.75rem; padding: 4px 10px; border-radius: 20px; background: #1f2937; border: 1px solid #374151; }
-.green-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; animation: pulse 2s infinite; }
-.yellow-dot { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; animation: pulse 1s infinite; }
+.green-dot        { width: 7px; height: 7px; border-radius: 50%; background: #34d399; animation: pulse 2s infinite; }
+.green-dot-static { width: 7px; height: 7px; border-radius: 50%; background: #34d399; }
+.yellow-dot       { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
 .disconnect-btn { background: none; border: 1px solid #374151; border-radius: 6px; color: #6b7280; font-size: 0.75rem; padding: 5px 12px; cursor: pointer; transition: all 0.15s; }
 .disconnect-btn:hover { color: #e2e8f0; border-color: #6b7280; }
@@ -195,9 +196,13 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .status-dot {
   width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
 }
-.status-dot.ai      { background: #3b82f6; }
-.status-dot.human   { background: #10b981; }
+.status-dot.white   { background: #e2e8f0; }
+.status-dot.green   { background: #22c55e; }
+.status-dot.red     { background: #ef4444; }
 .status-dot.waiting { background: #f59e0b; }
+.status-dot.neutral   { background: #22c55e; }
+.status-dot.email-red { background: #ef4444; }
+.conv-item.email-sent:not(.status-human)::before { background: #ef4444; }
 
 .unread-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -375,11 +380,12 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
   width: 7px; height: 7px; border-radius: 50%;
   flex-shrink: 0;
 }
-.tone-dot.neutral { background: #374151; }
-.tone-dot.happy { background: #22c55e; animation: led-green 1.2s infinite; }
-.tone-dot.angry { background: #ef4444; animation: led-red   0.5s infinite; box-shadow: 0 0 6px #ef4444; }
-.tone-dot.agent { background: #e2e8f0; animation: led-black 0.85s infinite; }
-.tone-dot.alert { background: #ef4444; animation: led-red   0.5s infinite; box-shadow: 0 0 6px #ef4444; }
+.tone-dot.neutral { background: #22c55e; }
+.tone-dot.happy   { background: #22c55e; }
+.tone-dot.angry   { background: #ef4444; }
+.tone-dot.agent       { background: #e2e8f0; animation: led-white 1.2s infinite; }
+.tone-dot.email-alert { background: #ef4444; animation: led-red 0.8s ease-in-out infinite; }
+@keyframes led-white { 0%,100%{opacity:1;box-shadow:0 0 8px rgba(226,232,240,0.8)} 50%{opacity:0.15;box-shadow:none} }
 
 /* Session item highlight for urgent attention */
 .conv-item.needs-attention { background: rgba(239,68,68,0.06) !important; }
@@ -556,6 +562,7 @@ let reconnectAttempt = 0;
 let intentionalDisconnect = false;
 let allSessions = [];           // full list from last sessions_update
 let unreadSessions = new Set(); // session ids with new msgs while not selected
+let isConnected = false;
 
 // ── Handoff popup state ───────────────────────────────────────────────────────
 let pendingHandoffSession = null;  // session_id of current popup
@@ -698,6 +705,7 @@ function handle(msg) {
       allSessions = msg.sessions || [];
       renderHistory(allSessions, document.getElementById("search-input").value);
       updateTonePanel();
+      updateConnDot();
       break;
 
     case "history":
@@ -728,6 +736,7 @@ function handle(msg) {
         updateConvHeader();
       }
       setInputEnabled(true);
+      updateConnDot();
       break;
 
     case "handoff_request":
@@ -754,9 +763,24 @@ function handle(msg) {
   }
 }
 
+function updateConnDot() {
+  const dot = document.getElementById("conn-dot");
+  if (!dot) return;
+  if (!isConnected) { dot.className = "yellow-dot"; return; }
+  const hasWaiting = allSessions.some(s => s.status === "waiting");
+  if (hasWaiting) {
+    dot.className = "yellow-dot";       // blinking amber = handoff pending
+  } else if (myActiveSession) {
+    dot.className = "green-dot";        // blinking green = in active session
+  } else {
+    dot.className = "green-dot-static"; // solid green = online, idle
+  }
+}
+
 function setConnStatus(online) {
-  document.getElementById("conn-dot").className = online ? "green-dot" : "yellow-dot";
+  isConnected = online;
   document.getElementById("status-label").textContent = online ? `${myName} · Online` : "Reconnecting…";
+  updateConnDot();
 }
 
 // ── Dashboard visibility ─────────────────────────────────────────────────────
@@ -874,13 +898,14 @@ function renderHistory(sessions, query = "") {
       const timeStr    = formatTime(s.created_at);
       const title      = s.title || `Session #${s.session_id}`;
       const needsAttention = s.tone === "angry" && s.status !== "human";
+      const emailPending   = s.email_sent && s.status !== "human";
       html += `
-        <div class="conv-item status-${s.status}${isSelected ? " selected" : ""}${needsAttention ? " needs-attention" : ""}" onclick="selectSession('${s.session_id}')">
+        <div class="conv-item status-${s.status}${isSelected ? " selected" : ""}${needsAttention ? " needs-attention" : ""}${emailPending ? " email-sent" : ""}" onclick="selectSession('${s.session_id}')">
           <div class="conv-icon ${s.status}">${icon}</div>
           <div class="conv-info">
             <div class="conv-title-text">${esc(title)}</div>
             <div class="conv-meta">
-              <span class="status-dot ${s.status}"></span>
+              <span class="status-dot ${getSidebarDotColor(s)}"></span>
               <span class="conv-time">${timeStr}</span>
               ${s.message_count ? `<span class="conv-msg-count">· ${s.message_count} msgs</span>` : ""}
             </div>
@@ -901,17 +926,23 @@ function filterHistory(query) {
 
 // ── Tone indicator helpers ────────────────────────────────────────────────────
 
+function getSidebarDotColor(s) {
+  if (s.status === "human") return "white";
+  if (s.email_sent) return "email-red";
+  if (s.tone === "angry") return "red";
+  if (s.tone === "happy") return "green";
+  return "neutral";
+}
+
 function getToneDotHtml(s) {
-  let cls = "neutral", label = "AI handling";
   if (s.status === "human") {
-    cls = s.tone_from_red ? "alert" : "agent";
-    label = s.tone_from_red ? "Agent took over: user was angry" : "Agent chatting";
-  } else if (s.tone === "angry") {
-    cls = "angry"; label = "User angry — needs assistance!";
-  } else if (s.tone === "happy") {
-    cls = "happy"; label = "User satisfied";
+    const label = s.tone_from_red ? "Agent took over: user was angry" : "Agent chatting";
+    return `<div class="tone-dot agent" title="${label}"></div>`;
   }
-  return `<div class="tone-dot ${cls}" title="${label}"></div>`;
+  if (s.email_sent) return `<div class="tone-dot email-alert" title="Escalation email sent — awaiting agent"></div>`;
+  if (s.tone === "angry") return `<div class="tone-dot angry" title="User upset — needs attention!"></div>`;
+  if (s.tone === "happy") return `<div class="tone-dot happy" title="User satisfied"></div>`;
+  return `<div class="tone-dot neutral" title="AI handling"></div>`;
 }
 
 function updateTonePanel() {
@@ -961,7 +992,7 @@ async function deleteSession(sid, event) {
     unreadSessions.delete(sid);
     if (activeSessionId === sid) {
       activeSessionId = null;
-      if (myActiveSession === sid) { myActiveSession = null; setInputEnabled(false); }
+      if (myActiveSession === sid) { myActiveSession = null; setInputEnabled(false); updateConnDot(); }
       resetConvPanel();
     }
     renderHistory(allSessions, document.getElementById('search-input').value);
@@ -1021,6 +1052,7 @@ function doRelease() {
   setInputEnabled(false);
   updateButtons();
   updateTonePanel();
+  updateConnDot();
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
