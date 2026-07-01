@@ -437,33 +437,60 @@ class AgentHub:
             return  # already accepted — task was cancelled
         self._pending_handoffs.pop(session_id, None)
         session = self._sessions.get(session_id)
-        _timeout_msg = {
-            "type": "handoff_timeout",
-            "message": "No agent is available right now. We've emailed our support team and someone will reach out to you soon.",
-        }
-        if session and session.status == "waiting":
-            session.status = "ai"
-            session.handoff_exhausted = True
-            session.email_sent = True
-            # Tag the triggering user message so the super-admin "Agent Only" view can flag it
-            for m in reversed(session.history):
-                if m.role == "user":
-                    m.meta["escalation_sent"] = True
-                    break
+        if not session or session.status != "waiting":
+            return
+
+        session.status = "ai"
+        session.handoff_exhausted = True
+
+        # Only send email when ALL online agents have explicitly declined.
+        # If some agents are still online but simply didn't respond, go back to AI
+        # without emailing — email is reserved for the "truly no one available" case.
+        still_available = [
+            a for a in self._agents.values()
+            if session_id not in a.declined_sessions
+        ]
+        if still_available:
+            # Agents are online but didn't respond — silent timeout, AI resumes
+            _busy_msg = {
+                "type": "handoff_timeout",
+                "message": "Our agents are busy right now. Layla will continue helping you!",
+            }
             delivered = False
             if session.user_ws:
                 try:
-                    await session.user_ws.send_json(_timeout_msg)
+                    await session.user_ws.send_json(_busy_msg)
                     delivered = True
                 except Exception:
                     pass
             if not delivered:
-                # WS disconnected — buffer so it's sent on next reconnect
-                session.pending_ws_message = _timeout_msg
+                session.pending_ws_message = _busy_msg
             self._save_sessions()
-        # Send escalation email in a thread so we don't block the event loop
+            await self._broadcast_sessions_update()
+            return
+
+        # All online agents declined (or no agents online) — send escalation email
+        session.email_sent = True
+        for m in reversed(session.history):
+            if m.role == "user":
+                m.meta["escalation_sent"] = True
+                break
+        _timeout_msg = {
+            "type": "handoff_timeout",
+            "message": "No agent is available right now. We've emailed our support team and someone will reach out to you soon.",
+        }
+        delivered = False
+        if session.user_ws:
+            try:
+                await session.user_ws.send_json(_timeout_msg)
+                delivered = True
+            except Exception:
+                pass
+        if not delivered:
+            session.pending_ws_message = _timeout_msg
+        self._save_sessions()
         import asyncio as _aio
-        history_snapshot = list(session.history) if session else []
+        history_snapshot = list(session.history)
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
         await self._broadcast_sessions_update()
 
@@ -836,9 +863,18 @@ class AgentHub:
 
     async def _broadcast_sessions_update(self):
         sessions = self.list_sessions()
+        online_agents = [
+            {
+                "agent_id": a.agent_id,
+                "name": a.name,
+                "status": "chatting" if a.active_session else "online",
+            }
+            for a in self._agents.values()
+        ]
+        payload = {"type": "sessions_update", "sessions": sessions, "online_agents": online_agents}
         for agent in list(self._agents.values()):
             try:
-                await agent.ws.send_json({"type": "sessions_update", "sessions": sessions})
+                await agent.ws.send_json(payload)
             except Exception:
                 pass
 
