@@ -81,6 +81,8 @@
   .btn-unblock:hover{background:var(--green);color:#fff}
   .btn-assign{background:var(--accent);color:#fff}
   .btn-assign:hover{background:var(--accent2)}
+  .btn-delete{background:#ef444422;color:var(--red);border:1px solid var(--red)}
+  .btn-delete:hover{background:var(--red);color:#fff}
 
   .tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:20px}
   .tab{background:transparent;border:none;color:var(--muted);padding:10px 18px;font-size:.85rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s}
@@ -370,7 +372,10 @@ async function showSessionDetail(sid, meta) {
   const detailEl = document.getElementById('session-detail');
   detailEl.innerHTML = `
     <div class="session-conv-header">
-      <div class="session-conv-title">${h(meta?.title || sid)}</div>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:6px">
+        <div class="session-conv-title" style="margin-bottom:0">${h(meta?.title || sid)}</div>
+        <button class="btn btn-delete" id="sv-delete" style="white-space:nowrap;flex-shrink:0">Delete Chat</button>
+      </div>
       <div class="session-conv-meta">
         <span class="status-pill pill-${meta?.status}">${meta?.status || '—'}</span>
         <span>${meta?.message_count || 0} total messages</span>
@@ -396,6 +401,13 @@ async function showSessionDetail(sid, meta) {
     detailEl.querySelector('#sv-agent').classList.add('active');
     renderSessionMsgs(sid, 'agent');
   };
+  detailEl.querySelector('#sv-delete').onclick = () => doDeleteSession(sid, () => {
+    document.getElementById('session-detail').style.display = 'none';
+    document.getElementById('welcome-view').style.display = '';
+    document.getElementById('main-title').textContent = 'Overview';
+    selectedSessionId = null;
+    renderSidebarSessions();
+  });
 
   await renderSessionMsgs(sid, viewMode);
 }
@@ -539,7 +551,10 @@ async function renderDetailBody(agent) {
               <div class="chat-sid">Session #${h(c.session_id)} &nbsp;·&nbsp; ${c.reply_count||0} agent replies</div>
               <div class="chat-info">${h(c.started_at||'')} ${c.ended_at ? '→ '+h(c.ended_at) : '→ <span style="color:var(--green)">Ongoing</span>'}</div>
             </div>
-            <span class="chat-arrow" data-arr="${i}">▼</span>
+            <div style="display:flex;align-items:center;gap:8px">
+              <button class="btn btn-delete chat-del" data-del-idx="${i}" style="padding:5px 12px;font-size:.75rem">Delete</button>
+              <span class="chat-arrow" data-arr="${i}">▼</span>
+            </div>
           </div>
           <div class="transcript" id="ct-${i}">
             <div class="view-toggle" style="margin-top:8px">
@@ -551,6 +566,17 @@ async function renderDetailBody(agent) {
         </div>`).join('');
 
       body.onclick = async e => {
+        // Delete button clicked?
+        const delBtn = e.target.closest('.chat-del');
+        if (delBtn) {
+          e.stopPropagation();
+          const idx = delBtn.dataset.delIdx;
+          const card = body.querySelector(`[data-idx="${idx}"]`);
+          const sid = card?.dataset.sid;
+          if (!sid) return;
+          doDeleteSession(sid, () => card.remove());
+          return;
+        }
         // View toggle button clicked?
         const vtBtn = e.target.closest('[data-view][data-for]');
         if (vtBtn) {
@@ -733,6 +759,21 @@ async function loadChatMsgs(idx, sid, viewMode) {
 }
 
 // ── Actions ────────────────────────────────────────────────────────────────
+async function doDeleteSession(sid, onSuccess) {
+  if (!confirm(`Delete chat for session #${sid}?\n\nThis permanently removes the conversation history and cannot be undone.`)) return;
+  try {
+    const r = await fetch(`/super-admin/session/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+      headers: {'X-Super-Admin-Token': token},
+    });
+    const d = await r.json();
+    if (d.ok) { toast('Chat deleted'); onSuccess(); }
+    else toast('Session not found or already deleted.', true);
+  } catch(ex) {
+    toast('Delete failed — ' + ex.message, true);
+  }
+}
+
 async function toggleBlock(name, block) {
   const url = `/super-admin/agent/${encodeURIComponent(name)}/${block ? 'block' : 'unblock'}`;
   await fetch(url, { method: 'POST', headers: {'X-Super-Admin-Token': token} });

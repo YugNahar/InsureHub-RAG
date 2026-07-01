@@ -424,6 +424,12 @@ async def super_admin_assign(request: Request, token: str = Depends(_check_super
     return {"ok": ok}
 
 
+@app.delete("/super-admin/session/{session_id}")
+async def super_admin_delete_session(session_id: str, token: str = Depends(_check_super_admin)):
+    ok = await _agent_hub.delete_session(session_id)
+    return {"ok": ok}
+
+
 @app.websocket("/ws/super-admin")
 async def ws_super_admin(websocket: WebSocket):
     await websocket.accept()
