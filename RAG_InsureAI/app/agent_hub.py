@@ -670,6 +670,18 @@ class AgentHub:
         session = self._sessions.get(session_id)
         if not agent or not session or agent.blocked:
             return
+        # Exclusive lock: block takeover if another agent already owns this session
+        if session.status == "human" and session.agent_id and session.agent_id != agent_id:
+            try:
+                other = self._agents.get(session.agent_id)
+                other_name = other.name if other else "another agent"
+                await agent.ws.send_json({
+                    "type": "error",
+                    "message": f"Session #{session_id} is locked by {other_name}. You can only take over after they hand back to AI.",
+                })
+            except Exception:
+                pass
+            return
         if agent.active_session and agent.active_session != session_id:
             old = self._sessions.get(agent.active_session)
             if old:
@@ -722,6 +734,16 @@ class AgentHub:
         agent = self._agents.get(agent_id)
         session = self._sessions.get(session_id)
         if not agent or not session:
+            return
+        # Only the assigned agent may send messages to a locked session
+        if session.agent_id and session.agent_id != agent_id:
+            try:
+                await agent.ws.send_json({
+                    "type": "error",
+                    "message": "You are not the assigned agent for this session.",
+                })
+            except Exception:
+                pass
             return
         msg = ChatMessage(role="agent", content=content)
         session.history.append(msg)
