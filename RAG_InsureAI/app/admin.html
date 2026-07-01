@@ -442,13 +442,7 @@
 // panel survives tunnel restarts automatically.
 // On Vercel (static host): use the tunnel URL baked in at build time.
 (function () {
-  const built = 'https://union-gbp-regulated-booth.trycloudflare.com'.replace(/\/$/, '');
-  const h = window.location.hostname;
-  if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
-    window.__BACKEND_URL = window.location.origin.replace(/\/$/, '');
-  } else {
-    window.__BACKEND_URL = (built && !built.startsWith('__')) ? built : '';
-  }
+  window.__BACKEND_URL = window.location.origin.replace(/\/$/, '');
 })();
 const API = window.__BACKEND_URL;
 
