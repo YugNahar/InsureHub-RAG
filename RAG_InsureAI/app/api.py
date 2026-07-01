@@ -748,7 +748,8 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     # ── Step 2: Tag document — use regex only (llm=None) so ingest never
     # blocks on slow LLM calls. Regex tagging is fast and reliable enough
     # for metadata; LLM refinement can take 60-120s and causes job timeouts.
-    doc_tags = tag_document(filename, preview, extra_text=extra_text, doc_type=doc_type, llm=None)
+    llm = None
+    doc_tags = tag_document(filename, preview, extra_text=extra_text, doc_type=doc_type, llm=llm)
 
     # ── Step 3: Annotate raw docs so the chunker inherits doc_type ────────────
     for raw_doc in raw_docs:
