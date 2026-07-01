@@ -310,35 +310,85 @@ _FOLLOWUP_KEYWORDS = frozenset({
 })
 
 
+_CHIP_STOPWORDS = frozenset({
+    "what", "is", "are", "the", "a", "an", "how", "why", "when", "where",
+    "which", "does", "do", "can", "will", "would", "should", "be", "to",
+    "of", "in", "for", "and", "or", "on", "at", "by", "with", "that",
+    "this", "it", "its", "has", "have", "had", "was", "were", "i", "me",
+    "my", "your", "their", "there", "from", "about", "if", "tell", "explain",
+    "give", "get", "any", "more",
+})
+
+
+def _question_answerable_in_context(question: str, context: str) -> bool:
+    """
+    Return True when at least half the content words in *question* appear
+    somewhere in *context*.  Cheap, no LLM call.  Content words = words
+    longer than 3 chars that are not stopwords.
+    """
+    words = [w.lower().strip("?.,!;:'\"()") for w in question.split()]
+    content_words = [w for w in words if len(w) >= 4 and w not in _CHIP_STOPWORDS]
+    if not content_words:
+        return False            # can't verify — drop it to be safe
+    ctx_lower = context.lower()
+    hits = sum(1 for w in content_words if w in ctx_lower)
+    return hits >= max(1, len(content_words) * 0.5)
+
+
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
-    """Generate 2-3 follow-up question chips grounded in the retrieved KB context."""
+    """
+    Generate follow-up chip questions grounded in the retrieved KB context.
+
+    Steps:
+      1. Ask the LLM to produce 5 candidate questions from the KB snippet.
+      2. Verify each candidate by checking content-word overlap with the full
+         retrieved context — questions whose key terms don't appear in the
+         context are dropped before they reach the user.
+      3. Return up to 3 verified questions.
+    """
     try:
         import aiohttp as _ah
         from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
         if _active_backend() != "vllm" or not VLLM_HOST:
             return []
-        ctx_snippet = context[:500].strip() if context else ""
+        if not context or not context.strip():
+            return []
+        # Use a larger snippet so the model has enough material to draw from
+        ctx_snippet = context[:1000].strip()
         prompt = (
             f"Knowledge base content:\n{ctx_snippet}\n\n"
-            f"User asked: {question}\n"
-            f"Answer given: {answer[:200]}\n\n"
-            "Write exactly 3 short follow-up questions (max 8 words each) that a user could ask next "
-            "and that can be answered from the knowledge base content above.\n"
-            "Only ask about topics present in the knowledge base content. Do not invent topics.\n"
-            "Output only the 3 questions, one per line, no numbering, no bullets:"
+            f"User asked: {question}\n\n"
+            "Write 5 short follow-up questions (max 8 words each) that:\n"
+            "1. Ask about specific facts, terms, or details mentioned in the knowledge base content above.\n"
+            "2. A user would naturally ask AFTER reading the answer above.\n"
+            "3. Can be answered ONLY from the knowledge base content above — do not invent topics.\n"
+            "Output only the questions, one per line, no numbering, no bullets, no explanations:"
         )
         async with _ah.ClientSession() as _s:
             async with _s.post(
                 f"{VLLM_HOST}/v1/chat/completions",
-                json={"model": _resolve_vllm_model(), "messages": [{"role": "user", "content": prompt}], "max_tokens": 80, "stream": False},
+                json={
+                    "model": _resolve_vllm_model(),
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 120,
+                    "stream": False,
+                },
                 headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
-                timeout=_ah.ClientTimeout(total=5),
+                timeout=_ah.ClientTimeout(total=6),
             ) as _r:
-                if _r.status == 200:
-                    _data = await _r.json()
-                    _text = _data["choices"][0]["message"]["content"].strip()
-                    _qs = [q.strip().lstrip("0123456789.-) ").strip() for q in _text.split("\n") if q.strip()]
-                    return [q for q in _qs if 2 <= len(q.split()) <= 10][:3]
+                if _r.status != 200:
+                    return []
+                _data = await _r.json()
+                _text = _data["choices"][0]["message"]["content"].strip()
+        # Parse and clean candidates
+        _candidates = [
+            q.strip().lstrip("0123456789.-) ").strip()
+            for q in _text.split("\n") if q.strip()
+        ]
+        _candidates = [q for q in _candidates if 2 <= len(q.split()) <= 10]
+        # Verify each candidate has actual coverage in the full retrieved context
+        _verified = [q for q in _candidates if _question_answerable_in_context(q, context)]
+        return _verified[:3]
     except Exception:
         pass
     return []
