@@ -394,6 +394,50 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 .conv-item.needs-attention::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:#ef4444; border-radius:0; }
 .conv-item.needs-attention.selected { background: rgba(239,68,68,0.1) !important; }
 
+/* ── Online Agents panel ── */
+.online-agents-section {
+  border-bottom: 1px solid #1f2937;
+  flex-shrink: 0;
+}
+.online-agents-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px 6px;
+  font-size: 0.65rem; font-weight: 700; color: #4b5563;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  cursor: pointer; user-select: none;
+}
+.online-agents-header:hover { color: #6b7280; }
+.online-agents-toggle { font-size: 0.6rem; color: #374151; }
+.online-count-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #374151; color: #9ca3af;
+  font-size: 0.6rem; font-weight: 700;
+}
+.online-count-badge.has-agents { background: rgba(34,197,94,0.2); color: #22c55e; }
+#online-agents-list { padding: 0 8px 8px; }
+.online-agent-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 6px; border-radius: 7px;
+  transition: background 0.1s;
+}
+.online-agent-row:hover { background: #1f2937; }
+.online-agent-avatar {
+  width: 24px; height: 24px; border-radius: 50%;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.65rem; font-weight: 700; color: white; flex-shrink: 0;
+}
+.online-agent-info { flex: 1; min-width: 0; }
+.online-agent-name { font-size: 0.78rem; color: #d1d5db; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.online-agent-status { font-size: 0.62rem; color: #4b5563; }
+.online-agent-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+}
+.online-agent-dot.online  { background: #22c55e; }
+.online-agent-dot.chatting { background: #e2e8f0; animation: led-white 1.2s infinite; }
+.online-agents-empty { padding: 6px 6px 2px; font-size: 0.72rem; color: #374151; text-align: center; }
+
 /* Lock badge — shown when another agent owns the session */
 .lock-badge {
   font-size: 0.6rem; padding: 1px 5px; border-radius: 4px;
@@ -510,6 +554,17 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
         </div>
       </div>
 
+      <!-- Online Agents Panel -->
+      <div class="online-agents-section" id="online-agents-section">
+        <div class="online-agents-header" onclick="toggleOnlineAgents()">
+          <span>Online Agents <span class="online-count-badge" id="online-count-badge">0</span></span>
+          <span class="online-agents-toggle" id="online-agents-toggle">▲</span>
+        </div>
+        <div id="online-agents-list">
+          <div class="online-agents-empty">No other agents online</div>
+        </div>
+      </div>
+
       <div class="history-scroll" id="history-scroll">
         <div class="no-history">
           <div style="font-size:1.8rem;margin-bottom:8px">💬</div>
@@ -577,8 +632,10 @@ let reconnectTimer = null;
 let reconnectAttempt = 0;
 let intentionalDisconnect = false;
 let allSessions = [];           // full list from last sessions_update
+let onlineAgents = [];          // list of currently connected agents from last sessions_update
 let unreadSessions = new Set(); // session ids with new msgs while not selected
 let isConnected = false;
+let onlineAgentsPanelOpen = true;
 
 // ── Handoff popup state ───────────────────────────────────────────────────────
 let pendingHandoffSession = null;  // session_id of current popup
@@ -725,7 +782,9 @@ function handle(msg) {
 
     case "sessions_update":
       allSessions = msg.sessions || [];
+      onlineAgents = msg.online_agents || [];
       renderHistory(allSessions, document.getElementById("search-input").value);
+      renderOnlineAgents();
       updateTonePanel();
       updateConnDot();
       break;
@@ -805,6 +864,38 @@ function setConnStatus(online) {
   updateConnDot();
 }
 
+// ── Online Agents panel ──────────────────────────────────────────────────────
+function renderOnlineAgents() {
+  const list    = document.getElementById("online-agents-list");
+  const badge   = document.getElementById("online-count-badge");
+  const others  = onlineAgents.filter(a => a.agent_id !== myAgentId);
+
+  badge.textContent = others.length;
+  badge.className   = "online-count-badge" + (others.length ? " has-agents" : "");
+
+  if (!others.length) {
+    list.innerHTML = '<div class="online-agents-empty">No other agents online</div>';
+    return;
+  }
+  list.innerHTML = others.map(a => `
+    <div class="online-agent-row">
+      <div class="online-agent-avatar">${esc(a.name[0]?.toUpperCase() || "A")}</div>
+      <div class="online-agent-info">
+        <div class="online-agent-name">${esc(a.name)}</div>
+        <div class="online-agent-status">${a.status === "chatting" ? "Chatting with user" : "Available"}</div>
+      </div>
+      <div class="online-agent-dot ${a.status}" title="${a.status === "chatting" ? "In active chat" : "Online & available"}"></div>
+    </div>`).join("");
+}
+
+function toggleOnlineAgents() {
+  onlineAgentsPanelOpen = !onlineAgentsPanelOpen;
+  const list   = document.getElementById("online-agents-list");
+  const toggle = document.getElementById("online-agents-toggle");
+  list.style.display   = onlineAgentsPanelOpen ? "" : "none";
+  toggle.textContent   = onlineAgentsPanelOpen ? "▲" : "▼";
+}
+
 // ── Dashboard visibility ─────────────────────────────────────────────────────
 function showDashboard(show) {
   document.getElementById("login-screen").style.display = show ? "none" : "flex";
@@ -822,8 +913,11 @@ document.getElementById("disconnect-btn").addEventListener("click", () => {
   document.getElementById("reconnect-banner").style.display = "none";
   showDashboard(false);
   myAgentId = null; myActiveSession = null; activeSessionId = null;
-  reconnectAttempt = 0; allSessions = []; unreadSessions.clear();
+  reconnectAttempt = 0; allSessions = []; onlineAgents = []; unreadSessions.clear();
   document.getElementById("agent-id-label").textContent = "";
+  document.getElementById("online-agents-list").innerHTML = '<div class="online-agents-empty">No other agents online</div>';
+  document.getElementById("online-count-badge").textContent = "0";
+  document.getElementById("online-count-badge").className = "online-count-badge";
   document.getElementById("inp-pass").value = "";
   document.getElementById("search-input").value = "";
   clearErr();
