@@ -438,7 +438,7 @@
 
 <script>
 // ── Backend URL ────────────────────────────────────────────────────────────────
-const API = '__API_URL__'.replace(/\/$/, '');
+  const API = window.location.origin.replace(/\/$/, '');
 
 // ── Auth guard ────────────────────────────────────────────────────────────────
 const token = localStorage.getItem('insure_token');

@@ -532,16 +532,10 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 </div>
 
 <script>
-// ── Backend URL — __API_URL__ is replaced by build.js at deploy time ──────────
-const _BUILT_IN_API = '__API_URL__';
+// ── Backend URL — always uses the current domain ──────────────────────────────
+const _BUILT_IN_API = '';
 function getBackendUrl() {
-  const stored = localStorage.getItem('insure_backend_url') || '';
-  // _BUILT_IN_API stays as the literal '__API_URL__' when not replaced at build time
-  const builtIn = _BUILT_IN_API.startsWith('http') ? _BUILT_IN_API : 'http://123.253.124.14:8501';
-  return (stored || builtIn).replace(/\/$/, '');
-}
-function setBackendUrl(url) {
-  localStorage.setItem('insure_backend_url', url.replace(/\/$/, ''));
+  return window.location.origin.replace(/\/$/, '');
 }
 
 

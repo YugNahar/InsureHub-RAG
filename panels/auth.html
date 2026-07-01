@@ -181,7 +181,7 @@
 
 <script>
   // __API_URL__ is replaced by the Vite build plugin with VITE_API_BASE_URL at deploy time.
-  const API = '__API_URL__'.replace(/\/$/, '');
+  const API = window.location.origin.replace(/\/$/, '');
 
   // If already logged in, verify and go straight to admin
   const _existingToken = localStorage.getItem('insure_token');
