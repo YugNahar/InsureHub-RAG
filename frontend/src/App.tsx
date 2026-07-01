@@ -541,14 +541,6 @@ function ChatWidget({
             </div>
             <div className="text-xs text-muted-foreground">{headerLabel}</div>
           </div>
-          <button
-            type="button"
-            onClick={() => onOpenChange(false)}
-            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-            aria-label="Close chat"
-          >
-            <X className="h-4 w-4" />
-          </button>
         </div>
 
         <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
