@@ -181,7 +181,7 @@
 
 <script>
   (function () {
-    const built = '__API_URL__'.replace(/\/$/, '');
+    const built = ''.replace(/\/$/, '');
     window.__BACKEND_URL = (built && !built.startsWith('__'))
       ? built
       : window.location.origin.replace(/\/$/, '');
