@@ -617,6 +617,7 @@ async function pollJob(job_id, fill) {
     await new Promise(r => setTimeout(r, 1500));
     try {
       const res = await fetch(`${API}/upload/${job_id}`, { headers: authHeaders() });
+      if (!res.ok) continue;  // transient network blip — keep polling
       const job = await res.json();
       if (job.status === 'done') {
         fill.style.width = '100%';
@@ -625,17 +626,20 @@ async function pollJob(job_id, fill) {
         return;
       }
       if (job.status === 'error') {
-        throw new Error(job.error || 'Ingestion failed.');
+        // Doc may have been ingested despite error status (e.g. restart mid-job).
+        loadDocs();
+        showToast((job.error || 'Upload encountered an issue') + ' — check document list below.', 'warning');
+        bar.classList.remove('active');
+        return;
       }
       fill.style.width = Math.min(40 + i * 2, 90) + '%';
     } catch (e) {
-      showToast(e.message, 'error');
-      bar.classList.remove('active');
-      return;
+      // Network error during polling — retry next iteration
     }
   }
-  showToast('Timed out waiting for job to complete.', 'error');
+  showToast('Upload taking longer than expected — check document list below.', 'warning');
   bar.classList.remove('active');
+  loadDocs();
 }
 
 // ── Video upload ──────────────────────────────────────────────────────────────

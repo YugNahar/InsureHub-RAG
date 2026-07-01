@@ -309,15 +309,15 @@ async def root():
 
 @app.get("/auth")
 async def auth_page():
-    return FileResponse(os.path.join(_APP_DIR, "auth.html"))
+    return FileResponse(os.path.join(_FRONTEND_DIST, "auth.html"))
 
 @app.get("/admin")
 async def admin_page():
-    return FileResponse(os.path.join(_APP_DIR, "admin.html"))
+    return FileResponse(os.path.join(_FRONTEND_DIST, "admin.html"))
 
 @app.get("/agent-dashboard")
 async def agent_dashboard_page():
-    return FileResponse(os.path.join(_APP_DIR, "agent_dashboard.html"))
+    return FileResponse(os.path.join(_FRONTEND_DIST, "agent-dashboard.html"))
 
 @app.get("/super-admin")
 async def super_admin_page():
