@@ -236,9 +236,14 @@ function connectWS() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'error') { sessionStorage.removeItem('sa_token'); location.reload(); return; }
       if (msg.type === 'connected' || msg.type === 'update') {
+        const firstLoad = !allData.agents.length;
         allData = { agents: msg.agents || [], live_sessions: msg.live_sessions || [] };
         renderAll();
         setConn(true);
+        // Auto-select the first agent on initial load so data is visible immediately
+        if (firstLoad && allData.agents.length && !selectedAgentName) {
+          selectAgent(0);
+        }
       }
     } catch(ex) { console.error(ex); }
   };

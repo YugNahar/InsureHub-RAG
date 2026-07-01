@@ -804,14 +804,16 @@ class AgentHub:
                 pass
 
     def get_super_admin_data(self) -> dict:
-        online_names = {a.name for a in self._agents.values()}
-        chatting_names = {a.name for a in self._agents.values() if a.active_session}
+        # Case-insensitive lookup — agent might log in as "Lavish" but record key is "lavish"
+        online_names = {a.name.lower() for a in self._agents.values()}
+        chatting_names = {a.name.lower() for a in self._agents.values() if a.active_session}
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         agents_out = []
         for name, rec in self._agent_records.items():
-            if name in chatting_names:
+            name_lc = name.lower()
+            if name_lc in chatting_names:
                 status = "chatting"
-            elif name in online_names:
+            elif name_lc in online_names:
                 status = "online"
             else:
                 status = "offline"
