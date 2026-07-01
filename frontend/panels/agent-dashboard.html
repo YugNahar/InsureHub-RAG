@@ -537,16 +537,10 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 <script>
 // ── Backend URL — __API_URL__ is replaced by build.js at deploy time ──────────
 function getBackendUrl() {
-  // On the backend's own domain (tunnel / localhost): use current origin so
-  // the dashboard survives tunnel restarts without a stale baked-in URL.
-  // On Vercel (static hosting): use the tunnel URL baked in at build time,
-  // because window.location.origin would be the Vercel domain, not the backend.
   const built = '__API_URL__'.replace(/\/$/, '');
-  const h = window.location.hostname;
-  if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
-    return window.location.origin.replace(/\/$/, '');
-  }
-  return (built && !built.startsWith('__')) ? built : 'http://localhost:8501';
+  return (built && !built.startsWith('__'))
+    ? built
+    : window.location.origin.replace(/\/$/, '');
 }
 function setBackendUrl(url) { /* no-op */ }
 
