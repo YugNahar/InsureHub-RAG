@@ -169,10 +169,28 @@ type Message = {
   agentName?: string;
 };
 
-// Both keys in localStorage so session + history survive tab switches and browser restarts.
-// This prevents a new sidebar entry appearing whenever the user opens a fresh tab.
-const STORAGE_KEY    = "insurehub_chat_history";
-const SESSION_ID_KEY = "insurehub_session_id";
+// Session + history stored in both cookie (1 year) and localStorage.
+// Cookie survives cleared localStorage so the same user always reconnects
+// to their existing session — no new chat appearing in the agent dashboard.
+const STORAGE_KEY       = "insurehub_chat_history";
+const SESSION_ID_KEY    = "insurehub_session_id";
+const SESSION_COOKIE    = "insurehub_sid";
+
+function _getCookie(name: string): string | null {
+  const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+function _setCookie(name: string, value: string, days: number) {
+  const exp = new Date(Date.now() + days * 864e5).toUTCString();
+  document.cookie = `${name}=${encodeURIComponent(value)};expires=${exp};path=/;SameSite=Lax`;
+}
+function _loadSessionId(): string | null {
+  return _getCookie(SESSION_COOKIE) || window.localStorage.getItem(SESSION_ID_KEY);
+}
+function _saveSessionId(id: string) {
+  window.localStorage.setItem(SESSION_ID_KEY, id);
+  _setCookie(SESSION_COOKIE, id, 365);
+}
 
 const GREETING: Message = {
   role: "assistant",
@@ -212,6 +230,7 @@ function ChatWidget({
   const wsRef = useRef<WebSocket | null>(null);
   const pollSeenRef = useRef<number>(0);       // last message index seen via polling
   const chatModeRef = useRef<ChatMode>("ai");  // ref so polling closure sees latest value
+  const wsHandlerRef = useRef<((ev: MessageEvent) => void) | null>(null); // always-current WS handler
 
   // chatModeRef is updated synchronously whenever setChatMode is called — see setModeSync below.
   // This ensures polling closures always read the current value without a render cycle.
@@ -222,10 +241,13 @@ function ChatWidget({
   }
 
   // Create or reuse hub session on mount, then open WebSocket.
-  // Session ID is persisted in sessionStorage so page refreshes don't create a new chat entry.
+  // Session ID is persisted in cookie (1 year) + localStorage so the same user
+  // always reconnects to their existing session — no new chat in agent dashboard.
   useEffect(() => {
-    const storedId = window.localStorage.getItem(SESSION_ID_KEY);
+    const storedId = _loadSessionId();
     if (storedId) {
+      // Re-save to refresh cookie expiry each visit
+      _saveSessionId(storedId);
       // Sync pollSeenRef to backend total BEFORE starting the polling interval,
       // so we don't replay old messages that are already in localStorage.
       apiFetch(`/session/${storedId}/poll?after=0`)
@@ -233,20 +255,34 @@ function ChatWidget({
         .catch(() => {})
         .finally(() => {
           setSessionId(storedId);
+          wsHandlerRef.current = handleWsMessage;
           const ws = new WebSocket(`${getWsUrl()}/ws/user/${storedId}`);
           wsRef.current = ws;
-          ws.onmessage = handleWsMessage;
-          ws.onclose = () => { wsRef.current = null; };
+          ws.onmessage = (ev) => wsHandlerRef.current?.(ev);
+          ws.onclose = () => {
+            wsRef.current = null;
+            // Reconnect once after 3s so the backend can deliver any pending_ws_message
+            setTimeout(() => {
+              const sid = _loadSessionId();
+              if (sid && !wsRef.current) {
+                const rws = new WebSocket(`${getWsUrl()}/ws/user/${sid}`);
+                wsRef.current = rws;
+                rws.onmessage = (ev2) => wsHandlerRef.current?.(ev2);
+                rws.onclose = () => { wsRef.current = null; };
+              }
+            }, 3000);
+          };
         });
     } else {
       apiFetch("/session/create", { method: "POST" })
         .then((d: { session_id: string }) => {
           if (!d?.session_id) return;
-          window.localStorage.setItem(SESSION_ID_KEY, d.session_id);
+          _saveSessionId(d.session_id);
           setSessionId(d.session_id);
+          wsHandlerRef.current = handleWsMessage;
           const ws = new WebSocket(`${getWsUrl()}/ws/user/${d.session_id}`);
           wsRef.current = ws;
-          ws.onmessage = handleWsMessage;
+          ws.onmessage = (ev) => wsHandlerRef.current?.(ev);
           ws.onclose = () => { wsRef.current = null; };
         })
         .catch(() => {});
@@ -275,8 +311,18 @@ function ChatWidget({
           setModeSync("waiting");
         }
         if (data.status === "ai" && chatModeRef.current !== "ai") {
+          const wasWaiting = chatModeRef.current === "waiting";
           setModeSync("ai");
           setAgentName(null);
+          if (wasWaiting) {
+            setMessages((m) => [
+              ...m,
+              {
+                role: "system",
+                content: "No agents are available right now. Your question has been emailed to our support team — someone will reach out to you soon.",
+              },
+            ]);
+          }
         }
 
         // Deliver agent messages not yet shown
@@ -366,6 +412,7 @@ function ChatWidget({
       // Agent cleared the conversation — wipe local state and start fresh
       window.localStorage.removeItem(SESSION_ID_KEY);
       window.localStorage.removeItem(STORAGE_KEY);
+      _setCookie(SESSION_COOKIE, "", 0); // expire the session cookie
       setModeSync("ai");
       setAgentName(null);
       pollSeenRef.current = 0;
@@ -375,11 +422,12 @@ function ChatWidget({
       apiFetch("/session/create", { method: "POST" })
         .then((d: { session_id: string }) => {
           if (!d?.session_id) return;
-          window.localStorage.setItem(SESSION_ID_KEY, d.session_id);
+          _saveSessionId(d.session_id);
           setSessionId(d.session_id);
+          wsHandlerRef.current = handleWsMessage;
           const ws = new WebSocket(`${getWsUrl()}/ws/user/${d.session_id}`);
           wsRef.current = ws;
-          ws.onmessage = handleWsMessage;
+          ws.onmessage = (ev) => wsHandlerRef.current?.(ev);
           ws.onclose = () => { wsRef.current = null; };
         })
         .catch(() => {});

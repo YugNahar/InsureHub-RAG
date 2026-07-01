@@ -4,6 +4,7 @@ Supports document filtering with substring matching.
 """
 import asyncio
 import logging
+import os
 import re
 from typing import List, Tuple, Optional
 
@@ -155,13 +156,17 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             ).lower()
             all_terms.update(re.findall(r'\b[a-z]{3,}\b', text))
 
-        # Also pass if the top chunk has a high rerank score — the cross-encoder
-        # has validated relevance and the keyword check should not override it.
+        # Only bypass keyword coverage check when the cross-encoder is *highly*
+        # confident the chunk is relevant (raw BGE logit >= 4.0 ≈ clearly relevant).
+        # The previous threshold of 0.5 was far too permissive — marginally relevant
+        # chunks (logit 0.5-2) passed this gate and the LLM then filled gaps from
+        # training knowledge.  At 4.0 only chunks that are genuinely on-topic bypass
+        # the keyword check.
         top_rerank = max(
             (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
             default=0,
         )
-        if top_rerank >= 0.5:
+        if top_rerank >= 4.0:
             return True
 
         # OR-logic: pass if AT LEAST ONE topic phrase is fully covered.
@@ -1420,9 +1425,33 @@ class MultiSourceRAG:
         )
         all_chunks = all_chunks[:_chunk_limit]
 
+        # ── Hard reranker gate ────────────────────────────────────────────────
+        # If the best reranker score across ALL retrieved chunks is below the
+        # gate threshold (default 0.0 = BGE raw logit, meaning "not relevant"),
+        # refuse immediately without calling the LLM at all.
+        # Small 7B models ignore grounding instructions and answer from training
+        # knowledge when the context is irrelevant, so gating here prevents that.
+        import json as _json_s
+        _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.0"))
+        _top_rerank = max(
+            (c.metadata.get("rerank_score", float("-inf"))
+             for c in all_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
+            default=float("-inf"),
+        )
+        if not document_filter and _top_rerank < _rerank_gate:
+            logger.info(
+                "[ask_stream] Reranker gate: top=%.3f < gate=%.3f — not in KB",
+                _top_rerank, _rerank_gate,
+            )
+            yield (
+                "Hmm, I don't have that specific information in my knowledge base right now. "
+                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+            )
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
+            return
+
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
-        import json as _json_s
         topics_for_coverage = None if _detected_as_followup else (llm_topics or None)
         ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage) and _quoted_comparison_covered(question, all_chunks)
         if not ctx_covered and not document_filter:
