@@ -7,7 +7,6 @@ import {
   FileText,
   Film,
   Globe,
-  MessageCircle,
   Send,
   X,
   Upload,
@@ -181,11 +180,10 @@ const GREETING: Message = {
 };
 
 function IndexPage() {
-  const isEmbedded = typeof window !== "undefined" && window.self !== window.top;
-  const [open, setOpen] = useState(isEmbedded);
+  const [open, setOpen] = useState(true);
   return (
     <div className="min-h-screen bg-background">
-      <ChatWidget open={open} onOpenChange={setOpen} hideLauncher={isEmbedded} />
+      <ChatWidget open={open} onOpenChange={setOpen} />
     </div>
   );
 }
@@ -522,24 +520,6 @@ function ChatWidget({
 
   return (
     <>
-      {!hideLauncher && (
-        <button
-          type="button"
-          onClick={() => onOpenChange(!open)}
-          aria-label={open ? "Close chat" : "Open chat with Layla"}
-          className={cn(
-            "fixed bottom-5 right-5 z-50 flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-2xl shadow-primary/30 ring-1 ring-primary/40 transition-all hover:scale-105 active:scale-95",
-            open && "scale-90 opacity-0 pointer-events-none",
-          )}
-        >
-          <MessageCircle className="h-6 w-6" />
-          <span className="absolute -top-1 -right-1 flex h-3 w-3">
-            <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400/70" />
-            <span className="relative h-3 w-3 rounded-full bg-emerald-400 ring-2 ring-background" />
-          </span>
-        </button>
-      )}
-
       <div
         className={cn(
           "fixed bottom-5 right-5 z-50 flex w-[calc(100vw-2.5rem)] max-w-sm origin-bottom-right flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/95 shadow-2xl shadow-black/40 backdrop-blur transition-all duration-200",
