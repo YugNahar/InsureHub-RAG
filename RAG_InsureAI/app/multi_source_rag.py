@@ -443,10 +443,13 @@ def _is_likely_followup(question: str) -> bool:
     if bool(tokens & _FOLLOWUP_SIGNALS) or any(q_lower.startswith(op) for op in _FOLLOWUP_OPENERS):
         return True
 
-    # Example request with no insurance vocabulary → clearly a follow-up
-    # e.g. "can you explain with the help of an example" (9 words, no insurance term)
-    # The 6-word limit below would miss this, so check it first.
-    if any(sig in q_lower for sig in _EXAMPLE_SIGNALS):
+    # Modifier-only request with no insurance vocabulary → clearly a follow-up.
+    # Covers "can you explain with the help of an example" (example, 9 words),
+    # "explain in simple language" (simple), "can you explain in more detail" (detail),
+    # "in simple language with example", "in detail with simple language", etc.
+    # The 6-word keyword check below misses these because of the word-count gate.
+    _all_modifier_signals = _DETAIL_SIGNALS | _SIMPLE_SIGNALS | _EXAMPLE_SIGNALS
+    if any(sig in q_lower for sig in _all_modifier_signals):
         from re import compile as _re_compile
         _II_QUICK = _re_compile(
             r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
@@ -1545,23 +1548,67 @@ class MultiSourceRAG:
             # _detected_as_followup is used (not _is_followup) so the fix applies
             # even when we fell back to history-based topic extraction.
             prompt_question = retrieval_query if _detected_as_followup else question
-            # If user asked for an example, append explicit instruction.
-            # Follow-up: they already know the concept — give ONLY the example.
-            # Fresh question: explain and include an example.
-            _q_lower = question.lower()
-            if any(sig in _q_lower for sig in _EXAMPLE_SIGNALS):
-                if _detected_as_followup:
-                    prompt_question = (
-                        prompt_question.rstrip(" .?") +
-                        " — The user already understands this concept from the previous answer. "
+
+            # ── Modifier-signal instruction injection ─────────────────────────
+            # Detect what kind of modifier the user asked for (example / simple /
+            # detail) and inject a targeted instruction into prompt_question so
+            # the LLM knows exactly what format/style is expected.
+            _q_lower_mod = question.lower()
+            _has_example = any(sig in _q_lower_mod for sig in _EXAMPLE_SIGNALS)
+            _has_simple  = any(sig in _q_lower_mod for sig in _SIMPLE_SIGNALS)
+            _has_detail  = any(sig in _q_lower_mod for sig in _DETAIL_SIGNALS)
+
+            if _detected_as_followup and (_has_example or _has_simple or _has_detail):
+                # Build instruction based on the combination of signals.
+                if _has_detail and _has_simple and _has_example:
+                    _mod_instr = (
+                        "Give a detailed explanation in simple, everyday language with one "
+                        "concrete real-life example. No jargon — explain like you would to a friend. "
+                        "Use numbered points."
+                    )
+                    detailed = True  # SIMPLE normally overrides; force detailed prompt here
+                elif _has_detail and _has_simple:
+                    _mod_instr = (
+                        "Give a thorough, detailed explanation using simple, everyday language. "
+                        "No jargon or technical terms. Use numbered points."
+                    )
+                    detailed = True
+                elif _has_detail and _has_example:
+                    _mod_instr = (
+                        "Give a full, detailed breakdown with a concrete real-life example."
+                    )
+                elif _has_simple and _has_example:
+                    _mod_instr = (
+                        "Re-explain in very simple, everyday language — no jargon. "
+                        "Then give one concrete real-life example to illustrate it clearly."
+                    )
+                elif _has_example:
+                    _mod_instr = (
+                        "The user already understands this concept from the previous answer. "
                         "Do NOT re-explain or repeat the definition. "
                         "Give ONLY one concrete real-life example that illustrates it clearly."
                     )
-                else:
-                    prompt_question = (
-                        prompt_question.rstrip(" .?") +
-                        " — please include a concrete real-life example to illustrate this concept clearly."
+                elif _has_simple:
+                    _mod_instr = (
+                        "Re-explain this in very simple, everyday language. "
+                        "No jargon or technical terms — plain words only."
                     )
+                elif _has_detail:
+                    _mod_instr = (
+                        "Give a full, detailed breakdown. "
+                        "The user wants more depth — use numbered points."
+                    )
+                else:
+                    _mod_instr = ""
+                if _mod_instr:
+                    prompt_question = f"{prompt_question.rstrip(' .?')} — {_mod_instr}"
+            elif not _detected_as_followup and _has_example:
+                # Fresh question asking for an explanation with an example
+                prompt_question = (
+                    f"{prompt_question.rstrip(' .?')} — "
+                    "please include a concrete real-life example to illustrate this concept clearly."
+                )
+
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
                 llm = get_insurance_llm(temperature=0)

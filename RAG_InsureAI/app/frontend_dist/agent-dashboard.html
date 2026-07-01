@@ -103,6 +103,7 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 }
 .agent-name { font-size: 0.82rem; font-weight: 600; color: #e2e8f0; }
 .agent-role { font-size: 0.68rem; color: #6b7280; }
+.agent-id-badge { font-size: 0.6rem; color: #374151; margin-top: 2px; font-family: monospace; letter-spacing: 0.03em; }
 
 .search-bar {
   position: relative;
@@ -392,11 +393,31 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 .conv-item.needs-attention:hover { background: rgba(239,68,68,0.12) !important; }
 .conv-item.needs-attention::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:#ef4444; border-radius:0; }
 .conv-item.needs-attention.selected { background: rgba(239,68,68,0.1) !important; }
+
+/* Lock badge — shown when another agent owns the session */
+.lock-badge {
+  font-size: 0.6rem; padding: 1px 5px; border-radius: 4px;
+  background: rgba(245,158,11,0.15); color: #f59e0b;
+  border: 1px solid rgba(245,158,11,0.3);
+  flex-shrink: 0; white-space: nowrap;
+}
+
+/* Toast notification */
+#agent-toast {
+  display: none; position: fixed; bottom: 44px; left: 50%; transform: translateX(-50%);
+  background: #1f2937; border: 1px solid #374151; border-radius: 10px;
+  padding: 10px 18px; font-size: 0.82rem; color: #e2e8f0;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 2000; max-width: 380px;
+  text-align: center; animation: toast-in 0.2s ease;
+}
+#agent-toast.error { border-color: #f87171; color: #fca5a5; background: #1c1010; }
+@keyframes toast-in { from{opacity:0;transform:translateX(-50%) translateY(8px)} to{opacity:1;transform:translateX(-50%) translateY(0)} }
 </style>
 </head>
 <body>
 
 <div id="reconnect-banner">⚠ Connection lost — reconnecting automatically…</div>
+<div id="agent-toast"></div>
 
 <!-- Tunnel URL bar (bottom) -->
 <div id="tunnel-bar">
@@ -479,6 +500,7 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
           <div>
             <div class="agent-name" id="agent-name-label">—</div>
             <div class="agent-role">Human Agent · Online</div>
+            <div class="agent-id-badge" id="agent-id-label"></div>
           </div>
         </div>
         <!-- Search -->
@@ -686,13 +708,19 @@ function handle(msg) {
       myAgentId = msg.agent_id;
       showDashboard(true);
       setConnStatus(true);
+      document.getElementById("agent-id-label").textContent = `ID: ${myAgentId}`;
       if (activeSessionId && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "monitor", session_id: activeSessionId }));
       }
       break;
 
     case "error":
-      if (!myAgentId) { showErr(msg.message || "Connection error."); if (ws) ws.close(); }
+      if (!myAgentId) {
+        showErr(msg.message || "Connection error.");
+        if (ws) ws.close();
+      } else {
+        showToast(msg.message || "An error occurred.", true);
+      }
       break;
 
     case "sessions_update":
@@ -795,6 +823,7 @@ document.getElementById("disconnect-btn").addEventListener("click", () => {
   showDashboard(false);
   myAgentId = null; myActiveSession = null; activeSessionId = null;
   reconnectAttempt = 0; allSessions = []; unreadSessions.clear();
+  document.getElementById("agent-id-label").textContent = "";
   document.getElementById("inp-pass").value = "";
   document.getElementById("search-input").value = "";
   clearErr();
@@ -853,14 +882,17 @@ function formatTime(createdAt) {
 function renderHistory(sessions, query = "") {
   const scroll = document.getElementById("history-scroll");
   const q = (query || "").toLowerCase().trim();
+  const hidden = getHiddenSessions();
 
-  let filtered = q
-    ? sessions.filter(s =>
-        s.session_id.toLowerCase().includes(q) ||
-        (s.title || "").toLowerCase().includes(q) ||
-        (s.last_message || "").toLowerCase().includes(q)
-      )
-    : sessions;
+  // Exclude locally-deleted sessions and apply search filter
+  let filtered = sessions.filter(s => !hidden.has(s.session_id));
+  if (q) {
+    filtered = filtered.filter(s =>
+      s.session_id.toLowerCase().includes(q) ||
+      (s.title || "").toLowerCase().includes(q) ||
+      (s.last_message || "").toLowerCase().includes(q)
+    );
+  }
 
   if (!filtered.length) {
     scroll.innerHTML = `<div class="no-history">${
@@ -893,6 +925,7 @@ function renderHistory(sessions, query = "") {
       const title      = s.title || `Session #${s.session_id}`;
       const needsAttention = s.tone === "angry" && s.status !== "human";
       const emailPending   = s.email_sent && s.status !== "human";
+      const lockedByOther = s.status === "human" && s.agent_id && s.agent_id !== myAgentId;
       html += `
         <div class="conv-item status-${s.status}${isSelected ? " selected" : ""}${needsAttention ? " needs-attention" : ""}${emailPending ? " email-sent" : ""}" onclick="selectSession('${s.session_id}')">
           <div class="conv-icon ${s.status}">${icon}</div>
@@ -904,9 +937,10 @@ function renderHistory(sessions, query = "") {
               ${s.message_count ? `<span class="conv-msg-count">· ${s.message_count} msgs</span>` : ""}
             </div>
           </div>
+          ${lockedByOther ? `<span class="lock-badge" title="Locked by another agent">🔒</span>` : ""}
           ${getToneDotHtml(s)}
           ${hasUnread ? `<div class="unread-dot" title="New messages"></div>` : ""}
-          <button class="conv-delete" onclick="deleteSession('${s.session_id}',event)" title="Delete conversation">🗑</button>
+          <button class="conv-delete" onclick="hideSessionLocally('${s.session_id}',event)" title="Remove from my view">🗑</button>
         </div>`;
     }
   }
@@ -976,23 +1010,39 @@ function updateTonePanel() {
   }
 }
 
-async function deleteSession(sid, event) {
-  event.stopPropagation();
-  if (!confirm('Delete this conversation? This cannot be undone.')) return;
-  try {
-    const r = await fetch(`${getBackendUrl()}/session/${sid}`, { method: 'DELETE' });
-    if (!r.ok) throw new Error('Server error');
-    allSessions = allSessions.filter(s => s.session_id !== sid);
-    unreadSessions.delete(sid);
-    if (activeSessionId === sid) {
-      activeSessionId = null;
-      if (myActiveSession === sid) { myActiveSession = null; setInputEnabled(false); updateConnDot(); }
-      resetConvPanel();
-    }
-    renderHistory(allSessions, document.getElementById('search-input').value);
-  } catch {
-    alert('Failed to delete conversation. Please try again.');
+// ── Local-only session hide (localStorage) ────────────────────────────────────
+// Key by agent name so hidden sessions persist across login sessions for the same agent
+function _hiddenKey() { return `insurehub_hidden_${(myName || myAgentId || 'anon').toLowerCase()}`; }
+
+function getHiddenSessions() {
+  try { return new Set(JSON.parse(localStorage.getItem(_hiddenKey()) || '[]')); }
+  catch { return new Set(); }
+}
+
+function hideSessionLocally(sid, event) {
+  if (event) event.stopPropagation();
+  if (!confirm('Remove this conversation from your view?\n\nThe server data is not deleted — the super admin and other agents can still see it.')) return;
+  const hidden = getHiddenSessions();
+  hidden.add(sid);
+  localStorage.setItem(_hiddenKey(), JSON.stringify([...hidden]));
+  if (activeSessionId === sid) {
+    activeSessionId = null;
+    if (myActiveSession === sid) { myActiveSession = null; setInputEnabled(false); updateConnDot(); }
+    resetConvPanel();
   }
+  unreadSessions.delete(sid);
+  renderHistory(allSessions, document.getElementById('search-input').value);
+}
+
+// ── Toast notification ────────────────────────────────────────────────────────
+let _toastTimer = null;
+function showToast(msg, isError = false) {
+  const el = document.getElementById('agent-toast');
+  el.textContent = msg;
+  el.className = isError ? 'error' : '';
+  el.style.display = 'block';
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.style.display = 'none'; }, 4000);
 }
 
 function selectSession(sid) {
