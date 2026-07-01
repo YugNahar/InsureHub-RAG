@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    { "source": "/auth",            "destination": "/auth.html" },
+    { "source": "/admin",           "destination": "/admin.html" },
+    { "source": "/agent-dashboard", "destination": "/agent-dashboard.html" },
+    { "source": "/(.*)",            "destination": "/index.html" }
+  ]
+}

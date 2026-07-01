@@ -388,6 +388,17 @@ async def super_admin_agent_chats(name: str, token: str = Depends(_check_super_a
     return {"name": name, "chats": rec.get("chats", [])}
 
 
+@app.get("/super-admin/sessions")
+async def super_admin_all_sessions(token: str = Depends(_check_super_admin)):
+    return {"sessions": _agent_hub.get_all_sessions_for_super_admin()}
+
+
+@app.get("/super-admin/session/{session_id}/messages")
+async def super_admin_session_messages(session_id: str, token: str = Depends(_check_super_admin)):
+    msgs = _agent_hub.get_session_full_messages(session_id)
+    return {"session_id": session_id, "messages": msgs}
+
+
 @app.post("/super-admin/agent/{name}/block")
 async def super_admin_block(name: str, token: str = Depends(_check_super_admin)):
     ok = _agent_hub.block_agent(name)

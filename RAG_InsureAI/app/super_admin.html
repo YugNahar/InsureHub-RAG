@@ -49,10 +49,10 @@
   .agent-sub{font-size:.72rem;color:var(--muted);margin-top:2px}
   .badge-blocked{font-size:.62rem;background:var(--red);color:#fff;border-radius:4px;padding:1px 5px}
 
-  .ls-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
-  .ls-item:hover{border-color:var(--accent)}
+  .ls-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;transition:border-color .15s}
+  .ls-item:hover,.ls-item.selected{border-color:var(--accent)}
   .ls-title{font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
-  .ls-meta{font-size:.71rem;color:var(--muted);display:flex;gap:8px;align-items:center}
+  .ls-meta{font-size:.71rem;color:var(--muted);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .status-pill{padding:1px 6px;border-radius:4px;font-size:.67rem;font-weight:700;text-transform:uppercase}
   .pill-human{background:#16a34a22;color:var(--green)}
   .pill-waiting{background:#d9770622;color:var(--yellow)}
@@ -98,7 +98,7 @@
   th{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.04em;background:var(--surface2)}
   tr:last-child td{border-bottom:none}
 
-  /* Chat items */
+  /* Chat cards */
   .chat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden}
   .chat-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;cursor:pointer;user-select:none}
   .chat-head:hover{background:var(--surface2)}
@@ -107,12 +107,26 @@
   .chat-arrow{color:var(--muted);font-size:.8rem}
   .transcript{display:none;padding:4px 16px 14px;border-top:1px solid var(--border)}
   .transcript.open{display:block}
+
+  /* Messages */
   .msg{margin-bottom:10px}
   .msg-header{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px}
   .role-user .msg-header{color:var(--accent2)}
   .role-agent .msg-header{color:var(--green)}
-  .role-ai .msg-header,.role-system .msg-header{color:var(--muted)}
+  .role-ai .msg-header{color:#818cf8}
+  .role-system .msg-header{color:var(--muted)}
   .msg-bubble{font-size:.82rem;line-height:1.55;background:var(--surface2);border-radius:7px;padding:8px 12px}
+
+  /* View-mode toggle */
+  .view-toggle{display:flex;gap:6px;margin:8px 0 12px}
+  .vtbtn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:4px 12px;font-size:.75rem;font-weight:600;cursor:pointer;transition:.15s}
+  .vtbtn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+  /* Session detail view */
+  #session-detail{display:none}
+  .session-conv-header{margin-bottom:18px}
+  .session-conv-title{font-size:1.05rem;font-weight:700;margin-bottom:6px}
+  .session-conv-meta{font-size:.78rem;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
 
   /* Assign rows */
   .assign-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
@@ -148,7 +162,7 @@
     </div>
     <div id="sidebar-tabs">
       <button class="s-tab active" id="s-tab-agents">Agents</button>
-      <button class="s-tab" id="s-tab-sessions">Sessions</button>
+      <button class="s-tab" id="s-tab-sessions">All Sessions</button>
     </div>
     <div id="agent-list"></div>
     <div id="sessions-list" style="display:none"></div>
@@ -162,9 +176,10 @@
     <div id="main-content">
       <div id="welcome-view">
         <h2>Welcome, Super Admin</h2>
-        <p>Select an agent from the sidebar to view their activity and manage permissions.</p>
+        <p>Select an agent from the sidebar to view activity, or browse <strong>All Sessions</strong> to see every conversation.</p>
       </div>
       <div id="agent-detail"></div>
+      <div id="session-detail"></div>
     </div>
   </div>
 </div>
@@ -177,9 +192,13 @@ let token = sessionStorage.getItem('sa_token') || '';
 let ws = null;
 let allData = { agents: [], live_sessions: [] };
 let selectedAgentName = null;
-let sidebarMode = 'agents';   // 'agents' | 'sessions'
-let detailTab = 'overview';   // 'overview' | 'chats' | 'assign'
-let _sidebarAgents = [];      // ordered array — use index in onclick to avoid JSON-in-attribute bug
+let selectedSessionId = null;
+let sidebarMode = 'agents';
+let detailTab = 'overview';
+let _sidebarAgents = [];
+let _allSessions = [];
+let _sessionViewModes = {};  // session_id → 'full' | 'agent'
+let _chatViewModes = {};     // card-idx → 'full' | 'agent'
 let pingTimer = null;
 
 // ── Login ──────────────────────────────────────────────────────────────────
@@ -211,17 +230,17 @@ function boot() {
   connectWS();
 }
 
-// ── Sidebar tab buttons ────────────────────────────────────────────────────
+// ── Sidebar tabs ───────────────────────────────────────────────────────────
 function setupSidebarTabs() {
-  document.getElementById('s-tab-agents').onclick = () => switchSidebarMode('agents');
+  document.getElementById('s-tab-agents').onclick   = () => switchSidebarMode('agents');
   document.getElementById('s-tab-sessions').onclick = () => switchSidebarMode('sessions');
 }
 
 function switchSidebarMode(mode) {
   sidebarMode = mode;
-  document.getElementById('agent-list').style.display   = mode === 'agents'   ? '' : 'none';
+  document.getElementById('agent-list').style.display    = mode === 'agents'   ? '' : 'none';
   document.getElementById('sessions-list').style.display = mode === 'sessions' ? '' : 'none';
-  document.getElementById('s-tab-agents').classList.toggle('active', mode === 'agents');
+  document.getElementById('s-tab-agents').classList.toggle('active',   mode === 'agents');
   document.getElementById('s-tab-sessions').classList.toggle('active', mode === 'sessions');
   if (mode === 'sessions') renderSidebarSessions();
 }
@@ -240,10 +259,7 @@ function connectWS() {
         allData = { agents: msg.agents || [], live_sessions: msg.live_sessions || [] };
         renderAll();
         setConn(true);
-        // Auto-select the first agent on initial load so data is visible immediately
-        if (firstLoad && allData.agents.length && !selectedAgentName) {
-          selectAgent(0);
-        }
+        if (firstLoad && allData.agents.length && !selectedAgentName) selectAgent(0);
       }
     } catch(ex) { console.error(ex); }
   };
@@ -262,7 +278,6 @@ function setConn(live) {
 function renderAll() {
   renderSidebarAgents();
   if (sidebarMode === 'sessions') renderSidebarSessions();
-  // Refresh the main panel if an agent is selected
   if (selectedAgentName) {
     const fresh = allData.agents.find(a => a.name === selectedAgentName);
     if (fresh) renderMainPanel(fresh);
@@ -290,7 +305,6 @@ function renderSidebarAgents() {
       </div>
     </div>`).join('');
 
-  // Attach click handlers via event delegation (avoids JSON-in-onclick)
   el.onclick = e => {
     const item = e.target.closest('.agent-item');
     if (!item) return;
@@ -302,28 +316,120 @@ function selectAgent(idx) {
   const a = _sidebarAgents[idx];
   if (!a) return;
   selectedAgentName = a.name;
+  selectedSessionId = null;
   detailTab = 'overview';
-  renderSidebarAgents(); // re-render to update selected highlight
+  renderSidebarAgents();
   renderMainPanel(a);
 }
 
-// ── Sidebar — sessions ────────────────────────────────────────────────────
-function renderSidebarSessions() {
+// ── Sidebar — all sessions ─────────────────────────────────────────────────
+async function renderSidebarSessions() {
   const el = document.getElementById('sessions-list');
-  if (!allData.live_sessions.length) { el.innerHTML = '<div class="empty">No active sessions.</div>'; return; }
-  el.innerHTML = allData.live_sessions.map(s => `
-    <div class="ls-item">
-      <div class="ls-title">${h(s.title || s.session_id)}</div>
-      <div class="ls-meta">
-        <span class="status-pill pill-${s.status}">${s.status}</span>
-        <span>${s.message_count} msgs</span>
-      </div>
-    </div>`).join('');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const r = await fetch('/super-admin/sessions', { headers: {'X-Super-Admin-Token': token} });
+    if (!r.ok) throw new Error(r.status);
+    const { sessions } = await r.json();
+    _allSessions = sessions || [];
+    if (!_allSessions.length) { el.innerHTML = '<div class="empty">No sessions yet.</div>'; return; }
+    el.innerHTML = _allSessions.map((s, i) => `
+      <div class="ls-item${s.session_id === selectedSessionId ? ' selected' : ''}" data-sid="${h(s.session_id)}" data-idx="${i}">
+        <div class="ls-title">${h(s.title)}</div>
+        <div class="ls-meta">
+          <span class="status-pill pill-${s.status}">${s.status}</span>
+          <span>${s.message_count} msgs</span>
+          ${s.has_agent ? '<span style="color:var(--green);font-size:.67rem">👤 agent</span>' : ''}
+        </div>
+      </div>`).join('');
+    el.onclick = e => {
+      const item = e.target.closest('[data-sid]');
+      if (!item) return;
+      showSessionDetail(item.dataset.sid, _allSessions[parseInt(item.dataset.idx, 10)]);
+    };
+  } catch(ex) {
+    el.innerHTML = `<div class="empty">Failed to load (${ex.message}).</div>`;
+  }
 }
 
-// ── Main panel ─────────────────────────────────────────────────────────────
+// ── Session detail view ────────────────────────────────────────────────────
+async function showSessionDetail(sid, meta) {
+  selectedSessionId = sid;
+  selectedAgentName = null;
+
+  document.getElementById('welcome-view').style.display = 'none';
+  document.getElementById('agent-detail').style.display = 'none';
+  document.getElementById('session-detail').style.display = 'block';
+  document.getElementById('main-title').textContent = 'Session';
+
+  // Highlight in sidebar
+  document.querySelectorAll('#sessions-list .ls-item').forEach(el => {
+    el.classList.toggle('selected', el.dataset.sid === sid);
+  });
+
+  const viewMode = _sessionViewModes[sid] || 'full';
+  const detailEl = document.getElementById('session-detail');
+  detailEl.innerHTML = `
+    <div class="session-conv-header">
+      <div class="session-conv-title">${h(meta?.title || sid)}</div>
+      <div class="session-conv-meta">
+        <span class="status-pill pill-${meta?.status}">${meta?.status || '—'}</span>
+        <span>${meta?.message_count || 0} total messages</span>
+        ${meta?.has_agent ? '<span style="color:var(--green)">👤 agent involved</span>' : ''}
+        <span>${h(meta?.created_at || '')}</span>
+      </div>
+      <div class="view-toggle">
+        <button class="vtbtn${viewMode==='full'?' active':''}" id="sv-full">Full Conversation</button>
+        <button class="vtbtn${viewMode==='agent'?' active':''}" id="sv-agent">Agent Only</button>
+      </div>
+    </div>
+    <div id="session-msgs"><div class="empty">Loading…</div></div>`;
+
+  detailEl.querySelector('#sv-full').onclick = () => {
+    _sessionViewModes[sid] = 'full';
+    detailEl.querySelector('#sv-full').classList.add('active');
+    detailEl.querySelector('#sv-agent').classList.remove('active');
+    renderSessionMsgs(sid, 'full');
+  };
+  detailEl.querySelector('#sv-agent').onclick = () => {
+    _sessionViewModes[sid] = 'agent';
+    detailEl.querySelector('#sv-full').classList.remove('active');
+    detailEl.querySelector('#sv-agent').classList.add('active');
+    renderSessionMsgs(sid, 'agent');
+  };
+
+  await renderSessionMsgs(sid, viewMode);
+}
+
+async function renderSessionMsgs(sid, viewMode) {
+  const msgsEl = document.getElementById('session-msgs');
+  if (!msgsEl) return;
+  msgsEl.innerHTML = '<div class="empty">Loading messages…</div>';
+  try {
+    const r = await fetch(`/super-admin/session/${encodeURIComponent(sid)}/messages`,
+      { headers: {'X-Super-Admin-Token': token} });
+    if (!r.ok) throw new Error(r.status);
+    const { messages } = await r.json();
+    const filtered = viewMode === 'agent' ? filterAgentOnly(messages) : messages;
+    if (!filtered.length) {
+      msgsEl.innerHTML = '<div class="empty">No messages ' + (viewMode === 'agent' ? '(no escalations or agent messages in this session)' : 'in this session') + '.</div>';
+      return;
+    }
+    msgsEl.innerHTML = viewMode === 'agent'
+      ? filtered.map(renderAgentOnlyMsg).join('')
+      : filtered.map(m => `
+          <div class="msg role-${m.role}">
+            <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(m.timestamp||'')}</div>
+            <div class="msg-bubble">${h(m.content)}</div>
+          </div>`).join('');
+  } catch(ex) {
+    msgsEl.innerHTML = `<div class="empty">Failed to load messages (${ex.message}).</div>`;
+  }
+}
+
+// ── Main panel — agent detail ──────────────────────────────────────────────
 function renderMainPanel(agent) {
   document.getElementById('welcome-view').style.display = 'none';
+  document.getElementById('session-detail').style.display = 'none';
   document.getElementById('main-title').textContent = agent.name;
   const el = document.getElementById('agent-detail');
   el.style.display = 'block';
@@ -349,7 +455,6 @@ function renderMainPanel(agent) {
     </div>
     <div id="detail-body"></div>`;
 
-  // Tab clicks
   el.querySelector('.tabs').onclick = e => {
     const btn = e.target.closest('[data-tab]');
     if (!btn) return;
@@ -358,11 +463,8 @@ function renderMainPanel(agent) {
     renderDetailBody(agent);
   };
 
-  // Block / unblock button
   const actionBtn = el.querySelector('#action-btn');
-  if (actionBtn) {
-    actionBtn.onclick = () => toggleBlock(agent.name, !agent.blocked);
-  }
+  if (actionBtn) actionBtn.onclick = () => toggleBlock(agent.name, !agent.blocked);
 
   renderDetailBody(agent);
 }
@@ -375,7 +477,6 @@ async function renderDetailBody(agent) {
   if (detailTab === 'overview') {
     const sessions = agent.login_sessions || [];
     const totalHours = (sessions.reduce((s, x) => s + (x.duration_minutes || 0), 0) / 60).toFixed(1);
-
     const rows = sessions.length
       ? [...sessions].reverse().slice(0, 50).map(s => {
           const ongoing = !s.logout_time;
@@ -408,38 +509,83 @@ async function renderDetailBody(agent) {
         { headers: {'X-Super-Admin-Token': token} });
       if (!r.ok) throw new Error(r.status);
       const { chats } = await r.json();
+
       if (!chats || !chats.length) {
-        body.innerHTML = '<div class="empty">No chats recorded yet.<br>Chats appear here after Lavish handles a user session with the new tracking code active.</div>';
+        body.innerHTML = '<div class="empty">No chats recorded yet.</div>';
         return;
       }
-      const reversed = [...chats].reverse();
-      body.innerHTML = reversed.map((c, i) => {
-        const msgs = (c.messages || []).map(m => `
-          <div class="msg role-${m.role}">
-            <div class="msg-header">${m.role.toUpperCase()} &nbsp;${h(m.timestamp||'')}</div>
-            <div class="msg-bubble">${h(m.content)}</div>
-          </div>`).join('') || '<div class="empty">No messages in this chat.</div>';
-        return `
-          <div class="chat-card">
-            <div class="chat-head" data-idx="${i}">
-              <div>
-                <div class="chat-sid">Session #${h(c.session_id)} — ${c.reply_count||0} agent replies</div>
-                <div class="chat-info">${h(c.started_at||'')} → ${c.ended_at ? h(c.ended_at) : '<span style="color:var(--green)">Ongoing</span>'}</div>
-              </div>
-              <span class="chat-arrow" id="arr-${i}">▼</span>
-            </div>
-            <div class="transcript" id="tr-${i}">${msgs}</div>
-          </div>`;
-      }).join('');
 
-      body.onclick = e => {
+      // Deduplicate by session_id — merge multiple takeover episodes into one card
+      const sidMap = new Map();
+      for (const c of chats) {
+        const sid = c.session_id;
+        if (!sidMap.has(sid)) {
+          sidMap.set(sid, { ...c });
+        } else {
+          const ex = sidMap.get(sid);
+          ex.reply_count = (ex.reply_count || 0) + (c.reply_count || 0);
+          // Keep the latest ended_at
+          if (c.ended_at) ex.ended_at = c.ended_at;
+          // If any episode is still open, mark as open
+          if (!c.ended_at) ex.ended_at = null;
+        }
+      }
+      const deduped = [...sidMap.values()].reverse(); // newest first
+
+      body.innerHTML = deduped.map((c, i) => `
+        <div class="chat-card" data-sid="${h(c.session_id)}" data-idx="${i}">
+          <div class="chat-head">
+            <div>
+              <div class="chat-sid">Session #${h(c.session_id)} &nbsp;·&nbsp; ${c.reply_count||0} agent replies</div>
+              <div class="chat-info">${h(c.started_at||'')} ${c.ended_at ? '→ '+h(c.ended_at) : '→ <span style="color:var(--green)">Ongoing</span>'}</div>
+            </div>
+            <span class="chat-arrow" data-arr="${i}">▼</span>
+          </div>
+          <div class="transcript" id="ct-${i}">
+            <div class="view-toggle" style="margin-top:8px">
+              <button class="vtbtn active" data-view="full" data-for="${i}">Full Conversation</button>
+              <button class="vtbtn" data-view="agent" data-for="${i}">Agent Only</button>
+            </div>
+            <div id="ct-msgs-${i}"><div class="empty" style="padding:8px 0">Expand to load messages.</div></div>
+          </div>
+        </div>`).join('');
+
+      body.onclick = async e => {
+        // View toggle button clicked?
+        const vtBtn = e.target.closest('[data-view][data-for]');
+        if (vtBtn) {
+          const idx = vtBtn.dataset.for;
+          const sid = body.querySelector(`[data-idx="${idx}"]`)?.dataset.sid;
+          const viewMode = vtBtn.dataset.view;
+          if (!sid) return;
+          _chatViewModes[idx] = viewMode;
+          // Update button active state
+          body.querySelectorAll(`[data-for="${idx}"]`).forEach(b => {
+            b.classList.toggle('active', b.dataset.view === viewMode);
+          });
+          const tr = document.getElementById(`ct-${idx}`);
+          if (tr && tr.classList.contains('open')) {
+            await loadChatMsgs(idx, sid, viewMode);
+          }
+          return;
+        }
+        // Card head clicked → expand/collapse
         const head = e.target.closest('.chat-head');
         if (!head) return;
-        const i = head.dataset.idx;
-        const tr = document.getElementById(`tr-${i}`);
-        const arr = document.getElementById(`arr-${i}`);
-        if (tr) { tr.classList.toggle('open'); if (arr) arr.textContent = tr.classList.contains('open') ? '▲' : '▼'; }
+        const card = head.closest('.chat-card');
+        if (!card) return;
+        const idx = card.dataset.idx;
+        const sid = card.dataset.sid;
+        const tr = document.getElementById(`ct-${idx}`);
+        const arr = card.querySelector(`[data-arr="${idx}"]`);
+        if (!tr) return;
+        tr.classList.toggle('open');
+        if (arr) arr.textContent = tr.classList.contains('open') ? '▲' : '▼';
+        if (tr.classList.contains('open')) {
+          await loadChatMsgs(idx, sid, _chatViewModes[idx] || 'full');
+        }
       };
+
     } catch(ex) {
       body.innerHTML = `<div class="empty">Failed to load chat history (${ex.message}).</div>`;
     }
@@ -447,12 +593,11 @@ async function renderDetailBody(agent) {
   } else if (detailTab === 'assign') {
     const onlineFree = allData.agents.filter(a => a.status !== 'offline' && !a.blocked);
     const sessions = allData.live_sessions;
-
     if (!sessions.length) { body.innerHTML = '<div class="empty">No active sessions to assign.</div>'; return; }
 
     body.innerHTML = `
       <p style="font-size:.82rem;color:var(--muted);margin-bottom:14px">
-        Assign any active session directly to an online agent. The agent must be online and not blocked.
+        Assign any active session directly to an online agent.
       </p>
       ${sessions.map((s, si) => `
         <div class="assign-card">
@@ -476,12 +621,114 @@ async function renderDetailBody(agent) {
       btn.onclick = async () => {
         const card = btn.closest('.assign-card');
         const sel  = card.querySelector('.assign-sel');
-        const sid  = sel && sel.dataset.sid;
-        const aname = sel && sel.value;
-        if (!sid || !aname) return;
-        await doAssign(sid, aname);
+        if (!sel || !sel.value) return;
+        await doAssign(sel.dataset.sid, sel.value);
       };
     });
+  }
+}
+
+// ── Agent-only smart filter ────────────────────────────────────────────────
+// Layla's canned "I can't answer" phrases — same set as response_needs_human in backend
+const _LAYLA_REFUSAL = [
+  "don't have information", "don't have that", "not in my knowledge",
+  "not in the documents", "can't find", "couldn't find", "no information",
+  "not sure about", "can't answer", "cannot answer", "don't know",
+  "outside my knowledge", "not covered in", "not available in",
+  "not from your uploaded documents", "not in the uploaded documents",
+  // canned refusal lines from multi_source_rag
+  "don't have that specific information in my knowledge base",
+  "that topic doesn't seem to be covered in my knowledge base",
+  "don't have that in my knowledge base",
+];
+
+function _isLaylaRefusal(content) {
+  const lower = (content || '').toLowerCase();
+  return _LAYLA_REFUSAL.some(p => lower.includes(p));
+}
+
+// Returns only: escalation-triggered / unanswered user messages (tagged "NOT ANSWERED") +
+// user messages the human agent actually answered + all agent replies.
+function filterAgentOnly(messages) {
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    // Always show agent replies
+    if (m.role === 'agent') { out.push(m); continue; }
+    if (m.role !== 'user') continue;
+
+    // Backend-tagged: email was sent but no agent responded
+    if (m.meta && m.meta.escalation_sent) {
+      out.push({...m, _not_answered: true, _reason: 'email_sent'});
+      continue;
+    }
+
+    // Frontend detection: next AI response is a refusal AND no agent stepped in
+    // before the next user message
+    const nextMsg = messages[i + 1];
+    if (nextMsg && nextMsg.role === 'ai' && _isLaylaRefusal(nextMsg.content)) {
+      let agentAnswered = false;
+      for (let j = i + 1; j < messages.length; j++) {
+        if (messages[j].role === 'agent') { agentAnswered = true; break; }
+        if (messages[j].role === 'user') break; // new question before any agent = not answered
+      }
+      if (!agentAnswered) {
+        out.push({...m, _not_answered: true, _reason: 'layla_refused'});
+        continue;
+      }
+    }
+
+    // Agent-phase: any message between here and the next AI response is from agent
+    let agentPhase = false;
+    for (let j = i + 1; j < messages.length; j++) {
+      if (messages[j].role === 'agent') { agentPhase = true; break; }
+      if (messages[j].role === 'ai') break;
+    }
+    if (agentPhase) out.push(m);
+  }
+  return out;
+}
+
+function renderAgentOnlyMsg(m) {
+  let badge = '';
+  if (m._not_answered) {
+    const label = m._reason === 'email_sent'
+      ? '🔴 NOT ANSWERED — email sent, no agent responded'
+      : '🔴 NOT ANSWERED — outside knowledge base, no agent was available';
+    badge = `<span style="background:#ef444420;color:#ef4444;font-size:.65rem;font-weight:700;border-radius:4px;padding:1px 6px;margin-left:8px;border:1px solid #ef444440">${label}</span>`;
+  }
+  return `
+    <div class="msg role-${m.role}">
+      <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(m.timestamp||'')}${badge}</div>
+      <div class="msg-bubble">${h(m.content)}</div>
+    </div>`;
+}
+
+// ── Load messages for a chat card ─────────────────────────────────────────
+async function loadChatMsgs(idx, sid, viewMode) {
+  const msgsEl = document.getElementById(`ct-msgs-${idx}`);
+  if (!msgsEl) return;
+  msgsEl.innerHTML = '<div class="empty" style="padding:8px 0">Loading…</div>';
+  try {
+    const r = await fetch(`/super-admin/session/${encodeURIComponent(sid)}/messages`,
+      { headers: {'X-Super-Admin-Token': token} });
+    if (!r.ok) throw new Error(r.status);
+    const { messages } = await r.json();
+    const filtered = viewMode === 'agent' ? filterAgentOnly(messages) : messages;
+    if (!filtered.length) {
+      msgsEl.innerHTML = '<div class="empty" style="padding:8px 0">' +
+        (viewMode === 'agent' ? 'No escalations or agent messages in this session.' : 'No messages.') + '</div>';
+      return;
+    }
+    msgsEl.innerHTML = viewMode === 'agent'
+      ? filtered.map(renderAgentOnlyMsg).join('')
+      : filtered.map(m => `
+          <div class="msg role-${m.role}">
+            <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(m.timestamp||'')}</div>
+            <div class="msg-bubble">${h(m.content)}</div>
+          </div>`).join('');
+  } catch(ex) {
+    msgsEl.innerHTML = `<div class="empty" style="padding:8px 0">Failed to load (${ex.message}).</div>`;
   }
 }
 
@@ -503,6 +750,13 @@ async function doAssign(sessionId, agentName) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+function roleName(role) {
+  if (role === 'user')   return 'USER';
+  if (role === 'agent')  return 'AGENT';
+  if (role === 'ai')     return 'LAYLA (AI)';
+  if (role === 'system') return 'SYSTEM';
+  return role.toUpperCase();
+}
 function dotClass(s) { return s==='chatting'?'dot-chatting':s==='online'?'dot-online':'dot-offline'; }
 function statusText(s) { return s==='chatting'?'● Chatting':s==='online'?'● Online':'● Offline'; }
 function h(s) {

@@ -96,6 +96,7 @@ class ChatMessage:
     role: str   # "user" | "ai" | "agent" | "system"
     content: str
     timestamp: str = field(default_factory=_now)
+    meta: dict = field(default_factory=dict)  # e.g. {"escalation_sent": True}
 
 
 @dataclass
@@ -162,6 +163,7 @@ class AgentHub:
                         role=m["role"],
                         content=m["content"],
                         timestamp=m.get("timestamp", ""),
+                        meta=m.get("meta", {}),
                     ))
                 self._sessions[sid] = session
         except Exception:
@@ -177,7 +179,7 @@ class AgentHub:
                     "handoff_exhausted": s.handoff_exhausted,
                     "email_sent": s.email_sent,
                     "history": [
-                        {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+                        {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta}
                         for m in s.history
                     ],
                 }
@@ -438,6 +440,11 @@ class AgentHub:
             session.status = "ai"
             session.handoff_exhausted = True
             session.email_sent = True
+            # Tag the triggering user message so the super-admin "Agent Only" view can flag it
+            for m in reversed(session.history):
+                if m.role == "user":
+                    m.meta["escalation_sent"] = True
+                    break
             delivered = False
             if session.user_ws:
                 try:
@@ -513,6 +520,12 @@ class AgentHub:
         session.status = "ai"
         session.agent_id = None
         session.handoff_exhausted = True
+        session.email_sent = True
+        # Tag the triggering user message so the super-admin "Agent Only" view can flag it
+        for m in reversed(session.history):
+            if m.role == "user":
+                m.meta["escalation_sent"] = True
+                break
         _decline_msg = {
             "type": "handoff_timeout",
             "message": "No agent is available right now. We've notified our support team and someone will follow up with you shortly.",
@@ -542,6 +555,11 @@ class AgentHub:
         session = self._sessions.get(session_id)
         if session:
             session.email_sent = True
+            # Tag the triggering user message so the super-admin "Agent Only" view can flag it
+            for m in reversed(session.history):
+                if m.role == "user":
+                    m.meta["escalation_sent"] = True
+                    break
             self._save_sessions()
         history_snapshot = list(session.history) if session else []
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
@@ -572,20 +590,31 @@ class AgentHub:
         agent.active_session = session.session_id
         agent.monitoring.add(session.session_id)
         self._save_sessions()
-        # Open a new chat record in agent activity
+        # Open or reopen a chat record in agent activity.
+        # Deduplicate: if a record already exists for this session_id, reopen it
+        # instead of creating a new one — prevents duplicate entries on re-login.
         rec = self._ensure_agent_record(agent.name)
         snapshot_msgs = [
             {"role": m.role, "content": m.content, "timestamp": m.timestamp}
             for m in session.history
         ]
-        rec["chats"].append({
-            "session_id": session.session_id,
-            "agent_id": agent.agent_id,
-            "started_at": _now_full(),
-            "ended_at": None,
-            "messages": snapshot_msgs,
-            "reply_count": 0,
-        })
+        existing_chat = next(
+            (c for c in rec["chats"] if c.get("session_id") == session.session_id),
+            None,
+        )
+        if existing_chat:
+            existing_chat["ended_at"] = None
+            existing_chat["agent_id"] = agent.agent_id
+            existing_chat["messages"] = snapshot_msgs  # refresh snapshot
+        else:
+            rec["chats"].append({
+                "session_id": session.session_id,
+                "agent_id": agent.agent_id,
+                "started_at": _now_full(),
+                "ended_at": None,
+                "messages": snapshot_msgs,
+                "reply_count": 0,
+            })
         self._save_agent_records()
         history_payload = [
             {"role": m.role, "content": m.content, "timestamp": m.timestamp}
@@ -661,6 +690,7 @@ class AgentHub:
         if session:
             session.status = "ai"
             session.agent_id = None
+            session.tone = "neutral"
             session.tone_from_red = False
             self._save_sessions()
             if session.user_ws:
@@ -846,6 +876,33 @@ class AgentHub:
                     "login_sessions": [],
                 })
         return {"agents": agents_out, "live_sessions": self.list_sessions()}
+
+    def get_session_full_messages(self, session_id: str) -> list:
+        """Return the complete message history for a session (all roles)."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return []
+        return [
+            {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta}
+            for m in session.history
+        ]
+
+    def get_all_sessions_for_super_admin(self) -> list:
+        """Metadata list of ALL sessions for the super-admin sessions browser."""
+        out = []
+        for s in sorted(self._sessions.values(), key=lambda x: x.created_at, reverse=True):
+            first_user = next((m.content[:80] for m in s.history if m.role == "user"), "")
+            has_agent = any(m.role == "agent" for m in s.history)
+            out.append({
+                "session_id": s.session_id,
+                "created_at": s.created_at,
+                "status": s.status,
+                "message_count": len(s.history),
+                "title": first_user or f"Session #{s.session_id}",
+                "has_agent": has_agent,
+                "tone": s.tone,
+            })
+        return out
 
     def block_agent(self, name: str) -> bool:
         rec = self._ensure_agent_record(name)

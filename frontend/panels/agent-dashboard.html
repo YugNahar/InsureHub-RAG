@@ -196,10 +196,10 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .status-dot {
   width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
 }
-.status-dot.white   { background: #e2e8f0; }
-.status-dot.green   { background: #22c55e; }
-.status-dot.red     { background: #ef4444; }
-.status-dot.waiting { background: #f59e0b; }
+.status-dot.white     { background: #e2e8f0; }
+.status-dot.green     { background: #22c55e; }
+.status-dot.red       { background: #ef4444; }
+.status-dot.waiting   { background: #f59e0b; }
 .status-dot.neutral   { background: #22c55e; }
 .status-dot.email-red { background: #ef4444; }
 .conv-item.email-sent:not(.status-human)::before { background: #ef4444; }
@@ -380,9 +380,9 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
   width: 7px; height: 7px; border-radius: 50%;
   flex-shrink: 0;
 }
-.tone-dot.neutral { background: #22c55e; }
-.tone-dot.happy   { background: #22c55e; }
-.tone-dot.angry   { background: #ef4444; }
+.tone-dot.neutral     { background: #22c55e; }
+.tone-dot.happy       { background: #22c55e; }
+.tone-dot.angry       { background: #ef4444; }
 .tone-dot.agent       { background: #e2e8f0; animation: led-white 1.2s infinite; }
 .tone-dot.email-alert { background: #ef4444; animation: led-red 0.8s ease-in-out infinite; }
 @keyframes led-white { 0%,100%{opacity:1;box-shadow:0 0 8px rgba(226,232,240,0.8)} 50%{opacity:0.15;box-shadow:none} }
@@ -403,7 +403,7 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
   <span>Tunnel:</span>
   <a id="tunnel-link" href="#" target="_blank">detecting…</a>
   <button id="tunnel-copy-btn" onclick="copyTunnelUrl()">copy</button>
-  <span style="margin-left:auto;color:#374151">Chat: <a id="chat-link" href="/" target="_blank">Open Chat</a></span>
+  <span style="margin-left:auto;color:#374151">Chat: <a id="chat-link" href="/">Open Chat</a></span>
 </div>
 
 <!-- Handoff Request Popup -->
@@ -535,9 +535,18 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
 </div>
 
 <script>
-// ── Backend URL — always uses the current domain ──────────────────────────────
+// ── Backend URL — __API_URL__ is replaced by build.js at deploy time ──────────
 function getBackendUrl() {
-  return window.location.origin.replace(/\/$/, '');
+  // On the backend's own domain (tunnel / localhost): use current origin so
+  // the dashboard survives tunnel restarts without a stale baked-in URL.
+  // On Vercel (static hosting): use the tunnel URL baked in at build time,
+  // because window.location.origin would be the Vercel domain, not the backend.
+  const built = '__API_URL__'.replace(/\/$/, '');
+  const h = window.location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.trycloudflare.com')) {
+    return window.location.origin.replace(/\/$/, '');
+  }
+  return (built && !built.startsWith('__')) ? built : 'http://localhost:8501';
 }
 function setBackendUrl(url) { /* no-op */ }
 
@@ -919,7 +928,7 @@ function filterHistory(query) {
 
 function getSidebarDotColor(s) {
   if (s.status === "human") return "white";
-  if (s.email_sent) return "email-red";
+  if (s.email_sent) return "email-red";   // email sent — waiting for agent
   if (s.tone === "angry") return "red";
   if (s.tone === "happy") return "green";
   return "neutral";
@@ -955,8 +964,13 @@ function updateTonePanel() {
   const isMonitoring = !isChatting && !!activeSessionId;      // I opened it but didn't take over
 
   if (isChatting) {
-    // Agent is actively chatting — only the white LED blinks regardless of history
-    blackLed.className = "tone-led active-black";
+    // Agent is actively chatting with user
+    if (fromRed) {
+      redLed.className   = "tone-led active-red";   // session was triggered by anger
+      blackLed.className = "tone-led active-black";
+    } else {
+      blackLed.className = "tone-led active-black";
+    }
   } else if (isMonitoring) {
     // Agent is watching — green steady = "I'm here, monitoring"
     greenLed.className = "tone-led steady-green";

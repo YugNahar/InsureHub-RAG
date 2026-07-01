@@ -193,6 +193,35 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     return False
 
 
+def _quoted_comparison_covered(question: str, docs: list) -> bool:
+    """True unless the question quotes 2+ specific terms to compare and the
+    retrieved context is missing one of them.
+
+    _context_covers_query() only requires ANY topic word to appear ANYWHERE
+    in the retrieved pool, so a question like 'difference between "floater
+    policy" and "specific policy" in fire insurance' passes on the generic
+    words "fire"/"policy" alone even when the KB never discusses a floater
+    vs. specific split — the LLM then fills the gap from training knowledge.
+    This closes that gap: every quoted term must have at least one of its
+    non-generic words present in context, or we decline instead of guessing.
+    """
+    quoted = re.findall(r'["‘’“”]([^"‘’“”]{3,40})["‘’“”]', question)
+    quoted = [q.strip() for q in quoted if q.strip()]
+    if len(quoted) < 2:
+        return True
+    ctx_lower = " ".join(
+        (doc.page_content if hasattr(doc, "page_content") else doc.get("text", ""))
+        for doc in docs
+    ).lower()
+    for term in quoted:
+        distinguishing = _extract_topic_terms(term)
+        if not distinguishing:
+            continue
+        if not any(w in ctx_lower for w in distinguishing):
+            return False
+    return True
+
+
 _DETAIL_SIGNALS = {
     'in detail', 'step by step', 'step-by-step', 'in steps', 'procedure',
     'how to', 'elaborate', 'walk me through',
@@ -1080,7 +1109,7 @@ class MultiSourceRAG:
             )
 
         # ── Prompt selection ──────────────────────────────────────────────────
-        ctx_covered = _context_covers_query(question, all_chunks)
+        ctx_covered = _context_covers_query(question, all_chunks) and _quoted_comparison_covered(question, all_chunks)
 
         # If the KB has no relevant content for this question, skip the LLM
         # entirely — small models ignore "don't use your training knowledge"
@@ -1395,7 +1424,7 @@ class MultiSourceRAG:
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
         import json as _json_s
         topics_for_coverage = None if _detected_as_followup else (llm_topics or None)
-        ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
+        ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage) and _quoted_comparison_covered(question, all_chunks)
         if not ctx_covered and not document_filter:
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "

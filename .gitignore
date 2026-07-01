@@ -39,3 +39,17 @@ RAG_InsureAI/app/sessions_data.json
 
 # Panels build output
 panels/dist/
+
+# Frontend source (React/Vite SPA — merged from insurehub-RAG-frontend repo)
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.env
+frontend/.env.*
+frontend/.env*
+frontend/.vercel
+frontend/.vscode/
+frontend/*.local
+
+# Runtime agent-activity data
+RAG_InsureAI/app/agent_activity.json
