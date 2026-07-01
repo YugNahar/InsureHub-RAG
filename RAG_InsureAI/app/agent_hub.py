@@ -359,7 +359,12 @@ class AgentHub:
         await self._broadcast_super_admin_update()
 
     def online_count(self) -> int:
-        return len(self._agents)
+        # Only count agents whose WebSocket connection is still open
+        from starlette.websockets import WebSocketState
+        return sum(
+            1 for a in self._agents.values()
+            if a.ws.client_state == WebSocketState.CONNECTED
+        )
 
     # ── Handoff ───────────────────────────────────────────────────────────────
 
