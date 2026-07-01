@@ -181,10 +181,11 @@ const GREETING: Message = {
 };
 
 function IndexPage() {
-  const [open, setOpen] = useState(false);
+  const isEmbedded = typeof window !== "undefined" && window.self !== window.top;
+  const [open, setOpen] = useState(isEmbedded);
   return (
     <div className="min-h-screen bg-background">
-      <ChatWidget open={open} onOpenChange={setOpen} />
+      <ChatWidget open={open} onOpenChange={setOpen} hideLauncher={isEmbedded} />
     </div>
   );
 }
@@ -194,9 +195,11 @@ type ChatMode = "ai" | "waiting" | "human";
 function ChatWidget({
   open,
   onOpenChange,
+  hideLauncher = false,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
+  hideLauncher?: boolean;
 }) {
   const [messages, setMessages] = useState<Message[]>([GREETING]);
   const [hydrated, setHydrated] = useState(false);
@@ -519,21 +522,23 @@ function ChatWidget({
 
   return (
     <>
-      <button
-        type="button"
-        onClick={() => onOpenChange(!open)}
-        aria-label={open ? "Close chat" : "Open chat with Layla"}
-        className={cn(
-          "fixed bottom-5 right-5 z-50 flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-2xl shadow-primary/30 ring-1 ring-primary/40 transition-all hover:scale-105 active:scale-95",
-          open && "scale-90 opacity-0 pointer-events-none",
-        )}
-      >
-        <MessageCircle className="h-6 w-6" />
-        <span className="absolute -top-1 -right-1 flex h-3 w-3">
-          <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400/70" />
-          <span className="relative h-3 w-3 rounded-full bg-emerald-400 ring-2 ring-background" />
-        </span>
-      </button>
+      {!hideLauncher && (
+        <button
+          type="button"
+          onClick={() => onOpenChange(!open)}
+          aria-label={open ? "Close chat" : "Open chat with Layla"}
+          className={cn(
+            "fixed bottom-5 right-5 z-50 flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-2xl shadow-primary/30 ring-1 ring-primary/40 transition-all hover:scale-105 active:scale-95",
+            open && "scale-90 opacity-0 pointer-events-none",
+          )}
+        >
+          <MessageCircle className="h-6 w-6" />
+          <span className="absolute -top-1 -right-1 flex h-3 w-3">
+            <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400/70" />
+            <span className="relative h-3 w-3 rounded-full bg-emerald-400 ring-2 ring-background" />
+          </span>
+        </button>
+      )}
 
       <div
         className={cn(
