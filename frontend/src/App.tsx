@@ -570,9 +570,8 @@ function ChatWidget({
     <>
       <div
         className={cn(
-          "fixed bottom-5 right-5 z-50 flex w-[calc(100vw-2.5rem)] max-w-sm origin-bottom-right flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/95 shadow-2xl shadow-black/40 backdrop-blur transition-all duration-200",
-          "h-[32rem] max-h-[calc(100vh-2.5rem)]",
-          open ? "scale-100 opacity-100" : "pointer-events-none scale-95 opacity-0",
+          "fixed inset-0 z-50 flex flex-col overflow-hidden bg-card transition-all duration-200",
+          open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
         role="dialog"
         aria-label="Chat with Layla"
