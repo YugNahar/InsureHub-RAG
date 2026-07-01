@@ -834,6 +834,31 @@ function handle(msg) {
       if (pendingHandoffSession === msg.session_id) dismissHandoffPopup();
       break;
 
+    case "session_removed": {
+      // Super admin permanently deleted this session — remove from every agent's view
+      const removedSid = msg.session_id;
+      allSessions = allSessions.filter(s => s.session_id !== removedSid);
+      unreadSessions.delete(removedSid);
+      // Clean up localStorage hidden set for this session
+      const hiddenSet = getHiddenSessions();
+      if (hiddenSet.has(removedSid)) {
+        hiddenSet.delete(removedSid);
+        localStorage.setItem(_hiddenKey(), JSON.stringify([...hiddenSet]));
+      }
+      if (activeSessionId === removedSid) {
+        activeSessionId = null;
+        if (myActiveSession === removedSid) {
+          myActiveSession = null;
+          setInputEnabled(false);
+          updateConnDot();
+        }
+        resetConvPanel();
+        showToast("This conversation was permanently deleted by the administrator.", true);
+      }
+      renderHistory(allSessions, document.getElementById("search-input").value);
+      break;
+    }
+
     case "tone_update": {
       const ts = allSessions.find(x => x.session_id === msg.session_id);
       if (ts) { ts.tone = msg.tone; ts.tone_from_red = msg.from_red; }

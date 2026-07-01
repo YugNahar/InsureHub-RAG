@@ -236,12 +236,22 @@ class AgentHub:
             try:
                 await session.user_ws.send_json({
                     "type": "session_deleted",
-                    "message": "This conversation was cleared by an agent.",
+                    "message": "This conversation was removed by an administrator.",
                 })
             except Exception:
                 pass
         del self._sessions[session_id]
         self._save_sessions()
+        # Notify every connected agent to remove this session from their view immediately
+        for agent in list(self._agents.values()):
+            agent.monitoring.discard(session_id)
+            try:
+                await agent.ws.send_json({
+                    "type": "session_removed",
+                    "session_id": session_id,
+                })
+            except Exception:
+                pass
         await self._broadcast_sessions_update()
         return True
 
@@ -442,42 +452,15 @@ class AgentHub:
 
         session.status = "ai"
         session.handoff_exhausted = True
-
-        # Only send email when ALL online agents have explicitly declined.
-        # If some agents are still online but simply didn't respond, go back to AI
-        # without emailing — email is reserved for the "truly no one available" case.
-        still_available = [
-            a for a in self._agents.values()
-            if session_id not in a.declined_sessions
-        ]
-        if still_available:
-            # Agents are online but didn't respond — silent timeout, AI resumes
-            _busy_msg = {
-                "type": "handoff_timeout",
-                "message": "Our agents are busy right now. Layla will continue helping you!",
-            }
-            delivered = False
-            if session.user_ws:
-                try:
-                    await session.user_ws.send_json(_busy_msg)
-                    delivered = True
-                except Exception:
-                    pass
-            if not delivered:
-                session.pending_ws_message = _busy_msg
-            self._save_sessions()
-            await self._broadcast_sessions_update()
-            return
-
-        # All online agents declined (or no agents online) — send escalation email
         session.email_sent = True
+        # Tag the triggering user message so the super-admin "Agent Only" view can flag it
         for m in reversed(session.history):
             if m.role == "user":
                 m.meta["escalation_sent"] = True
                 break
         _timeout_msg = {
             "type": "handoff_timeout",
-            "message": "No agent is available right now. We've emailed our support team and someone will reach out to you soon.",
+            "message": "No agent responded in time. We've emailed our support team — someone will reach out to you soon.",
         }
         delivered = False
         if session.user_ws:
