@@ -250,6 +250,9 @@ _EXAMPLE_SIGNALS = {
     'show me an example', 'show an example', 'can you give example',
     'explain with example', 'example please', 'real life example',
     'real example', 'for example', 'use example',
+    'with the help of an example', 'with the help of example',
+    'explain me with example', 'can you give me an example',
+    'explain with the help', 'using an example', 'using example',
 }
 
 
@@ -439,6 +442,18 @@ def _is_likely_followup(question: str) -> bool:
     # Existing checks: pronoun-like tokens and fixed opener phrases
     if bool(tokens & _FOLLOWUP_SIGNALS) or any(q_lower.startswith(op) for op in _FOLLOWUP_OPENERS):
         return True
+
+    # Example request with no insurance vocabulary → clearly a follow-up
+    # e.g. "can you explain with the help of an example" (9 words, no insurance term)
+    # The 6-word limit below would miss this, so check it first.
+    if any(sig in q_lower for sig in _EXAMPLE_SIGNALS):
+        from re import compile as _re_compile
+        _II_QUICK = _re_compile(
+            r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
+            r"life|motor|travel|home|vehicle|accident|liability|rider|annuity|pension)\b"
+        )
+        if not _II_QUICK.search(q_lower):
+            return True
 
     # Additional keyword check: short messages (<= 6 words) that contain a
     # follow-up keyword but NO actual insurance vocabulary are likely referential
@@ -1530,14 +1545,23 @@ class MultiSourceRAG:
             # _detected_as_followup is used (not _is_followup) so the fix applies
             # even when we fell back to history-based topic extraction.
             prompt_question = retrieval_query if _detected_as_followup else question
-            # If user asked for an example, append explicit instruction so the LLM
-            # generates a concrete illustrative scenario even if not in the KB.
+            # If user asked for an example, append explicit instruction.
+            # Follow-up: they already know the concept — give ONLY the example.
+            # Fresh question: explain and include an example.
             _q_lower = question.lower()
             if any(sig in _q_lower for sig in _EXAMPLE_SIGNALS):
-                prompt_question = (
-                    prompt_question.rstrip(" .?") +
-                    " — please include a concrete real-life example to illustrate this concept clearly."
-                )
+                if _detected_as_followup:
+                    prompt_question = (
+                        prompt_question.rstrip(" .?") +
+                        " — The user already understands this concept from the previous answer. "
+                        "Do NOT re-explain or repeat the definition. "
+                        "Give ONLY one concrete real-life example that illustrates it clearly."
+                    )
+                else:
+                    prompt_question = (
+                        prompt_question.rstrip(" .?") +
+                        " — please include a concrete real-life example to illustrate this concept clearly."
+                    )
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
                 llm = get_insurance_llm(temperature=0)
