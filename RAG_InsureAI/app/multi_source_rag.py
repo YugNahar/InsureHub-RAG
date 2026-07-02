@@ -1311,7 +1311,7 @@ class MultiSourceRAG:
                 context=full_context,
                 question=question,
             )
-            llm = get_insurance_llm(temperature=0.3)
+            llm = get_insurance_llm(temperature=0)
 
         # ── LLM invocation with backend-error guard ───────────────────────────
         # When the context does NOT cover the query (out-of-KB question) and the
@@ -1827,7 +1827,7 @@ class MultiSourceRAG:
                     context=full_context,
                     question=prompt_question,
                 )
-                llm = get_insurance_llm(temperature=0.3)
+                llm = get_insurance_llm(temperature=0)
 
         # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
         # LangChain's astream() buffers the full response before yielding.
