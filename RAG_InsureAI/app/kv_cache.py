@@ -350,5 +350,15 @@ class QueryKVCache:
             self._data = d.get("entries", {})
             self._emb_dirty = True
             logger.info("[KVCache] loaded %d entries from %s", len(self._data), self._path)
+            # Prune expired entries immediately on load so stale answers from
+            # previous sessions are never served after a container restart.
+            now = time.time()
+            expired_keys = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
+            if expired_keys:
+                for k in expired_keys:
+                    del self._data[k]
+                self._emb_dirty = True
+                self._save()
+                logger.info("[KVCache] pruned %d expired entries on startup", len(expired_keys))
         except Exception as exc:
             logger.warning("[KVCache] load failed (%s) — starting fresh", exc)
