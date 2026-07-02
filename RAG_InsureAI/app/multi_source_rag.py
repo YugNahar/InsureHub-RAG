@@ -104,67 +104,9 @@ _QUERY_STOP_WORDS = {
     'period', 'time', 'duration', 'date', 'days', 'year', 'month', 'months',
 }
 
-# ── Dynamic (LLM-learned) stop words ─────────────────────────────────────────
-# The static list above only covers words we've thought of by hand. New
-# generic words surface constantly ("suitable", "budget", "family", ...) and
-# hand-updating a regex list every time one slips through doesn't scale.
-# Instead, _extract_intent_topics() asks the LLM — on every query — to flag
-# which words are generic filler (appear in virtually every insurance doc)
-# vs specific/discriminating. Generic words get merged into this disk-backed
-# set permanently, so the NEXT time the same word appears it's filtered
-# instantly with zero extra LLM cost — only genuinely new words need a fresh
-# LLM judgment call.
-import json as _json_stopwords
-
-_LEARNED_STOPWORDS_PATH = os.path.join(
-    os.getenv("INSUREHUB_DATA_DIR", os.path.expanduser("~/.insurehub")),
-    "cache",
-    "learned_query_stopwords.json",
-)
-_learned_stopwords: set[str] = set()
-
-
-def _load_learned_stopwords() -> None:
-    global _learned_stopwords
-    try:
-        if os.path.exists(_LEARNED_STOPWORDS_PATH):
-            with open(_LEARNED_STOPWORDS_PATH, "r", encoding="utf-8") as f:
-                _learned_stopwords = set(_json_stopwords.load(f))
-            logger.info("[QueryStopwords] loaded %d learned stopword(s)", len(_learned_stopwords))
-    except Exception as exc:
-        logger.warning("[QueryStopwords] load failed: %s", exc)
-
-
-def _save_learned_stopwords() -> None:
-    try:
-        os.makedirs(os.path.dirname(_LEARNED_STOPWORDS_PATH), exist_ok=True)
-        tmp = _LEARNED_STOPWORDS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            _json_stopwords.dump(sorted(_learned_stopwords), f)
-        os.replace(tmp, _LEARNED_STOPWORDS_PATH)
-    except Exception as exc:
-        logger.warning("[QueryStopwords] save failed: %s", exc)
-
-
-def _learn_generic_words(words: set[str]) -> None:
-    """Merge newly LLM-classified generic words into the persisted set."""
-    new_words = {w for w in words if w and w not in _learned_stopwords and w not in _QUERY_STOP_WORDS}
-    if new_words:
-        _learned_stopwords.update(new_words)
-        _save_learned_stopwords()
-        logger.info("[QueryStopwords] learned %d new generic word(s): %s", len(new_words), sorted(new_words))
-
-
-def _all_stopwords() -> set[str]:
-    return _QUERY_STOP_WORDS | _learned_stopwords
-
-
-_load_learned_stopwords()
-
-
 def _extract_topic_terms(query: str) -> set[str]:
     """Return discriminating topic words from a query after stop-word filtering."""
-    stop = _all_stopwords()
+    stop = _QUERY_STOP_WORDS
     return {
         w for w in re.findall(r'\b[a-z]{3,}\b', query.lower())
         if not _is_stopword(w, stop)
@@ -257,10 +199,10 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # The original AND-logic (all topics must match) was too strict —
         # a single missing synonym killed answers that were clearly in the KB.
         # Defense in depth: even though _extract_intent_topics() is instructed
-        # to return only discriminating terms, strip any word that's since been
-        # learned as generic filler — a topic left with zero discriminating
-        # words after stripping gives no coverage signal and is skipped.
-        stop = _all_stopwords()
+        # to return only discriminating terms, strip any word that's a known
+        # generic filler — a topic left with zero discriminating words after
+        # stripping gives no coverage signal and is skipped.
+        stop = _QUERY_STOP_WORDS
         for topic in llm_topics:
             words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and not _is_stopword(w, stop)]
             if not words:
@@ -715,9 +657,8 @@ Question: {question}
 
 
 async def _extract_intent_topics(question: str) -> set[str]:
-    """Fast LLM call (runs in parallel with retrieval) to extract core topic words
-    AND learn which words are generic filler (persisted so future queries with
-    the same word are filtered instantly, without another LLM call).
+    """Fast LLM call (runs in parallel with retrieval) to extract core,
+    discriminating topic words from the question for the coverage check.
 
     Uses vLLM with max_tokens=60 so the round-trip is <1 s on an idle server.
     Falls back to an empty set on any error — caller uses regex fallback.
@@ -764,15 +705,22 @@ async def _extract_intent_topics(question: str) -> set[str]:
                     if phrase and phrase not in ("none", "n/a"):
                         topics.add(phrase)
 
-                # Individual generic words get flattened and merged into the
-                # persisted learned-stopwords set for instant future filtering.
+                # "Generic:" is still requested in the prompt — contrasting it
+                # against "Specific:" helps the model reason about the split —
+                # but its output is no longer persisted anywhere. An earlier
+                # version fed it into a disk-backed learned-stopwords set
+                # shared across queries, which caused two confirmed bugs: (1)
+                # off-topic test/user queries taught it nonsense words with
+                # nothing to do with insurance, and (2) each deployment
+                # accumulates its own independent, un-synced state, so
+                # identical code + identical KB behaved differently across
+                # environments depending on each one's unrelated query
+                # history. Kept for debug visibility only.
                 generic_words: set[str] = set()
                 for phrase in generic_line.lower().split(","):
                     phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
                     if phrase and phrase not in ("none", "n/a"):
                         generic_words.update(w for w in phrase.split() if len(w) >= 3)
-                if generic_words:
-                    _learn_generic_words(generic_words)
 
                 logger.debug("[INTENT] %r → specific=%s generic=%s", question, topics, generic_words)
                 return topics
