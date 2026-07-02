@@ -253,21 +253,42 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             return True
         return False
 
-    # Regex fallback: split compound questions on "and"/"or".
+    # Regex fallback (used for follow-up turns, where extracted LLM topics
+    # from the raw short follow-up text aren't trustworthy — the topic lives
+    # in conversation history, not the follow-up itself). Split compound
+    # questions on "and"/"or", one discriminating-word set per sub-query.
+    #
+    # Same AND-logic + per-chunk co-occurrence fix as the llm_topics branch
+    # above, and for the same reason: the old version required only ONE word
+    # of a sub-query's term set to appear ANYWHERE in the pool (OR-logic,
+    # scattered matching) — so "is regular health insurance mandatory"
+    # (terms: "health", "mandatory") passed on "health" alone appearing
+    # somewhere in an unrelated section, even though "mandatory" never
+    # appeared anywhere and the KB never addresses legal requirements at
+    # all. Every discriminating word of a sub-query must now co-occur
+    # within a single chunk, and every sub-query must be satisfied.
     sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
     all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
     all_term_sets = [t for t in all_term_sets if t]
     if not all_term_sets:
         return True
 
+    chunk_term_sets = []
     for doc in docs:
         text = (
             doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
         ).lower()
-        chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text))
-        for topic_terms in all_term_sets:
-            if _topics_hit_chunk(topic_terms, chunk_terms):
-                return True
+        chunk_term_sets.append(set(re.findall(r'\b[a-z]{3,}\b', text)))
+
+    all_covered = all(
+        any(
+            all(any(_word_matches(w, c) for c in chunk_terms) for w in term_set)
+            for chunk_terms in chunk_term_sets
+        )
+        for term_set in all_term_sets
+    )
+    if all_covered:
+        return True
     return False
 
 
