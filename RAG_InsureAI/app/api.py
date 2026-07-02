@@ -355,6 +355,7 @@ async def tunnel_url_endpoint():
 
 _ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "insurehub2026")
 _SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "superadmin2026")
+_AGENT_PASSWORD = os.getenv("AGENT_PASSWORD", "") or _ADMIN_PASSWORD
 
 
 # ── Super-admin API ────────────────────────────────────────────────────────────
@@ -517,7 +518,7 @@ async def ws_agent_endpoint(websocket: WebSocket):
             await websocket.close(code=1008)
             return
         name = (data.get("name") or "Agent").strip() or "Agent"
-        if data.get("password") != _ADMIN_PASSWORD:
+        if data.get("password") != _AGENT_PASSWORD:
             await websocket.send_json({"type": "error", "message": "Invalid password."})
             await websocket.close(code=1008)
             return
