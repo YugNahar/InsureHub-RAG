@@ -17,6 +17,8 @@ except ImportError:
 
 from rapidfuzz import fuzz, process
 
+logger = logging.getLogger(__name__)
+
 _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
 
 # ── Typo-tolerant insurance vocabulary ──────────────────────────────────────────
@@ -409,62 +411,6 @@ def _needs_detailed_answer(question: str) -> bool:
     if q.count(' and ') >= 3:
         return True
     return False
-
-
-async def _llm_classify_intent(question: str) -> bool:
-    """Classify whether a question needs a detailed answer (True) or brief (False).
-
-    Fast path: keyword signals handle the obvious cases with zero latency.
-    LLM path: a non-blocking aiohttp call (max 5 tokens, 5 s timeout) for
-    ambiguous questions. Falls back to False (brief) on any error or timeout.
-    Designed to run in parallel with retrieval — adds zero wall-clock latency.
-    """
-    q = question.lower()
-    # Fast path — explicit simple/brief signal overrides everything
-    if any(sig in q for sig in _SIMPLE_SIGNALS):
-        return False
-    # Fast path — unambiguously detailed
-    if any(sig in q for sig in _DETAIL_SIGNALS):
-        return True
-    if len(question.split()) > 25:
-        return True
-    if q.count(' and ') >= 3:
-        return True
-
-    # LLM path — non-blocking aiohttp call, same pattern as _extract_intent_topics
-    try:
-        import aiohttp as _aiohttp
-        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
-        if _active_backend() != "vllm" or not VLLM_HOST:
-            return False
-        prompt = (
-            "Classify this insurance question with ONE word only.\n"
-            "Reply 'detailed' if it needs steps, a list, or multiple parts.\n"
-            "Reply 'brief' if 2-3 sentences would fully answer it.\n\n"
-            f"Question: {question}\n\nAnswer:"
-        )
-        payload = {
-            "model": _resolve_vllm_model(),
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 5,
-            "temperature": 0,
-            "stream": False,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {VLLM_API_KEY}",
-        }
-        timeout = _aiohttp.ClientTimeout(total=5)
-        async with _aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{VLLM_HOST}/v1/chat/completions",
-                json=payload, headers=headers, timeout=timeout,
-            ) as resp:
-                data = await resp.json()
-                result = data["choices"][0]["message"]["content"].strip().lower()
-                return "detailed" in result
-    except Exception:
-        return False  # safe default: brief
 
 
 _FOLLOWUP_SIGNALS = {
@@ -868,12 +814,6 @@ def _strip_model_preamble(text: str) -> str:
 
 _RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
 
-# Reuse the same "clearly relevant" bar as the keyword-check bypass (see
-# _context_covers_query) so both decisions agree on what counts as solid
-# grounding rather than drifting out of sync. Scores are sigmoid-bounded
-# [0, 1] probabilities (see _context_covers_query for calibration notes).
-_RULE4_TRUST_THRESHOLD = 0.5
-
 
 def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
     """Handle the LLM appending the canned Rule 4 fallback ("Honestly/Honest,
@@ -1119,8 +1059,6 @@ from prompt_template import (
 )
 from context_compressor import ContextCompressor
 from rag import LLM_CONTEXT_WINDOW_CHARS
-
-logger = logging.getLogger(__name__)
 
 class MultiSourceRAG:
     def __init__(self):
@@ -1649,29 +1587,30 @@ class MultiSourceRAG:
             })
             return
 
-        # Streaming path: parallel retrieval + LLM intent extraction + LLM intent classification.
-        # _keyword_detailed is already computed above; OR with LLM result for final flag.
+        # Streaming path: parallel retrieval + LLM intent extraction.
+        # _keyword_detailed is already computed above and is the only signal
+        # used for detail level — an LLM-based detail classifier used to run
+        # here too, but its result was never actually used (the LLM
+        # over-classifies insurance questions as needing detail, making
+        # every answer verbose), so it was purely wasted latency: a full
+        # extra round-trip to the LLM server on every query for a result
+        # nothing read. Removed.
         if not document_filter:
-            (doc_chunks, video_chunks, webpage_chunks), llm_topics, _llm_detailed = await asyncio.gather(
+            (doc_chunks, video_chunks, webpage_chunks), llm_topics = await asyncio.gather(
                 asyncio.gather(
                     self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                     asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True),
                     asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True),
                 ),
                 _extract_intent_topics(question),
-                _llm_classify_intent(question),
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
-            doc_chunks, llm_topics, _llm_detailed = await asyncio.gather(
+            doc_chunks, llm_topics = await asyncio.gather(
                 self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                 _extract_intent_topics(question),
-                _llm_classify_intent(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
-        # Only trigger detailed mode on explicit user signals ("in detail", "step by step", etc.)
-        # _llm_detailed is intentionally excluded — the LLM over-classifies insurance questions
-        # (which often have lists/procedures) as "detailed", making every answer verbose.
         detailed = _keyword_detailed
 
         # Prefer BGE rerank_score when available (set by rerank_documents).
@@ -1961,10 +1900,20 @@ class MultiSourceRAG:
         # and then ALSO appends the Rule 4 canned fallback at the end because
         # the specific fact wasn't in the retrieved context. When real content
         # precedes the fallback, strip the fallback so users only see the answer.
+        # trust_content uses the SAME bar as the pre-generation hard gate
+        # (_rerank_gate), not a separate stricter one — if a chunk was
+        # already good enough to generate an answer from, it's good enough
+        # to trust that answer post-hoc too. An earlier, stricter separate
+        # threshold (0.5) caused real regressions: legitimately correct
+        # answers (e.g. proximate-cause explanations phrased differently
+        # than the source doc) scored below it on the cross-encoder despite
+        # being genuinely grounded, and got wrongly discarded. The actual
+        # fix for ungrounded content is upstream — the hard gate + per-chunk
+        # filtering — not a second, disagreeing gate here.
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
         _rule4_discarded = False
-        _r4_trusted = _top_rerank >= _RULE4_TRUST_THRESHOLD
+        _r4_trusted = _top_rerank >= _rerank_gate
         _r4_stripped = _strip_rule4_fallback(_reply_stripped, trust_content=_r4_trusted)
         if _r4_stripped:
             _reply_stripped = _r4_stripped
@@ -1972,10 +1921,10 @@ class MultiSourceRAG:
             _corrected_text = _r4_stripped
             logger.info("[ask_stream] stripped Rule4 fallback appended after real content (%d chars)", len(_r4_stripped))
         elif _r4_stripped == "":
-            # Marker present but the leading content isn't independently
-            # supported (reranker score below trust threshold) — the model's
-            # own disclaimer is the more reliable signal here. Discard the
-            # unconfirmed claim and show the standard refusal instead.
+            # Marker present but the leading content didn't even clear the
+            # entry gate (shouldn't normally happen since generation only
+            # runs on chunks that passed it) — discard and show the
+            # standard refusal instead of an unconfirmed claim.
             _refusal_text = (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it — they'll be able to help you better! 😊"
@@ -1985,8 +1934,8 @@ class MultiSourceRAG:
             _corrected_text = _refusal_text
             _rule4_discarded = True
             logger.info(
-                "[ask_stream] discarded low-confidence Rule4 answer (top_rerank=%.3f < %.3f)",
-                _top_rerank, _RULE4_TRUST_THRESHOLD,
+                "[ask_stream] discarded low-confidence Rule4 answer (top_rerank=%.3f < gate=%.3f)",
+                _top_rerank, _rerank_gate,
             )
 
         # ── Truncation detection ─────────────────────────────────────────────
