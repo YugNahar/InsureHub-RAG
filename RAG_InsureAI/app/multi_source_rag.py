@@ -1634,13 +1634,23 @@ class MultiSourceRAG:
         # Small 7B models ignore grounding instructions and answer from training
         # knowledge when the context is irrelevant, so gating here prevents that.
         # Scores are sigmoid-bounded [0,1] probabilities (see
-        # _context_covers_query for empirical calibration) — a 0.0 default
-        # here was a no-op (scores can't go negative, so nothing was ever
-        # rejected); 0.2 rejects unrelated (~0.0000) and merely-topical
-        # (~0.01-0.16) chunks while still letting genuinely relevant
-        # (~0.3+) ones through.
+        # _context_covers_query for empirical calibration notes) — but a
+        # 0.2 threshold, tried previously, was measured to wrongly refuse
+        # ~20% of legitimate KB questions: standard terms like "no claim
+        # bonus" scored just 0.0024 and "free look period" scored 0.008 —
+        # both far below 0.2 — while the actual bad case that motivated
+        # raising this gate scored 0.062, HIGHER than those legitimate
+        # answers. The score ranges for "genuinely relevant, oddly phrased"
+        # and "borderline irrelevant" genuinely overlap; no single
+        # threshold in between can separate them. This gate is kept only
+        # as a backstop against results indistinguishable from random
+        # noise (~0.00004-0.00006 in the same measurements) — the real
+        # defense against ungrounded answers is the content-based checks
+        # below (_context_covers_query, _enumeration_query_covered), which
+        # check for actual word/entity presence rather than an ML
+        # confidence score that isn't reliable at this granularity.
         import json as _json_s
-        _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.2"))
+        _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.0005"))
         _top_rerank = max(
             (c.metadata.get("rerank_score", float("-inf"))
              for c in all_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
