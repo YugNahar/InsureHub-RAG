@@ -91,6 +91,16 @@ _QUERY_STOP_WORDS = {
     'need', 'like', 'just', 'also', 'more', 'some', 'very', 'well', 'good',
     'different', 'types', 'type', 'kind', 'kinds', 'various', 'general',
     'basic', 'main', 'key', 'between', 'difference', 'example', 'examples',
+    # Answer-style/format requests — ask HOW to phrase the answer, never
+    # appear as literal words inside actual KB content (no policy document
+    # says "explain in simple words"). Reformulated follow-ups like "explain
+    # it in simple words" or "give me an example" fold these into the
+    # retrieval query, and requiring them to co-occur with the real topic
+    # in a source chunk always fails regardless of whether the topic itself
+    # is genuinely covered.
+    'simple', 'simply', 'definition', 'define', 'detail', 'detailed',
+    'briefly', 'brief', 'short', 'layman', 'easy', 'explanation',
+    'language', 'words', 'scenario', 'illustration', 'instance',
     # Generic quality/selection words — appear in virtually every insurance doc
     # so they cannot indicate topic coverage (e.g. "best coverage", "choose a plan")
     'best', 'top', 'great', 'better', 'right', 'ideal', 'suitable', 'suited',
@@ -175,6 +185,27 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
             default=0,
         )
+        stop = _QUERY_STOP_WORDS
+        topic_word_lists = []
+        for topic in llm_topics:
+            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and not _is_stopword(w, stop)]
+            if words:
+                topic_word_lists.append(words)
+
+        # Score-based rescues (the 0.5 full-bypass below and the 0.05
+        # lexical-miss fallback further down) are only safe for single-topic
+        # questions. top_rerank is the SINGLE best score across ALL chunks —
+        # for a compound question ("X and Y"), a high score usually just
+        # means ONE part matched well, and applying it question-wide lets
+        # that one strong match vouch for a completely unrelated other part.
+        # Measured: "what is a deductible and what is the GST rate on
+        # insurance premiums" scored 0.53 purely from the deductible half,
+        # bypassing this check entirely and letting the model invent a
+        # specific GST percentage that appears nowhere in the KB. For
+        # multi-topic questions, every topic must pass the strict per-chunk
+        # lexical check below — no score-based rescue.
+        single_topic = len(topic_word_lists) <= 1
+
         # Only bypass keyword coverage check when the cross-encoder is *highly*
         # confident the chunk is relevant. The reranker (BAAI/bge-reranker-base
         # via sentence-transformers CrossEncoder) is sigmoid-activated, so
@@ -184,7 +215,7 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # matches ≈ 0.9+. A stale threshold of 4.0 here was calibrated for
         # raw logits and was literally unreachable (scores can't exceed 1.0),
         # silently making this bypass permanently dead code.
-        if top_rerank >= 0.5:
+        if single_topic and top_rerank >= 0.5:
             return True
 
         # Require EVERY extracted topic to be covered (AND-logic), not just
@@ -212,12 +243,6 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # satisfied "zero depreciation" even though no chunk ever discussed
         # the concept as a unit) — but different topics may be satisfied by
         # different chunks, since the LLM sees the union of all of them.
-        stop = _QUERY_STOP_WORDS
-        topic_word_lists = []
-        for topic in llm_topics:
-            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and not _is_stopword(w, stop)]
-            if words:
-                topic_word_lists.append(words)
         if topic_word_lists:
             chunk_term_sets = []
             for doc in docs:
@@ -242,14 +267,16 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # IS a semantic model — it's what separates genuinely-relevant-but-
         # differently-worded content from actual noise, independent of
         # literal wording. When the lexical AND-check fails, fall back to
-        # trusting that signal — but only well above the noise floor:
-        # measured false positives (e.g. "IDV" scored 0.024 with zero
-        # actual IDV content) sit close to measured true positives (e.g.
-        # "rejected"/"refused" scored 0.074), so this bar is deliberately
-        # conservative and still imperfect at this boundary — a known
-        # residual limit of a purely retrieval-based gate, not a fully
-        # solved problem.
-        if top_rerank >= 0.05:
+        # trusting that signal — but only well above the noise floor, and
+        # only for single-topic questions (see single_topic above — this
+        # fallback has the same compound-question smuggling risk as the 0.5
+        # bypass): measured false positives (e.g. "IDV" scored 0.024 with
+        # zero actual IDV content) sit close to measured true positives
+        # (e.g. "rejected"/"refused" scored 0.074), so this bar is
+        # deliberately conservative and still imperfect at this boundary —
+        # a known residual limit of a purely retrieval-based gate, not a
+        # fully solved problem.
+        if single_topic and top_rerank >= 0.05:
             return True
         return False
 
@@ -273,6 +300,24 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     if not all_term_sets:
         return True
 
+    # Same single-topic-gated reranker-score rescue as the llm_topics branch
+    # above, and it belongs here for the identical reason: pure lexical
+    # matching can't handle phrasing gaps ("proximate cause" query vs.
+    # source explaining it via "nearest cause"/"closest cause" without ever
+    # using the words "proximate" or "determined" together) — the LLM-topics
+    # extraction can also come back empty for a legitimate question (observed:
+    # "How is proximate cause determined when multiple causes contribute to a
+    # loss?" returned zero specific topics), which silently routes here with
+    # no fallback at all before this fix, even when the actual best chunk
+    # scored 0.92 — about as confident as this system ever gets.
+    top_rerank = max(
+        (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
+        default=0,
+    )
+    single_topic = len(all_term_sets) <= 1
+    if single_topic and top_rerank >= 0.5:
+        return True
+
     chunk_term_sets = []
     for doc in docs:
         text = (
@@ -288,6 +333,9 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         for term_set in all_term_sets
     )
     if all_covered:
+        return True
+
+    if single_topic and top_rerank >= 0.05:
         return True
     return False
 
@@ -1921,20 +1969,25 @@ class MultiSourceRAG:
         # and then ALSO appends the Rule 4 canned fallback at the end because
         # the specific fact wasn't in the retrieved context. When real content
         # precedes the fallback, strip the fallback so users only see the answer.
-        # trust_content uses the SAME bar as the pre-generation hard gate
-        # (_rerank_gate), not a separate stricter one — if a chunk was
-        # already good enough to generate an answer from, it's good enough
-        # to trust that answer post-hoc too. An earlier, stricter separate
-        # threshold (0.5) caused real regressions: legitimately correct
-        # answers (e.g. proximate-cause explanations phrased differently
-        # than the source doc) scored below it on the cross-encoder despite
-        # being genuinely grounded, and got wrongly discarded. The actual
-        # fix for ungrounded content is upstream — the hard gate + per-chunk
-        # filtering — not a second, disagreeing gate here.
+        # trust_content used to reuse _rerank_gate directly, on the reasoning
+        # that "good enough to generate from is good enough to trust
+        # post-hoc". That stopped being true once _rerank_gate was separately
+        # lowered to 0.0005 (a near-zero noise backstop, not a relevance bar)
+        # to fix an unrelated false-rejection problem — the two changes
+        # combined made _r4_trusted almost always True, so the model's own
+        # explicit "I don't have that specific info" hedge got silently
+        # discarded even when the leading claim was genuinely ungrounded
+        # (observed: "IRDAI guidelines specify certain obligations... honestly,
+        # I don't have that specific info" — the hedge was right, but got
+        # stripped anyway, leaving a confident-sounding vague claim). Use the
+        # same 0.05 bar as the single-topic lexical-miss rescue elsewhere in
+        # this file instead — below that, trust the model's own uncertainty
+        # signal rather than overriding it with a rerank_gate that no longer
+        # means "relevant enough", just "not pure noise".
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
         _rule4_discarded = False
-        _r4_trusted = _top_rerank >= _rerank_gate
+        _r4_trusted = _top_rerank >= 0.05
         _r4_stripped = _strip_rule4_fallback(_reply_stripped, trust_content=_r4_trusted)
         if _r4_stripped:
             _reply_stripped = _r4_stripped
@@ -1955,8 +2008,8 @@ class MultiSourceRAG:
             _corrected_text = _refusal_text
             _rule4_discarded = True
             logger.info(
-                "[ask_stream] discarded low-confidence Rule4 answer (top_rerank=%.3f < gate=%.3f)",
-                _top_rerank, _rerank_gate,
+                "[ask_stream] discarded low-confidence Rule4 answer (top_rerank=%.3f < 0.05)",
+                _top_rerank,
             )
 
         # ── Truncation detection ─────────────────────────────────────────────

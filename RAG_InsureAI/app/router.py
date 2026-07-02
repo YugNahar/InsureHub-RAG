@@ -2,6 +2,11 @@
 Router — LLM routing with auto-fallback.
 
 Priority order:
+  0. Groq (generation only) — set FORCE_BACKEND=groq AND GROQ_API_KEY. An
+     explicit opt-in toggle, not just having the key present, so testing
+     against a bigger model never silently overrides the stored vLLM
+     config below — flip FORCE_BACKEND back off (or unset it) and vLLM is
+     immediately active again with zero other changes.
   1. vLLM server        — set VLLM_HOST (VLLM_MODEL is validated/auto-detected)
   2. OpenAI             — set OPENAI_API_KEY  (model: gpt-4o-mini or OPENAI_MODEL)
   3. Anthropic          — set ANTHROPIC_API_KEY (model: claude-haiku-4-5-20251001 or ANTHROPIC_MODEL)
@@ -17,6 +22,11 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 # ── Read env vars (no crash at import time) ────────────────────────────────────
+FORCE_BACKEND = os.getenv("FORCE_BACKEND", "").strip().lower()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+
 VLLM_HOST  = os.getenv("VLLM_HOST", "").strip().rstrip("/")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "").strip()
 VLLM_API_KEY = (
@@ -98,6 +108,8 @@ def _resolve_vllm_model() -> str:
 # ── Backend detection ──────────────────────────────────────────────────────────
 
 def _active_backend() -> str:
+    if FORCE_BACKEND == "groq" and GROQ_API_KEY:
+        return "groq"
     if VLLM_HOST:
         return "vllm"
     if OPENAI_API_KEY:
@@ -109,6 +121,8 @@ def _active_backend() -> str:
 
 def get_active_model_info() -> dict:
     backend = _active_backend()
+    if backend == "groq":
+        return {"backend": "groq", "model": GROQ_MODEL}
     if backend == "vllm":
         return {
             "backend": "vllm",
@@ -132,6 +146,21 @@ def get_insurance_llm(temperature: float = 0, max_tokens: int = 0):
     80 for RAGAS/judge calls). Pass an explicit value to override.
     """
     backend = _active_backend()
+
+    if backend == "groq":
+        from langchain_openai import ChatOpenAI
+
+        _mt = max_tokens if max_tokens > 0 else 500
+        logger.debug("[LLM] Groq model=%s max_tokens=%d", GROQ_MODEL, _mt)
+        return ChatOpenAI(
+            model=GROQ_MODEL,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY,
+            temperature=temperature,
+            max_tokens=_mt,
+            timeout=60,
+            max_retries=1,
+        )
 
     if backend == "vllm":
         from langchain_openai import ChatOpenAI
