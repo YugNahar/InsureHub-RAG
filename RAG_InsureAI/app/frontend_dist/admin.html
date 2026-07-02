@@ -353,6 +353,7 @@
     <button class="tab active" onclick="switchTab('docs')">📄 Documents</button>
     <button class="tab" onclick="switchTab('video')">🎬 Videos</button>
     <button class="tab" onclick="switchTab('web')">🌐 Webpages</button>
+    <button class="tab" onclick="switchTab('system')">⚙️ System</button>
   </div>
 
   <!-- Documents tab -->
@@ -429,6 +430,16 @@
       <div class="doc-list" id="webList"><div class="empty-state">Click refresh to load.</div></div>
       <div class="no-results" id="webNoResults">No results match your search.</div>
       <div class="list-summary" id="webSummary"></div>
+    </div>
+  </div>
+
+  <!-- System tab -->
+  <div class="tab-panel" id="tab-system">
+    <div class="card">
+      <div class="card-title">Answer Cache</div>
+      <div class="card-sub">Clear the KV answer cache when responses seem stale or incorrect. All future queries will regenerate fresh answers.</div>
+      <button class="btn-danger" style="margin-top:12px" onclick="clearCache()">Clear Answer Cache</button>
+      <div id="cacheStatus" style="margin-top:10px;font-size:13px;color:var(--text-muted)"></div>
     </div>
   </div>
 </div>
@@ -510,11 +521,29 @@ function logout() {
   window.location.href = '/auth';
 }
 
+// ── Cache clear ───────────────────────────────────────────────────────────────
+async function clearCache() {
+  const status = document.getElementById('cacheStatus');
+  status.textContent = 'Clearing…';
+  try {
+    const r = await fetch(API + '/admin/cache/clear', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token }
+    });
+    if (!r.ok) throw new Error(await r.text());
+    status.textContent = 'Cache cleared successfully. Next query will generate a fresh answer.';
+    showToast('Answer cache cleared');
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    showToast('Failed to clear cache', true);
+  }
+}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 const _tabLoaded = {};
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach((t, i) => {
-    const names = ['docs','video','web'];
+    const names = ['docs','video','web','system'];
     t.classList.toggle('active', names[i] === name);
   });
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));

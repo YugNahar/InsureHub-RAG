@@ -1711,6 +1711,18 @@ async def clear_docs(_: str = Depends(require_auth)):
     return {"status": "cleared"}
 
 
+@app.post("/admin/cache/clear", tags=["admin"])
+async def clear_kv_cache(_: str = Depends(require_auth)):
+    """Clear the KV answer cache. All future queries will regenerate fresh answers."""
+    multi = _get_multi_rag()
+    cache = getattr(multi, "doc_pipeline", None)
+    cache = getattr(cache, "_cache", None) if cache is not None else None
+    if cache is None:
+        raise HTTPException(status_code=503, detail="Cache not available.")
+    await asyncio.to_thread(cache.clear)
+    return {"status": "cleared"}
+
+
 @app.delete("/docs/{name:path}")
 async def remove_doc(name: str, _: str = Depends(require_auth)):
     pipeline = _get_pipeline()
