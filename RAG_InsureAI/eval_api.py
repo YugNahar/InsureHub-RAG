@@ -1829,6 +1829,26 @@ def eval_llm_test():
             "status": "error", "backend": info.get("backend"), "model": info.get("model"), "message": str(exc),
         })
 
+@app.get("/eval/chunks", summary="Browse all chunks stored in the vector store")
+def eval_chunks(offset: int = 0, limit: int = 50, source: str = "", q: str = ""):
+    vs = get_vector_store()
+    result = vs.collection.get(include=["documents", "metadatas"])
+    ids   = result.get("ids", [])
+    docs  = result.get("documents", [])
+    metas = result.get("metadatas", [])
+
+    all_chunks = []
+    for doc_id, text, meta in zip(ids, docs, metas):
+        if source and source not in meta.get("source", ""):
+            continue
+        if q and q.lower() not in (text or "").lower():
+            continue
+        all_chunks.append({"id": doc_id, "text": text or "", "metadata": meta or {}})
+
+    total = len(all_chunks)
+    return {"chunks": all_chunks[offset: offset + limit], "total": total, "offset": offset, "limit": limit}
+
+
 @app.get("/eval/health")
 def health():
     try:

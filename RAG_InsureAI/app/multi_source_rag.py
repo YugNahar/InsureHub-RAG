@@ -89,6 +89,12 @@ _QUERY_STOP_WORDS = {
     'need', 'like', 'just', 'also', 'more', 'some', 'very', 'well', 'good',
     'different', 'types', 'type', 'kind', 'kinds', 'various', 'general',
     'basic', 'main', 'key', 'between', 'difference', 'example', 'examples',
+    # Generic quality/selection words — appear in virtually every insurance doc
+    # so they cannot indicate topic coverage (e.g. "best coverage", "choose a plan")
+    'best', 'top', 'great', 'better', 'right', 'ideal', 'suitable', 'suited',
+    'choose', 'choosing', 'select', 'selecting', 'pick', 'decide', 'deciding',
+    'compare', 'comparing', 'recommend', 'recommended', 'important', 'affordable',
+    'option', 'options', 'available', 'offer', 'offers', 'provide', 'provides',
     # Domain-generic insurance terms that appear in almost every chunk
     'insurance', 'insured', 'insurer', 'policy', 'policies', 'cover', 'coverage',
     'plan', 'claim', 'claims', 'benefits', 'benefit',

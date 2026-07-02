@@ -476,38 +476,73 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     """
     Load a PDF with per-page Documents.
 
-    Priority order (uses whatever is installed):
-      1. pypdf  — modern, pure-Python, actively maintained (pip install pypdf)
-      2. pdfplumber — good for complex layouts (pip install pdfplumber)
+    Strategy:
+      1. pypdf extracts all pages it can
+      2. For pages pypdf returned empty text, pdfplumber is tried as a per-page fallback
+         (handles complex layouts, tables, and PDFs with non-standard encoding)
 
     Raises RuntimeError if neither library is available.
     """
-    # ── pypdf (preferred — installed as 'pypdf' v6+) ──────────────────────────
+    _src  = filename or file_path
+    _base = filename or os.path.basename(file_path)
+
+    # ── pypdf (preferred — fast pure-Python reader) ───────────────────────────
     try:
         from pypdf import PdfReader  # type: ignore
 
-        docs: list[Document] = []
         reader = PdfReader(file_path)
-        total = len(reader.pages)
+        total  = len(reader.pages)
+        pypdf_texts: dict[int, str] = {}
         for page_num, page in enumerate(reader.pages):
             text = (page.extract_text() or "").strip()
             if text:
-                docs.append(Document(
-                    page_content=text,
-                    metadata={
-                        "source": filename or file_path,
-                        "filename": filename or os.path.basename(file_path),
-                        "page": page_num + 1,
-                        "total_pages": total,
-                    },
-                ))
-        logger.info("[PDF/pypdf] Loaded %d pages from '%s'", len(docs), filename)
+                pypdf_texts[page_num] = text
+
+        empty_pages = set(range(total)) - set(pypdf_texts)
+
+        # ── pdfplumber fallback for pages pypdf couldn't extract ──────────────
+        plumber_texts: dict[int, str] = {}
+        if empty_pages:
+            try:
+                import pdfplumber  # type: ignore
+                with pdfplumber.open(file_path) as pdf:
+                    for page_num in sorted(empty_pages):
+                        if page_num < len(pdf.pages):
+                            text = (pdf.pages[page_num].extract_text() or "").strip()
+                            if text:
+                                plumber_texts[page_num] = text
+                if plumber_texts:
+                    logger.info(
+                        "[PDF] pdfplumber recovered %d page(s) that pypdf missed: %s",
+                        len(plumber_texts),
+                        sorted(p + 1 for p in plumber_texts),
+                    )
+            except ImportError:
+                pass
+
+        all_texts = {**pypdf_texts, **plumber_texts}
+        docs: list[Document] = [
+            Document(
+                page_content=all_texts[page_num],
+                metadata={
+                    "source":      _src,
+                    "filename":    _base,
+                    "page":        page_num + 1,
+                    "total_pages": total,
+                },
+            )
+            for page_num in sorted(all_texts)
+        ]
+        logger.info(
+            "[PDF/pypdf] Loaded %d/%d pages from '%s' (%d via pdfplumber fallback)",
+            len(docs), total, _base, len(plumber_texts),
+        )
         return docs
 
     except ImportError:
-        logger.warning("[PDF] pypdf not available, trying pdfplumber")
+        logger.warning("[PDF] pypdf not available, falling back to pdfplumber")
 
-    # ── pdfplumber (fallback) ─────────────────────────────────────────────────
+    # ── pdfplumber (if pypdf not installed at all) ────────────────────────────
     try:
         import pdfplumber  # type: ignore
 
@@ -520,21 +555,19 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
                     docs.append(Document(
                         page_content=text,
                         metadata={
-                            "source": filename or file_path,
-                            "filename": filename or os.path.basename(file_path),
-                            "page": page_num + 1,
+                            "source":      _src,
+                            "filename":    _base,
+                            "page":        page_num + 1,
                             "total_pages": total,
                         },
                     ))
-        logger.info("[PDF/pdfplumber] Loaded %d pages from '%s'", len(docs), filename)
+        logger.info("[PDF/pdfplumber] Loaded %d pages from '%s'", len(docs), _base)
         return docs
 
     except ImportError:
         pass
 
-    raise RuntimeError(
-        "No PDF library installed. Run: pip install pypdf"
-    )
+    raise RuntimeError("No PDF library installed. Run: pip install pypdf")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

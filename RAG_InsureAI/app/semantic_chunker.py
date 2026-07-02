@@ -185,7 +185,7 @@ class SemanticChunker:
         self,
         text: str,
         for_youtube: bool = False,  # accepted for backward compat, ignored
-    ) -> List[str]:
+    ) -> tuple:
         """
         Split *text* into final chunks.
 
@@ -200,7 +200,8 @@ class SemanticChunker:
         """
         paragraphs = _split_paragraphs(text)
         if len(paragraphs) < 2:
-            return [text.strip()] if text.strip() else []
+            stripped = text.strip()
+            return ([stripped], [0]) if stripped else ([], [])
 
         # ── Step 2: embed all paragraphs at once ────────────────────────────
         model = self._model_or_default()
@@ -270,28 +271,37 @@ class SemanticChunker:
         )
 
         # ── Step 4: sliding-window overlap ───────────────────────────────────
+        overlap_sizes: List[int] = [0] * len(chunks)
         if self._overlap_words > 0 and len(chunks) > 1:
-            chunks = self._apply_overlap(chunks, self._overlap_words)
+            chunks, overlap_sizes = self._apply_overlap(chunks, self._overlap_words)
 
-        return chunks
+        return chunks, overlap_sizes  # (List[str], List[int])
 
     @staticmethod
-    def _apply_overlap(chunks: List[str], overlap_words: int) -> List[str]:
-        """Prepend the last N words of chunk[i-1] to the start of chunk[i]."""
+    def _apply_overlap(
+        chunks: List[str], overlap_words: int
+    ) -> tuple:
+        """
+        Prepend the last N words of chunk[i-1] to the start of chunk[i].
+        Returns (new_chunks, overlap_word_counts) where overlap_word_counts[i]
+        is the number of words prepended to chunk[i] (0 for chunk[0]).
+        """
         result: List[str] = [chunks[0]]
+        sizes: List[int]  = [0]
         for i in range(1, len(chunks)):
             prev_words = chunks[i - 1].split()
-            tail = (
-                " ".join(prev_words[-overlap_words:])
-                if len(prev_words) > overlap_words
-                else " ".join(prev_words)
-            )
+            tail_words = prev_words[-overlap_words:] if len(prev_words) > overlap_words else prev_words
+            tail = " ".join(tail_words)
             current = chunks[i]
-            if tail and not current.startswith(tail[:40]):
+            # Skip overlap if the next chunk already starts with the same content
+            # (happens when consecutive PDF pages repeat the same boundary text).
+            if tail and not current.startswith(tail[:60]):
                 result.append(tail + "\n\n" + current)
+                sizes.append(len(tail_words))
             else:
                 result.append(current)
-        return result
+                sizes.append(0)
+        return result, sizes
 
     def split_documents(
         self,
@@ -314,8 +324,8 @@ class SemanticChunker:
                 or doc.metadata.get("page_num")
                 or 0
             )
-            pieces = self.split_text(doc.page_content)
-            for idx, piece in enumerate(pieces):
+            pieces_raw, overlap_sizes = self.split_text(doc.page_content)
+            for idx, (piece, ov_size) in enumerate(zip(pieces_raw, overlap_sizes)):
                 markers = _PAGE_MARKER_RE.findall(piece)
                 recovered_page = page_value
                 if markers:
@@ -326,13 +336,16 @@ class SemanticChunker:
                         recovered_page = markers[0]
                     piece = _PAGE_MARKER_RE.sub("", piece).strip()
 
+                # Count overlap words after marker stripping so the value is
+                # accurate for the stored (marker-free) text.
                 result.append(Document(
                     page_content=piece,
                     metadata={
                         **doc.metadata,
-                        "page":            recovered_page,
-                        "chunk_index":     idx,
-                        "chunking_method": "semantic",
+                        "page":                recovered_page,
+                        "chunk_index":         idx,
+                        "chunking_method":     "semantic",
+                        "overlap_prefix_words": ov_size,
                     },
                 ))
         return result

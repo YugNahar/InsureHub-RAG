@@ -118,7 +118,34 @@
   .main-tab { padding: 10px 16px; font-size: 13px; cursor: pointer; border: none; background: none; color: var(--text2); border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: var(--font); transition: color .12s; }
   .main-tab:hover { color: var(--text); }
   .main-tab.active { color: var(--text); font-weight: 500; border-bottom-color: var(--accent); }
-  #mpanel-eval, #mpanel-summaries { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+  #mpanel-eval, #mpanel-summaries, #mpanel-chunks { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+
+  /* Chunks browser */
+  .chunks-toolbar { display: flex; gap: 8px; align-items: center; padding: 12px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }
+  .chunks-search { flex: 1; min-width: 180px; padding: 6px 10px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text); font-size: 13px; font-family: var(--font); outline: none; }
+  .chunks-search:focus { border-color: var(--accent); }
+  .chunks-source-select { padding: 6px 10px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text); font-size: 12px; font-family: var(--font); outline: none; cursor: pointer; }
+  .chunks-count-label { font-size: 12px; color: var(--text3); white-space: nowrap; }
+  .chunks-refresh-btn { padding: 5px 12px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text2); font-size: 12px; cursor: pointer; }
+  .chunks-refresh-btn:hover { color: var(--text); border-color: var(--accent); }
+  .chunks-scroll { flex: 1; overflow-y: auto; padding: 16px 24px; }
+  .chunks-scroll::-webkit-scrollbar { width: 5px; }
+  .chunks-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+  .chunk-browser-card { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 8px; background: var(--surface); transition: border-color .15s; }
+  .chunk-browser-card:hover { border-color: var(--accent); }
+  .chunk-browser-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chunk-browser-num { font-size: 11px; font-weight: 700; color: var(--text3); min-width: 36px; }
+  .chunk-browser-source { font-size: 11px; color: var(--text2); background: var(--surface2); border: 1px solid var(--border2); border-radius: 4px; padding: 1px 6px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chunk-browser-text { font-size: 12px; color: var(--text2); line-height: 1.65; font-family: var(--mono); background: var(--surface2); border-radius: var(--radius-sm); padding: 9px 11px; max-height: 80px; overflow: hidden; transition: max-height .25s ease; white-space: pre-wrap; word-break: break-word; }
+  .chunk-browser-text.open { max-height: 500px; }
+  .chunk-browser-toggle { font-size: 11px; color: var(--accent); cursor: pointer; background: none; border: none; font-family: var(--font); margin-top: 5px; }
+  .chunk-overlap-prefix { background: rgba(26,107,74,0.12); border-bottom: 1px dashed var(--accent); color: var(--text); }
+  .chunk-overlap-badge { font-size: 10px; font-weight: 600; color: var(--accent); background: var(--accent-bg); border-radius: 3px; padding: 1px 5px; margin-bottom: 4px; display: inline-block; }
+  .chunks-pagination { display: flex; align-items: center; gap: 8px; padding: 10px 24px; border-top: 1px solid var(--border); flex-shrink: 0; }
+  .page-btn { padding: 4px 12px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface2); color: var(--text2); font-size: 12px; cursor: pointer; }
+  .page-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+  .page-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .page-info { font-size: 12px; color: var(--text3); flex: 1; text-align: center; }
   /* API url */
   .api-input { width: 100%; padding: 5px 8px; border: 1px solid var(--border2); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: 11px; font-family: var(--mono); }
   /* Main area */
@@ -360,6 +387,7 @@
     <div class="main-tabs">
       <button class="main-tab active" id="mtab-eval" onclick="switchMainTab('eval')">Evaluator</button>
       <button class="main-tab" id="mtab-summaries" onclick="switchMainTab('summaries')">Summaries</button>
+      <button class="main-tab" id="mtab-chunks" onclick="switchMainTab('chunks')">Chunks</button>
     </div>
 
     <!-- Evaluator panel -->
@@ -393,6 +421,26 @@
         <div id="summary-list">
           <div class="empty"><div class="big">📋</div><p>No summaries yet. Ingest documents to generate summaries.</p></div>
         </div>
+      </div>
+    </div>
+
+    <!-- Chunks Browser panel -->
+    <div id="mpanel-chunks" style="display:none">
+      <div class="chunks-toolbar">
+        <input class="chunks-search" id="chunks-search" placeholder="🔍  Search chunk text…" oninput="chunksSearchDebounced()" />
+        <select class="chunks-source-select" id="chunks-source" onchange="loadChunks(0)">
+          <option value="">All sources</option>
+        </select>
+        <button class="chunks-refresh-btn" onclick="loadChunks(0)">↻ Refresh</button>
+        <span class="chunks-count-label" id="chunks-count-label">—</span>
+      </div>
+      <div class="chunks-scroll" id="chunks-scroll">
+        <div class="empty"><div class="big">📦</div><p>Switch to this tab to browse chunks.</p></div>
+      </div>
+      <div class="chunks-pagination" id="chunks-pagination" style="display:none">
+        <button class="page-btn" id="chunks-prev" onclick="chunksPage(-1)">← Prev</button>
+        <span class="page-info" id="chunks-page-info"></span>
+        <button class="page-btn" id="chunks-next" onclick="chunksPage(1)">Next →</button>
       </div>
     </div>
   </main>
@@ -1006,8 +1054,11 @@ function showToast(msg) {
 function switchMainTab(tab) {
   document.getElementById('mpanel-eval').style.display       = tab === 'eval'      ? 'flex' : 'none';
   document.getElementById('mpanel-summaries').style.display  = tab === 'summaries' ? 'flex' : 'none';
+  document.getElementById('mpanel-chunks').style.display     = tab === 'chunks'    ? 'flex' : 'none';
   document.getElementById('mtab-eval').classList.toggle('active',      tab === 'eval');
   document.getElementById('mtab-summaries').classList.toggle('active',  tab === 'summaries');
+  document.getElementById('mtab-chunks').classList.toggle('active',     tab === 'chunks');
+  if (tab === 'chunks') loadChunks(0);
   if (tab === 'summaries') {
     loadSummaries();
     loadCacheStats();
@@ -1271,6 +1322,127 @@ renderResults = function(d) {
   _showCacheHit(!!(d.doc_metadata && d.doc_metadata.from_cache));
   _origRender(d);
 };
+
+// ── Chunks Browser ────────────────────────────────────────────────────────────
+let _chunksOffset = 0;
+const _CHUNKS_LIMIT = 50;
+let _chunksTotal = 0;
+let _chunksSearchTimer = null;
+
+function chunksSearchDebounced() {
+  clearTimeout(_chunksSearchTimer);
+  _chunksSearchTimer = setTimeout(() => loadChunks(0), 300);
+}
+
+function chunksPage(dir) {
+  const next = _chunksOffset + dir * _CHUNKS_LIMIT;
+  if (next < 0 || next >= _chunksTotal) return;
+  loadChunks(next);
+}
+
+async function loadChunks(offset = 0) {
+  _chunksOffset = offset;
+  const q      = document.getElementById('chunks-search').value.trim();
+  const source = document.getElementById('chunks-source').value;
+  const label  = document.getElementById('chunks-count-label');
+  const scroll = document.getElementById('chunks-scroll');
+  const pager  = document.getElementById('chunks-pagination');
+
+  label.textContent = 'Loading…';
+  scroll.innerHTML  = '<div class="empty"><div class="big" style="font-size:1.4rem">⏳</div><p>Fetching chunks…</p></div>';
+  pager.style.display = 'none';
+
+  const params = new URLSearchParams({ offset, limit: _CHUNKS_LIMIT });
+  if (q)      params.set('q', q);
+  if (source) params.set('source', source);
+
+  try {
+    const res = await fetch(`${API()}/eval/chunks?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    _chunksTotal = data.total;
+
+    // Populate source filter (first load or when filter is empty)
+    if (!source && !q && offset === 0) {
+      try {
+        const docsRes = await fetch(`${API()}/eval/documents`);
+        const docs = await docsRes.json();
+        const sel = document.getElementById('chunks-source');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">All sources</option>' +
+          (docs.sources || []).map(s => `<option value="${esc(s)}"${s === current ? ' selected' : ''}>${esc(s)}</option>`).join('');
+      } catch(_) {}
+    }
+
+    label.textContent = `${data.total} chunk${data.total !== 1 ? 's' : ''}`;
+
+    if (!data.chunks.length) {
+      scroll.innerHTML = '<div class="empty"><div class="big">🔍</div><p>No chunks match your search.</p></div>';
+      return;
+    }
+
+    scroll.innerHTML = data.chunks.map((c, i) => {
+      const meta   = c.metadata || {};
+      const absIdx = offset + i + 1;
+      const src    = meta.source || c.id || '';
+      const srcShort = src.length > 55 ? '…' + src.slice(-52) : src;
+      const badges = [
+        meta.page        != null ? `<span class="badge b-neutral">p.${meta.page}</span>` : '',
+        meta.chunk_type         ? `<span class="badge b-info">${esc(meta.chunk_type)}</span>` : '',
+        meta.policy_type        ? `<span class="badge b-green">${esc(meta.policy_type)}</span>` : '',
+        meta.intent             ? `<span class="badge b-neutral">${esc(meta.intent)}</span>` : '',
+        meta.insurer && meta.insurer !== 'UNKNOWN' ? `<span class="badge b-warn">${esc(meta.insurer)}</span>` : '',
+      ].filter(Boolean).join('');
+      // Render overlap prefix highlighted + rest of text
+      const ovWords = parseInt(meta.overlap_prefix_words) || 0;
+      let textHtml;
+      if (ovWords > 0) {
+        const words = c.text.split(/(\s+)/);
+        // Split by words (keeping whitespace tokens), take first ovWords non-whitespace tokens
+        let wCount = 0, splitIdx = 0;
+        for (let wi = 0; wi < words.length; wi++) {
+          if (words[wi].trim()) wCount++;
+          if (wCount === ovWords) { splitIdx = wi + 1; break; }
+        }
+        const overlapPart = esc(words.slice(0, splitIdx).join(''));
+        const restPart    = esc(words.slice(splitIdx).join(''));
+        textHtml = `<span class="chunk-overlap-badge">↺ ${ovWords}-word overlap</span>\n<span class="chunk-overlap-prefix">${overlapPart}</span>${restPart}`;
+      } else {
+        textHtml = esc(c.text);
+      }
+      return `
+        <div class="chunk-browser-card">
+          <div class="chunk-browser-header">
+            <span class="chunk-browser-num">#${absIdx}</span>
+            <span class="chunk-browser-source" title="${esc(src)}">${esc(srcShort)}</span>
+            ${badges}
+            ${ovWords > 0 ? `<span class="badge b-neutral" title="${ovWords} overlap words from previous chunk">↺ overlap</span>` : ''}
+          </div>
+          <div class="chunk-browser-text" id="cbt-${absIdx}">${textHtml}</div>
+          <button class="chunk-browser-toggle" onclick="toggleChunkText('cbt-${absIdx}',this)">Show more</button>
+        </div>`;
+    }).join('');
+
+    // Pagination
+    if (_chunksTotal > _CHUNKS_LIMIT) {
+      pager.style.display = 'flex';
+      const from = offset + 1;
+      const to   = Math.min(offset + _CHUNKS_LIMIT, _chunksTotal);
+      document.getElementById('chunks-page-info').textContent = `${from}–${to} of ${_chunksTotal}`;
+      document.getElementById('chunks-prev').disabled = offset === 0;
+      document.getElementById('chunks-next').disabled = to >= _chunksTotal;
+    }
+  } catch (e) {
+    label.textContent = 'Error';
+    scroll.innerHTML = `<div class="empty"><div class="big">⚠</div><p>Failed to load chunks: ${esc(e.message)}</p></div>`;
+  }
+}
+
+function toggleChunkText(id, btn) {
+  const el = document.getElementById(id);
+  const open = el.classList.toggle('open');
+  btn.textContent = open ? 'Show less' : 'Show more';
+}
 </script>
 </body>
 </html>
