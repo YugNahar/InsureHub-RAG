@@ -171,14 +171,10 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     Falls back to regex (OR logic) when llm_topics is absent.
     """
     if llm_topics:
-        # Build a combined term set across ALL retrieved chunks.
-        all_terms: set[str] = set()
-        for doc in docs:
-            text = (
-                doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
-            ).lower()
-            all_terms.update(re.findall(r'\b[a-z]{3,}\b', text))
-
+        top_rerank = max(
+            (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
+            default=0,
+        )
         # Only bypass keyword coverage check when the cross-encoder is *highly*
         # confident the chunk is relevant. The reranker (BAAI/bge-reranker-base
         # via sentence-transformers CrossEncoder) is sigmoid-activated, so
@@ -188,42 +184,72 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # matches ≈ 0.9+. A stale threshold of 4.0 here was calibrated for
         # raw logits and was literally unreachable (scores can't exceed 1.0),
         # silently making this bypass permanently dead code.
-        top_rerank = max(
-            (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
-            default=0,
-        )
         if top_rerank >= 0.5:
             return True
 
-        # OR-logic: pass if AT LEAST ONE topic phrase is fully covered.
-        # The original AND-logic (all topics must match) was too strict —
-        # a single missing synonym killed answers that were clearly in the KB.
-        # Defense in depth: even though _extract_intent_topics() is instructed
-        # to return only discriminating terms, strip any word that's a known
-        # generic filler — a topic left with zero discriminating words after
-        # stripping gives no coverage signal and is skipped.
+        # Require EVERY extracted topic to be covered (AND-logic), not just
+        # one via OR-logic. The LLM extracts several "Specific" topics per
+        # question, but many are weak riders that survive stopword-filtering
+        # down to one common word — e.g. "motor insurance" -> "motor",
+        # "health insurance" -> "health", or a country name like "india" —
+        # which trivially matches almost any chunk in that domain. Under
+        # plain OR-logic, a query like "what is a no-claim bonus" (topics:
+        # "no-claim bonus", "motor insurance", "premiums") passed because
+        # "motor" and "premiums" matched SOMETHING, even though the actual
+        # distinguishing term "bonus" never appeared anywhere — the KB
+        # genuinely doesn't define NCB, but a weak rider smuggled the query
+        # through. An earlier attempt to fix this by checking only the
+        # "most specific" (longest) topic broke when several topics tied
+        # for length (e.g. "india", "health", "portability" are all single
+        # words after filtering) — the arbitrary tie-break could pick the
+        # weak rider instead of the real term. Requiring ALL topics to pass
+        # removes the ambiguity: a weak rider passing no longer matters if
+        # the real term still fails.
+        #
+        # Each topic's words must co-occur within a SINGLE chunk (not be
+        # scattered independently across the whole retrieved pool — "zero"
+        # in one unrelated chunk and "depreciation" in another otherwise
+        # satisfied "zero depreciation" even though no chunk ever discussed
+        # the concept as a unit) — but different topics may be satisfied by
+        # different chunks, since the LLM sees the union of all of them.
         stop = _QUERY_STOP_WORDS
+        topic_word_lists = []
         for topic in llm_topics:
             words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and not _is_stopword(w, stop)]
-            if not words:
-                continue
-            if all(any(_word_matches(w, c) for c in all_terms) for w in words):
-                return True  # at least one topic fully covered → adequate context
+            if words:
+                topic_word_lists.append(words)
+        if topic_word_lists:
+            chunk_term_sets = []
+            for doc in docs:
+                text = (
+                    doc.page_content if hasattr(doc, 'page_content') else doc.get('text', '')
+                ).lower()
+                chunk_term_sets.append(set(re.findall(r'\b[a-z]{3,}\b', text)))
+            all_topics_covered = all(
+                any(
+                    all(any(_word_matches(w, c) for c in chunk_terms) for w in words)
+                    for chunk_terms in chunk_term_sets
+                )
+                for words in topic_word_lists
+            )
+            if all_topics_covered:
+                return True
 
-        # Lexical matching (even root-aware) structurally can't handle true
-        # synonyms — "claim rejected" vs. source text saying "claim refused"
-        # share no root, so no hand-maintained synonym list can ever be
-        # complete; the next mismatched pair is always one query away. But
-        # the cross-encoder reranker IS a semantic model — it's what
-        # separates genuinely-relevant-but-differently-worded content
-        # (~0.01-0.16, e.g. this exact "rejected"/"refused" case scored
-        # 0.074) from actual noise (~0.00005), independent of literal
-        # wording. When every topic fails the lexical check, fall back to
-        # trusting that existing signal rather than declining outright.
-        # Kept well below the 0.5 full-bypass above — this only rescues
-        # lexical misses, it doesn't skip the check for genuinely weak
-        # matches.
-        if top_rerank >= 0.01:
+        # Lexical matching (even root-aware, even per-chunk) structurally
+        # can't handle true synonyms — "claim rejected" vs. source text
+        # saying "claim refused" share no root, so no hand-maintained
+        # synonym list can ever be complete. But the cross-encoder reranker
+        # IS a semantic model — it's what separates genuinely-relevant-but-
+        # differently-worded content from actual noise, independent of
+        # literal wording. When the lexical AND-check fails, fall back to
+        # trusting that signal — but only well above the noise floor:
+        # measured false positives (e.g. "IDV" scored 0.024 with zero
+        # actual IDV content) sit close to measured true positives (e.g.
+        # "rejected"/"refused" scored 0.074), so this bar is deliberately
+        # conservative and still imperfect at this boundary — a known
+        # residual limit of a purely retrieval-based gate, not a fully
+        # solved problem.
+        if top_rerank >= 0.05:
             return True
         return False
 
