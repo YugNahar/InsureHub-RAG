@@ -267,6 +267,22 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
                 continue
             if all(any(_word_matches(w, c) for c in all_terms) for w in words):
                 return True  # at least one topic fully covered → adequate context
+
+        # Lexical matching (even root-aware) structurally can't handle true
+        # synonyms — "claim rejected" vs. source text saying "claim refused"
+        # share no root, so no hand-maintained synonym list can ever be
+        # complete; the next mismatched pair is always one query away. But
+        # the cross-encoder reranker IS a semantic model — it's what
+        # separates genuinely-relevant-but-differently-worded content
+        # (~0.01-0.16, e.g. this exact "rejected"/"refused" case scored
+        # 0.074) from actual noise (~0.00005), independent of literal
+        # wording. When every topic fails the lexical check, fall back to
+        # trusting that existing signal rather than declining outright.
+        # Kept well below the 0.5 full-bypass above — this only rescues
+        # lexical misses, it doesn't skip the check for genuinely weak
+        # matches.
+        if top_rerank >= 0.01:
+            return True
         return False
 
     # Regex fallback: split compound questions on "and"/"or".
