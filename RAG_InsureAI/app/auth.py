@@ -27,9 +27,10 @@ ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "")  # bcrypt hash
 ADMIN_PASSWORD_PLAIN = os.getenv("ADMIN_PASSWORD", "")       # fallback plain (dev only)
 AGENT_PASSWORD_PLAIN = os.getenv("AGENT_PASSWORD", "") or ADMIN_PASSWORD_PLAIN
 
-# Temporary escape hatch: set DISABLE_AUTH=true to skip login entirely.
-# Unset this (or set to false) before exposing the app beyond trusted testers.
-DISABLE_AUTH = os.getenv("DISABLE_AUTH", "false").strip().lower() in ("1", "true", "yes")
+# TEMPORARY: auth is OFF by default so it works with zero .env setup on any
+# machine (e.g. a colleague's clone) during early testing. Set DISABLE_AUTH=false
+# in .env to require login again before exposing this beyond trusted testers.
+DISABLE_AUTH = os.getenv("DISABLE_AUTH", "true").strip().lower() in ("1", "true", "yes")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
