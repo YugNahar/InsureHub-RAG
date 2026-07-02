@@ -1695,11 +1695,27 @@ class MultiSourceRAG:
             _kv_reply = answer
             yield answer
 
+        # ── Rule 4 fallback strip ─────────────────────────────────────────────
+        # The 7B model sometimes generates real content from training knowledge
+        # and then ALSO appends the Rule 4 canned fallback at the end because
+        # the specific fact wasn't in the retrieved context. When real content
+        # precedes the fallback, strip the fallback so users only see the answer.
+        _reply_stripped = (_kv_reply or "").rstrip()
+        _corrected_text = None
+        _RULE4_MARKER = "honestly, i don't have that specific info"
+        _reply_lower_r4 = _reply_stripped.lower()
+        if _RULE4_MARKER in _reply_lower_r4:
+            _r4_idx = _reply_lower_r4.index(_RULE4_MARKER)
+            _real_before = _reply_stripped[:_r4_idx].strip()
+            if len(_real_before) > 40:
+                _reply_stripped = _real_before
+                _kv_reply = _real_before
+                _corrected_text = _real_before
+                logger.info("[ask_stream] stripped Rule4 fallback appended after real content (%d chars)", len(_real_before))
+
         # ── Truncation detection ─────────────────────────────────────────────
         # If the stream hit max_tokens mid-sentence, trim to the last complete
         # sentence and tell the frontend to replace the displayed text.
-        _reply_stripped = (_kv_reply or "").rstrip()
-        _corrected_text = None
         _SENT_ENDERS = frozenset('.!?…')
         if _reply_stripped and _reply_stripped[-1] not in _SENT_ENDERS:
             # Response doesn't end at a sentence boundary — find the last one
