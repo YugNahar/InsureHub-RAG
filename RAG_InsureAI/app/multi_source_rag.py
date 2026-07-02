@@ -236,16 +236,19 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
             all_terms.update(re.findall(r'\b[a-z]{3,}\b', text))
 
         # Only bypass keyword coverage check when the cross-encoder is *highly*
-        # confident the chunk is relevant (raw BGE logit >= 4.0 ≈ clearly relevant).
-        # The previous threshold of 0.5 was far too permissive — marginally relevant
-        # chunks (logit 0.5-2) passed this gate and the LLM then filled gaps from
-        # training knowledge.  At 4.0 only chunks that are genuinely on-topic bypass
-        # the keyword check.
+        # confident the chunk is relevant. The reranker (BAAI/bge-reranker-base
+        # via sentence-transformers CrossEncoder) is sigmoid-activated, so
+        # scores are bounded probabilities in [0, 1], NOT raw unbounded
+        # logits — empirically: unrelated content ≈ 0.0000, marginally-topical
+        # content ≈ 0.01-0.16, genuinely on-topic ≈ 0.3-0.5+, near-certain
+        # matches ≈ 0.9+. A stale threshold of 4.0 here was calibrated for
+        # raw logits and was literally unreachable (scores can't exceed 1.0),
+        # silently making this bypass permanently dead code.
         top_rerank = max(
             (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
             default=0,
         )
-        if top_rerank >= 4.0:
+        if top_rerank >= 0.5:
             return True
 
         # OR-logic: pass if AT LEAST ONE topic phrase is fully covered.
@@ -863,26 +866,49 @@ def _strip_model_preamble(text: str) -> str:
     return "\n".join(clean).strip()
 
 
-_RULE4_MARKER = "honestly, i don't have that specific info"
+_RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
+
+# Reuse the same "clearly relevant" bar as the keyword-check bypass (see
+# _context_covers_query) so both decisions agree on what counts as solid
+# grounding rather than drifting out of sync. Scores are sigmoid-bounded
+# [0, 1] probabilities (see _context_covers_query for calibration notes).
+_RULE4_TRUST_THRESHOLD = 0.5
 
 
-def _strip_rule4_fallback(text: str) -> Optional[str]:
-    """If the LLM generated a real answer and then ALSO appended the canned
-    Rule 4 fallback ("Honestly, I don't have that specific info...") because
-    the fact wasn't verbatim in the retrieved context, return the text with
-    the fallback removed. Returns None if no stripping was needed.
+def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
+    """Handle the LLM appending the canned Rule 4 fallback ("Honestly/Honest,
+    I don't have that specific info...") after already writing something.
+
+    Returns:
+      None            — marker not found, caller should leave text untouched.
+      non-empty str   — marker found, trust_content was True, and there was
+                         real content before it (>40 chars) — likely a
+                         genuinely grounded answer with a redundant refusal
+                         glued on; return the answer with the refusal removed.
+      ""              — marker found but trust_content was False (or there
+                         wasn't enough leading content) — the marker is the
+                         model's own admission the leading text isn't solidly
+                         grounded (e.g. it was built from a merely
+                         topic-adjacent chunk). Caller should discard the
+                         whole thing and show the standard refusal instead
+                         of serving an unconfirmed claim as fact.
+
+    trust_content should reflect independent evidence (e.g. a high reranker
+    score) that the leading text is actually grounded — text pattern
+    matching alone can't tell a correct answer with a pointless disclaimer
+    apart from a shaky inference with a legitimate one.
 
     Applied both to freshly-generated answers AND to KV cache hits — a cache
     hit can replay an answer that was cached before this fix existed, so the
     check has to run on served text either way, not just on fresh generations.
     """
     stripped = (text or "").rstrip()
-    lower = stripped.lower()
-    if _RULE4_MARKER in lower:
-        idx = lower.index(_RULE4_MARKER)
-        real_before = stripped[:idx].strip()
-        if len(real_before) > 40:
+    m = _RULE4_MARKER_RE.search(stripped)
+    if m:
+        real_before = stripped[:m.start()].strip()
+        if trust_content and len(real_before) > 40:
             return real_before
+        return ""
     return None
 
 
@@ -1629,8 +1655,8 @@ class MultiSourceRAG:
             (doc_chunks, video_chunks, webpage_chunks), llm_topics, _llm_detailed = await asyncio.gather(
                 asyncio.gather(
                     self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
-                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
-                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=False),
+                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True),
+                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True),
                 ),
                 _extract_intent_topics(question),
                 _llm_classify_intent(question),
@@ -1665,12 +1691,17 @@ class MultiSourceRAG:
 
         # ── Hard reranker gate ────────────────────────────────────────────────
         # If the best reranker score across ALL retrieved chunks is below the
-        # gate threshold (default 0.0 = BGE raw logit, meaning "not relevant"),
-        # refuse immediately without calling the LLM at all.
+        # gate threshold, refuse immediately without calling the LLM at all.
         # Small 7B models ignore grounding instructions and answer from training
         # knowledge when the context is irrelevant, so gating here prevents that.
+        # Scores are sigmoid-bounded [0,1] probabilities (see
+        # _context_covers_query for empirical calibration) — a 0.0 default
+        # here was a no-op (scores can't go negative, so nothing was ever
+        # rejected); 0.2 rejects unrelated (~0.0000) and merely-topical
+        # (~0.01-0.16) chunks while still letting genuinely relevant
+        # (~0.3+) ones through.
         import json as _json_s
-        _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.0"))
+        _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.2"))
         _top_rerank = max(
             (c.metadata.get("rerank_score", float("-inf"))
              for c in all_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
@@ -1687,6 +1718,18 @@ class MultiSourceRAG:
             )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
+
+        # A single strong chunk clearing the gate above must not let unrelated
+        # weak chunks ride along into context — every chunk the LLM sees has
+        # to individually clear the relevance bar, not just "someone in the
+        # retrieved pool did". Only drop chunks that HAVE a rerank_score below
+        # gate; anything without one (shouldn't happen now that video/webpage
+        # are reranked too) is left alone rather than silently dropped.
+        if not document_filter:
+            all_chunks = [
+                c for c in all_chunks
+                if c.metadata.get("rerank_score", _rerank_gate) >= _rerank_gate
+            ]
 
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
@@ -1920,12 +1963,31 @@ class MultiSourceRAG:
         # precedes the fallback, strip the fallback so users only see the answer.
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
-        _r4_stripped = _strip_rule4_fallback(_reply_stripped)
-        if _r4_stripped is not None:
+        _rule4_discarded = False
+        _r4_trusted = _top_rerank >= _RULE4_TRUST_THRESHOLD
+        _r4_stripped = _strip_rule4_fallback(_reply_stripped, trust_content=_r4_trusted)
+        if _r4_stripped:
             _reply_stripped = _r4_stripped
             _kv_reply = _r4_stripped
             _corrected_text = _r4_stripped
             logger.info("[ask_stream] stripped Rule4 fallback appended after real content (%d chars)", len(_r4_stripped))
+        elif _r4_stripped == "":
+            # Marker present but the leading content isn't independently
+            # supported (reranker score below trust threshold) — the model's
+            # own disclaimer is the more reliable signal here. Discard the
+            # unconfirmed claim and show the standard refusal instead.
+            _refusal_text = (
+                "Hmm, I don't have that specific information in my knowledge base right now. "
+                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+            )
+            _reply_stripped = _refusal_text
+            _kv_reply = _refusal_text
+            _corrected_text = _refusal_text
+            _rule4_discarded = True
+            logger.info(
+                "[ask_stream] discarded low-confidence Rule4 answer (top_rerank=%.3f < %.3f)",
+                _top_rerank, _RULE4_TRUST_THRESHOLD,
+            )
 
         # ── Truncation detection ─────────────────────────────────────────────
         # If the stream hit max_tokens mid-sentence, trim to the last complete
@@ -2001,7 +2063,12 @@ class MultiSourceRAG:
             except Exception as _exc:
                 logger.debug("[ask_stream] KV cache write failed: %s", _exc)
 
-        _final_payload: dict = {"sources": unique_sources, "done": True}
+        _final_payload: dict = {
+            "sources": [] if _rule4_discarded else unique_sources,
+            "done": True,
+        }
+        if _rule4_discarded:
+            _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
         _reply_for_chips = (_corrected_text or _kv_reply or "").strip()

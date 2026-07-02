@@ -879,7 +879,15 @@ class TurboVecStore:
             dense_score = candidate[4] if len(candidate) > 4 else orig_score
             doc = Document(page_content=text, metadata=dict(meta))
             doc.metadata["similarity"] = dense_score
-            doc.metadata["rrf_score"] = orig_score
+            # After _rerank(), orig_score is the cross-encoder's relevance
+            # score, not an RRF rank score — store it under the same
+            # "rerank_score" key rerank_documents() uses for doc chunks, so
+            # every downstream relevance gate sees it regardless of which
+            # of the two reranking code paths produced it.
+            if reranker_used:
+                doc.metadata["rerank_score"] = orig_score
+            else:
+                doc.metadata["rrf_score"] = orig_score
             method = "hybrid" if hybrid_used else "dense"
             if reranker_used:
                 method += "+rerank"
