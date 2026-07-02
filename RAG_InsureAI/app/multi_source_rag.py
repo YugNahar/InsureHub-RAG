@@ -102,12 +102,70 @@ _QUERY_STOP_WORDS = {
     'period', 'time', 'duration', 'date', 'days', 'year', 'month', 'months',
 }
 
+# ── Dynamic (LLM-learned) stop words ─────────────────────────────────────────
+# The static list above only covers words we've thought of by hand. New
+# generic words surface constantly ("suitable", "budget", "family", ...) and
+# hand-updating a regex list every time one slips through doesn't scale.
+# Instead, _extract_intent_topics() asks the LLM — on every query — to flag
+# which words are generic filler (appear in virtually every insurance doc)
+# vs specific/discriminating. Generic words get merged into this disk-backed
+# set permanently, so the NEXT time the same word appears it's filtered
+# instantly with zero extra LLM cost — only genuinely new words need a fresh
+# LLM judgment call.
+import json as _json_stopwords
+
+_LEARNED_STOPWORDS_PATH = os.path.join(
+    os.getenv("INSUREHUB_DATA_DIR", os.path.expanduser("~/.insurehub")),
+    "cache",
+    "learned_query_stopwords.json",
+)
+_learned_stopwords: set[str] = set()
+
+
+def _load_learned_stopwords() -> None:
+    global _learned_stopwords
+    try:
+        if os.path.exists(_LEARNED_STOPWORDS_PATH):
+            with open(_LEARNED_STOPWORDS_PATH, "r", encoding="utf-8") as f:
+                _learned_stopwords = set(_json_stopwords.load(f))
+            logger.info("[QueryStopwords] loaded %d learned stopword(s)", len(_learned_stopwords))
+    except Exception as exc:
+        logger.warning("[QueryStopwords] load failed: %s", exc)
+
+
+def _save_learned_stopwords() -> None:
+    try:
+        os.makedirs(os.path.dirname(_LEARNED_STOPWORDS_PATH), exist_ok=True)
+        tmp = _LEARNED_STOPWORDS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json_stopwords.dump(sorted(_learned_stopwords), f)
+        os.replace(tmp, _LEARNED_STOPWORDS_PATH)
+    except Exception as exc:
+        logger.warning("[QueryStopwords] save failed: %s", exc)
+
+
+def _learn_generic_words(words: set[str]) -> None:
+    """Merge newly LLM-classified generic words into the persisted set."""
+    new_words = {w for w in words if w and w not in _learned_stopwords and w not in _QUERY_STOP_WORDS}
+    if new_words:
+        _learned_stopwords.update(new_words)
+        _save_learned_stopwords()
+        logger.info("[QueryStopwords] learned %d new generic word(s): %s", len(new_words), sorted(new_words))
+
+
+def _all_stopwords() -> set[str]:
+    return _QUERY_STOP_WORDS | _learned_stopwords
+
+
+_load_learned_stopwords()
+
 
 def _extract_topic_terms(query: str) -> set[str]:
     """Return discriminating topic words from a query after stop-word filtering."""
+    stop = _all_stopwords()
     return {
         w for w in re.findall(r'\b[a-z]{3,}\b', query.lower())
-        if w not in _QUERY_STOP_WORDS
+        if w not in stop
     }
 
 
@@ -178,8 +236,13 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # OR-logic: pass if AT LEAST ONE topic phrase is fully covered.
         # The original AND-logic (all topics must match) was too strict —
         # a single missing synonym killed answers that were clearly in the KB.
+        # Defense in depth: even though _extract_intent_topics() is instructed
+        # to return only discriminating terms, strip any word that's since been
+        # learned as generic filler — a topic left with zero discriminating
+        # words after stripping gives no coverage signal and is skipped.
+        stop = _all_stopwords()
         for topic in llm_topics:
-            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3]
+            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and w not in stop]
             if not words:
                 continue
             if all(any(_word_matches(w, c) for c in all_terms) for w in words):
@@ -583,31 +646,48 @@ Search query:"""
 
 
 _INTENT_PROMPT = """\
-Extract the specific insurance topic from the question below.
-Output ONLY the topic as 1-5 comma-separated words or short phrases — nothing else.
-Keep compound terms together (e.g. "no-claim bonus", "free look period", "sum assured").
+Read the insurance question below and classify its content words/phrases into two groups.
+
+SPECIFIC = names a particular concept, country, provider, rule, or number that only
+           documents actually discussing that exact thing would contain.
+GENERIC  = so common it appears in almost EVERY insurance document regardless of
+           topic — quality/selection words (best, choose, recommend), audience
+           words (family, individual, personal), or filler (important, options).
+
+Output EXACTLY two lines, nothing else. Use "(none)" if a group is empty.
+Keep specific compound terms together (e.g. "no-claim bonus", "free look period").
 
 Examples:
-"what is life insurance"                                       → life insurance
-"what is a no-claim bonus"                                     → no-claim bonus
-"what is a free look period"                                   → free look period
-"what is a deductible"                                         → deductible
-"explain reinsurance"                                          → reinsurance
-"how are premiums calculated for fire insurance"               → fire insurance, premium
-"what is the difference between term and whole life"           → term life, whole life
-"how to file a motor insurance claim"                          → motor claim
-"what documents are needed for health insurance claim"         → health claim, documents
-"how does reinsurance work and what is its legal significance" → reinsurance, legal
-"tell me about motor policy claims"                            → motor, claims
+Question: "what is a no-claim bonus"
+Specific: no-claim bonus
+Generic: (none)
+
+Question: "what is a deductible"
+Specific: deductible
+Generic: (none)
+
+Question: "choosing the best insurance policy in the uae for families"
+Specific: uae
+Generic: choosing, best, insurance, policy, families
+
+Question: "how are premiums calculated for fire insurance"
+Specific: fire insurance, premium
+Generic: (none)
+
+Question: "what should i know about maternity coverage for individuals vs families"
+Specific: maternity
+Generic: should, know, coverage, individuals, families
 
 Question: {question}
-Topic:"""
+"""
 
 
 async def _extract_intent_topics(question: str) -> set[str]:
-    """Fast LLM call (runs in parallel with retrieval) to extract core topic words.
+    """Fast LLM call (runs in parallel with retrieval) to extract core topic words
+    AND learn which words are generic filler (persisted so future queries with
+    the same word are filtered instantly, without another LLM call).
 
-    Uses vLLM with max_tokens=30 so the round-trip is <1 s on an idle server.
+    Uses vLLM with max_tokens=60 so the round-trip is <1 s on an idle server.
     Falls back to an empty set on any error — caller uses regex fallback.
     """
     import aiohttp as _aiohttp
@@ -619,7 +699,7 @@ async def _extract_intent_topics(question: str) -> set[str]:
         payload = {
             "model": _resolve_vllm_model(),
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 30,
+            "max_tokens": 60,
             "temperature": 0,
             "stream": False,
         }
@@ -633,15 +713,36 @@ async def _extract_intent_topics(question: str) -> set[str]:
                                     json=payload, headers=headers,
                                     timeout=timeout) as resp:
                 data = await resp.json()
-                raw = data["choices"][0]["message"]["content"].strip().lower()
+                raw = data["choices"][0]["message"]["content"].strip()
+
+                specific_line = ""
+                generic_line = ""
+                for line in raw.split("\n"):
+                    line_l = line.strip().lower()
+                    if line_l.startswith("specific:"):
+                        specific_line = line.split(":", 1)[1] if ":" in line else ""
+                    elif line_l.startswith("generic:"):
+                        generic_line = line.split(":", 1)[1] if ":" in line else ""
+
                 # Parse phrases like "no-claim bonus, deductible" keeping
                 # multi-word/hyphenated compounds intact for phrase matching.
                 topics: set[str] = set()
-                for phrase in raw.split(","):
+                for phrase in specific_line.lower().split(","):
                     phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
-                    if phrase:
-                        topics.add(phrase)  # keep compound e.g. "no-claim bonus"
-                logger.debug("[INTENT] %r → topics=%s", question, topics)
+                    if phrase and phrase not in ("none", "n/a"):
+                        topics.add(phrase)
+
+                # Individual generic words get flattened and merged into the
+                # persisted learned-stopwords set for instant future filtering.
+                generic_words: set[str] = set()
+                for phrase in generic_line.lower().split(","):
+                    phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
+                    if phrase and phrase not in ("none", "n/a"):
+                        generic_words.update(w for w in phrase.split() if len(w) >= 3)
+                if generic_words:
+                    _learn_generic_words(generic_words)
+
+                logger.debug("[INTENT] %r → specific=%s generic=%s", question, topics, generic_words)
                 return topics
     except Exception as exc:
         logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
