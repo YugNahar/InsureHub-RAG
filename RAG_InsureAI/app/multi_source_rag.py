@@ -165,7 +165,7 @@ def _extract_topic_terms(query: str) -> set[str]:
     stop = _all_stopwords()
     return {
         w for w in re.findall(r'\b[a-z]{3,}\b', query.lower())
-        if w not in stop
+        if not _is_stopword(w, stop)
     }
 
 
@@ -184,6 +184,21 @@ def _word_matches(topic: str, chunk_word: str) -> bool:
     min_len = 5
     prefix = min(len(topic), len(chunk_word), min_len)
     return prefix >= min_len and topic[:prefix] == chunk_word[:prefix]
+
+
+def _is_stopword(word: str, stop: set[str]) -> bool:
+    """True if word is (or shares a root with) an entry in the stopword set.
+
+    A hand/LLM-curated list only ever lists one inflection ("insurer") and
+    silently misses others ("insurers"). Since that missed plural is common
+    enough to appear in almost every KB chunk, it then slips through the
+    coverage-check gate as if it were a topic-specific word, letting the LLM
+    "confirm" a query that isn't actually covered by the KB. Root-matching
+    against the stopword set closes this gap without hand-listing every form.
+    """
+    if word in stop:
+        return True
+    return any(_word_matches(word, s) for s in stop)
 
 
 def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
@@ -242,7 +257,7 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
         # words after stripping gives no coverage signal and is skipped.
         stop = _all_stopwords()
         for topic in llm_topics:
-            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and w not in stop]
+            words = [w for w in topic.replace('-', ' ').split() if len(w) >= 3 and not _is_stopword(w, stop)]
             if not words:
                 continue
             if all(any(_word_matches(w, c) for c in all_terms) for w in words):
@@ -294,6 +309,58 @@ def _quoted_comparison_covered(question: str, docs: list) -> bool:
         if not any(w in ctx_lower for w in distinguishing):
             return False
     return True
+
+
+# "Which insurers cover X" / "who offers Y" expect a NAMED list back.
+# _context_covers_query() only requires generic topic words ("travel",
+# "america") to appear somewhere in the retrieved pool — a general
+# educational video that mentions America as an example destination passes
+# that gate even though it never names a single insurer. This closes that
+# gap: enumeration-style questions additionally require at least one
+# proper-noun-like token (a plausible brand/company name) in the context.
+_ENUMERATION_PATTERN = re.compile(
+    r'\b(which|what)\s+(\w+\s+){0,2}(insurers?|insurance\s+compan(?:y|ies)|'
+    r'compan(?:y|ies)|providers?|banks?|firms?|carriers?)\b'
+    r'|\bwho\s+(covers?|offers?|provides?|insures?|sells?|underwrites?)\b'
+    r'|\b(name|list)\s+(the|all|some)\b.{0,30}(insurers?|compan(?:y|ies)|providers?)',
+    re.IGNORECASE,
+)
+
+_ENUM_COMMON_CAP_WORDS = {
+    "the", "this", "that", "these", "those", "america", "india", "usa", "uk",
+    "europe", "asia", "africa", "australia", "canada", "china", "japan",
+    "however", "therefore", "additionally", "furthermore", "generally",
+    "typically", "importantly", "note", "tip", "example", "for", "when",
+    "while", "before", "after", "during", "also", "some", "many", "most",
+    "several", "various", "certain", "so", "now", "here", "there", "yes", "no",
+}
+
+
+def _has_named_entity(text: str) -> bool:
+    """Loose heuristic: a capitalized word, not sentence-initial, not a
+    common capitalized filler — a plausible company/brand name."""
+    sentence_initial = {
+        m.start(1) for m in re.finditer(r'(?:^|[.!?]\s+)([A-Z][a-zA-Z]{2,})', text)
+    }
+    for m in re.finditer(r'\b[A-Z][a-zA-Z]{2,}\b', text):
+        if m.start() in sentence_initial:
+            continue
+        if m.group(0).lower() in _ENUM_COMMON_CAP_WORDS:
+            continue
+        return True
+    return False
+
+
+def _enumeration_query_covered(question: str, docs: list) -> bool:
+    """True unless the question asks 'which/who provides X' and the
+    retrieved context contains no plausible named entity at all."""
+    if not _ENUMERATION_PATTERN.search(question):
+        return True
+    for doc in docs:
+        text = doc.page_content if hasattr(doc, "page_content") else doc.get("text", "")
+        if _has_named_entity(text):
+            return True
+    return False
 
 
 _DETAIL_SIGNALS = {
@@ -1262,7 +1329,11 @@ class MultiSourceRAG:
             )
 
         # ── Prompt selection ──────────────────────────────────────────────────
-        ctx_covered = _context_covers_query(question, all_chunks) and _quoted_comparison_covered(question, all_chunks)
+        ctx_covered = (
+            _context_covers_query(question, all_chunks)
+            and _quoted_comparison_covered(question, all_chunks)
+            and _enumeration_query_covered(question, all_chunks)
+        )
 
         # If the KB has no relevant content for this question, skip the LLM
         # entirely — small models ignore "don't use your training knowledge"
@@ -1620,7 +1691,11 @@ class MultiSourceRAG:
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
         topics_for_coverage = None if _detected_as_followup else (llm_topics or None)
-        ctx_covered = _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage) and _quoted_comparison_covered(question, all_chunks)
+        ctx_covered = (
+            _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
+            and _quoted_comparison_covered(question, all_chunks)
+            and _enumeration_query_covered(question, all_chunks)
+        )
         if not ctx_covered and not document_filter:
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
