@@ -1619,7 +1619,16 @@ async def ask_stream(req: AskRequest):
                     except Exception:
                         final_data = {"sources": [], "done": True}
                     sources = final_data.get("sources", [])
-                    ai_cant_answer = _agent_hub.response_needs_human(full_text, sources)
+                    # Prefer corrected_text over the raw streamed full_text: when
+                    # multi_source_rag.py strips a Rule4 disclaimer the model
+                    # appended after an already-correct, trusted answer, full_text
+                    # (accumulated from tokens streamed BEFORE that correction) still
+                    # contains the disclaimer — checking it here would independently
+                    # re-trigger the human-handoff/offline-escalation flow even
+                    # though the actual displayed answer no longer has the
+                    # disclaimer at all.
+                    _text_for_handoff_check = final_data.get("corrected_text") or full_text
+                    ai_cant_answer = _agent_hub.response_needs_human(_text_for_handoff_check, sources)
                     agents_online  = _agent_hub.online_count() > 0
                     needs_human         = ai_cant_answer and agents_online
                     offline_escalated   = ai_cant_answer and not agents_online
@@ -1631,23 +1640,25 @@ async def ask_stream(req: AskRequest):
                         if offline_escalated:
                             # Must await so history is fully written before PDF is generated
                             await _agent_hub.log_message(req.session_id, "user", req.question)
-                            await _agent_hub.log_message(req.session_id, "ai", full_text)
+                            await _agent_hub.log_message(req.session_id, "ai", _text_for_handoff_check)
                             asyncio.create_task(
                                 _agent_hub.trigger_offline_escalation(req.session_id, req.question)
                             )
                         else:
                             asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
-                            asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", full_text))
+                            asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _text_for_handoff_check))
                             if needs_human and agents_online:
                                 # Await (not create_task) so the popup is sent to the agent
                                 # BEFORE the final JSON reaches the frontend. This guarantees
                                 # the question text is included and no race with frontend WS.
                                 await _agent_hub.request_handoff(req.session_id, req.question)
-                    # Persist this turn so the next question sees it as history
-                    if req.session_id and req.session_id != "default" and full_text:
+                    # Persist this turn so the next question sees it as history — use the
+                    # corrected text so a stripped Rule4 disclaimer doesn't leak into
+                    # future-turn context and confuse follow-up reformulation.
+                    if req.session_id and req.session_id != "default" and _text_for_handoff_check:
                         new_hist = history_list + [
                             {"role": "user", "content": req.question},
-                            {"role": "assistant", "content": full_text},
+                            {"role": "assistant", "content": _text_for_handoff_check},
                         ]
                         asyncio.create_task(_save_conversation_history(req.session_id, new_hist))
                     yield "\n\n" + _json.dumps(final_data)
