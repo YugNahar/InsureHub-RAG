@@ -27,6 +27,10 @@ ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "")  # bcrypt hash
 ADMIN_PASSWORD_PLAIN = os.getenv("ADMIN_PASSWORD", "")       # fallback plain (dev only)
 AGENT_PASSWORD_PLAIN = os.getenv("AGENT_PASSWORD", "") or ADMIN_PASSWORD_PLAIN
 
+# Temporary escape hatch: set DISABLE_AUTH=true to skip login entirely.
+# Unset this (or set to false) before exposing the app beyond trusted testers.
+DISABLE_AUTH = os.getenv("DISABLE_AUTH", "false").strip().lower() in ("1", "true", "yes")
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -51,6 +55,8 @@ def _create_access_token(data: dict, expires_delta: Optional[timedelta] = None) 
 # ── Dependency: require valid JWT ─────────────────────────────────────────────
 def require_auth(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     """FastAPI dependency — raise 401 if token is missing or invalid."""
+    if DISABLE_AUTH:
+        return ADMIN_USERNAME
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -115,6 +121,11 @@ def create_login_endpoint(app):
     async def verify_token(username: str = Depends(require_auth)):
         """Frontend can call this to check if stored token is still valid."""
         return {"valid": True, "username": username}
+
+    @app.get("/auth/status", tags=["auth"])
+    async def auth_status():
+        """Public: lets the frontend know whether login is currently required."""
+        return {"disabled": DISABLE_AUTH}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
