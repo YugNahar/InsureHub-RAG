@@ -796,6 +796,29 @@ def _strip_model_preamble(text: str) -> str:
     return "\n".join(clean).strip()
 
 
+_RULE4_MARKER = "honestly, i don't have that specific info"
+
+
+def _strip_rule4_fallback(text: str) -> Optional[str]:
+    """If the LLM generated a real answer and then ALSO appended the canned
+    Rule 4 fallback ("Honestly, I don't have that specific info...") because
+    the fact wasn't verbatim in the retrieved context, return the text with
+    the fallback removed. Returns None if no stripping was needed.
+
+    Applied both to freshly-generated answers AND to KV cache hits — a cache
+    hit can replay an answer that was cached before this fix existed, so the
+    check has to run on served text either way, not just on fresh generations.
+    """
+    stripped = (text or "").rstrip()
+    lower = stripped.lower()
+    if _RULE4_MARKER in lower:
+        idx = lower.index(_RULE4_MARKER)
+        real_before = stripped[:idx].strip()
+        if len(real_before) > 40:
+            return real_before
+    return None
+
+
 # ── Short follow-up detection & reformulation ──────────────────────────────
 # When a user sends a very short message (e.g. "yes", "ok", "what about that")
 # the raw text has no standalone semantic content for vector retrieval, causing
@@ -1502,7 +1525,26 @@ class MultiSourceRAG:
         if _kv_hit is not None:
             import json as _json_s
             logger.info("[ask_stream] KV cache hit  query=%r detailed=%s", retrieval_query[:80], _keyword_detailed)
-            yield _kv_hit.get("answer", "")
+            _cached_answer = _kv_hit.get("answer", "")
+            # A cache hit can replay an answer that was cached BEFORE the Rule 4
+            # strip fix existed — the buggy two-part text would otherwise be
+            # served verbatim forever until its TTL naturally expires. Check and
+            # clean it here too, then persist the corrected version under the
+            # current exact key so future exact-match hits are already clean.
+            _r4_cached = _strip_rule4_fallback(_cached_answer)
+            if _r4_cached is not None:
+                _cached_answer = _r4_cached
+                logger.info("[ask_stream] stripped Rule4 fallback from cached answer (%d chars)", len(_r4_cached))
+                try:
+                    _kv.put(
+                        _kv_key,
+                        {**_kv_hit, "answer": _cached_answer},
+                        query_embedding=_kv_q_emb,
+                        query_text=retrieval_query,
+                    )
+                except Exception:
+                    pass
+            yield _cached_answer
             yield "\n\n" + _json_s.dumps({
                 "sources": _kv_hit.get("sources", []),
                 "done": True,
@@ -1803,16 +1845,12 @@ class MultiSourceRAG:
         # precedes the fallback, strip the fallback so users only see the answer.
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
-        _RULE4_MARKER = "honestly, i don't have that specific info"
-        _reply_lower_r4 = _reply_stripped.lower()
-        if _RULE4_MARKER in _reply_lower_r4:
-            _r4_idx = _reply_lower_r4.index(_RULE4_MARKER)
-            _real_before = _reply_stripped[:_r4_idx].strip()
-            if len(_real_before) > 40:
-                _reply_stripped = _real_before
-                _kv_reply = _real_before
-                _corrected_text = _real_before
-                logger.info("[ask_stream] stripped Rule4 fallback appended after real content (%d chars)", len(_real_before))
+        _r4_stripped = _strip_rule4_fallback(_reply_stripped)
+        if _r4_stripped is not None:
+            _reply_stripped = _r4_stripped
+            _kv_reply = _r4_stripped
+            _corrected_text = _r4_stripped
+            logger.info("[ask_stream] stripped Rule4 fallback appended after real content (%d chars)", len(_r4_stripped))
 
         # ── Truncation detection ─────────────────────────────────────────────
         # If the stream hit max_tokens mid-sentence, trim to the last complete
