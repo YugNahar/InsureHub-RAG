@@ -25,6 +25,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("AUTH_TOKEN_EXPIRE_MINUTES") or "480
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "")  # bcrypt hash
 ADMIN_PASSWORD_PLAIN = os.getenv("ADMIN_PASSWORD", "")       # fallback plain (dev only)
+AGENT_PASSWORD_PLAIN = os.getenv("AGENT_PASSWORD", "") or ADMIN_PASSWORD_PLAIN
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -99,6 +100,16 @@ def create_login_endpoint(app):
             access_token=token,
             expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         )
+
+    @app.post("/auth/agent-login", tags=["auth"])
+    async def agent_login(req: LoginRequest):
+        """Validate an agent password. Uses AGENT_PASSWORD (falls back to ADMIN_PASSWORD)."""
+        if req.password != AGENT_PASSWORD_PLAIN:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect agent password.",
+            )
+        return {"ok": True}
 
     @app.get("/auth/verify", tags=["auth"])
     async def verify_token(username: str = Depends(require_auth)):
