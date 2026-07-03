@@ -502,7 +502,7 @@ body.sidebar-closed #sidebar-toggle { left: 0; }
       <input id="inp-name" type="text" placeholder="e.g. Sarah" autocomplete="off" />
     </div>
     <div class="field">
-      <label>Admin password</label>
+      <label>Agent password</label>
       <input id="inp-pass" type="password" placeholder="••••••••" autocomplete="current-password" />
     </div>
     <button class="submit-btn" id="login-btn">Connect →</button>
@@ -700,14 +700,14 @@ async function doLogin() {
   const name = document.getElementById("inp-name").value.trim();
   const pass = document.getElementById("inp-pass").value;
   if (!name) return showErr("Please enter your name.");
-  if (!pass) return showErr("Please enter the admin password.");
+  if (!pass) return showErr("Please enter the agent password.");
   clearErr();
 
   try {
-    const r = await fetch(`${backend}/auth/login`, {
+    const r = await fetch(`${backend}/auth/agent-login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "admin", password: pass }),
+      body: JSON.stringify({ username: "agent", password: pass }),
     });
     if (!r.ok) return showErr("Wrong password. Please try again.");
   } catch {
