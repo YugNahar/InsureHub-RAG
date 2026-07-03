@@ -113,6 +113,29 @@ def _get_shared_reranker() -> CrossEncoder:
     return _shared_reranker
 
 
+# CrossEncoder already caps at 512 tokens (BAAI/bge-reranker-base's
+# model_max_length), but that cap is enforced AFTER tokenizing the full
+# input — so a 4000-char chunk still pays full tokenization cost, and if it
+# tokenizes to more than ~512 tokens the forward pass runs at the max
+# sequence length every time. Measured in production: real KB chunks average
+# 2000-4400 characters (500-1100+ tokens), consistently at or past the cap,
+# while reranking calls on chunks that size took 5-10s for as few as 8-14
+# candidates — the dominant cost in the whole request, dwarfing the actual
+# LLM generation call (~0.4s to Groq). A short synthetic-text benchmark
+# (150 chars) completed the same candidate counts in under a second,
+# confirming chunk length — not candidate count — drives the latency.
+# Truncate the text used for rerank SCORING only; the returned Document
+# still carries the untruncated page_content, so the final LLM context is
+# unaffected. 700 chars (~150-180 tokens) keeps a full topic-establishing
+# paragraph — more than enough for a relevance judgment — while cutting
+# forward-pass cost well below the 512-token cap.
+_RERANK_TEXT_CHARS = 700
+
+
+def _truncate_for_rerank(text: str) -> str:
+    return text[:_RERANK_TEXT_CHARS] if text else text
+
+
 class TurboVecStore:
     """
     A ChromaDB-replacement vector store backed by TurboQuantIndex for dense
@@ -777,7 +800,7 @@ class TurboVecStore:
         if not candidates:
             return []
         self._ensure_reranker()
-        pairs = [(query, c[1]) for c in candidates]
+        pairs = [(query, _truncate_for_rerank(c[1])) for c in candidates]
         rerank_scores = self.reranker.predict(pairs)
         combined = list(zip(candidates, rerank_scores))
         combined.sort(key=lambda x: x[1], reverse=True)
@@ -797,7 +820,7 @@ class TurboVecStore:
         if not docs:
             return []
         self._ensure_reranker()
-        pairs = [(query, doc.page_content) for doc in docs]
+        pairs = [(query, _truncate_for_rerank(doc.page_content)) for doc in docs]
         scores = self.reranker.predict(pairs)
         ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
         result = []
