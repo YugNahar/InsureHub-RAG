@@ -41,9 +41,9 @@ npm ci
 npm run build
 cd "$COMPOSE_DIR"
 
-echo "==> Writing server environment overrides..."
-cat > "$COMPOSE_DIR/.env" <<EOF
-# On the server, vLLM runs locally so we use localhost
+if [ ! -f "$COMPOSE_DIR/.env" ]; then
+  echo "==> No .env found, writing default server environment..."
+  cat > "$COMPOSE_DIR/.env" <<EOF
 VLLM_HOST=http://localhost:7000
 VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
 EMBED_MODEL=BAAI/bge-base-en-v1.5
@@ -52,6 +52,9 @@ ADMIN_PASSWORD=insurehub2026
 AUTH_SECRET_KEY=insurehub-rag-secret-2026
 AUTH_TOKEN_EXPIRE_MINUTES=43200
 EOF
+else
+  echo "==> .env already exists on server, leaving it untouched."
+fi
 
 echo "==> Building and starting the backend..."
 cd "$COMPOSE_DIR"
