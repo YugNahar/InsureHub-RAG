@@ -523,8 +523,12 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
     """
     try:
         import aiohttp as _ah
-        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
-        if _active_backend() != "vllm" or not VLLM_HOST:
+        # Deliberately checks VLLM_HOST directly, not _active_backend() — this
+        # auxiliary call should keep using vLLM even when FORCE_BACKEND=groq
+        # is set for testing the MAIN generation model. Only the answer
+        # generation itself is meant to swap backends for that A/B test.
+        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+        if not VLLM_HOST:
             return []
         if not context or not context.strip():
             return []
@@ -656,8 +660,11 @@ async def _reformulate_query(question: str, history: str) -> str:
     Falls back to the original question on any error.
     """
     import aiohttp as _aiohttp
-    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
-    if _active_backend() != "vllm" or not VLLM_HOST:
+    # Deliberately checks VLLM_HOST directly, not _active_backend() — see
+    # _generate_suggestions() for why: this auxiliary call stays on vLLM
+    # even when FORCE_BACKEND=groq swaps the main generation model.
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+    if not VLLM_HOST:
         return question
     # Use only the last 6 lines (3 turns) of history to keep the prompt short
     recent = '\n'.join(history.strip().split('\n')[-6:])
@@ -759,8 +766,14 @@ async def _extract_intent_topics(question: str) -> set[str]:
     Falls back to an empty set on any error — caller uses regex fallback.
     """
     import aiohttp as _aiohttp
-    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
-    if _active_backend() != "vllm" or not VLLM_HOST:
+    # Deliberately checks VLLM_HOST directly, not _active_backend() — see
+    # _generate_suggestions() for why: this is the coverage-check topic
+    # extractor (drives the AND-logic gate), and must keep running on vLLM
+    # even when FORCE_BACKEND=groq swaps the main generation model —
+    # otherwise every query would silently fall through to the weaker
+    # regex-only coverage path, confounding any generation-model A/B test.
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+    if not VLLM_HOST:
         return set()
     try:
         prompt = _INTENT_PROMPT.format(question=question)
