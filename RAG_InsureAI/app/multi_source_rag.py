@@ -449,6 +449,17 @@ _EXAMPLE_SIGNALS = {
     'explain with the help', 'using an example', 'using example',
 }
 
+# Every entry above contains the word "example" — the phrase list is really a
+# proxy for "does the user want one". A fixed phrase list breaks on ordinary
+# grammar drift (e.g. "with a example" instead of "with an example"), which
+# silently disabled both the KV-cache safeguard and the prompt instruction for
+# that query. Match on the word itself instead, which is the real signal.
+_EXAMPLE_PATTERN = re.compile(r'\bexamples?\b', re.IGNORECASE)
+
+
+def _wants_example(text: str) -> bool:
+    return bool(_EXAMPLE_PATTERN.search(text))
+
 
 def _needs_detailed_answer(question: str) -> bool:
     """True when the question expects a comprehensive, multi-part, or procedural answer."""
@@ -629,8 +640,8 @@ def _is_likely_followup(question: str) -> bool:
     # "explain in simple language" (simple), "can you explain in more detail" (detail),
     # "in simple language with example", "in detail with simple language", etc.
     # The 6-word keyword check below misses these because of the word-count gate.
-    _all_modifier_signals = _DETAIL_SIGNALS | _SIMPLE_SIGNALS | _EXAMPLE_SIGNALS
-    if any(sig in q_lower for sig in _all_modifier_signals):
+    _all_modifier_signals = _DETAIL_SIGNALS | _SIMPLE_SIGNALS
+    if any(sig in q_lower for sig in _all_modifier_signals) or _wants_example(q_lower):
         from re import compile as _re_compile
         _II_QUICK = _re_compile(
             r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
@@ -1559,7 +1570,7 @@ class MultiSourceRAG:
         _kv = self.doc_pipeline._cache
         _kv_sources = self.doc_pipeline._vector_store.list_sources()
         _q_lower_intent = question.lower()
-        _kv_has_example = any(sig in _q_lower_intent for sig in _EXAMPLE_SIGNALS)
+        _kv_has_example = _wants_example(_q_lower_intent)
         _kv_has_simple  = any(sig in _q_lower_intent for sig in _SIMPLE_SIGNALS)
         _kv_key = _kv.make_key(
             query=retrieval_query,
@@ -1865,7 +1876,7 @@ class MultiSourceRAG:
             # detail) and inject a targeted instruction into prompt_question so
             # the LLM knows exactly what format/style is expected.
             _q_lower_mod = question.lower()
-            _has_example = any(sig in _q_lower_mod for sig in _EXAMPLE_SIGNALS)
+            _has_example = _wants_example(_q_lower_mod)
             _has_simple  = any(sig in _q_lower_mod for sig in _SIMPLE_SIGNALS)
             _has_detail  = any(sig in _q_lower_mod for sig in _DETAIL_SIGNALS)
 
