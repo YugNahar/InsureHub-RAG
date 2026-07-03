@@ -168,6 +168,16 @@ def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
     return False
 
 
+# Splits a compound query on "and"/"or" only when a question-word/aux-verb
+# immediately follows — see the regex-fallback branch of
+# _context_covers_query() for why a bare split on every "and" is wrong.
+_COMPOUND_SPLIT = re.compile(
+    r'\b(?:and|or)\s+(?=(?:what|who|which|how|why|when|where|is|are|'
+    r'does|do|can|could|should|will|would|was|were)\b)',
+    re.IGNORECASE,
+)
+
+
 def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
     """True if >=1 retrieved chunk contains at least one topic keyword (root-aware).
 
@@ -294,7 +304,19 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     # appeared anywhere and the KB never addresses legal requirements at
     # all. Every discriminating word of a sub-query must now co-occur
     # within a single chunk, and every sub-query must be satisfied.
-    sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
+    #
+    # `query` here is usually the LLM-reformulated retrieval phrase for a
+    # follow-up (e.g. "standard fire insurance policy exclusions and
+    # limitations clause analysis"), not the user's raw question — and plain
+    # "and"/"or" is extremely common in ordinary topic phrasing ("exclusions
+    # and limitations", "terms and conditions") without meaning two separate
+    # questions. Splitting on every bare "and" turned each such phrase into
+    # two sub-queries, and the second half ("limitations clause analysis")
+    # never lexically matches the actual chunks, failing the whole coverage
+    # check and refusing a genuinely-covered topic. Real compound questions
+    # ("what is a deductible and what is the GST rate...") repeat a
+    # question-word/aux-verb right after the conjunction — only split there.
+    sub_queries = [q.strip() for q in _COMPOUND_SPLIT.split(query) if q.strip()]
     all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
     all_term_sets = [t for t in all_term_sets if t]
     if not all_term_sets:
