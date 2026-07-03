@@ -605,10 +605,10 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
 
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
     """
-    Generate follow-up chip questions grounded in the retrieved KB context.
+    Generate follow-up chip questions grounded in the answer just given.
 
     Steps:
-      1. Ask the LLM to produce 5 candidate questions from the KB snippet.
+      1. Ask the LLM to produce 5 candidate questions from the answer text.
       2. Verify each candidate by checking content-word overlap with the full
          retrieved context — questions whose key terms don't appear in the
          context are dropped before they reach the user.
@@ -617,15 +617,27 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
     try:
         if not context or not context.strip():
             return []
-        # Use a larger snippet so the model has enough material to draw from
-        ctx_snippet = context[:1000].strip()
+        if not answer or not answer.strip():
+            return []
+        # Ground generation in the ANSWER the user actually read, not the raw
+        # retrieved-chunk pool. context[:1000] used to be fed to the LLM
+        # instead — but retrieval returns several chunks (often 2000-4400
+        # chars each), so the first 1000 chars is effectively just whichever
+        # chunk landed first in the pool, which is frequently NOT what the
+        # conversational answer was actually grounded in (e.g. a thin-KB
+        # topic like Takaful pulling in an unrelated "types of insurance"
+        # chunk that also mentions motor insurance as an example). The
+        # `answer` param was already being passed in but never referenced in
+        # the prompt, so suggestions had no connection to what the user
+        # actually read. Context is still used below, only for verification.
+        ans_snippet = answer[:800].strip()
         prompt = (
-            f"Knowledge base content:\n{ctx_snippet}\n\n"
             f"User asked: {question}\n\n"
+            f"They were given this answer:\n{ans_snippet}\n\n"
             "Write 5 short follow-up questions (max 8 words each) that:\n"
-            "1. Ask about specific facts, terms, or details mentioned in the knowledge base content above.\n"
-            "2. A user would naturally ask AFTER reading the answer above.\n"
-            "3. Can be answered ONLY from the knowledge base content above — do not invent topics.\n"
+            "1. Ask about specific facts, terms, or details actually mentioned in the answer above — not other topics.\n"
+            "2. A user would naturally ask AFTER reading that exact answer.\n"
+            "3. Do not repeat the original question or invent unrelated topics.\n"
             "Output only the questions, one per line, no numbering, no bullets, no explanations:"
         )
         _text = await _backend_completion(prompt, max_tokens=120, timeout=6)
