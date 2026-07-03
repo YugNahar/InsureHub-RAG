@@ -698,17 +698,26 @@ function filterAgentOnly(messages) {
         if (messages[j].role === 'agent') { agentAnswered = true; break; }
         if (messages[j].role === 'user') break; // new question before any agent = not answered
       }
-      if (!agentAnswered) {
-        out.push({...m, _not_answered: true, _reason: 'layla_refused'});
-        continue;
-      }
+      // BUG (fixed): when agentAnswered was true, this used to fall through to
+      // the agent-phase check below without pushing `m` — and that check broke
+      // on the very next 'ai' message (the refusal itself) before ever reaching
+      // the 'agent' reply that comes after it, so the question silently
+      // vanished from the agent-only view while the agent's reply still showed
+      // unconditionally. Push the question directly here instead — we've
+      // already confirmed an agent answered it.
+      if (agentAnswered) { out.push(m); continue; }
+      out.push({...m, _not_answered: true, _reason: 'layla_refused'});
+      continue;
     }
 
-    // Agent-phase: any message between here and the next AI response is from agent
+    // Agent-phase: an agent reply anywhere before the next user message means
+    // this question was answered by an agent — even if Layla's own (non-refusal)
+    // answer comes first and the agent adds/corrects afterward. Don't stop at
+    // the first 'ai' role; keep scanning past it for a later 'agent' message.
     let agentPhase = false;
     for (let j = i + 1; j < messages.length; j++) {
       if (messages[j].role === 'agent') { agentPhase = true; break; }
-      if (messages[j].role === 'ai') break;
+      if (messages[j].role === 'user') break;
     }
     if (agentPhase) out.push(m);
   }
