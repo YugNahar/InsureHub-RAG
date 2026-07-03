@@ -1660,7 +1660,20 @@ async def ask_stream(req: AskRequest):
                             {"role": "user", "content": req.question},
                             {"role": "assistant", "content": _text_for_handoff_check},
                         ]
-                        asyncio.create_task(_save_conversation_history(req.session_id, new_hist))
+                        # Must await (not create_task): the next request on this
+                        # session reads history at the very start of generate()
+                        # via _get_conversation_history(). A fire-and-forget save
+                        # here raced against a fast-enough follow-up — the read
+                        # could land before this write finished, silently making
+                        # a real follow-up look like a fresh, history-less
+                        # question. Reproduced with zero-delay back-to-back
+                        # requests: a follow-up asking for "a real world example
+                        # of that" answered about a completely unrelated topic
+                        # because history was still empty when it was reformulated.
+                        # The actual text has already been streamed to the client
+                        # by this point, so this only delays the trailing metadata
+                        # JSON chunk, not the perceived answer.
+                        await _save_conversation_history(req.session_id, new_hist)
                     yield "\n\n" + _json.dumps(final_data)
                     return
                 buf += token
