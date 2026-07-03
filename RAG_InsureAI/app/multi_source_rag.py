@@ -168,6 +168,16 @@ def _topics_hit_chunk(topics: set, chunk_terms: set) -> bool:
     return False
 
 
+# Splits a compound query on "and"/"or" only when a question-word/aux-verb
+# immediately follows — see the regex-fallback branch of
+# _context_covers_query() for why a bare split on every "and" is wrong.
+_COMPOUND_SPLIT = re.compile(
+    r'\b(?:and|or)\s+(?=(?:what|who|which|how|why|when|where|is|are|'
+    r'does|do|can|could|should|will|would|was|were)\b)',
+    re.IGNORECASE,
+)
+
+
 def _context_covers_query(query: str, docs: list, llm_topics: set | None = None) -> bool:
     """True if >=1 retrieved chunk contains at least one topic keyword (root-aware).
 
@@ -294,7 +304,19 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     # appeared anywhere and the KB never addresses legal requirements at
     # all. Every discriminating word of a sub-query must now co-occur
     # within a single chunk, and every sub-query must be satisfied.
-    sub_queries = [q.strip() for q in re.split(r'\band\b|\bor\b', query, flags=re.IGNORECASE) if q.strip()]
+    #
+    # `query` here is usually the LLM-reformulated retrieval phrase for a
+    # follow-up (e.g. "standard fire insurance policy exclusions and
+    # limitations clause analysis"), not the user's raw question — and plain
+    # "and"/"or" is extremely common in ordinary topic phrasing ("exclusions
+    # and limitations", "terms and conditions") without meaning two separate
+    # questions. Splitting on every bare "and" turned each such phrase into
+    # two sub-queries, and the second half ("limitations clause analysis")
+    # never lexically matches the actual chunks, failing the whole coverage
+    # check and refusing a genuinely-covered topic. Real compound questions
+    # ("what is a deductible and what is the GST rate...") repeat a
+    # question-word/aux-verb right after the conjunction — only split there.
+    sub_queries = [q.strip() for q in _COMPOUND_SPLIT.split(query) if q.strip()]
     all_term_sets = [_extract_topic_terms(sq) for sq in sub_queries]
     all_term_sets = [t for t in all_term_sets if t]
     if not all_term_sets:
@@ -448,6 +470,17 @@ _EXAMPLE_SIGNALS = {
     'explain me with example', 'can you give me an example',
     'explain with the help', 'using an example', 'using example',
 }
+
+# Every entry above contains the word "example" — the phrase list is really a
+# proxy for "does the user want one". A fixed phrase list breaks on ordinary
+# grammar drift (e.g. "with a example" instead of "with an example"), which
+# silently disabled both the KV-cache safeguard and the prompt instruction for
+# that query. Match on the word itself instead, which is the real signal.
+_EXAMPLE_PATTERN = re.compile(r'\bexamples?\b', re.IGNORECASE)
+
+
+def _wants_example(text: str) -> bool:
+    return bool(_EXAMPLE_PATTERN.search(text))
 
 
 def _needs_detailed_answer(question: str) -> bool:
@@ -629,8 +662,8 @@ def _is_likely_followup(question: str) -> bool:
     # "explain in simple language" (simple), "can you explain in more detail" (detail),
     # "in simple language with example", "in detail with simple language", etc.
     # The 6-word keyword check below misses these because of the word-count gate.
-    _all_modifier_signals = _DETAIL_SIGNALS | _SIMPLE_SIGNALS | _EXAMPLE_SIGNALS
-    if any(sig in q_lower for sig in _all_modifier_signals):
+    _all_modifier_signals = _DETAIL_SIGNALS | _SIMPLE_SIGNALS
+    if any(sig in q_lower for sig in _all_modifier_signals) or _wants_example(q_lower):
         from re import compile as _re_compile
         _II_QUICK = _re_compile(
             r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
@@ -1559,7 +1592,7 @@ class MultiSourceRAG:
         _kv = self.doc_pipeline._cache
         _kv_sources = self.doc_pipeline._vector_store.list_sources()
         _q_lower_intent = question.lower()
-        _kv_has_example = any(sig in _q_lower_intent for sig in _EXAMPLE_SIGNALS)
+        _kv_has_example = _wants_example(_q_lower_intent)
         _kv_has_simple  = any(sig in _q_lower_intent for sig in _SIMPLE_SIGNALS)
         _kv_key = _kv.make_key(
             query=retrieval_query,
@@ -1865,7 +1898,7 @@ class MultiSourceRAG:
             # detail) and inject a targeted instruction into prompt_question so
             # the LLM knows exactly what format/style is expected.
             _q_lower_mod = question.lower()
-            _has_example = any(sig in _q_lower_mod for sig in _EXAMPLE_SIGNALS)
+            _has_example = _wants_example(_q_lower_mod)
             _has_simple  = any(sig in _q_lower_mod for sig in _SIMPLE_SIGNALS)
             _has_detail  = any(sig in _q_lower_mod for sig in _DETAIL_SIGNALS)
 
