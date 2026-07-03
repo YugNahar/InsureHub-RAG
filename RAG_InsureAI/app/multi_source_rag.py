@@ -1982,6 +1982,22 @@ class MultiSourceRAG:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                        # An HTTP error (rate limit, auth failure, server error,
+                        # etc.) returns a JSON error body, not SSE "data: ..."
+                        # lines — every line silently fails the startswith
+                        # check below and gets skipped, so the loop finishes
+                        # having yielded zero tokens while streamed_ok=True
+                        # still gets set at the end, producing a SILENT EMPTY
+                        # ANSWER with no error surfaced anywhere. Explicitly
+                        # failing here instead routes into the except block
+                        # below, which falls back to the non-streaming path
+                        # (or, if that also fails, at least logs a real
+                        # warning instead of nothing at all). Found via a
+                        # genuine Groq 429 (daily token quota hit) that
+                        # produced exactly this silent-empty-response bug.
+                        if resp.status != 200:
+                            body = await resp.text()
+                            raise RuntimeError(f"HTTP {resp.status} from {_active} backend: {body[:300]}")
                         # vLLM SSE chunks may contain multiple "data: ..." lines.
                         # Reading resp.content by chunk (default) silently drops
                         # events when json.loads sees multi-line text. Buffer and
