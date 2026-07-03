@@ -1187,9 +1187,16 @@ class MultiSourceRAG:
                     # they are already partially in the pool.  The initial top-k
                     # may have fetched the wrong sections of that document; the
                     # boost fetches the 2 chunks most relevant to THIS query.
+                    # (Was silently 5 for a while, paired with summary_top_k=3
+                    # at the call sites — up to 15 extra candidates before
+                    # reranking even started, a major, disproportionate driver
+                    # of reranking latency for a modest recall benefit. Capped
+                    # back down to what the comment always said, and
+                    # summary_top_k trimmed to 2 alongside it — now at most
+                    # 2 docs x 2 chunks = 4 extra candidates.)
                     boost = await asyncio.to_thread(
                         self.doc_pipeline._vector_store.search,
-                        retrieval_query, 5, {"source": {"$eq": src}}, True, False,
+                        retrieval_query, 2, {"source": {"$eq": src}}, True, False,
                     )
                     if boost:
                         existing = {d.page_content[:80] for d in doc_chunks}
@@ -1533,7 +1540,13 @@ class MultiSourceRAG:
         _keyword_detailed = _needs_detailed_answer(question)
         _doc_top_k   = 14 if _keyword_detailed else 8
         _chunk_limit = 12 if _keyword_detailed else 8
-        _media_top_k =  5 if _keyword_detailed else 4
+        # Trimmed from 5/4 — video/webpage search()'s internal reranking
+        # candidate pool is 2x this value (safe_k = min(2*top_k, count)), so
+        # this alone controls how many chunks each source reranks before
+        # picking the best ones. Fewer candidates = faster reranking, traded
+        # against a small chance of missing a good chunk further down the
+        # similarity ranking.
+        _media_top_k = 4 if _keyword_detailed else 3
 
         # Apply typo correction to the retrieval_query before KV cache and retrieval
         retrieval_query = _correct_typos(retrieval_query)
@@ -1682,14 +1695,14 @@ class MultiSourceRAG:
             # parallel via its own task while the CPU-bound retrieval work
             # below proceeds sequentially.
             _topics_task = asyncio.create_task(_extract_intent_topics(question))
-            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3)
+            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2)
             video_chunks = await asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
             webpage_chunks = await asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
             llm_topics = await _topics_task
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
             doc_chunks, llm_topics = await asyncio.gather(
-                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
+                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2),
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
