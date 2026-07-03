@@ -510,6 +510,66 @@ def _question_answerable_in_context(question: str, context: str) -> bool:
     return hits >= max(1, len(content_words) * 0.5)
 
 
+async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temperature: float = 0) -> Optional[str]:
+    """Fast, non-streaming chat completion against whichever backend is
+    currently active (vLLM or Groq — both OpenAI-compatible, same request
+    shape). Returns the raw response text, or None on any failure, timeout,
+    or unconfigured/unsupported backend.
+
+    Used for short, best-effort auxiliary calls (topic extraction, query
+    reformulation, suggested-question generation) that should follow the
+    SAME backend as the main answer generation, not be pinned to vLLM
+    regardless of FORCE_BACKEND. An earlier version hardcoded these to
+    always use vLLM specifically to keep a Groq-vs-vLLM generation-fidelity
+    A/B test uncontaminated by a different topic-extraction model also
+    changing retrieval-gating behavior. That trade-off made sense for a
+    controlled test, but not for actual production use — once FORCE_BACKEND
+    picks a backend to actually serve answers from, every supporting call
+    should use that same fast backend too, not bottleneck the whole request
+    on a slower one just for a few background tokens.
+
+    Only vLLM and Groq are handled (matches what existed before this
+    generalization) — OpenAI/Anthropic backends fall through to None here,
+    same as an unconfigured backend, and callers already have a graceful
+    fallback for that.
+    """
+    import aiohttp as _ah
+    from router import (
+        VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend,
+        GROQ_API_KEY, GROQ_MODEL,
+    )
+    backend = _active_backend()
+    if backend == "vllm":
+        url = f"{VLLM_HOST}/v1/chat/completions"
+        model = _resolve_vllm_model()
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"}
+    elif backend == "groq":
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        model = GROQ_MODEL
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"}
+    else:
+        return None
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": False,
+    }
+    try:
+        async with _ah.ClientSession() as session:
+            async with session.post(
+                url, json=payload, headers=headers,
+                timeout=_ah.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
     """
     Generate follow-up chip questions grounded in the retrieved KB context.
@@ -522,14 +582,6 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
       3. Return up to 3 verified questions.
     """
     try:
-        import aiohttp as _ah
-        # Deliberately checks VLLM_HOST directly, not _active_backend() — this
-        # auxiliary call should keep using vLLM even when FORCE_BACKEND=groq
-        # is set for testing the MAIN generation model. Only the answer
-        # generation itself is meant to swap backends for that A/B test.
-        from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
-        if not VLLM_HOST:
-            return []
         if not context or not context.strip():
             return []
         # Use a larger snippet so the model has enough material to draw from
@@ -543,22 +595,9 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
             "3. Can be answered ONLY from the knowledge base content above — do not invent topics.\n"
             "Output only the questions, one per line, no numbering, no bullets, no explanations:"
         )
-        async with _ah.ClientSession() as _s:
-            async with _s.post(
-                f"{VLLM_HOST}/v1/chat/completions",
-                json={
-                    "model": _resolve_vllm_model(),
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 120,
-                    "stream": False,
-                },
-                headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
-                timeout=_ah.ClientTimeout(total=6),
-            ) as _r:
-                if _r.status != 200:
-                    return []
-                _data = await _r.json()
-                _text = _data["choices"][0]["message"]["content"].strip()
+        _text = await _backend_completion(prompt, max_tokens=120, timeout=6)
+        if not _text:
+            return []
         # Parse and clean candidates
         _candidates = [
             q.strip().lstrip("0123456789.-) ").strip()
@@ -659,13 +698,6 @@ async def _reformulate_query(question: str, history: str) -> str:
     Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
     Falls back to the original question on any error.
     """
-    import aiohttp as _aiohttp
-    # Deliberately checks VLLM_HOST directly, not _active_backend() — see
-    # _generate_suggestions() for why: this auxiliary call stays on vLLM
-    # even when FORCE_BACKEND=groq swaps the main generation model.
-    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
-    if not VLLM_HOST:
-        return question
     # Use only the last 6 lines (3 turns) of history to keep the prompt short
     recent = '\n'.join(history.strip().split('\n')[-6:])
     prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
@@ -693,31 +725,12 @@ Conversation:
 
 Follow-up: {question}
 Search query:"""
-    try:
-        payload = {
-            "model": _resolve_vllm_model(),
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 30,
-            "temperature": 0,
-            "stream": False,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {VLLM_API_KEY}",
-        }
-        async with _aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{VLLM_HOST}/v1/chat/completions",
-                json=payload, headers=headers,
-                timeout=_aiohttp.ClientTimeout(total=4),
-            ) as resp:
-                data = await resp.json()
-                reformulated = data["choices"][0]["message"]["content"].strip().strip('"\'')
-                if reformulated and len(reformulated) >= 3:
-                    logger.info("[REFORM] %r -> %r", question, reformulated)
-                    return reformulated
-    except Exception as exc:
-        logger.debug("[REFORM] failed (%s) — using original question", exc)
+    reformulated = await _backend_completion(prompt, max_tokens=30, timeout=4)
+    if reformulated:
+        reformulated = reformulated.strip().strip('"\'')
+        if len(reformulated) >= 3:
+            logger.info("[REFORM] %r -> %r", question, reformulated)
+            return reformulated
     return question
 
 
@@ -762,76 +775,51 @@ async def _extract_intent_topics(question: str) -> set[str]:
     """Fast LLM call (runs in parallel with retrieval) to extract core,
     discriminating topic words from the question for the coverage check.
 
-    Uses vLLM with max_tokens=60 so the round-trip is <1 s on an idle server.
+    max_tokens=60 so the round-trip is <1 s on an idle backend.
     Falls back to an empty set on any error — caller uses regex fallback.
     """
-    import aiohttp as _aiohttp
-    # Deliberately checks VLLM_HOST directly, not _active_backend() — see
-    # _generate_suggestions() for why: this is the coverage-check topic
-    # extractor (drives the AND-logic gate), and must keep running on vLLM
-    # even when FORCE_BACKEND=groq swaps the main generation model —
-    # otherwise every query would silently fall through to the weaker
-    # regex-only coverage path, confounding any generation-model A/B test.
-    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
-    if not VLLM_HOST:
-        return set()
     try:
         prompt = _INTENT_PROMPT.format(question=question)
-        payload = {
-            "model": _resolve_vllm_model(),
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 60,
-            "temperature": 0,
-            "stream": False,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {VLLM_API_KEY}",
-        }
-        timeout = _aiohttp.ClientTimeout(total=5)
-        async with _aiohttp.ClientSession() as session:
-            async with session.post(f"{VLLM_HOST}/v1/chat/completions",
-                                    json=payload, headers=headers,
-                                    timeout=timeout) as resp:
-                data = await resp.json()
-                raw = data["choices"][0]["message"]["content"].strip()
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=5)
+        if not raw:
+            return set()
 
-                specific_line = ""
-                generic_line = ""
-                for line in raw.split("\n"):
-                    line_l = line.strip().lower()
-                    if line_l.startswith("specific:"):
-                        specific_line = line.split(":", 1)[1] if ":" in line else ""
-                    elif line_l.startswith("generic:"):
-                        generic_line = line.split(":", 1)[1] if ":" in line else ""
+        specific_line = ""
+        generic_line = ""
+        for line in raw.split("\n"):
+            line_l = line.strip().lower()
+            if line_l.startswith("specific:"):
+                specific_line = line.split(":", 1)[1] if ":" in line else ""
+            elif line_l.startswith("generic:"):
+                generic_line = line.split(":", 1)[1] if ":" in line else ""
 
-                # Parse phrases like "no-claim bonus, deductible" keeping
-                # multi-word/hyphenated compounds intact for phrase matching.
-                topics: set[str] = set()
-                for phrase in specific_line.lower().split(","):
-                    phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
-                    if phrase and phrase not in ("none", "n/a"):
-                        topics.add(phrase)
+        # Parse phrases like "no-claim bonus, deductible" keeping
+        # multi-word/hyphenated compounds intact for phrase matching.
+        topics: set[str] = set()
+        for phrase in specific_line.lower().split(","):
+            phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
+            if phrase and phrase not in ("none", "n/a"):
+                topics.add(phrase)
 
-                # "Generic:" is still requested in the prompt — contrasting it
-                # against "Specific:" helps the model reason about the split —
-                # but its output is no longer persisted anywhere. An earlier
-                # version fed it into a disk-backed learned-stopwords set
-                # shared across queries, which caused two confirmed bugs: (1)
-                # off-topic test/user queries taught it nonsense words with
-                # nothing to do with insurance, and (2) each deployment
-                # accumulates its own independent, un-synced state, so
-                # identical code + identical KB behaved differently across
-                # environments depending on each one's unrelated query
-                # history. Kept for debug visibility only.
-                generic_words: set[str] = set()
-                for phrase in generic_line.lower().split(","):
-                    phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
-                    if phrase and phrase not in ("none", "n/a"):
-                        generic_words.update(w for w in phrase.split() if len(w) >= 3)
+        # "Generic:" is still requested in the prompt — contrasting it
+        # against "Specific:" helps the model reason about the split —
+        # but its output is no longer persisted anywhere. An earlier
+        # version fed it into a disk-backed learned-stopwords set
+        # shared across queries, which caused two confirmed bugs: (1)
+        # off-topic test/user queries taught it nonsense words with
+        # nothing to do with insurance, and (2) each deployment
+        # accumulates its own independent, un-synced state, so
+        # identical code + identical KB behaved differently across
+        # environments depending on each one's unrelated query
+        # history. Kept for debug visibility only.
+        generic_words: set[str] = set()
+        for phrase in generic_line.lower().split(","):
+            phrase = re.sub(r"[^a-z\- ]", "", phrase).strip()
+            if phrase and phrase not in ("none", "n/a"):
+                generic_words.update(w for w in phrase.split() if len(w) >= 3)
 
-                logger.debug("[INTENT] %r → specific=%s generic=%s", question, topics, generic_words)
-                return topics
+        logger.debug("[INTENT] %r → specific=%s generic=%s", question, topics, generic_words)
+        return topics
     except Exception as exc:
         logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
         return set()
