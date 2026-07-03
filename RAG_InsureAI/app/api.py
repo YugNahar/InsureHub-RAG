@@ -293,7 +293,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_FRONTEND_DIST = os.path.join(_APP_DIR, "frontend_dist")
+_FRONTEND_DIST = "/app/frontend_dist"
 
 # Serve the React app's static assets (/assets/*, /favicon.ico, etc.)
 if os.path.isdir(_FRONTEND_DIST):
