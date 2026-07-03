@@ -1911,10 +1911,13 @@ class MultiSourceRAG:
                 )
                 llm = get_insurance_llm(temperature=0)
 
-        # ── Stream LLM tokens directly via vLLM HTTP SSE ─────────────────────
+        # ── Stream LLM tokens directly via HTTP SSE ───────────────────────────
         # LangChain's astream() buffers the full response before yielding.
-        # We bypass it and call the vLLM /v1/chat/completions endpoint with
-        # stream=True so the frontend sees the first word in <1 second.
+        # We bypass it and call the backend's /v1/chat/completions endpoint
+        # directly with stream=True so the frontend sees the first word in
+        # <1 second. Groq's API is OpenAI-compatible — identical SSE shape
+        # to vLLM's — so both backends share this one streaming path rather
+        # than Groq falling back to a single blocking response.
         import json as _json
         import aiohttp
         from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend
@@ -1923,19 +1926,36 @@ class MultiSourceRAG:
         streamed_ok = False
         _kv_reply = ""  # buffer for cache write
 
-        if _active_backend() == "vllm" and VLLM_HOST:
-            model = _resolve_vllm_model()
-            url = f"{VLLM_HOST}/v1/chat/completions"
+        _active = _active_backend()
+        _stream_url = None
+        _stream_model = None
+        _stream_headers = None
+        if _active == "vllm" and VLLM_HOST:
+            _stream_model = _resolve_vllm_model()
+            _stream_url = f"{VLLM_HOST}/v1/chat/completions"
+            _stream_headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {VLLM_API_KEY}",
+            }
+        elif _active == "groq":
+            from router import GROQ_API_KEY, GROQ_MODEL
+            _stream_model = GROQ_MODEL
+            _stream_url = "https://api.groq.com/openai/v1/chat/completions"
+            _stream_headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+            }
+
+        if _stream_url:
+            model = _stream_model
+            url = _stream_url
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "600") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "300")),
                 "stream": True,
             }
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {VLLM_API_KEY}",
-            }
+            headers = _stream_headers
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
@@ -1967,10 +1987,12 @@ class MultiSourceRAG:
                                 break
                 streamed_ok = True
             except Exception as exc:
-                logger.warning("[ask_stream] direct vLLM streaming failed, falling back: %s", exc)
+                logger.warning("[ask_stream] direct %s streaming failed, falling back: %s", _active, exc)
 
         if not streamed_ok:
-            # Fallback: regular invoke (no streaming)
+            # Fallback: regular invoke (no streaming) — only reached for
+            # openai/anthropic backends, or if the vLLM/Groq streaming call
+            # above raised an exception.
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
             answer = _strip_markdown(_strip_model_preamble(answer))
