@@ -527,6 +527,7 @@ async def ws_agent_endpoint(websocket: WebSocket):
         await websocket.send_json({"type": "logged_in", "agent_id": agent_id, "name": name})
         await websocket.send_json({"type": "sessions_update", "sessions": _agent_hub.list_sessions()})
         await _agent_hub._broadcast_super_admin_update()
+        await _agent_hub.notify_pending_escalations()
         while True:
             msg = await websocket.receive_json()
             t = msg.get("type", "")

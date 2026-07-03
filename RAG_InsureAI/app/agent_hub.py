@@ -440,6 +440,36 @@ class AgentHub:
         await self._broadcast_sessions_update()
         return True
 
+    async def notify_pending_escalations(self):
+        """
+        Called whenever an agent connects — re-broadcasts a handoff popup for
+        every session still sitting unresolved in the email-escalation
+        backlog (email_sent=True, no agent assigned yet).
+
+        request_handoff() only ever fires in real time, at the moment a
+        question comes in, and only reaches agents who are online at that
+        exact instant. A question asked while nobody was online goes to
+        email and — until now — never got another chance at a popup even
+        after an agent came online later; the only trace was a passive red
+        dot in the session list an agent had to notice on their own.
+
+        handoff_exhausted must be reset first: it's set True by the same
+        timeout/all-declined path that produces email_sent=True in the
+        first place, and request_handoff() refuses to re-fire while it's
+        set. Resetting it here is intentional — a newly-connected agent is
+        a genuinely new notification opportunity, not a same-turn re-trigger.
+        """
+        for session in list(self._sessions.values()):
+            if not session.email_sent or session.status == "human":
+                continue
+            if session.session_id in self._pending_handoffs:
+                continue  # already actively being (re-)notified
+            session.handoff_exhausted = False
+            unanswerable = next(
+                (m.content for m in reversed(session.history) if m.role == "user"), ""
+            )
+            await self.request_handoff(session.session_id, unanswerable)
+
     async def _handoff_timeout(self, session_id: str, unanswerable_query: str):
         """Called after _HANDOFF_TIMEOUT seconds if no agent accepted the popup."""
         await asyncio.sleep(_HANDOFF_TIMEOUT)
