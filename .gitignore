@@ -53,3 +53,6 @@ frontend/*.local
 
 # Runtime agent-activity data
 RAG_InsureAI/app/agent_activity.json
+
+# Duplicate frontend build (served via bind mount from frontend/dist)
+RAG_InsureAI/app/frontend_dist/

@@ -21,12 +21,25 @@ if ! docker compose version &>/dev/null; then
   sudo yum install -y docker-compose-plugin 2>/dev/null || true
 fi
 
+echo "==> Checking Node.js..."
+if ! command -v node &>/dev/null; then
+  echo "    Installing Node.js 20..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+  sudo apt-get install -y nodejs
+fi
+
 echo "==> Cloning / updating repo..."
 if [ -d "$REPO_DIR/.git" ]; then
   git -C "$REPO_DIR" pull --rebase
 else
   git clone "$REPO_URL" "$REPO_DIR"
 fi
+
+echo "==> Building frontend..."
+cd "$REPO_DIR/frontend"
+npm ci
+npm run build
+cd "$COMPOSE_DIR"
 
 echo "==> Writing server environment overrides..."
 cat > "$COMPOSE_DIR/.env" <<EOF
