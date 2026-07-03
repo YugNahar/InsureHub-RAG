@@ -1656,14 +1656,36 @@ class MultiSourceRAG:
         # extra round-trip to the LLM server on every query for a result
         # nothing read. Removed.
         if not document_filter:
-            (doc_chunks, video_chunks, webpage_chunks), llm_topics = await asyncio.gather(
-                asyncio.gather(
-                    self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
-                    asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True),
-                    asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True),
-                ),
-                _extract_intent_topics(question),
-            )
+            # Local reranking (doc, video, webpage) all share one CrossEncoder
+            # model running on CPU. Firing all three concurrently via
+            # asyncio.gather looks parallel but isn't a clean speedup here —
+            # each call's own internal PyTorch/OpenMP threading tries to use
+            # every available core, so "concurrent" execution causes
+            # contention (isolated measurement on this deployment: ~16.6s
+            # concurrent vs ~9.8s sequential for the same reranking work).
+            # Tried capping each call's thread budget via OMP_NUM_THREADS
+            # instead of serializing — that caused requests to hang outright
+            # (reranker calls stuck at 0% progress, a real deadlock under
+            # concurrent low-thread-count execution), so that approach was
+            # reverted. Serializing avoids the deadlock risk entirely and is
+            # never worse than the contended-concurrent version, though
+            # end-to-end wins are inconsistent in practice — actual per-query
+            # cost varies a lot because the stage-1 summary-boost step inside
+            # _retrieve_doc_chunks() pulls in a variable, sometimes large,
+            # number of extra candidates before reranking (measured 8 vs an
+            # actual 18 for the same query), so this alone does not reliably
+            # hit any specific latency target — it removes one real risk
+            # (contention/deadlock), not the whole bottleneck.
+            #
+            # The LLM topic-extraction call has no such conflict — it's a
+            # network call, not CPU-bound — so it still runs in genuine
+            # parallel via its own task while the CPU-bound retrieval work
+            # below proceeds sequentially.
+            _topics_task = asyncio.create_task(_extract_intent_topics(question))
+            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3)
+            video_chunks = await asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
+            webpage_chunks = await asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
+            llm_topics = await _topics_task
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
             doc_chunks, llm_topics = await asyncio.gather(
