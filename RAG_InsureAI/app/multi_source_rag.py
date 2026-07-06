@@ -864,6 +864,24 @@ def _is_likely_followup(question: str) -> bool:
     return False
 
 
+# A flat history string is "User: ...\nAssistant: ...\nUser: ...\nAssistant: ..."
+# — but a single turn's own content can contain internal newlines (e.g. a
+# numbered-list answer, one "\n" per point). Splitting on every raw "\n" to
+# grab "the last N lines" of history silently fragments that ONE long turn
+# into many pieces, so the window can end up holding only the tail of a
+# numbered list (points 6-8) while dropping the earlier points (1-5) — and a
+# follow-up asking about "the second point" then has no way to know what
+# point 2 actually was. Splitting only at newlines immediately followed by
+# "User:"/"Assistant:" keeps each turn whole no matter how many lines its
+# own content spans, so "last N turns" means what it says.
+_HISTORY_TURN_BOUNDARY_RE = re.compile(r'\n(?=(?:User|Assistant):\s)')
+
+
+def _split_history_turns(history: str) -> list[str]:
+    """Split a flat history string into whole turns (see module note above)."""
+    return [t.strip() for t in _HISTORY_TURN_BOUNDARY_RE.split(history.strip()) if t.strip()]
+
+
 async def _reformulate_query(question: str, history: str) -> str:
     """Rewrite a follow-up question as a standalone search query using conversation history.
 
@@ -875,8 +893,8 @@ async def _reformulate_query(question: str, history: str) -> str:
     Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
     Falls back to the original question on any error.
     """
-    # Use only the last 6 lines (3 turns) of history to keep the prompt short
-    recent = '\n'.join(history.strip().split('\n')[-6:])
+    # Use only the last 3 turns of history to keep the prompt short
+    recent = '\n'.join(_split_history_turns(history)[-6:])
     prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
 Use precise insurance/legal terms that would appear in a textbook (not casual phrasing).
 Output ONLY the search query — no quotes, no explanation, nothing else.
@@ -1084,8 +1102,8 @@ async def _contextualize_query(question: str, history: str) -> str:
     if not history or not history.strip():
         return question
     # Use only the last 1-2 turns — parse the flat "User: ...\nAssistant: ..." format
-    lines = [l.strip() for l in history.strip().split("\n") if l.strip()]
-    recent = lines[-4:]  # at most 4 lines = 2 turns
+    lines = _split_history_turns(history)
+    recent = lines[-4:]  # at most 4 turns
     if not recent:
         return question
     history_text = "\n".join(recent)
@@ -1094,9 +1112,13 @@ async def _contextualize_query(question: str, history: str) -> str:
         f"New question: {question}\n\n"
         "Rewrite the new question to be fully self-contained by resolving "
         "any pronouns or implicit references (e.g. 'it', 'that', 'those', "
-        "'their') using the recent conversation. If the question is "
-        "already self-contained and doesn't depend on the conversation "
-        "above, return it completely unchanged. "
+        "'their') using the recent conversation. If the new question refers "
+        "to an ordinal position in a numbered or listed answer above (e.g. "
+        "'the second point', 'point 3', 'the last one'), rewrite it to name "
+        "the SPECIFIC subject of that one point only — do not fold in "
+        "neighboring points. If the question is already self-contained and "
+        "doesn't depend on the conversation above, return it completely "
+        "unchanged. "
         "Respond with ONLY the rewritten (or unchanged) question, nothing else."
     )
     try:
@@ -1266,11 +1288,11 @@ def _reformulate_with_history(question: str, history: str) -> str:
     *question* is still passed to the LLM prompt so the model answers what the
     user actually asked.
     """
-    lines = history.strip().split("\n")
+    turns = _split_history_turns(history)
     last_assistant = ""
-    for line in reversed(lines):
-        if line.startswith("Assistant:"):
-            last_assistant = line[len("Assistant:"):].strip()
+    for turn in reversed(turns):
+        if turn.startswith("Assistant:"):
+            last_assistant = turn[len("Assistant:"):].strip()
             break
     if last_assistant:
         return f"{last_assistant} {question}"
