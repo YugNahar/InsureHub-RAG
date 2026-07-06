@@ -10,7 +10,7 @@ InsureAI is a local Q&A agent built for insurance documents. You upload your pol
 
 The system has two main pieces:
 - **The app** — runs locally in Docker on your machine (port 8501)
-- **The LLM server** — a remote vLLM server that does the actual text generation (you need this to be running separately)
+- **The LLM server** — a remote vLLM or Groq server that does the actual text generation (you need this to be running separately)
 
 ---
 
@@ -25,6 +25,9 @@ Download from docker.com. During installation, make sure WSL2 integration is ena
 Download from git-scm.com.
 
 You'll also need at least 8 GB of RAM free and around 10 GB of disk space for the Docker image and model caches.
+
+**Python 3.11+** (for local development without Docker)
+Download from python.org. Verify with `python --version`.
 
 ---
 
@@ -45,9 +48,13 @@ AIAgent/
   docker-compose.yml
   Dockerfile
   requirements.txt
+  render.yaml
+  setup_guide.md
+  TECH_STACK.md
 ```
 
 ---
+
 ## Step 1.5 — Create Your `.env` File
 
 Create a file named `.env` in the project root (same directory as `docker-compose.yml`).
@@ -55,10 +62,29 @@ Create a file named `.env` in the project root (same directory as `docker-compos
 Example:
 
 ```env
-VLLM_HOST=http://<your-vllm-server-ip>:7000
-VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
-EMBED_MODEL=BAAI/bge-base-en-v1.5
+# ── LLM Backend ────────────────────────────────────────────────────────────
+# Either VLLM_HOST (for self-hosted vLLM) or GROQ_API_KEY (for Groq cloud)
+# If both are set, FORCE_BACKEND=vllm or FORCE_BACKEND=groq picks which to use.
+# If neither is set, defaults to groq if GROQ_API_KEY is present, else vllm.
 
+VLLM_HOST=http://<your-vllm-server-ip>:7000
+VLLM_API_KEY=not-needed-for-local
+VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+VLLM_MODEL_BRIEF=Qwen/Qwen2.5-7B-Instruct-AWQ
+VLLM_MAX_TOKENS=600
+VLLM_MAX_TOKENS_BRIEF=300
+
+GROQ_API_KEY=gsk_your_groq_api_key_here
+GROQ_MODEL=llama-3.3-70b-versatile
+
+# ── Forced backend (optional) — uncomment to pin: "vllm" or "groq"
+# FORCE_BACKEND=groq
+
+# ── Embeddings & Re-ranking ─────────────────────────────────────────────────
+EMBED_MODEL=BAAI/bge-base-en-v1.5
+RERANK_MODEL=BAAI/bge-reranker-base
+
+# ── Admin Authentication ────────────────────────────────────────────────────
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=yourpassword
 
@@ -71,10 +97,11 @@ AUTH_TOKEN_EXPIRE_MINUTES=480
 * Never commit this file to Git.
 * Use a long random string for `AUTH_SECRET_KEY`.
 * Change the default admin username and password before deploying to production.
+* If using Groq, the `GROQ_MODEL` must be a model that supports function calling/JSON mode for structured extraction (e.g. `llama-3.3-70b-versatile` or `mixtral-8x7b-32768`).
 
 ---
 
-## Step 2 — Configure the vLLM Connection
+## Step 2 — Configure the Backend Connection
 
 Open `docker-compose.yml` and verify that the API service loads values from the `.env` file:
 
@@ -82,7 +109,12 @@ Open `docker-compose.yml` and verify that the API service loads values from the 
 environment:
   - VLLM_HOST=${VLLM_HOST}
   - VLLM_MODEL=${VLLM_MODEL}
+  - VLLM_API_KEY=${VLLM_API_KEY}
+  - GROQ_API_KEY=${GROQ_API_KEY}
+  - GROQ_MODEL=${GROQ_MODEL}
+  - FORCE_BACKEND=${FORCE_BACKEND}
   - EMBED_MODEL=${EMBED_MODEL}
+  - RERANK_MODEL=${RERANK_MODEL}
 
   - ADMIN_USERNAME=${ADMIN_USERNAME}
   - ADMIN_PASSWORD=${ADMIN_PASSWORD}
@@ -90,30 +122,21 @@ environment:
   - AUTH_TOKEN_EXPIRE_MINUTES=${AUTH_TOKEN_EXPIRE_MINUTES}
 ```
 
-Before continuing, verify the vLLM server is reachable:
+Before continuing, verify the chosen backend is reachable:
 
+**For vLLM:**
 ```bash
 curl $VLLM_HOST/v1/models
 ```
 
-Expected response:
-
-```json
-{
-  "data": [...]
-}
+**For Groq:**
+```bash
+curl -H "Authorization: Bearer $GROQ_API_KEY" https://api.groq.com/openai/v1/models
 ```
 
-If the request times out or returns a connection error, verify:
+The API container can start without the LLM server, but document questions will fail until the model server becomes reachable.
 
-* The vLLM server is running.
-* The host and port are correct.
-* Firewall rules allow access to port `7000`.
-
-The API container can start without the vLLM server, but document questions will fail until the model server becomes reachable.
-
-```
-```
+---
 
 ## Step 3 — Build and Start
 
@@ -123,7 +146,7 @@ Open a terminal, navigate to the project folder, and run:
 docker compose up -d --build
 ```
 
-The first time you run this it will take a while — it needs to download the base Python image, install all the packages, and on first startup it will also pull the embedding and reranker models from HuggingFace. Subsequent starts are much faster.
+The first time you run this it will take a while — it needs to download the base Python image, install all the packages (including LangChain 0.3.x, FastAPI 0.115+, and sentence-transformers 3.x), and on first startup it will also pull the embedding and reranker models from HuggingFace. Subsequent starts are much faster.
 
 Once it finishes, verify everything is up:
 
@@ -166,7 +189,7 @@ curl http://localhost:8501/upload/<job_id>
 When `status` says `done`, the document is in the knowledge base and ready to query.
 
 **Supported file types:**
-PDF, Word (.docx/.doc), Excel (.xlsx/.xls), PowerPoint (.pptx/.ppt), CSV, plain text, and .eml files.
+PDF, Word (.docx/.doc), Excel (.xlsx/.xls), PowerPoint (.pptx/.ppt), CSV, plain text, .txt, and .eml files.
 
 ---
 
@@ -179,6 +202,14 @@ curl -X POST http://localhost:8501/ask \
 ```
 
 The `session_id` is optional — if you include the same one across multiple questions, the system remembers the conversation context. Leave it out or use `"default"` if you don't need that.
+
+For streaming (token-by-token) responses:
+
+```
+curl -X POST http://localhost:8501/ask-stream \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the deductible?", "session_id": "my-session"}'
+```
 
 ---
 
@@ -276,10 +307,31 @@ To start all services (API + eval), use the standard:
 ```bash
 docker compose up -d
 ```
+
 If you ran `docker compose down -v`, that deletes the volumes including your document store. Use `docker compose down` (without `-v`) to preserve data between restarts.
 
 **Voice transcription isn't working**
 Whisper downloads its model on first use — make sure the container has internet access. Supported audio formats are `.webm`, `.wav`, `.mp3`, and `.m4a`.
+
+---
+
+## Local Development (Without Docker)
+
+For development or testing without Docker, you can run the API directly:
+
+```bash
+# Create a virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Start the server
+uvicorn app.main:app --host 0.0.0.0 --port 8501 --reload
+```
+
+The `--reload` flag enables auto-reload on code changes. Note: you'll need to set environment variables manually or use a `.env` file with `python-dotenv`.
 
 ---
 
@@ -295,3 +347,30 @@ All persistent data lives in Docker named volumes, not inside the container imag
 | Temporary file uploads | `upload_data` volume |
 
 These survive container restarts and rebuilds. They're only lost if you explicitly run `docker compose down -v`.
+
+---
+
+## Troubleshooting
+
+**"I don't have that in my knowledge base" for a question that should be answerable**
+This can happen if the query contextualization over-injects topic context. First verify the question is standalone (no pronouns like "it", "that", "their"). If it is, the system should return it unchanged. Check the logs for `[CTX]` entries to see if the query was being rewritten when it shouldn't.
+
+**The LLM seems to be answering from general knowledge**
+The system applies multiple grounding checks: lexical keyword overlap, named-entity enumeration verification, quoted-term comparison, and a semantic LLM-based grounding check (`_verify_grounding`). If any of these fail, the answer is refused. Check the application logs for coverage-check results.
+
+**Reranker gate is blocking legitimate content**
+The reranker gate threshold is set very low (0.0005 by default) to only block pure noise. If legitimate chunks are being dropped, check `RERANK_GATE_THRESHOLD` in the environment — the default should rarely need adjustment.
+
+**Package version conflicts**
+If you encounter dependency conflicts during `docker compose up --build`, ensure you're using Python 3.11 in the Docker base image. The current requirements target Python 3.11+ with updated package versions.
+
+**Whisper model download fails**
+Ensure the container has internet access on first run. Whisper downloads its model (~140MB for the base model) on first transcription request. If behind a proxy, set `HTTP_PROXY`/`HTTPS_PROXY` environment variables in docker-compose.yml.
+
+**Import errors after updating requirements**
+If you see module import errors after updating dependencies, rebuild the Docker image from scratch:
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+```

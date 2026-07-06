@@ -1088,16 +1088,41 @@ async def _contextualize_query(question: str, history: str) -> str:
     recent = lines[-4:]  # at most 4 lines = 2 turns
     if not recent:
         return question
+
+    # Fast path: if the question contains NO pronoun or implicit-reference tokens,
+    # skip the LLM call entirely. The question is structurally standalone — no
+    # "it", "that", "those", "their", "its", "they", "this", "them", "which",
+    # "one(s)", "the X one", or bare modifiers ("more", "elaborate") that refer
+    # back to a prior topic. Any of these signals a reference dependency; their
+    # absence means the question is self-contained regardless of topical proximity
+    # to recent conversation. This catches "how do I file a claim" after a Takaful
+    # talk — no pronoun → return unchanged, fast, no LLM call.
+    _REFERENCE_TOKENS = re.compile(
+        r"\b(?:it|its|that|this|those|these|they|them|their|which|"
+        r"one\b|ones\b|the\s+\w+\s+one|the\s+other\b|"
+        r"more\b|further\b|elaborate\b|"
+        r"first\b|second\b|third\b|last\b|"
+        r"other\b|another\b)",
+        re.IGNORECASE,
+    )
+    q_lower = question.strip().lower()
+    if not _REFERENCE_TOKENS.search(q_lower):
+        return question
+
     history_text = "\n".join(recent)
     prompt = (
         f"Recent conversation:\n{history_text}\n\n"
         f"New question: {question}\n\n"
-        "Rewrite the new question to be fully self-contained by resolving "
-        "any pronouns or implicit references (e.g. 'it', 'that', 'those', "
-        "'their') using the recent conversation. If the question is "
-        "already self-contained and doesn't depend on the conversation "
-        "above, return it completely unchanged. "
-        "Respond with ONLY the rewritten (or unchanged) question, nothing else."
+        "Does the new question contain a pronoun or implicit reference (e.g. "
+        "'it', 'that', 'those', 'their', 'the second one') that depends on "
+        "the conversation above to be understood? "
+        "If YES, rewrite the question to resolve that reference, replacing "
+        "the pronoun/reference with the specific thing it refers to. "
+        "If NO — the question is already a complete, standalone question, "
+        "even if it's on a different topic than the conversation above — "
+        "return the question completely UNCHANGED. Do not add topic context "
+        "to a question that doesn't need it. "
+        "Respond with ONLY the question (rewritten or unchanged), nothing else."
     )
     try:
         raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
