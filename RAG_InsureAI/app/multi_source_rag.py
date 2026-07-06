@@ -986,6 +986,56 @@ async def _verify_grounding(question: str, context: str) -> bool:
     except Exception:
         return False
 
+async def _contextualize_query(question: str, history: str) -> str:
+    """Rewrite the question into a standalone, self-contained form by
+    resolving pronouns and implicit references against recent conversation
+    history. Runs on every turn — a true first-turn or already-standalone
+    question should be returned unchanged, not gated behind a separate
+    followup/not-followup classifier.
+
+    This replaces the keyword-based _is_likely_followup() approach. That
+    approach breaks on any surface form not in its keyword list (e.g. a
+    bare pronoun like "it's" in "what are it's principles") because it's
+    trying to answer a semantic question ("does this question depend on
+    prior context?") with syntax matching. This function delegates that
+    judgment to the LLM instead, which handles arbitrary phrasing.
+
+    *history* is a flat ``"User: ...\\nAssistant: ..."`` string as built
+    by ``ConversationAgent._build_history_string()`` — not a list of
+    dicts. Uses only the last 1-2 turns (recent context is what pronouns
+    and implicit references actually resolve against).
+
+    Fail-safe: on any exception, timeout, or empty response, return the
+    original question unchanged rather than blocking the pipeline —
+    worst case is identical to today's behavior (retrieval on the raw
+    question), not a new failure mode.
+    """
+    if not history or not history.strip():
+        return question
+    # Use only the last 1-2 turns — parse the flat "User: ...\nAssistant: ..." format
+    lines = [l.strip() for l in history.strip().split("\n") if l.strip()]
+    recent = lines[-4:]  # at most 4 lines = 2 turns
+    if not recent:
+        return question
+    history_text = "\n".join(recent)
+    prompt = (
+        f"Recent conversation:\n{history_text}\n\n"
+        f"New question: {question}\n\n"
+        "Rewrite the new question to be fully self-contained by resolving "
+        "any pronouns or implicit references (e.g. 'it', 'that', 'those', "
+        "'their') using the recent conversation. If the question is "
+        "already self-contained and doesn't depend on the conversation "
+        "above, return it completely unchanged. "
+        "Respond with ONLY the rewritten (or unchanged) question, nothing else."
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+        if not raw or not raw.strip():
+            return question
+        return raw.strip()
+    except Exception:
+        return question
+
 
 _HANDOFF_MSG = (
     "I don't have that in my knowledge base right now — "
@@ -1403,6 +1453,22 @@ class MultiSourceRAG:
         has_history = bool(history.strip())
         retrieval_query = _reformulate_with_history(question, history) if (is_short and has_history) else question
 
+        # ── LLM-based query contextualization (replaces keyword follow-up detection) ──
+        # Resolves pronouns and implicit references against recent conversation
+        # history on every turn. The rewritten query is used for retrieval and
+        # coverage checks; the original question is kept for the LLM prompt so
+        # the model answers what the user actually asked.
+        _contextualized = await _contextualize_query(retrieval_query, history)
+        if _contextualized != retrieval_query:
+            # Also log what the old keyword-based classifier would have said,
+            # for side-by-side comparison in production logs before removal.
+            _old_followup = _is_likely_followup(question) if history else False
+            logger.info(
+                "[CTX] %r → %r (old _is_likely_followup=%s)",
+                retrieval_query, _contextualized, _old_followup,
+            )
+            retrieval_query = _contextualized
+
         # Build filter
         filter_meta = None
         if document_filter:
@@ -1525,15 +1591,20 @@ class MultiSourceRAG:
         # Lexical checks run alongside the semantic _verify_grounding() backstop
         # via asyncio.gather() rather than after it, so the LLM round-trip isn't
         # serialized behind work that's already fast. Both must pass.
+        # Both the lexical checks and _verify_grounding() receive the
+        # contextualized retrieval_query (not the original question) so that
+        # pronoun-resolved terms like "takaful principles" are checked against
+        # the same query that was actually used for retrieval, not the raw
+        # unresolved question containing "it's".
         async def _lexical_covered():
             return (
-                _context_covers_query(question, all_chunks)
-                and _quoted_comparison_covered(question, all_chunks)
-                and _enumeration_query_covered(question, all_chunks)
+                _context_covers_query(retrieval_query, all_chunks)
+                and _quoted_comparison_covered(retrieval_query, all_chunks)
+                and _enumeration_query_covered(retrieval_query, all_chunks)
             )
         _lex_ok, _semantically_grounded = await asyncio.gather(
             _lexical_covered(),
-            _verify_grounding(question, full_context),
+            _verify_grounding(retrieval_query, full_context),
         )
         ctx_covered = _lex_ok and _semantically_grounded
 
@@ -1704,6 +1775,22 @@ class MultiSourceRAG:
                     _is_followup = True
         else:
             retrieval_query = corrected_question
+
+        # ── LLM-based query contextualization (replaces keyword follow-up detection) ──
+        # Resolves pronouns and implicit references against recent conversation
+        # history on every turn. The rewritten query is used for retrieval and
+        # coverage checks; the original question is kept for the LLM prompt so
+        # the model answers what the user actually asked.
+        _contextualized = await _contextualize_query(retrieval_query, history)
+        if _contextualized != retrieval_query:
+            # Also log what the old keyword-based classifier would have said,
+            # for side-by-side comparison in production logs before removal.
+            _old_followup = _is_likely_followup(question) if history else False
+            logger.info(
+                "[CTX] %r → %r (old _is_likely_followup=%s)",
+                retrieval_query, _contextualized, _old_followup,
+            )
+            retrieval_query = _contextualized
 
         # ── Keyword detailed check — must run BEFORE cache ───────────────────
         # So the cache key correctly separates brief vs. detailed for the same
@@ -1961,15 +2048,15 @@ class MultiSourceRAG:
         async def _lexical_covered():
             return (
                 _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
-                and _quoted_comparison_covered(question, all_chunks)
-                and _enumeration_query_covered(question, all_chunks)
+                and _quoted_comparison_covered(retrieval_query, all_chunks)
+                and _enumeration_query_covered(retrieval_query, all_chunks)
             )
         _grounding_context_preview = "\n\n".join(
             c.page_content for c in all_chunks if hasattr(c, "page_content")
         )
         _lex_ok, _semantically_grounded = await asyncio.gather(
             _lexical_covered(),
-            _verify_grounding(question, _grounding_context_preview),
+            _verify_grounding(retrieval_query, _grounding_context_preview),
         )
         ctx_covered = _lex_ok and _semantically_grounded
         if not ctx_covered and not document_filter:
