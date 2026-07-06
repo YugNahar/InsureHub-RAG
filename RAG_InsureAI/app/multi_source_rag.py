@@ -699,7 +699,10 @@ def _question_answerable_in_context(question: str, context: str) -> bool:
     return hits >= max(1, len(content_words) * 0.5)
 
 
-async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temperature: float = 0) -> Optional[str]:
+async def _backend_completion(
+    prompt: str, max_tokens: int, timeout: float, temperature: float = 0,
+    backend_override: Optional[str] = None,
+) -> Optional[str]:
     """Fast, non-streaming chat completion against whichever backend is
     currently active (vLLM or Groq — both OpenAI-compatible, same request
     shape). Returns the raw response text, or None on any failure, timeout,
@@ -717,6 +720,12 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
     should use that same fast backend too, not bottleneck the whole request
     on a slower one just for a few background tokens.
 
+    backend_override bypasses _active_backend() for the one call that needs
+    it regardless of FORCE_BACKEND: the query-cleaning fallback path exists
+    specifically to route around Groq's daily quota running out (observed
+    repeatedly in testing), so its own grounding re-check would defeat the
+    point if it silently used Groq again and failed the same way.
+
     Only vLLM and Groq are handled (matches what existed before this
     generalization) — OpenAI/Anthropic backends fall through to None here,
     same as an unconfigured backend, and callers already have a graceful
@@ -727,7 +736,7 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
         VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend,
         GROQ_API_KEY, GROQ_MODEL,
     )
-    backend = _active_backend()
+    backend = backend_override or _active_backend()
     if backend == "vllm":
         url = f"{VLLM_HOST}/v1/chat/completions"
         model = _resolve_vllm_model()
@@ -772,6 +781,110 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
     except Exception as exc:
         logger.warning("[_backend_completion] request to %s failed (backend=%s): %s", url, backend, exc)
         return None
+
+
+async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]]:
+    """Fallback query cleaner tried only when the primary retrieval attempt
+    already failed coverage — fixes general spelling mistakes (not just the
+    hand-curated insurance vocabulary _correct_typos() knows) and strips
+    specific qualifiers (a named country/city, emphasis words like
+    "affordable"/"cheap"/"best") that measurably tank the reranker's score
+    even when the KB covers the general topic well. Measured: "how to buy
+    motor insurance" scored 0.79; adding just "affordable" dropped it to
+    0.017; adding "in Dubai" alone dropped it to 0.15 — the same qualifier-
+    dilution pattern behind several earlier fixes this session, just never
+    addressed at the query-cleaning layer directly.
+
+    Calls vLLM specifically, not whatever _active_backend()/FORCE_BACKEND
+    currently points at — this is a retry path for a query that's already
+    failing, not primary answer generation, and shouldn't compete for the
+    same (rate-limited) Groq quota real answers need.
+
+    Returns (cleaned_query, dropped_terms_summary) — both None on any
+    failure, unconfigured backend, or empty response, so the caller falls
+    through to the existing refusal exactly as it did before this function
+    existed. dropped_terms_summary is computed programmatically from the
+    before/after diff (see _diff_dropped_terms), not self-reported by the
+    model — asking it to also report what it removed was tried first and
+    was unreliable, sometimes echoing the prompt's own example words
+    ("affordable", "cheap", "best") as "dropped" even when they were never
+    in the query, or weren't actually removed from the cleaned version.
+    """
+    import aiohttp as _ah
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+    if not VLLM_HOST:
+        return None, None
+    prompt = (
+        f"Query: {question}\n\n"
+        "This insurance-related search query may contain spelling mistakes, "
+        "and words that make it too specific for a keyword search to match "
+        "well (e.g. a country/city name, or emphasis words like "
+        "'affordable', 'cheap', 'best'). Rewrite it as a short, general "
+        "search query about the CORE topic only: fix any spelling mistakes, "
+        "and drop any specific location or emphasis words that aren't "
+        "needed to describe the core insurance topic. "
+        "Respond with ONLY the rewritten query, nothing else."
+    )
+    try:
+        url = f"{VLLM_HOST}/v1/chat/completions"
+        model = _resolve_vllm_model()
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"}
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 40,
+            "temperature": 0,
+            "stream": False,
+        }
+        async with _ah.ClientSession() as session:
+            async with session.post(
+                url, json=payload, headers=headers,
+                timeout=_ah.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status != 200:
+                    return None, None
+                data = await resp.json()
+                raw = data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None, None
+    cleaned = raw.strip().strip('"').strip("'").strip()
+    if not cleaned:
+        return None, None
+    return cleaned, _diff_dropped_terms(question, cleaned)
+
+
+# Emphasis/qualifier words worth calling out by name if the cleaner drops
+# them — deliberately short and specific rather than a broad stopword list,
+# since the goal is only to name concrete things that got removed, not to
+# flag every function word that naturally differs between two phrasings of
+# the same query.
+_EMPHASIS_WORDS = frozenset({
+    'affordable', 'cheap', 'cheapest', 'best', 'top', 'premium',
+    'expensive', 'discount', 'discounted', 'lowest', 'cheaply',
+})
+
+
+def _diff_dropped_terms(original: str, cleaned: str) -> Optional[str]:
+    """Return a short, comma-separated list of concrete terms present in
+    *original* but missing from *cleaned* — specifically capitalized words
+    other than the first (likely a proper noun: a country, city, or
+    provider name) and known emphasis words (_EMPHASIS_WORDS). Computed
+    directly from the text rather than trusted from the model's own
+    self-report (see _vllm_clean_query's docstring for why).
+    """
+    orig_words = original.split()
+    clean_lower = cleaned.lower()
+    dropped = []
+    for i, w in enumerate(orig_words):
+        w_clean = w.strip(".,!?;:()[]{}'\"")
+        if not w_clean:
+            continue
+        w_lower = w_clean.lower()
+        is_proper_noun = i > 0 and w_clean[0].isupper()
+        is_emphasis = w_lower in _EMPHASIS_WORDS
+        if (is_proper_noun or is_emphasis) and w_lower not in clean_lower:
+            dropped.append(w_clean)
+    return ", ".join(dict.fromkeys(dropped)) if dropped else None
 
 
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
@@ -1049,7 +1162,7 @@ async def _extract_intent_topics(question: str) -> set[str]:
 _GROUNDING_CONTEXT_CHARS = 3000
 
 
-async def _verify_grounding(question: str, context: str) -> bool:
+async def _verify_grounding(question: str, context: str, backend_override: Optional[str] = None) -> bool:
     """LLM-based semantic grounding backstop — an authoritative layer on top
     of the lexical/regex coverage checks (_context_covers_query,
     _enumeration_query_covered, _quoted_comparison_covered), not a
@@ -1065,6 +1178,10 @@ async def _verify_grounding(question: str, context: str) -> bool:
     insurers cover travel to South Africa" — same broad category
     (insurance), wrong specific topic, no lexical rule can enumerate every
     such near-miss in advance).
+
+    backend_override: see _backend_completion — used by the query-cleaning
+    fallback path to re-check grounding on vLLM specifically, so that path
+    stays independent of Groq's daily quota (the whole reason it exists).
 
     Fail-safe: any exception, timeout, or ambiguous/empty response returns
     False (not grounded) — matches the fail-safe direction already used
@@ -1087,7 +1204,7 @@ async def _verify_grounding(question: str, context: str) -> bool:
         "Answer with a single word: YES or NO."
     )
     try:
-        raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0)
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0, backend_override=backend_override)
         if not raw:
             return False
         cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
@@ -2366,6 +2483,47 @@ class MultiSourceRAG:
             _verify_grounding(retrieval_query, _grounding_context_preview),
         )
         ctx_covered = _lex_ok and _semantically_grounded
+
+        _dropped_terms_note = None
+        if not ctx_covered and not document_filter and not _pasted_grounds_answer:
+            # Before refusing, retry once with an LLM-cleaned, retrieval-
+            # optimized rewrite — fixes general spelling mistakes and strips
+            # specific qualifiers (a country/city name, "affordable"/"cheap"/
+            # "best") that can tank the reranker's score even though the KB
+            # covers the core topic well (see _vllm_clean_query's docstring
+            # for measured examples). If the cleaned query now passes, the
+            # answer proceeds using it; if something concrete (like a country
+            # name) had to be dropped to get there, that's surfaced to the
+            # user as an explicit "not covered" note rather than silently
+            # answering as if it were specific to what was actually asked.
+            _cleaned_query, _dropped = await _vllm_clean_query(retrieval_query)
+            if _cleaned_query and _cleaned_query.strip().lower() != retrieval_query.strip().lower():
+                _fallback_chunks = await self._retrieve_doc_chunks(
+                    _cleaned_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
+                )
+                _fallback_top = max(
+                    (c.metadata.get("rerank_score", float("-inf"))
+                     for c in _fallback_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
+                    default=float("-inf"),
+                )
+                if _fallback_top >= _rerank_gate:
+                    _fallback_context_preview = "\n\n".join(
+                        c.page_content for c in _fallback_chunks if hasattr(c, "page_content")
+                    )
+                    _fallback_lex_ok = (
+                        _context_covers_query(_cleaned_query, _fallback_chunks, llm_topics=None)
+                        and _quoted_comparison_covered(_cleaned_query, _fallback_chunks)
+                        and _enumeration_query_covered(_cleaned_query, _fallback_chunks)
+                    )
+                    _fallback_sem_grounded = await _verify_grounding(
+                        _cleaned_query, _fallback_context_preview, backend_override="vllm",
+                    )
+                    if _fallback_lex_ok and _fallback_sem_grounded:
+                        all_chunks = _fallback_chunks
+                        retrieval_query = _cleaned_query
+                        ctx_covered = True
+                        _dropped_terms_note = _dropped
+
         if not ctx_covered and not document_filter and not _pasted_grounds_answer:
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
@@ -2464,6 +2622,20 @@ class MultiSourceRAG:
             # _detected_as_followup is used (not _is_followup) so the fix applies
             # even when we fell back to history-based topic extraction.
             prompt_question = retrieval_query if _detected_as_followup else question
+
+            # The fallback query-cleaning above may have dropped a specific
+            # detail (a country/city name, "affordable"/"cheap"/"best") to
+            # get a match at all — tell the model explicitly so it answers
+            # with the general content it has while being honest that this
+            # detail specifically isn't covered, rather than silently
+            # presenting general info as if it addressed exactly what was
+            # asked (or ignoring that the user asked about it at all).
+            if _dropped_terms_note:
+                prompt_question = (
+                    f"{prompt_question.rstrip(' .?')}. Note: this knowledge base does not have "
+                    f"specific information about {_dropped_terms_note} — explicitly say that up front, "
+                    f"then answer using the general information you do have."
+                )
 
             # ── Modifier-signal instruction injection ─────────────────────────
             # Detect what kind of modifier the user asked for (example / simple /
