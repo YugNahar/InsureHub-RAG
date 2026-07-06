@@ -639,12 +639,23 @@ _FOLLOWUP_SIGNALS = {
 # attempt an LLM call.  If the question doesn't contain any of these tokens it
 # is structurally standalone (e.g. a fresh topic out of nowhere), so the LLM
 # round-trip can be skipped entirely.
+#
+# Ordinal references to a numbered list ("point 2", "the 2nd point", "explain
+# number 3") are just as much a reference needing resolution as "the second
+# point" — but people type them with a digit far more often than spelled out.
+# Without the digit patterns below, "explain the 2 point" fell through this
+# fast-path as "structurally standalone" and skipped contextualization
+# entirely, so the follow-up went to retrieval completely unresolved and the
+# model ended up guessing/blending a different point at generation time.
 _REFERENCE_TOKENS = re.compile(
     r"\b(?:it|its|that|this|those|these|they|them|their|which|"
     r"one\b|ones\b|the\s+\w+\s+one|the\s+other\b|"
     r"more\b|further\b|elaborate\b|"
     r"first\b|second\b|third\b|last\b|"
-    r"other\b|another\b)",
+    r"other\b|another\b|"
+    r"\d+(?:st|nd|rd|th)\b|"
+    r"point\s+\d+\b|\d+\s*(?:st|nd|rd|th)?\s+point\b|"
+    r"number\s+\d+\b)",
     re.IGNORECASE,
 )
 _FOLLOWUP_OPENERS = (
