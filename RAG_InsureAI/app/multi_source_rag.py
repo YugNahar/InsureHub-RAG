@@ -967,12 +967,14 @@ async def _verify_grounding(question: str, context: str) -> bool:
         f"Context:\n{context[:_GROUNDING_CONTEXT_CHARS]}\n\n"
         f"Question: {question}\n\n"
         "Can this exact question be answered using ONLY the information in "
-        "this context? Answer NO if the context is about a related-but-"
-        "different topic — the same broad category, but not the specific "
-        "thing actually asked (for example, content describing a general "
-        "insurance model or concept does not answer a question about a "
-        "specific country, provider, or coverage detail unless that exact "
-        "thing is actually discussed). Answer with a single word: YES or NO."
+        "this context? Answer NO only if the question asks about something "
+        "MORE SPECIFIC than what the context covers — for example, the "
+        "question names a particular country, provider, or coverage detail "
+        "that the context never actually discusses. If the question itself "
+        "is a general question about a concept or model, and the context "
+        "explains that same concept or model, answer YES — a general "
+        "question does not need a more specific answer than what was asked. "
+        "Answer with a single word: YES or NO."
     )
     try:
         raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0)
