@@ -26,7 +26,16 @@ _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
 # fix common typos before vector retrieval.
 _INSURANCE_VOCAB = [
     "insurance", "policy", "premium", "deductible", "coverage", "claim", "claims",
-    "insured", "insurer", "underwriting", "underwrite", "renewal", "nominee",
+    "insured", "insurer", "insurers", "underwriting", "underwrite", "renewal", "nominee",
+    # Prefixed/compound variants of shorter vocab words above (e.g. "insurance",
+    # "insured", "insurer") — without an exact vocab entry, fuzz.ratio scores
+    # these >= 80 against the shorter word (they share it as a substring) and
+    # _correct_typos() silently rewrites them away as if they were typos,
+    # e.g. "reinsurance" -> "insurance", turning "What is reinsurance?" into
+    # "What is insurance?" before retrieval even runs.
+    "reinsurance", "reinsurer", "reinsurers", "reinsured", "reinsure",
+    "coinsurance", "co-insurance", "uninsured", "underinsured",
+    "underinsurance", "overinsurance",
     "beneficiary", "cashless", "reimbursement", "rider", "liability", "copay",
     "endorsement", "subrogation", "exclusion", "maturity", "surrender",
     "vehicle", "comprehensive", "third party", "cover", "covered", "co-pay",
