@@ -49,6 +49,42 @@ _CASUAL_GREETINGS = frozenset({
 })
 
 
+# Common prefixes that turn a vocab word into a distinct compound insurance
+# term (re+insurance, co+insurance, un+insured, under+insured, over+insurance,
+# non+insurance). Users often type these with a space or hyphen instead of
+# joined — "re insurance" / "re-insurance" — which changes nothing for a
+# human reader but is a different token for retrieval than the corpus's
+# actual joined spelling. _join_split_compounds() below re-joins them.
+_COMPOUND_PREFIXES = ("re", "co", "un", "under", "over", "non")
+_COMPOUND_PREFIX_RE = re.compile(
+    r'\b(' + '|'.join(_COMPOUND_PREFIXES) + r')[\s-]+(\w{4,})\b',
+    re.IGNORECASE,
+)
+
+
+def _join_split_compounds(text: str) -> str:
+    """Re-join a compound prefix ("re", "co", "un", "under", "over", "non")
+    that was typed with a space or hyphen before a word matching an
+    _INSURANCE_VOCAB entry — "re insurance" / "re-insurance" -> "reinsurance",
+    "under insured" -> "underinsured" — so retrieval sees the same single
+    token the knowledge base actually uses, instead of two separate ones.
+
+    Only joins when the word after the prefix fuzzy-matches a vocab entry
+    (score >= 80); an unrelated word right after "re"/"co"/etc. ("re apply",
+    "co pay" -> "pay" is too short to check) is left untouched.
+    """
+    def _try_join(m: re.Match) -> str:
+        prefix, rest = m.group(1), m.group(2)
+        result = process.extractOne(rest, _INSURANCE_VOCAB, scorer=fuzz.ratio)
+        if result is not None:
+            best_match, score, _ = result
+            if score >= 80:
+                return f"{prefix.lower()}{best_match}"
+        return m.group(0)
+
+    return _COMPOUND_PREFIX_RE.sub(_try_join, text)
+
+
 def _correct_typos(text: str) -> str:
     """Fix common typos in insurance-domain terms using fuzzy matching.
 
@@ -71,7 +107,17 @@ def _correct_typos(text: str) -> str:
     "uninsured", "underinsured", etc. against "insurance"/"insured". This
     check generalizes the fix so every such compound survives untouched
     without having to hand-list each one in the vocab.
+
+    Also skips the reverse shape: a complete, shorter candidate word that
+    happens to be the tail end of a longer vocab word with one short
+    prefix chopped off — e.g. "over" scores 89 against "cover" (drop the
+    leading "c" and they're identical) and would otherwise get "corrected"
+    into "cover" any time it appears in an ordinary sentence ("what happens
+    over the policy term"). Real typos almost never drop exactly the
+    leading character(s) of a word; that's specifically the shape of an
+    unrelated, independently-valid short word.
     """
+    text = _join_split_compounds(text)
     words = text.split()
     corrected = []
     for w in words:
@@ -80,11 +126,18 @@ def _correct_typos(text: str) -> str:
             result = process.extractOne(stripped, _INSURANCE_VOCAB, scorer=fuzz.ratio)
             if result is not None:
                 best_match, score, _ = result
+                stripped_lower = stripped.lower()
+                best_match_lower = best_match.lower()
                 is_compound_extension = (
                     len(stripped) > len(best_match)
-                    and best_match.lower() in stripped.lower()
+                    and best_match_lower in stripped_lower
                 )
-                if score >= 80 and best_match != stripped and not is_compound_extension:
+                is_truncated_vocab_word = (
+                    len(best_match) > len(stripped)
+                    and best_match_lower.endswith(stripped_lower)
+                )
+                if (score >= 80 and best_match != stripped
+                        and not is_compound_extension and not is_truncated_vocab_word):
                     prefix = w[:len(w) - len(w.lstrip(".,!?;:()[]{}'\""))]
                     suffix = w[len(w.rstrip(".,!?;:()[]{}'\"") or len(w)):]
                     corrected.append(f"{prefix}{best_match}{suffix}")
