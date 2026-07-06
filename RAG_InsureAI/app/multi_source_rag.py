@@ -1229,6 +1229,72 @@ def _strip_paste_reference_filler(text: str) -> str:
     return stripped if stripped else text
 
 
+# ── Ordinal point-reference follow-ups ("explain point 2", "the 2nd point") ──
+# _contextualize_query() resolves these into a standalone retrieval query, but
+# that resolution is itself unreliable: sometimes the model substitutes the
+# point's real subject matter (works), sometimes it only normalizes the
+# wording ("point 2" -> "the second point", still no topical content), and
+# retrieval then has nothing to search with — confirmed in testing on two
+# back-to-back examples that only differed in which the model happened to
+# produce. The most reliable source for "what was point 2 about" is the
+# numbered list already sitting in conversation history, not a fresh KB
+# search trying to rediscover the same content. _extract_point_reference()
+# pulls that point's own text out of history and feeds it through the exact
+# same pasted-context path as a live paste (verify-then-bypass-or-blend) —
+# so this reuses tested machinery rather than adding a parallel one.
+_ORDINAL_WORDS = {
+    'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+    'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10,
+}
+_POINT_REFERENCE_RE = re.compile(
+    r'\bpoint\s+number\s+(\d+)\b|'
+    r'\bpoint\s+(\d+)\b|'
+    r'\bthe\s+(\d+)(?:st|nd|rd|th)?\s+point\b|'
+    r'\bthe\s+(' + '|'.join(_ORDINAL_WORDS) + r')\s+point\b|'
+    r'\bnumber\s+(\d+)\b|'
+    r'\bthe\s+(\d+)(?:st|nd|rd|th)\b(?!\s+\w)',
+    re.IGNORECASE,
+)
+_NUMBERED_POINT_RE = re.compile(r'(?:^|\n)\s*(\d+)\.\s+')
+
+
+def _extract_point_number(question: str) -> Optional[int]:
+    """Return the 1-based point number *question* refers to (digit or
+    spelled-out ordinal), or None if it doesn't reference one at all."""
+    m = _POINT_REFERENCE_RE.search(question.lower())
+    if not m:
+        return None
+    for g in m.groups():
+        if g is None:
+            continue
+        if g.isdigit():
+            return int(g)
+        if g in _ORDINAL_WORDS:
+            return _ORDINAL_WORDS[g]
+    return None
+
+
+def _extract_point_text_from_history(history: str, point_num: int) -> Optional[str]:
+    """Find the most recent assistant turn with a numbered list and return
+    just point *point_num*'s own text from it — None if no numbered list is
+    found, or that point number isn't in it."""
+    for turn in reversed(_split_history_turns(history)):
+        if not turn.startswith("Assistant:"):
+            continue
+        content = turn[len("Assistant:"):].strip()
+        matches = list(_NUMBERED_POINT_RE.finditer(content))
+        if not matches:
+            continue
+        for i, m in enumerate(matches):
+            if int(m.group(1)) == point_num:
+                start = m.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+                point_text = content[start:end].strip()
+                return point_text or None
+        return None
+    return None
+
+
 _HANDOFF_MSG = (
     "I don't have that in my knowledge base right now — "
     "let me get a human agent to help you! 😊"
@@ -1972,6 +2038,16 @@ class MultiSourceRAG:
         # paste alone already supports an answer, independent of whatever
         # fresh KB retrieval turns up.
         pasted_context, question = await _extract_pasted_followup(question)
+        if pasted_context is None:
+            # No literal paste in this message — but a short "explain point 2"
+            # style follow-up references a numbered list from the PREVIOUS
+            # answer, which is already sitting in history. Pull that point's
+            # own text out and feed it through the same path as a live paste,
+            # rather than depending on retrieval rediscovering it from the KB
+            # (unreliable — see _extract_point_text_from_history's docstring).
+            _point_num = _extract_point_number(question)
+            if _point_num is not None and history:
+                pasted_context = _extract_point_text_from_history(history, _point_num)
         _pasted_grounds_answer = False
         if pasted_context:
             _pasted_grounds_answer = await _verify_grounding(question, pasted_context)
@@ -2352,23 +2428,24 @@ class MultiSourceRAG:
                 + full_context
             )
 
-        # Fold in the user-pasted context detected earlier. When it alone
-        # already grounds the answer (_pasted_grounds_answer), use it as the
-        # sole context — fresh retrieval still ran (for the gates above and
-        # in case it's needed), but its output would only dilute an already-
-        # sufficient answer with unrelated KB noise. When the paste isn't
-        # enough on its own, keep both: the paste plus whatever fresh KB
-        # content retrieval found.
+        # Fold in the prior-answer context detected earlier — either a literal
+        # paste from the user, or a specific point pulled from the previous
+        # numbered answer in history. When it alone already grounds the
+        # answer (_pasted_grounds_answer), use it as the sole context — fresh
+        # retrieval still ran (for the gates above and in case it's needed),
+        # but its output would only dilute an already-sufficient answer with
+        # unrelated KB noise. When it isn't enough on its own, keep both:
+        # this context plus whatever fresh KB content retrieval found.
         if pasted_context:
             if _pasted_grounds_answer:
-                full_context = "[Context the user pasted from an earlier answer]\n" + pasted_context
-                # The answer draws only from the paste, not from retrieval —
+                full_context = "[Context from an earlier answer]\n" + pasted_context
+                # The answer draws only from this, not from retrieval —
                 # citing KB documents that were fetched but never actually
                 # used would be a misleading source list.
                 sources = []
             else:
                 full_context = (
-                    "[Context the user pasted from an earlier answer]\n"
+                    "[Context from an earlier answer]\n"
                     + pasted_context
                     + ("\n\n[Knowledge base chunks]\n" + full_context if full_context.strip() else "")
                 )
