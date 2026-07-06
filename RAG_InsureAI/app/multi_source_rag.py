@@ -26,7 +26,7 @@ _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
 # fix common typos before vector retrieval.
 _INSURANCE_VOCAB = [
     "insurance", "policy", "premium", "deductible", "coverage", "claim", "claims",
-    "insured", "insurer", "underwriting", "underwrite", "renewal", "nominee",
+    "insured", "insurer", "insurers", "underwriting", "underwrite", "renewal", "nominee",
     "beneficiary", "cashless", "reimbursement", "rider", "liability", "copay",
     "endorsement", "subrogation", "exclusion", "maturity", "surrender",
     "vehicle", "comprehensive", "third party", "cover", "covered", "co-pay",
@@ -57,6 +57,20 @@ def _correct_typos(text: str) -> str:
     If the best match score >= 80 and is not already exact, replaces the
     word with the correctly-spelled vocabulary term. Returns the corrected
     sentence with original word order preserved.
+
+    Skips the correction when the matched vocab word is fully contained
+    inside a *longer* candidate word (e.g. "insurance" inside
+    "reinsurance") — that's a legitimate compound/prefixed domain term
+    built on top of the vocab word, not a misspelling of it. A real typo
+    is a substitution/transposition/omission that stays roughly the same
+    length as the intended word ("deductable" -> "deductible"); it doesn't
+    cleanly embed a complete shorter word plus extra characters. Without
+    this guard, "reinsurance" scores 90 against "insurance" (they share
+    it as a substring) and gets silently rewritten to "insurance" before
+    retrieval ever runs — and the same happens to "coinsurance",
+    "uninsured", "underinsured", etc. against "insurance"/"insured". This
+    check generalizes the fix so every such compound survives untouched
+    without having to hand-list each one in the vocab.
     """
     words = text.split()
     corrected = []
@@ -66,7 +80,11 @@ def _correct_typos(text: str) -> str:
             result = process.extractOne(stripped, _INSURANCE_VOCAB, scorer=fuzz.ratio)
             if result is not None:
                 best_match, score, _ = result
-                if score >= 80 and best_match != stripped:
+                is_compound_extension = (
+                    len(stripped) > len(best_match)
+                    and best_match.lower() in stripped.lower()
+                )
+                if score >= 80 and best_match != stripped and not is_compound_extension:
                     prefix = w[:len(w) - len(w.lstrip(".,!?;:()[]{}'\""))]
                     suffix = w[len(w.rstrip(".,!?;:()[]{}'\"") or len(w)):]
                     corrected.append(f"{prefix}{best_match}{suffix}")
