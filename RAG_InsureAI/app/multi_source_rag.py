@@ -1380,17 +1380,28 @@ def _is_short_followup(question: str) -> bool:
     return False
 
 
-def _split_history_turns(history: str) -> list[str]:
-    """Split a flat ``"User: ...\\nAssistant: ..."`` history string into a list of
-    individual turn lines (one per ``User:`` or ``Assistant:`` line), so that
-    callers can slice the last N turn lines without cutting a multi-line
-    response in half.
+# A flat history string is "User: ...\nAssistant: ...\nUser: ...\nAssistant: ..."
+# — but a single turn's own content can contain internal newlines (e.g. a
+# numbered-list answer, one "\n" per point). A naive history.split("\n") to
+# grab "the last N lines" fragments that ONE long turn into many pieces, so
+# the window can end up holding only the tail of a numbered list (points
+# 6-8) while dropping the earlier points (1-5) entirely — and a follow-up
+# asking about "point 2" then has no way to know what point 2 actually was,
+# since it was never in the history it saw at all (this exact regression
+# previously shipped and was fixed once already — see git history on this
+# function — before being silently reintroduced by an unrelated merge).
+# Splitting only at newlines immediately followed by "User:"/"Assistant:"
+# keeps each turn whole no matter how many lines its own content spans.
+_HISTORY_TURN_BOUNDARY_RE = re.compile(r'\n(?=(?:User|Assistant):\s)')
 
-    Follows the same ``"User:"`` / ``"Assistant:"``-prefixed line format already
-    used by ``_reformulate_with_history()`` and
-    ``ConversationAgent._build_history_string()``.
+
+def _split_history_turns(history: str) -> list[str]:
+    """Split a flat ``"User: ...\\nAssistant: ..."`` history string into whole
+    turns (see module note above), not naive newline-delimited lines — so
+    callers can slice the last N turns without cutting a multi-line response
+    in half.
     """
-    return [line for line in history.strip().split("\n") if line.strip()]
+    return [t.strip() for t in _HISTORY_TURN_BOUNDARY_RE.split(history.strip()) if t.strip()]
 
 
 def _reformulate_with_history(question: str, history: str) -> str:
