@@ -1,0 +1,147 @@
+{
+  "_notes": "Regression suite for InsureHub RAG. Each case has a 'category' and an 'expect' block describing what to check automatically. Fill in 'kb_topic_hint' with actual document/topic names from your knowledge base where marked TODO — the runner works without this, but results are more meaningful with real KB coverage in mind. History-bearing cases simulate a multi-turn conversation via the 'history' field (flat 'User: ...\\nAssistant: ...' string, matching what MultiSourceRAG expects).",
+
+  "cases": [
+
+    {"id": "standalone_01", "category": "standalone", "query": "What is takaful insurance?",
+     "expect": {"should_ground": true, "must_not_contain": ["I don't have that specific information"]}},
+
+    {"id": "standalone_02", "category": "standalone", "query": "What is a deductible?",
+     "expect": {"should_ground": true}},
+
+    {"id": "standalone_03", "category": "standalone", "query": "What is subrogation in insurance?",
+     "expect": {"should_ground": true}},
+
+    {"id": "standalone_04", "category": "standalone", "query": "What is the free look period?",
+     "expect": {"should_ground": true}},
+
+    {"id": "standalone_05", "category": "standalone", "query": "How do I file a claim?",
+     "expect": {"should_ground": true},
+     "notes": "This exact question previously caused _verify_grounding to over-trigger a false NO — regression check for that fix."},
+
+    {"id": "follow_up_01", "category": "follow_up", "query": "What are its principles?",
+     "history": "User: what is takaful?\nAssistant: Takaful is a cooperative insurance model based on mutual assistance, where participants contribute to a fund used to support each other in case of loss.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "takaful"}},
+
+    {"id": "follow_up_02", "category": "follow_up", "query": "is it legally required?",
+     "history": "User: explain reinsurance\nAssistant: Reinsurance is when insurers share risk with other insurers to limit their own exposure to large claims.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "reinsurance"}},
+
+    {"id": "follow_up_03", "category": "follow_up", "query": "how is it calculated?",
+     "history": "User: what is a deductible\nAssistant: A deductible is the amount you pay out of pocket before insurance coverage kicks in.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "deductible"}},
+
+    {"id": "follow_up_04", "category": "follow_up", "query": "give me an example",
+     "history": "User: what is subrogation\nAssistant: Subrogation means the insurer steps into the shoes of the insured to recover costs from a third party at fault.",
+     "expect": {"should_ground": true, "must_not_repeat_definition": true},
+     "notes": "Should give an example, not re-explain the definition it already gave."},
+
+    {"id": "ordinal_01", "category": "ordinal", "query": "explain the second one",
+     "history": "User: what documents do I need to file a claim?\nAssistant: You typically need: 1. Policy number and ID proof. 2. Incident report or FIR copy. 3. Original bills and receipts.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "incident report"},
+     "notes": "Must resolve to item 2 specifically, not fold in items 1 and 3."},
+
+    {"id": "ordinal_02", "category": "ordinal", "query": "tell me more about the first point",
+     "history": "User: what factors affect my premium?\nAssistant: Key factors are: 1. Age and health. 2. Coverage amount. 3. Claim history.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "age"}},
+
+    {"id": "ordinal_03", "category": "ordinal", "query": "what about the last one",
+     "history": "User: what are the types of life insurance?\nAssistant: Common types are: 1. Term life. 2. Whole life. 3. ULIP.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "ulip"}},
+
+    {"id": "enumeration_01", "category": "enumeration", "query": "which insurers cover travel to South Africa?",
+     "expect": {"named_entity_required": true},
+     "notes": "Regression case for the Takaful-model-chunk-answering-enumeration bug — must not answer with a general insurance-model chunk that names no actual insurer."},
+
+    {"id": "enumeration_02", "category": "enumeration", "query": "who offers motor insurance with zero depreciation cover?",
+     "expect": {"named_entity_required": true}},
+
+    {"id": "enumeration_03", "category": "enumeration", "query": "list the insurers that provide health insurance for senior citizens",
+     "expect": {"named_entity_required": true}},
+
+    {"id": "unsupported_01", "category": "unsupported", "query": "what is the GST rate on insurance premiums?",
+     "expect": {"should_refuse": true},
+     "notes": "Regression case — this previously got a confident but ungrounded specific percentage from a compound-question score bypass."},
+
+    {"id": "unsupported_02", "category": "unsupported", "query": "what is the current repo rate set by RBI?",
+     "expect": {"should_refuse": true}},
+
+    {"id": "unsupported_03", "category": "unsupported", "query": "who is the CEO of LIC right now?",
+     "expect": {"should_refuse": true}},
+
+    {"id": "unsupported_04", "category": "unsupported", "query": "what is IDV in motor insurance?",
+     "expect": {"should_refuse": true},
+     "notes": "Regression case — IDV previously scored 0.024 rerank with zero actual IDV content, a known false-positive risk zone."},
+
+    {"id": "greeting_01", "category": "greeting", "query": "hi",
+     "expect": {"is_greeting_response": true, "no_retrieval_expected": true}},
+
+    {"id": "greeting_02", "category": "greeting", "query": "hello there", "expect": {"is_greeting_response": true, "no_retrieval_expected": true}},
+
+    {"id": "greeting_03", "category": "greeting", "query": "good morning", "expect": {"is_greeting_response": true, "no_retrieval_expected": true}},
+
+    {"id": "modifier_simple_01", "category": "modifier", "query": "explain in simple words",
+     "history": "User: what is a no-claim bonus\nAssistant: A no-claim bonus (NCB) is a discount on your premium for not making any claims during the policy period.",
+     "expect": {"should_ground": true, "simple_language_expected": true}},
+
+    {"id": "modifier_detail_01", "category": "modifier", "query": "can you explain in more detail",
+     "history": "User: what is a waiting period\nAssistant: A waiting period is the time you must wait after buying a policy before certain claims become eligible.",
+     "expect": {"should_ground": true, "detailed_answer_expected": true}},
+
+    {"id": "modifier_example_01", "category": "modifier", "query": "can you give me an example",
+     "history": "User: what is a rider in insurance\nAssistant: A rider is an add-on to a base policy that provides extra coverage for a specific need.",
+     "expect": {"should_ground": true, "example_expected": true}},
+
+    {"id": "compound_01", "category": "compound", "query": "what is a deductible and what is the GST rate on insurance premiums",
+     "expect": {"should_refuse": true},
+     "notes": "Regression case — single-topic score bypass previously let the strong 'deductible' half vouch for the whole compound question, letting the GST half hallucinate. Must not fully ground on partial match."},
+
+    {"id": "compound_02", "category": "compound", "query": "what is a no-claim bonus and how are premiums calculated for fire insurance",
+     "expect": {"partial_grounding_review_needed": true},
+     "notes": "Both halves may be legitimately covered — manual review needed, not an auto pass/fail."},
+
+    {"id": "quoted_comparison_01", "category": "quoted_comparison", "query": "difference between \"floater policy\" and \"specific policy\" in fire insurance",
+     "expect": {"should_refuse_if_either_term_absent": true},
+     "notes": "Regression case — previously passed on generic words 'fire'/'policy' alone even when KB never discusses this specific split."},
+
+    {"id": "quoted_comparison_02", "category": "quoted_comparison", "query": "what's the difference between \"reinsurance\" and \"coinsurance\"",
+     "expect": {"should_refuse_if_either_term_absent": true}},
+
+    {"id": "short_followup_01", "category": "short_followup", "query": "yes",
+     "history": "User: do you want to know about our health insurance plans?\nAssistant: We offer several health insurance plans with different coverage levels.",
+     "expect": {"is_conversational_response": true, "no_retrieval_expected": true}},
+
+    {"id": "short_followup_02", "category": "short_followup", "query": "why though",
+     "history": "User: is dental covered under health insurance?\nAssistant: Dental coverage is typically not included in standard health insurance plans.",
+     "expect": {"should_ground": true, "must_reference_prior_topic": "dental"}},
+
+    {"id": "typo_01", "category": "typo_correction", "query": "what is the deductable amount",
+     "expect": {"should_ground": true},
+     "notes": "Regression case for _correct_typos — 'deductable' -> 'deductible', must not over-correct compound words."},
+
+    {"id": "typo_02", "category": "typo_correction", "query": "is co insurance the same as re insurance",
+     "expect": {"should_ground": true},
+     "notes": "Regression case for _join_split_compounds — must recognize 'co insurance' and 're insurance' as coinsurance/reinsurance, not strip to 'insurance'."},
+
+    {"id": "off_topic_01", "category": "off_topic", "query": "what's the weather today",
+     "expect": {"is_off_topic_refusal": true}},
+
+    {"id": "off_topic_02", "category": "off_topic", "query": "who won the cricket world cup",
+     "expect": {"is_off_topic_refusal": true}},
+
+    {"id": "off_topic_03", "category": "off_topic", "query": "can you write me a python script",
+     "expect": {"is_off_topic_refusal": true}},
+
+    {"id": "fresh_topic_after_followup_01", "category": "topic_switch", "query": "what is the waiting period for maternity coverage?",
+     "history": "User: what is takaful?\nAssistant: Takaful is a cooperative insurance model based on mutual assistance.\nUser: what are its principles?\nAssistant: The core principles are mutual cooperation, shared responsibility, and avoidance of uncertainty (gharar) and interest (riba).",
+     "expect": {"should_ground": true, "must_not_reference_prior_topic": "takaful"},
+     "notes": "Fresh standalone question after an unrelated follow-up chain — _contextualize_query must NOT drag in takaful context here."},
+
+    {"id": "user_statement_01", "category": "user_statement", "query": "I recently bought a term life insurance plan",
+     "expect": {"is_acknowledgment_response": true, "no_retrieval_expected": true}},
+
+    {"id": "calculation_01", "category": "calculation", "query": "if my sum insured is 500000 and I have a 10% no-claim bonus, what is my total cover?",
+     "expect": {"should_ground": true},
+     "notes": "Routes through compute_insurance_benefits / CALCULATION_PROMPT path — verify it doesn't fall into the standard grounding-refusal path incorrectly."}
+  ]
+}
