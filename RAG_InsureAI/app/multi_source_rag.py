@@ -1146,6 +1146,78 @@ async def _contextualize_query(question: str, history: str) -> str:
     except Exception:
         return question
 
+
+async def _extract_pasted_followup(question: str) -> Tuple[Optional[str], str]:
+    """Detect a message that's really "<a block of previously-given text>"
+    plus "<a short question about it>" pasted together as one message — e.g.
+    a user copying a chunk of an earlier answer (even one from many turns
+    back, well outside the retained history window) and asking about it
+    directly, rather than relying on the system to still remember that far.
+
+    Returns (pasted_context, actual_question). pasted_context is None (and
+    actual_question is the original, unmodified question) when no paste is
+    detected, including on any failure or ambiguity — the caller then
+    behaves exactly as it did before this function existed.
+    """
+    # An ordinary question is never this long — skip the LLM round-trip
+    # entirely below the bar where a paste becomes plausible.
+    if len(question.split()) < 40:
+        return None, question
+    prompt = (
+        f"Message:\n{question[:6000]}\n\n"
+        "This message may be a block of previously-given text (e.g. copied "
+        "from an earlier answer) followed by a short question or "
+        "instruction about it (e.g. 'explain this simply', 'summarize the "
+        "above', 'what does point 3 mean'). If so, respond with ONLY that "
+        "short question or instruction, copied VERBATIM from the message — "
+        "nothing else. If the message is just one ordinary question with "
+        "no pasted block, respond with exactly: NONE"
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+    except Exception:
+        return None, question
+    if not raw or not raw.strip():
+        return None, question
+    extracted = raw.strip()
+    if extracted.upper() == "NONE":
+        return None, question
+    idx = question.rfind(extracted)
+    if idx == -1:
+        # Couldn't confidently locate the extracted question verbatim in the
+        # original message — be conservative and treat this as no paste
+        # rather than guessing at a split point.
+        return None, question
+    pasted = (question[:idx] + question[idx + len(extracted):]).strip()
+    # The remaining "pasted" portion must itself be substantial, or this was
+    # likely just an ordinary question the model over-matched on.
+    if len(pasted.split()) < 20:
+        return None, question
+    return pasted, _strip_paste_reference_filler(extracted)
+
+
+# A follow-up about pasted content naturally opens with a connector back to
+# it ("now based on this,", "given the above,") — these add no topical
+# signal of their own and measurably dilute retrieval quality (embedding
+# score for "what is the free look period..." dropped from 0.34 to 0.06
+# once such a prefix was added, in testing). Stripped only from the
+# extracted question, not from pasted_context or the user-facing answer —
+# the LLM answering the question still has pasted_context available to
+# resolve "this" against; only the KB search string needs to be clean.
+_PASTE_FILLER_RE = re.compile(
+    r'^\s*(?:now|so|then|well|okay|ok)?[,\s]*'
+    r'(?:based on (?:this|that|the above)|given (?:this|that|the above)(?: information)?|'
+    r'considering (?:this|that|the above))'
+    r'(?: information)?[,\s]*',
+    re.IGNORECASE,
+)
+
+
+def _strip_paste_reference_filler(text: str) -> str:
+    stripped = _PASTE_FILLER_RE.sub('', text).strip()
+    return stripped if stripped else text
+
+
 _HANDOFF_MSG = (
     "I don't have that in my knowledge base right now — "
     "let me get a human agent to help you! 😊"
@@ -1867,6 +1939,21 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
+        # ── Pasted-context follow-up detection ────────────────────────────────
+        # A user pasting a chunk of an earlier answer (possibly from many
+        # turns back, well outside the retained history window) plus a
+        # question about it should be answered using that pasted text as
+        # context — not treated as one long, garbled retrieval query. From
+        # here on, `question` is the real, short question being asked;
+        # `pasted_context` (if any) is folded into full_context further down,
+        # and `_pasted_grounds_answer` lets the refusal gates below know the
+        # paste alone already supports an answer, independent of whatever
+        # fresh KB retrieval turns up.
+        pasted_context, question = await _extract_pasted_followup(question)
+        _pasted_grounds_answer = False
+        if pasted_context:
+            _pasted_grounds_answer = await _verify_grounding(question, pasted_context)
+
         # ── Typo correction for retrieval query ───────────────────────────────
         # Apply _correct_typos() to build a corrected question used ONLY for
         # the retrieval_query, not for the final LLM prompt (original question
@@ -2131,7 +2218,7 @@ class MultiSourceRAG:
              for c in all_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
             default=float("-inf"),
         )
-        if not document_filter and _top_rerank < _rerank_gate:
+        if not document_filter and _top_rerank < _rerank_gate and not _pasted_grounds_answer:
             logger.info(
                 "[ask_stream] Reranker gate: top=%.3f < gate=%.3f — not in KB",
                 _top_rerank, _rerank_gate,
@@ -2181,7 +2268,7 @@ class MultiSourceRAG:
             _verify_grounding(retrieval_query, _grounding_context_preview),
         )
         ctx_covered = _lex_ok and _semantically_grounded
-        if not ctx_covered and not document_filter:
+        if not ctx_covered and not document_filter and not _pasted_grounds_answer:
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it — they'll be able to help you better! 😊"
@@ -2242,6 +2329,27 @@ class MultiSourceRAG:
                 + "\n\n[Knowledge base chunks]\n"
                 + full_context
             )
+
+        # Fold in the user-pasted context detected earlier. When it alone
+        # already grounds the answer (_pasted_grounds_answer), use it as the
+        # sole context — fresh retrieval still ran (for the gates above and
+        # in case it's needed), but its output would only dilute an already-
+        # sufficient answer with unrelated KB noise. When the paste isn't
+        # enough on its own, keep both: the paste plus whatever fresh KB
+        # content retrieval found.
+        if pasted_context:
+            if _pasted_grounds_answer:
+                full_context = "[Context the user pasted from an earlier answer]\n" + pasted_context
+                # The answer draws only from the paste, not from retrieval —
+                # citing KB documents that were fetched but never actually
+                # used would be a misleading source list.
+                sources = []
+            else:
+                full_context = (
+                    "[Context the user pasted from an earlier answer]\n"
+                    + pasted_context
+                    + ("\n\n[Knowledge base chunks]\n" + full_context if full_context.strip() else "")
+                )
 
         if not full_context.strip():
             yield (
