@@ -527,7 +527,6 @@ async def ws_agent_endpoint(websocket: WebSocket):
         await websocket.send_json({"type": "logged_in", "agent_id": agent_id, "name": name})
         await websocket.send_json({"type": "sessions_update", "sessions": _agent_hub.list_sessions()})
         await _agent_hub._broadcast_super_admin_update()
-        await _agent_hub.notify_pending_escalations()
         while True:
             msg = await websocket.receive_json()
             t = msg.get("type", "")
@@ -538,6 +537,10 @@ async def ws_agent_endpoint(websocket: WebSocket):
                 await _agent_hub._broadcast_super_admin_update()
             elif t == "message":
                 await _agent_hub.agent_send_message(agent_id, msg.get("session_id", ""), msg.get("content", ""))
+            elif t == "answer_unanswered":
+                await _agent_hub.agent_answer_unanswered(
+                    agent_id, msg.get("session_id", ""), msg.get("index", -1), msg.get("content", "")
+                )
             elif t == "release":
                 await _agent_hub.agent_release(agent_id)
             elif t == "accept_handoff":

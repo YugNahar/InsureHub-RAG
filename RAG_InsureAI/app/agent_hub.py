@@ -440,36 +440,6 @@ class AgentHub:
         await self._broadcast_sessions_update()
         return True
 
-    async def notify_pending_escalations(self):
-        """
-        Called whenever an agent connects — re-broadcasts a handoff popup for
-        every session still sitting unresolved in the email-escalation
-        backlog (email_sent=True, no agent assigned yet).
-
-        request_handoff() only ever fires in real time, at the moment a
-        question comes in, and only reaches agents who are online at that
-        exact instant. A question asked while nobody was online goes to
-        email and — until now — never got another chance at a popup even
-        after an agent came online later; the only trace was a passive red
-        dot in the session list an agent had to notice on their own.
-
-        handoff_exhausted must be reset first: it's set True by the same
-        timeout/all-declined path that produces email_sent=True in the
-        first place, and request_handoff() refuses to re-fire while it's
-        set. Resetting it here is intentional — a newly-connected agent is
-        a genuinely new notification opportunity, not a same-turn re-trigger.
-        """
-        for session in list(self._sessions.values()):
-            if not session.email_sent or session.status == "human":
-                continue
-            if session.session_id in self._pending_handoffs:
-                continue  # already actively being (re-)notified
-            session.handoff_exhausted = False
-            unanswerable = next(
-                (m.content for m in reversed(session.history) if m.role == "user"), ""
-            )
-            await self.request_handoff(session.session_id, unanswerable)
-
     async def _handoff_timeout(self, session_id: str, unanswerable_query: str):
         """Called after _HANDOFF_TIMEOUT seconds if no agent accepted the popup."""
         await asyncio.sleep(_HANDOFF_TIMEOUT)
@@ -483,10 +453,13 @@ class AgentHub:
         session.status = "ai"
         session.handoff_exhausted = True
         session.email_sent = True
-        # Tag the triggering user message so the super-admin "Agent Only" view can flag it
-        for m in reversed(session.history):
-            if m.role == "user":
-                m.meta["escalation_sent"] = True
+        # Tag the triggering user message so the super-admin "Agent Only" view can flag it,
+        # and so it surfaces in the agent dashboard's per-session "Unanswered Queries" panel
+        escalated_index = None
+        for i in range(len(session.history) - 1, -1, -1):
+            if session.history[i].role == "user":
+                session.history[i].meta["escalation_sent"] = True
+                escalated_index = i
                 break
         _timeout_msg = {
             "type": "handoff_timeout",
@@ -502,6 +475,8 @@ class AgentHub:
         if not delivered:
             session.pending_ws_message = _timeout_msg
         self._save_sessions()
+        if escalated_index is not None:
+            await self._broadcast_message_meta_update(session_id, escalated_index, session.history[escalated_index].meta)
         import asyncio as _aio
         history_snapshot = list(session.history)
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
@@ -566,10 +541,13 @@ class AgentHub:
         session.agent_id = None
         session.handoff_exhausted = True
         session.email_sent = True
-        # Tag the triggering user message so the super-admin "Agent Only" view can flag it
-        for m in reversed(session.history):
-            if m.role == "user":
-                m.meta["escalation_sent"] = True
+        # Tag the triggering user message so the super-admin "Agent Only" view can flag it,
+        # and so it surfaces in the agent dashboard's per-session "Unanswered Queries" panel
+        escalated_index = None
+        for i in range(len(session.history) - 1, -1, -1):
+            if session.history[i].role == "user":
+                session.history[i].meta["escalation_sent"] = True
+                escalated_index = i
                 break
         _decline_msg = {
             "type": "handoff_timeout",
@@ -585,6 +563,8 @@ class AgentHub:
         if not delivered:
             session.pending_ws_message = _decline_msg
         self._save_sessions()
+        if escalated_index is not None:
+            await self._broadcast_message_meta_update(session_id, escalated_index, session.history[escalated_index].meta)
 
         unanswerable = next(
             (m.content for m in reversed(session.history) if m.role == "user"), ""
@@ -598,16 +578,21 @@ class AgentHub:
         """Called directly when NO agents are online at the time the AI can't answer."""
         import asyncio as _aio
         session = self._sessions.get(session_id)
+        escalated_index = None
         if session:
             session.email_sent = True
-            # Tag the triggering user message so the super-admin "Agent Only" view can flag it
-            for m in reversed(session.history):
-                if m.role == "user":
-                    m.meta["escalation_sent"] = True
+            # Tag the triggering user message so the super-admin "Agent Only" view can flag it,
+            # and so it surfaces in the agent dashboard's per-session "Unanswered Queries" panel
+            for i in range(len(session.history) - 1, -1, -1):
+                if session.history[i].role == "user":
+                    session.history[i].meta["escalation_sent"] = True
+                    escalated_index = i
                     break
             self._save_sessions()
         history_snapshot = list(session.history) if session else []
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
+        if session and escalated_index is not None:
+            await self._broadcast_message_meta_update(session_id, escalated_index, session.history[escalated_index].meta)
         await self._broadcast_sessions_update()
 
     async def _assign_agent(self, session: "ChatSession", agent: "HumanAgent"):
@@ -662,8 +647,8 @@ class AgentHub:
             })
         self._save_agent_records()
         history_payload = [
-            {"role": m.role, "content": m.content, "timestamp": m.timestamp}
-            for m in session.history[-100:]
+            {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta, "index": idx}
+            for idx, m in enumerate(session.history[-100:], start=max(0, len(session.history) - 100))
         ]
         try:
             await agent.ws.send_json({
@@ -693,8 +678,8 @@ class AgentHub:
         agent.monitoring.add(session_id)
         # Cap at last 100 messages so the WebSocket payload stays manageable
         history_payload = [
-            {"role": m.role, "content": m.content, "timestamp": m.timestamp}
-            for m in session.history[-100:]
+            {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta, "index": idx}
+            for idx, m in enumerate(session.history[-100:], start=max(0, len(session.history) - 100))
         ]
         try:
             await agent.ws.send_json({
@@ -811,6 +796,57 @@ class AgentHub:
             except Exception:
                 pass
 
+    async def agent_answer_unanswered(self, agent_id: str, session_id: str, message_index: int, content: str):
+        """
+        Lightweight reply to ONE specific escalated ("unanswered") user query, sent
+        from the per-session "Unanswered Queries" panel. Unlike agent_send_message,
+        this does NOT assign/lock the session to this agent — Layla keeps answering
+        any new questions normally, and any online agent (not just the one assigned,
+        if any) can resolve these, since the whole point is answering without taking
+        over ownership of the conversation.
+        """
+        agent = self._agents.get(agent_id)
+        session = self._sessions.get(session_id)
+        if not agent or not session:
+            return
+        if message_index < 0 or message_index >= len(session.history):
+            return
+        target = session.history[message_index]
+        if target.role != "user" or not target.meta.get("escalation_sent") or target.meta.get("escalation_resolved"):
+            return
+
+        target.meta["escalation_resolved"] = True
+        target.meta["resolved_by"] = agent.name
+
+        reply = ChatMessage(role="agent", content=content, meta={"answers_index": message_index})
+        session.history.append(reply)
+
+        # Sidebar red dot stays on until every escalated query in this session is resolved
+        session.email_sent = any(
+            m.role == "user" and m.meta.get("escalation_sent") and not m.meta.get("escalation_resolved")
+            for m in session.history
+        )
+        self._save_sessions()
+
+        rec = self._ensure_agent_record(agent.name)
+        rec["total_queries_answered"] = rec.get("total_queries_answered", 0) + 1
+        self._save_agent_records()
+
+        await self._broadcast_message_meta_update(session_id, message_index, target.meta)
+        await self._broadcast_new_message(session_id, reply)
+        await self._broadcast_sessions_update()
+        await self._broadcast_super_admin_update()
+
+        if session.user_ws:
+            try:
+                await session.user_ws.send_json({
+                    "type": "agent_message",
+                    "content": content,
+                    "agent_name": agent.name,
+                })
+            except Exception:
+                pass
+
     async def user_message_to_agent(self, session_id: str, content: str):
         """Log a user message during human-agent mode and broadcast to monitoring agents."""
         session = self._sessions.get(session_id)
@@ -837,12 +873,33 @@ class AgentHub:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _broadcast_new_message(self, session_id: str, msg: "ChatMessage"):
+        session = self._sessions.get(session_id)
+        index = (len(session.history) - 1) if session else None
         payload = {
             "type": "new_message",
             "session_id": session_id,
             "role": msg.role,
             "content": msg.content,
             "timestamp": msg.timestamp,
+            "meta": msg.meta,
+            "index": index,
+        }
+        for agent in list(self._agents.values()):
+            if session_id in agent.monitoring or agent.active_session == session_id:
+                try:
+                    await agent.ws.send_json(payload)
+                except Exception:
+                    pass
+
+    async def _broadcast_message_meta_update(self, session_id: str, index: int, meta: dict):
+        """Tells any agent currently viewing this session that an existing message's
+        meta flags changed (e.g. a query just got tagged/resolved as an escalation),
+        so the 'Unanswered Queries' panel can update live without a history reload."""
+        payload = {
+            "type": "message_meta_updated",
+            "session_id": session_id,
+            "index": index,
+            "meta": meta,
         }
         for agent in list(self._agents.values()):
             if session_id in agent.monitoring or agent.active_session == session_id:
