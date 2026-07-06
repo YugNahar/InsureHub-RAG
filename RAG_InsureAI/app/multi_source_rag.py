@@ -893,10 +893,21 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
 
     Steps:
       1. Ask the LLM to produce 5 candidate questions from the answer text.
-      2. Verify each candidate by checking content-word overlap with the full
-         retrieved context — questions whose key terms don't appear in the
-         context are dropped before they reach the user.
-      3. Return up to 3 verified questions.
+      2. Cheap pre-filter: drop candidates whose content words don't even
+         lexically appear in the retrieved context (no LLM call).
+      3. Semantic verification (_verify_suggestions_grounded): a candidate
+         can pass step 2 on a passing mention alone — e.g. the answer says
+         "...follows Islamic principles and Sharia law..." in one sentence,
+         which is enough word-overlap for "What are Islamic principles?" to
+         look "covered", but the KB has no dedicated content actually
+         explaining Islamic principles, only insurance content that
+         mentions them in passing. Confirmed live: this exact suggestion
+         was shown, and clicking it produced a refusal — the KB genuinely
+         can't answer it. Step 2 alone can't tell "mentioned in passing"
+         from "actually explained", so a real judgment call (the same kind
+         _verify_grounding already makes for real questions) is needed
+         before a suggestion reaches the user.
+      4. Return up to 3 verified questions.
     """
     try:
         if not context or not context.strip():
@@ -922,9 +933,10 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
             "1. Ask about specific facts, terms, or details actually mentioned in the answer above — not other topics.\n"
             "2. A user would naturally ask AFTER reading that exact answer.\n"
             "3. Do not repeat the original question or invent unrelated topics.\n"
+            "4. Each question must name the specific product/topic (e.g. the insurance type) instead of using 'it'/'its' — a reader must understand it with no other context, since clicking it sends it as a brand-new question.\n"
             "Output only the questions, one per line, no numbering, no bullets, no explanations:"
         )
-        _text = await _backend_completion(prompt, max_tokens=120, timeout=6)
+        _text = await _backend_completion(prompt, max_tokens=120, timeout=12)
         if not _text:
             return []
         # Parse and clean candidates
@@ -933,12 +945,50 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
             for q in _text.split("\n") if q.strip()
         ]
         _candidates = [q for q in _candidates if 2 <= len(q.split()) <= 10]
-        # Verify each candidate has actual coverage in the full retrieved context
-        _verified = [q for q in _candidates if _question_answerable_in_context(q, context)]
+        # Cheap lexical pre-filter before spending an LLM call on verification
+        _candidates = [q for q in _candidates if _question_answerable_in_context(q, context)]
+        if not _candidates:
+            return []
+        _verified = await _verify_suggestions_grounded(_candidates, context)
         return _verified[:3]
     except Exception:
         pass
     return []
+
+
+async def _verify_suggestions_grounded(candidates: List[str], context: str) -> List[str]:
+    """Semantic filter for suggested follow-up chips — same judgment
+    _verify_grounding() makes for a real question ("can this be FULLY
+    answered from this context, not just topically adjacent"), batched into
+    one call for all candidates instead of one round-trip per candidate so
+    it doesn't multiply suggestion-generation latency by the candidate
+    count. Fails safe to an empty list on any error, timeout, or
+    unparseable response — showing no chips beats showing ones that dead-end.
+    """
+    if not candidates:
+        return []
+    numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(candidates))
+    prompt = (
+        f"Context:\n{context[:_GROUNDING_CONTEXT_CHARS]}\n\n"
+        f"Candidate follow-up questions:\n{numbered}\n\n"
+        "For each numbered question, could it be FULLY and SPECIFICALLY "
+        "answered using ONLY the context above — not just a topic the "
+        "context mentions in passing, but enough detail there to actually "
+        "answer it? Respond with ONLY the numbers of the questions that "
+        "CAN be fully answered, comma-separated (e.g. \"2,3\"). If none "
+        "can, respond with exactly: none"
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=12)
+    except Exception:
+        return []
+    if not raw or raw.strip().lower() == "none":
+        return []
+    keep_indices = {
+        int(tok) - 1 for tok in re.findall(r"\d+", raw)
+        if tok.isdigit() and 0 < int(tok) <= len(candidates)
+    }
+    return [q for i, q in enumerate(candidates) if i in keep_indices]
 
 
 def _is_likely_followup(question: str) -> bool:
@@ -2335,11 +2385,15 @@ class MultiSourceRAG:
                 except Exception:
                     pass
             yield _cached_answer
-            yield "\n\n" + _json_s.dumps({
+            _cache_payload = {
                 "sources": _kv_hit.get("sources", []),
                 "done": True,
                 "needs_human": False,
-            })
+            }
+            _cached_sugg = _kv_hit.get("suggested_questions")
+            if _cached_sugg:
+                _cache_payload["suggested_questions"] = _cached_sugg
+            yield "\n\n" + _json_s.dumps(_cache_payload)
             return
 
         # Streaming path: parallel retrieval + LLM intent extraction.
@@ -2918,6 +2972,16 @@ class MultiSourceRAG:
             "don't have that right now",
             "i don't have that right now",
         )
+        # Suggestions are generated once here (not in the KV-hit branch above)
+        # and cached alongside the answer, so a cache hit on a later, identical
+        # question still gets chips instead of silently having none — the
+        # KV-hit early-return never re-derives full_context, so without this
+        # the suggestion pipeline would only ever run on the first ask.
+        _reply_for_chips = (_corrected_text or _kv_reply or "").strip()
+        _sugg: list = []
+        if _reply_for_chips and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
+            _sugg = await _generate_suggestions(question, _reply_for_chips, context=full_context)
+
         if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases):
             try:
                 _kv.put(
@@ -2929,6 +2993,7 @@ class MultiSourceRAG:
                         "detailed": _keyword_detailed,
                         "has_example": _kv_has_example,
                         "has_simple": _kv_has_simple,
+                        "suggested_questions": _sugg,
                     },
                     query_embedding=_kv_q_emb,
                     query_text=retrieval_query,
@@ -2945,11 +3010,8 @@ class MultiSourceRAG:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
-        _reply_for_chips = (_corrected_text or _kv_reply or "").strip()
-        if _reply_for_chips and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
-            _sugg = await _generate_suggestions(question, _reply_for_chips, context=full_context)
-            if _sugg:
-                _final_payload["suggested_questions"] = _sugg
+        if _sugg:
+            _final_payload["suggested_questions"] = _sugg
         yield "\n\n" + _json.dumps(_final_payload)
 
     # Management methods (keep as before)
