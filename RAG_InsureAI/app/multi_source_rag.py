@@ -639,12 +639,23 @@ _FOLLOWUP_SIGNALS = {
 # attempt an LLM call.  If the question doesn't contain any of these tokens it
 # is structurally standalone (e.g. a fresh topic out of nowhere), so the LLM
 # round-trip can be skipped entirely.
+#
+# Ordinal references to a numbered list ("point 2", "the 2nd point", "explain
+# number 3") are just as much a reference needing resolution as "the second
+# point" — but people type them with a digit far more often than spelled out.
+# Without the digit patterns below, "explain the 2 point" fell through this
+# fast-path as "structurally standalone" and skipped contextualization
+# entirely, so the follow-up went to retrieval completely unresolved and the
+# model ended up guessing/blending a different point at generation time.
 _REFERENCE_TOKENS = re.compile(
     r"\b(?:it|its|that|this|those|these|they|them|their|which|"
     r"one\b|ones\b|the\s+\w+\s+one|the\s+other\b|"
     r"more\b|further\b|elaborate\b|"
     r"first\b|second\b|third\b|last\b|"
-    r"other\b|another\b)",
+    r"other\b|another\b|"
+    r"\d+(?:st|nd|rd|th)\b|"
+    r"point\s+\d+\b|\d+\s*(?:st|nd|rd|th)?\s+point\b|"
+    r"number\s+\d+\b)",
     re.IGNORECASE,
 )
 _FOLLOWUP_OPENERS = (
@@ -688,7 +699,10 @@ def _question_answerable_in_context(question: str, context: str) -> bool:
     return hits >= max(1, len(content_words) * 0.5)
 
 
-async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temperature: float = 0) -> Optional[str]:
+async def _backend_completion(
+    prompt: str, max_tokens: int, timeout: float, temperature: float = 0,
+    backend_override: Optional[str] = None,
+) -> Optional[str]:
     """Fast, non-streaming chat completion against whichever backend is
     currently active (vLLM or Groq — both OpenAI-compatible, same request
     shape). Returns the raw response text, or None on any failure, timeout,
@@ -706,6 +720,12 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
     should use that same fast backend too, not bottleneck the whole request
     on a slower one just for a few background tokens.
 
+    backend_override bypasses _active_backend() for the one call that needs
+    it regardless of FORCE_BACKEND: the query-cleaning fallback path exists
+    specifically to route around Groq's daily quota running out (observed
+    repeatedly in testing), so its own grounding re-check would defeat the
+    point if it silently used Groq again and failed the same way.
+
     Only vLLM and Groq are handled (matches what existed before this
     generalization) — OpenAI/Anthropic backends fall through to None here,
     same as an unconfigured backend, and callers already have a graceful
@@ -716,7 +736,7 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
         VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend,
         GROQ_API_KEY, GROQ_MODEL,
     )
-    backend = _active_backend()
+    backend = backend_override or _active_backend()
     if backend == "vllm":
         url = f"{VLLM_HOST}/v1/chat/completions"
         model = _resolve_vllm_model()
@@ -741,11 +761,130 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
                 timeout=_ah.ClientTimeout(total=timeout),
             ) as resp:
                 if resp.status != 200:
+                    # Silently returning None here (as before) is indistinguishable
+                    # from a network blip or timeout in logs — every caller treats
+                    # it as "the model said no" and refuses, so a sustained
+                    # condition (e.g. a rate/quota limit) looks identical to
+                    # ordinary occasional flakiness with no way to tell them apart
+                    # short of manually replaying the exact request outside the
+                    # app. Logging status + body once per failure costs nothing
+                    # on the happy path and turns "everything is mysteriously
+                    # refusing" into an immediately diagnosable log line.
+                    body = await resp.text()
+                    logger.warning(
+                        "[_backend_completion] %s returned status=%s (backend=%s model=%s): %s",
+                        url, resp.status, backend, model, body[:300],
+                    )
                     return None
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"].strip()
-    except Exception:
+    except Exception as exc:
+        logger.warning("[_backend_completion] request to %s failed (backend=%s): %s", url, backend, exc)
         return None
+
+
+async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]]:
+    """Fallback query cleaner tried only when the primary retrieval attempt
+    already failed coverage — fixes general spelling mistakes (not just the
+    hand-curated insurance vocabulary _correct_typos() knows) and strips
+    specific qualifiers (a named country/city, emphasis words like
+    "affordable"/"cheap"/"best") that measurably tank the reranker's score
+    even when the KB covers the general topic well. Measured: "how to buy
+    motor insurance" scored 0.79; adding just "affordable" dropped it to
+    0.017; adding "in Dubai" alone dropped it to 0.15 — the same qualifier-
+    dilution pattern behind several earlier fixes this session, just never
+    addressed at the query-cleaning layer directly.
+
+    Calls vLLM specifically, not whatever _active_backend()/FORCE_BACKEND
+    currently points at — this is a retry path for a query that's already
+    failing, not primary answer generation, and shouldn't compete for the
+    same (rate-limited) Groq quota real answers need.
+
+    Returns (cleaned_query, dropped_terms_summary) — both None on any
+    failure, unconfigured backend, or empty response, so the caller falls
+    through to the existing refusal exactly as it did before this function
+    existed. dropped_terms_summary is computed programmatically from the
+    before/after diff (see _diff_dropped_terms), not self-reported by the
+    model — asking it to also report what it removed was tried first and
+    was unreliable, sometimes echoing the prompt's own example words
+    ("affordable", "cheap", "best") as "dropped" even when they were never
+    in the query, or weren't actually removed from the cleaned version.
+    """
+    import aiohttp as _ah
+    from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+    if not VLLM_HOST:
+        return None, None
+    prompt = (
+        f"Query: {question}\n\n"
+        "This insurance-related search query may contain spelling mistakes, "
+        "and words that make it too specific for a keyword search to match "
+        "well (e.g. a country/city name, or emphasis words like "
+        "'affordable', 'cheap', 'best'). Rewrite it as a short, general "
+        "search query about the CORE topic only: fix any spelling mistakes, "
+        "and drop any specific location or emphasis words that aren't "
+        "needed to describe the core insurance topic. "
+        "Respond with ONLY the rewritten query, nothing else."
+    )
+    try:
+        url = f"{VLLM_HOST}/v1/chat/completions"
+        model = _resolve_vllm_model()
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"}
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 40,
+            "temperature": 0,
+            "stream": False,
+        }
+        async with _ah.ClientSession() as session:
+            async with session.post(
+                url, json=payload, headers=headers,
+                timeout=_ah.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status != 200:
+                    return None, None
+                data = await resp.json()
+                raw = data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None, None
+    cleaned = raw.strip().strip('"').strip("'").strip()
+    if not cleaned:
+        return None, None
+    return cleaned, _diff_dropped_terms(question, cleaned)
+
+
+# Emphasis/qualifier words worth calling out by name if the cleaner drops
+# them — deliberately short and specific rather than a broad stopword list,
+# since the goal is only to name concrete things that got removed, not to
+# flag every function word that naturally differs between two phrasings of
+# the same query.
+_EMPHASIS_WORDS = frozenset({
+    'affordable', 'cheap', 'cheapest', 'best', 'top', 'premium',
+    'expensive', 'discount', 'discounted', 'lowest', 'cheaply',
+})
+
+
+def _diff_dropped_terms(original: str, cleaned: str) -> Optional[str]:
+    """Return a short, comma-separated list of concrete terms present in
+    *original* but missing from *cleaned* — specifically capitalized words
+    other than the first (likely a proper noun: a country, city, or
+    provider name) and known emphasis words (_EMPHASIS_WORDS). Computed
+    directly from the text rather than trusted from the model's own
+    self-report (see _vllm_clean_query's docstring for why).
+    """
+    orig_words = original.split()
+    clean_lower = cleaned.lower()
+    dropped = []
+    for i, w in enumerate(orig_words):
+        w_clean = w.strip(".,!?;:()[]{}'\"")
+        if not w_clean:
+            continue
+        w_lower = w_clean.lower()
+        is_proper_noun = i > 0 and w_clean[0].isupper()
+        is_emphasis = w_lower in _EMPHASIS_WORDS
+        if (is_proper_noun or is_emphasis) and w_lower not in clean_lower:
+            dropped.append(w_clean)
+    return ", ".join(dict.fromkeys(dropped)) if dropped else None
 
 
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
@@ -1023,7 +1162,7 @@ async def _extract_intent_topics(question: str) -> set[str]:
 _GROUNDING_CONTEXT_CHARS = 3000
 
 
-async def _verify_grounding(question: str, context: str) -> bool:
+async def _verify_grounding(question: str, context: str, backend_override: Optional[str] = None) -> bool:
     """LLM-based semantic grounding backstop — an authoritative layer on top
     of the lexical/regex coverage checks (_context_covers_query,
     _enumeration_query_covered, _quoted_comparison_covered), not a
@@ -1039,6 +1178,10 @@ async def _verify_grounding(question: str, context: str) -> bool:
     insurers cover travel to South Africa" — same broad category
     (insurance), wrong specific topic, no lexical rule can enumerate every
     such near-miss in advance).
+
+    backend_override: see _backend_completion — used by the query-cleaning
+    fallback path to re-check grounding on vLLM specifically, so that path
+    stays independent of Groq's daily quota (the whole reason it exists).
 
     Fail-safe: any exception, timeout, or ambiguous/empty response returns
     False (not grounded) — matches the fail-safe direction already used
@@ -1061,7 +1204,7 @@ async def _verify_grounding(question: str, context: str) -> bool:
         "Answer with a single word: YES or NO."
     )
     try:
-        raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0)
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0, backend_override=backend_override)
         if not raw:
             return False
         cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
@@ -1130,6 +1273,144 @@ async def _contextualize_query(question: str, history: str) -> str:
         return raw.strip()
     except Exception:
         return question
+
+
+async def _extract_pasted_followup(question: str) -> Tuple[Optional[str], str]:
+    """Detect a message that's really "<a block of previously-given text>"
+    plus "<a short question about it>" pasted together as one message — e.g.
+    a user copying a chunk of an earlier answer (even one from many turns
+    back, well outside the retained history window) and asking about it
+    directly, rather than relying on the system to still remember that far.
+
+    Returns (pasted_context, actual_question). pasted_context is None (and
+    actual_question is the original, unmodified question) when no paste is
+    detected, including on any failure or ambiguity — the caller then
+    behaves exactly as it did before this function existed.
+    """
+    # An ordinary question is never this long — skip the LLM round-trip
+    # entirely below the bar where a paste becomes plausible.
+    if len(question.split()) < 40:
+        return None, question
+    prompt = (
+        f"Message:\n{question[:6000]}\n\n"
+        "This message may be a block of previously-given text (e.g. copied "
+        "from an earlier answer) followed by a short question or "
+        "instruction about it (e.g. 'explain this simply', 'summarize the "
+        "above', 'what does point 3 mean'). If so, respond with ONLY that "
+        "short question or instruction, copied VERBATIM from the message — "
+        "nothing else. If the message is just one ordinary question with "
+        "no pasted block, respond with exactly: NONE"
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+    except Exception:
+        return None, question
+    if not raw or not raw.strip():
+        return None, question
+    extracted = raw.strip()
+    if extracted.upper() == "NONE":
+        return None, question
+    idx = question.rfind(extracted)
+    if idx == -1:
+        # Couldn't confidently locate the extracted question verbatim in the
+        # original message — be conservative and treat this as no paste
+        # rather than guessing at a split point.
+        return None, question
+    pasted = (question[:idx] + question[idx + len(extracted):]).strip()
+    # The remaining "pasted" portion must itself be substantial, or this was
+    # likely just an ordinary question the model over-matched on.
+    if len(pasted.split()) < 20:
+        return None, question
+    return pasted, _strip_paste_reference_filler(extracted)
+
+
+# A follow-up about pasted content naturally opens with a connector back to
+# it ("now based on this,", "given the above,") — these add no topical
+# signal of their own and measurably dilute retrieval quality (embedding
+# score for "what is the free look period..." dropped from 0.34 to 0.06
+# once such a prefix was added, in testing). Stripped only from the
+# extracted question, not from pasted_context or the user-facing answer —
+# the LLM answering the question still has pasted_context available to
+# resolve "this" against; only the KB search string needs to be clean.
+_PASTE_FILLER_RE = re.compile(
+    r'^\s*(?:now|so|then|well|okay|ok)?[,\s]*'
+    r'(?:based on (?:this|that|the above)|given (?:this|that|the above)(?: information)?|'
+    r'considering (?:this|that|the above))'
+    r'(?: information)?[,\s]*',
+    re.IGNORECASE,
+)
+
+
+def _strip_paste_reference_filler(text: str) -> str:
+    stripped = _PASTE_FILLER_RE.sub('', text).strip()
+    return stripped if stripped else text
+
+
+# ── Ordinal point-reference follow-ups ("explain point 2", "the 2nd point") ──
+# _contextualize_query() resolves these into a standalone retrieval query, but
+# that resolution is itself unreliable: sometimes the model substitutes the
+# point's real subject matter (works), sometimes it only normalizes the
+# wording ("point 2" -> "the second point", still no topical content), and
+# retrieval then has nothing to search with — confirmed in testing on two
+# back-to-back examples that only differed in which the model happened to
+# produce. The most reliable source for "what was point 2 about" is the
+# numbered list already sitting in conversation history, not a fresh KB
+# search trying to rediscover the same content. _extract_point_reference()
+# pulls that point's own text out of history and feeds it through the exact
+# same pasted-context path as a live paste (verify-then-bypass-or-blend) —
+# so this reuses tested machinery rather than adding a parallel one.
+_ORDINAL_WORDS = {
+    'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+    'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10,
+}
+_POINT_REFERENCE_RE = re.compile(
+    r'\bpoint\s+number\s+(\d+)\b|'
+    r'\bpoint\s+(\d+)\b|'
+    r'\bthe\s+(\d+)(?:st|nd|rd|th)?\s+point\b|'
+    r'\bthe\s+(' + '|'.join(_ORDINAL_WORDS) + r')\s+point\b|'
+    r'\bnumber\s+(\d+)\b|'
+    r'\bthe\s+(\d+)(?:st|nd|rd|th)\b(?!\s+\w)',
+    re.IGNORECASE,
+)
+_NUMBERED_POINT_RE = re.compile(r'(?:^|\n)\s*(\d+)\.\s+')
+
+
+def _extract_point_number(question: str) -> Optional[int]:
+    """Return the 1-based point number *question* refers to (digit or
+    spelled-out ordinal), or None if it doesn't reference one at all."""
+    m = _POINT_REFERENCE_RE.search(question.lower())
+    if not m:
+        return None
+    for g in m.groups():
+        if g is None:
+            continue
+        if g.isdigit():
+            return int(g)
+        if g in _ORDINAL_WORDS:
+            return _ORDINAL_WORDS[g]
+    return None
+
+
+def _extract_point_text_from_history(history: str, point_num: int) -> Optional[str]:
+    """Find the most recent assistant turn with a numbered list and return
+    just point *point_num*'s own text from it — None if no numbered list is
+    found, or that point number isn't in it."""
+    for turn in reversed(_split_history_turns(history)):
+        if not turn.startswith("Assistant:"):
+            continue
+        content = turn[len("Assistant:"):].strip()
+        matches = list(_NUMBERED_POINT_RE.finditer(content))
+        if not matches:
+            continue
+        for i, m in enumerate(matches):
+            if int(m.group(1)) == point_num:
+                start = m.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+                point_text = content[start:end].strip()
+                return point_text or None
+        return None
+    return None
+
 
 _HANDOFF_MSG = (
     "I don't have that in my knowledge base right now — "
@@ -1282,17 +1563,28 @@ def _is_short_followup(question: str) -> bool:
     return False
 
 
-def _split_history_turns(history: str) -> list[str]:
-    """Split a flat ``"User: ...\\nAssistant: ..."`` history string into a list of
-    individual turn lines (one per ``User:`` or ``Assistant:`` line), so that
-    callers can slice the last N turn lines without cutting a multi-line
-    response in half.
+# A flat history string is "User: ...\nAssistant: ...\nUser: ...\nAssistant: ..."
+# — but a single turn's own content can contain internal newlines (e.g. a
+# numbered-list answer, one "\n" per point). A naive history.split("\n") to
+# grab "the last N lines" fragments that ONE long turn into many pieces, so
+# the window can end up holding only the tail of a numbered list (points
+# 6-8) while dropping the earlier points (1-5) entirely — and a follow-up
+# asking about "point 2" then has no way to know what point 2 actually was,
+# since it was never in the history it saw at all (this exact regression
+# previously shipped and was fixed once already — see git history on this
+# function — before being silently reintroduced by an unrelated merge).
+# Splitting only at newlines immediately followed by "User:"/"Assistant:"
+# keeps each turn whole no matter how many lines its own content spans.
+_HISTORY_TURN_BOUNDARY_RE = re.compile(r'\n(?=(?:User|Assistant):\s)')
 
-    Follows the same ``"User:"`` / ``"Assistant:"``-prefixed line format already
-    used by ``_reformulate_with_history()`` and
-    ``ConversationAgent._build_history_string()``.
+
+def _split_history_turns(history: str) -> list[str]:
+    """Split a flat ``"User: ...\\nAssistant: ..."`` history string into whole
+    turns (see module note above), not naive newline-delimited lines — so
+    callers can slice the last N turns without cutting a multi-line response
+    in half.
     """
-    return [line for line in history.strip().split("\n") if line.strip()]
+    return [t.strip() for t in _HISTORY_TURN_BOUNDARY_RE.split(history.strip()) if t.strip()]
 
 
 def _reformulate_with_history(question: str, history: str) -> str:
@@ -1852,6 +2144,31 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
+        # ── Pasted-context follow-up detection ────────────────────────────────
+        # A user pasting a chunk of an earlier answer (possibly from many
+        # turns back, well outside the retained history window) plus a
+        # question about it should be answered using that pasted text as
+        # context — not treated as one long, garbled retrieval query. From
+        # here on, `question` is the real, short question being asked;
+        # `pasted_context` (if any) is folded into full_context further down,
+        # and `_pasted_grounds_answer` lets the refusal gates below know the
+        # paste alone already supports an answer, independent of whatever
+        # fresh KB retrieval turns up.
+        pasted_context, question = await _extract_pasted_followup(question)
+        if pasted_context is None:
+            # No literal paste in this message — but a short "explain point 2"
+            # style follow-up references a numbered list from the PREVIOUS
+            # answer, which is already sitting in history. Pull that point's
+            # own text out and feed it through the same path as a live paste,
+            # rather than depending on retrieval rediscovering it from the KB
+            # (unreliable — see _extract_point_text_from_history's docstring).
+            _point_num = _extract_point_number(question)
+            if _point_num is not None and history:
+                pasted_context = _extract_point_text_from_history(history, _point_num)
+        _pasted_grounds_answer = False
+        if pasted_context:
+            _pasted_grounds_answer = await _verify_grounding(question, pasted_context)
+
         # ── Typo correction for retrieval query ───────────────────────────────
         # Apply _correct_typos() to build a corrected question used ONLY for
         # the retrieval_query, not for the final LLM prompt (original question
@@ -2116,7 +2433,7 @@ class MultiSourceRAG:
              for c in all_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
             default=float("-inf"),
         )
-        if not document_filter and _top_rerank < _rerank_gate:
+        if not document_filter and _top_rerank < _rerank_gate and not _pasted_grounds_answer:
             logger.info(
                 "[ask_stream] Reranker gate: top=%.3f < gate=%.3f — not in KB",
                 _top_rerank, _rerank_gate,
@@ -2166,7 +2483,48 @@ class MultiSourceRAG:
             _verify_grounding(retrieval_query, _grounding_context_preview),
         )
         ctx_covered = _lex_ok and _semantically_grounded
-        if not ctx_covered and not document_filter:
+
+        _dropped_terms_note = None
+        if not ctx_covered and not document_filter and not _pasted_grounds_answer:
+            # Before refusing, retry once with an LLM-cleaned, retrieval-
+            # optimized rewrite — fixes general spelling mistakes and strips
+            # specific qualifiers (a country/city name, "affordable"/"cheap"/
+            # "best") that can tank the reranker's score even though the KB
+            # covers the core topic well (see _vllm_clean_query's docstring
+            # for measured examples). If the cleaned query now passes, the
+            # answer proceeds using it; if something concrete (like a country
+            # name) had to be dropped to get there, that's surfaced to the
+            # user as an explicit "not covered" note rather than silently
+            # answering as if it were specific to what was actually asked.
+            _cleaned_query, _dropped = await _vllm_clean_query(retrieval_query)
+            if _cleaned_query and _cleaned_query.strip().lower() != retrieval_query.strip().lower():
+                _fallback_chunks = await self._retrieve_doc_chunks(
+                    _cleaned_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
+                )
+                _fallback_top = max(
+                    (c.metadata.get("rerank_score", float("-inf"))
+                     for c in _fallback_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
+                    default=float("-inf"),
+                )
+                if _fallback_top >= _rerank_gate:
+                    _fallback_context_preview = "\n\n".join(
+                        c.page_content for c in _fallback_chunks if hasattr(c, "page_content")
+                    )
+                    _fallback_lex_ok = (
+                        _context_covers_query(_cleaned_query, _fallback_chunks, llm_topics=None)
+                        and _quoted_comparison_covered(_cleaned_query, _fallback_chunks)
+                        and _enumeration_query_covered(_cleaned_query, _fallback_chunks)
+                    )
+                    _fallback_sem_grounded = await _verify_grounding(
+                        _cleaned_query, _fallback_context_preview, backend_override="vllm",
+                    )
+                    if _fallback_lex_ok and _fallback_sem_grounded:
+                        all_chunks = _fallback_chunks
+                        retrieval_query = _cleaned_query
+                        ctx_covered = True
+                        _dropped_terms_note = _dropped
+
+        if not ctx_covered and not document_filter and not _pasted_grounds_answer:
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it — they'll be able to help you better! 😊"
@@ -2228,6 +2586,28 @@ class MultiSourceRAG:
                 + full_context
             )
 
+        # Fold in the prior-answer context detected earlier — either a literal
+        # paste from the user, or a specific point pulled from the previous
+        # numbered answer in history. When it alone already grounds the
+        # answer (_pasted_grounds_answer), use it as the sole context — fresh
+        # retrieval still ran (for the gates above and in case it's needed),
+        # but its output would only dilute an already-sufficient answer with
+        # unrelated KB noise. When it isn't enough on its own, keep both:
+        # this context plus whatever fresh KB content retrieval found.
+        if pasted_context:
+            if _pasted_grounds_answer:
+                full_context = "[Context from an earlier answer]\n" + pasted_context
+                # The answer draws only from this, not from retrieval —
+                # citing KB documents that were fetched but never actually
+                # used would be a misleading source list.
+                sources = []
+            else:
+                full_context = (
+                    "[Context from an earlier answer]\n"
+                    + pasted_context
+                    + ("\n\n[Knowledge base chunks]\n" + full_context if full_context.strip() else "")
+                )
+
         if not full_context.strip():
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
@@ -2242,6 +2622,20 @@ class MultiSourceRAG:
             # _detected_as_followup is used (not _is_followup) so the fix applies
             # even when we fell back to history-based topic extraction.
             prompt_question = retrieval_query if _detected_as_followup else question
+
+            # The fallback query-cleaning above may have dropped a specific
+            # detail (a country/city name, "affordable"/"cheap"/"best") to
+            # get a match at all — tell the model explicitly so it answers
+            # with the general content it has while being honest that this
+            # detail specifically isn't covered, rather than silently
+            # presenting general info as if it addressed exactly what was
+            # asked (or ignoring that the user asked about it at all).
+            if _dropped_terms_note:
+                prompt_question = (
+                    f"{prompt_question.rstrip(' .?')}. Note: this knowledge base does not have "
+                    f"specific information about {_dropped_terms_note} — explicitly say that up front, "
+                    f"then answer using the general information you do have."
+                )
 
             # ── Modifier-signal instruction injection ─────────────────────────
             # Detect what kind of modifier the user asked for (example / simple /
