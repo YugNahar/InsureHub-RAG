@@ -1629,7 +1629,15 @@ async def ask_stream(req: AskRequest):
                     # though the actual displayed answer no longer has the
                     # disclaimer at all.
                     _text_for_handoff_check = final_data.get("corrected_text") or full_text
-                    ai_cant_answer = _agent_hub.response_needs_human(_text_for_handoff_check, sources)
+                    # Read multi_source_rag.py's own grounding-check verdict before
+                    # it gets overwritten below — only present (True) on refusal
+                    # paths (reranker gate, coverage-check failure, empty context,
+                    # Rule4 discard); absent on a normal successful generation, in
+                    # which case there's no upstream complaint to add here.
+                    _upstream_needs_human = final_data.get("needs_human", False)
+                    ai_cant_answer = _agent_hub.response_needs_human(
+                        _text_for_handoff_check, sources, _upstream_needs_human
+                    )
                     agents_online  = _agent_hub.online_count() > 0
                     needs_human         = ai_cant_answer and agents_online
                     offline_escalated   = ai_cant_answer and not agents_online

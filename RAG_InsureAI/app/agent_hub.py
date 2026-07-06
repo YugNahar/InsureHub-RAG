@@ -1011,7 +1011,29 @@ class AgentHub:
         return True
 
     @staticmethod
-    def response_needs_human(response: str, sources: list) -> bool:
+    def response_needs_human(response: str, sources: list, upstream_needs_human: bool | None = None) -> bool:
+        """
+        upstream_needs_human, when provided (not None), is
+        multi_source_rag.py's own grounding-check result (the lexical
+        coverage checks plus the semantic _verify_grounding() backstop) —
+        it inspects the actual retrieved context against the question, not
+        just the final answer text after the fact the way the phrase list
+        below does.
+
+        This closes a real gap: a confidently-generated, wrong-topic answer
+        (e.g. Takaful-model content used to answer "which insurers cover
+        travel to South Africa") cites real (but irrelevant) sources and
+        never uses any of the canned refusal phrases below — phrase-matching
+        plus "has sources, so it's probably fine" then wrongly concluded no
+        handoff was needed, even though multi_source_rag.py's own grounding
+        checks had the information to know better. OR the two signals
+        together so upstream can only ADD a missing handoff trigger, never
+        remove one the phrase check already found correctly on its own.
+
+        When upstream_needs_human is None (not passed), behaves exactly as
+        before — this is the path for any caller with no upstream grounding
+        signal to provide.
+        """
         phrases = [
             # Explicit can't-answer phrases
             "don't have information",
@@ -1044,10 +1066,11 @@ class AgentHub:
         # If the text itself says "let me get an agent", sources are irrelevant —
         # the answer was replaced by the handoff message and must trigger a popup.
         if not result and sources:
-            logger.debug("response_needs_human=False (has sources, no handoff phrase)")
-            return False
-        logger.info("response_needs_human=%s | sources=%d | response_snippet=%r",
-                    result, len(sources), response[:120])
+            result = False
+        if upstream_needs_human is not None:
+            result = result or upstream_needs_human
+        logger.info("response_needs_human=%s | sources=%d | upstream=%s | response_snippet=%r",
+                    result, len(sources), upstream_needs_human, response[:120])
         return result
 
 

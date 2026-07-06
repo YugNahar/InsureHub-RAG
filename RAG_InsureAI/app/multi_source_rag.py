@@ -413,32 +413,93 @@ _ENUM_COMMON_CAP_WORDS = {
     "typically", "importantly", "note", "tip", "example", "for", "when",
     "while", "before", "after", "during", "also", "some", "many", "most",
     "several", "various", "certain", "so", "now", "here", "there", "yes", "no",
+    # Secondary safeguard (belt-and-suspenders, not the primary fix — see
+    # _has_named_entity()): these are capitalized when they open a
+    # proper-noun-style phrase like "Takaful Insurance" or "Islamic
+    # insurance model", but none of them are company names. The primary
+    # fix is requiring known-insurer-name or company-suffix-adjacency
+    # evidence in _has_named_entity() itself; this list additionally
+    # excludes these specific words even if they'd otherwise satisfy that
+    # adjacency check (e.g. "Islamic insurance" — "Islamic" sits directly
+    # next to the suffix word "insurance").
+    "takaful", "shariah", "islamic", "halal", "conventional",
 }
+
+# Known insurer names — factored out from _is_likely_followup()'s
+# _INSURANCE_INDICATORS_LOCAL regex (same list) below, so both places share
+# one source of truth instead of maintaining two independent copies.
+_KNOWN_INSURER_NAMES = frozenset({
+    "hdfc ergo", "icici", "bajaj", "tata aig", "reliance",
+    "new india", "oriental", "national", "united india",
+})
+
+# Capitalized word/phrase immediately adjacent to one of these counts as a
+# plausible company name (e.g. "New India Assurance", "XYZ Ltd", "ABC Corp").
+_COMPANY_SUFFIX_WORDS = frozenset({
+    "insurance", "assurance", "general", "life", "ltd", "inc", "co",
+    "corp", "group", "underwriters", "mutual", "holdings",
+})
 
 
 def _has_named_entity(text: str) -> bool:
-    """Loose heuristic: a capitalized word, not sentence-initial, not a
-    common capitalized filler — a plausible company/brand name."""
+    """Plausible company/brand name: either a known insurer name, or a
+    capitalized word/phrase immediately adjacent to a company-suffix word.
+
+    The old version treated ANY capitalized, non-sentence-initial word not
+    in a small filler list as a "plausible company name" — which let words
+    like "Takaful", "Islamic", "Shariah" (capitalized when they open a
+    proper-noun-style phrase, e.g. "Takaful Insurance") pass as named
+    entities. That wrongly satisfied _enumeration_query_covered() for
+    "which insurers cover the travel policy to south africa" when the
+    retrieved chunk was actually about the Takaful insurance MODEL and
+    never named a single real insurer — the confident answer that reached
+    the user cited that chunk as if it answered the question.
+    """
+    lower = text.lower()
+    if any(name in lower for name in _KNOWN_INSURER_NAMES):
+        return True
     sentence_initial = {
         m.start(1) for m in re.finditer(r'(?:^|[.!?]\s+)([A-Z][a-zA-Z]{2,})', text)
     }
     for m in re.finditer(r'\b[A-Z][a-zA-Z]{2,}\b', text):
         if m.start() in sentence_initial:
             continue
-        if m.group(0).lower() in _ENUM_COMMON_CAP_WORDS:
-            continue
-        return True
+        word = m.group(0)
+        if word.lower() in _ENUM_COMMON_CAP_WORDS:
+            continue  # belt-and-suspenders exclusion — see _ENUM_COMMON_CAP_WORDS
+        before = text[:m.start()].rstrip()
+        after = text[m.end():].lstrip()
+        before_word = re.search(r'(\w+)$', before)
+        after_word = re.match(r'^(\w+)', after)
+        if before_word and before_word.group(1).lower() in _COMPANY_SUFFIX_WORDS:
+            return True
+        if after_word and after_word.group(1).lower() in _COMPANY_SUFFIX_WORDS:
+            return True
     return False
 
 
 def _enumeration_query_covered(question: str, docs: list) -> bool:
     """True unless the question asks 'which/who provides X' and the
-    retrieved context contains no plausible named entity at all."""
+    retrieved context contains no plausible named entity at all — or has a
+    named entity, but not in the SAME chunk as the question's own topic
+    words. A named entity that only appears in an unrelated chunk doesn't
+    answer "which insurers cover travel to south africa" just because SOME
+    insurer name exists somewhere else in the retrieved pool.
+    """
     if not _ENUMERATION_PATTERN.search(question):
         return True
+    topic_words = _extract_topic_terms(question)
     for doc in docs:
         text = doc.page_content if hasattr(doc, "page_content") else doc.get("text", "")
-        if _has_named_entity(text):
+        if not _has_named_entity(text):
+            continue
+        if not topic_words:
+            # No specific topic words to check co-occurrence against (e.g.
+            # question was just "which insurers offer coverage?") — a named
+            # entity anywhere is sufficient, same as before.
+            return True
+        chunk_terms = set(re.findall(r'\b[a-z]{3,}\b', text.lower()))
+        if _topics_hit_chunk(topic_words, chunk_terms):
             return True
     return False
 
@@ -868,6 +929,60 @@ async def _extract_intent_topics(question: str) -> set[str]:
     except Exception as exc:
         logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
         return set()
+
+
+# Context passed to the grounding-check prompt is capped so this stays a
+# fast, cheap call (max_tokens=10 output either way) — not specified by the
+# original design, but consistent with how _generate_suggestions() and the
+# earlier context[:1000] pattern elsewhere in this file bound auxiliary-call
+# input size for latency.
+_GROUNDING_CONTEXT_CHARS = 3000
+
+
+async def _verify_grounding(question: str, context: str) -> bool:
+    """LLM-based semantic grounding backstop — an authoritative layer on top
+    of the lexical/regex coverage checks (_context_covers_query,
+    _enumeration_query_covered, _quoted_comparison_covered), not a
+    replacement for them.
+
+    Those lexical checks are pattern-matching heuristics: every new
+    phrasing that slips past them needs a new regex rule. This closes that
+    gap by directly asking the model whether the SPECIFIC question is
+    answerable from the SPECIFIC retrieved context — which catches the
+    failure mode the lexical checks structurally can't: a chunk that's
+    topically adjacent but not actually about the thing asked (e.g. a
+    Takaful-insurance-model chunk confidently used to answer "which
+    insurers cover travel to South Africa" — same broad category
+    (insurance), wrong specific topic, no lexical rule can enumerate every
+    such near-miss in advance).
+
+    Fail-safe: any exception, timeout, or ambiguous/empty response returns
+    False (not grounded) — matches the fail-safe direction already used
+    elsewhere in this file for needs_human (when in doubt, refuse rather
+    than risk answering ungrounded).
+    """
+    if not context or not context.strip():
+        return False
+    prompt = (
+        f"Context:\n{context[:_GROUNDING_CONTEXT_CHARS]}\n\n"
+        f"Question: {question}\n\n"
+        "Can this exact question be answered using ONLY the information in "
+        "this context? Answer NO if the context is about a related-but-"
+        "different topic — the same broad category, but not the specific "
+        "thing actually asked (for example, content describing a general "
+        "insurance model or concept does not answer a question about a "
+        "specific country, provider, or coverage detail unless that exact "
+        "thing is actually discussed). Answer with a single word: YES or NO."
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0)
+        if not raw:
+            return False
+        cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
+        words = set(cleaned.split())
+        return "yes" in words and "no" not in words
+    except Exception:
+        return False
 
 
 _HANDOFF_MSG = (
@@ -1405,11 +1520,20 @@ class MultiSourceRAG:
             )
 
         # ── Prompt selection ──────────────────────────────────────────────────
-        ctx_covered = (
-            _context_covers_query(question, all_chunks)
-            and _quoted_comparison_covered(question, all_chunks)
-            and _enumeration_query_covered(question, all_chunks)
+        # Lexical checks run alongside the semantic _verify_grounding() backstop
+        # via asyncio.gather() rather than after it, so the LLM round-trip isn't
+        # serialized behind work that's already fast. Both must pass.
+        async def _lexical_covered():
+            return (
+                _context_covers_query(question, all_chunks)
+                and _quoted_comparison_covered(question, all_chunks)
+                and _enumeration_query_covered(question, all_chunks)
+            )
+        _lex_ok, _semantically_grounded = await asyncio.gather(
+            _lexical_covered(),
+            _verify_grounding(question, full_context),
         )
+        ctx_covered = _lex_ok and _semantically_grounded
 
         # If the KB has no relevant content for this question, skip the LLM
         # entirely — small models ignore "don't use your training knowledge"
@@ -1822,12 +1946,30 @@ class MultiSourceRAG:
 
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
+        # Lexical checks run alongside the semantic _verify_grounding() backstop
+        # via asyncio.gather() rather than after it, so the LLM round-trip isn't
+        # serialized behind work that's already fast. Both must pass.
+        #
+        # full_context (the labeled, budget-compressed version used for the
+        # actual generation prompt) isn't built until later in this function —
+        # unlike ask(), where it already exists by this point. Build a plain,
+        # uncompressed join of all_chunks here instead, just for the grounding
+        # check; it doesn't touch full_context or the ContextCompressor at all.
         topics_for_coverage = None if _detected_as_followup else (llm_topics or None)
-        ctx_covered = (
-            _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
-            and _quoted_comparison_covered(question, all_chunks)
-            and _enumeration_query_covered(question, all_chunks)
+        async def _lexical_covered():
+            return (
+                _context_covers_query(retrieval_query, all_chunks, llm_topics=topics_for_coverage)
+                and _quoted_comparison_covered(question, all_chunks)
+                and _enumeration_query_covered(question, all_chunks)
+            )
+        _grounding_context_preview = "\n\n".join(
+            c.page_content for c in all_chunks if hasattr(c, "page_content")
         )
+        _lex_ok, _semantically_grounded = await asyncio.gather(
+            _lexical_covered(),
+            _verify_grounding(question, _grounding_context_preview),
+        )
+        ctx_covered = _lex_ok and _semantically_grounded
         if not ctx_covered and not document_filter:
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "

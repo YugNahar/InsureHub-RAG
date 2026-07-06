@@ -13,7 +13,17 @@ def extract_numerical_claims(answer: str) -> Set[str]:
 
 
 def validate_grounding(answer: str, context: str) -> Tuple[bool, List[str]]:
-    """Check that every numerical claim in the answer appears verbatim in the context."""
+    """Check that every numerical claim in the answer appears verbatim in the context.
+
+    Only used by the legacy /ask-documents-only path, via rag.py's
+    knowledge_query() — it is NOT called by the production chat path
+    (multi_source_rag.py's ask_stream(), used by /ask-stream). It also only
+    validates numerical claims, not topical/semantic relevance, so it would
+    not have caught the Takaful/South-Africa-travel hallucination even if it
+    were wired into the production path — that answer made no numerical
+    claims at all. See _verify_grounding() in multi_source_rag.py (added in
+    Phase 2 of this fix) for the production-path semantic check.
+    """
     answer_nums = extract_numerical_claims(answer)
     context_lower = context.lower()
     missing = [num for num in answer_nums if num not in context_lower]
