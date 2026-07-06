@@ -634,6 +634,19 @@ def _needs_detailed_answer(question: str) -> bool:
 _FOLLOWUP_SIGNALS = {
     'it', 'its', 'that', 'this', 'them', 'those', 'they', 'their', 'which', 'these',
 }
+
+# Pronoun/reference words used to decide whether _contextualize_query() should
+# attempt an LLM call.  If the question doesn't contain any of these tokens it
+# is structurally standalone (e.g. a fresh topic out of nowhere), so the LLM
+# round-trip can be skipped entirely.
+_REFERENCE_TOKENS = re.compile(
+    r"\b(?:it|its|that|this|those|these|they|them|their|which|"
+    r"one\b|ones\b|the\s+\w+\s+one|the\s+other\b|"
+    r"more\b|further\b|elaborate\b|"
+    r"first\b|second\b|third\b|last\b|"
+    r"other\b|another\b)",
+    re.IGNORECASE,
+)
 _FOLLOWUP_OPENERS = (
     'what about', 'how about', 'and what', 'also ', 'tell me more',
     'what does it', 'how does it', 'what is it', 'is it ', 'can it ',
@@ -1267,6 +1280,19 @@ def _is_short_followup(question: str) -> bool:
     if len(words) <= 2:
         return True
     return False
+
+
+def _split_history_turns(history: str) -> list[str]:
+    """Split a flat ``"User: ...\\nAssistant: ..."`` history string into a list of
+    individual turn lines (one per ``User:`` or ``Assistant:`` line), so that
+    callers can slice the last N turn lines without cutting a multi-line
+    response in half.
+
+    Follows the same ``"User:"`` / ``"Assistant:"``-prefixed line format already
+    used by ``_reformulate_with_history()`` and
+    ``ConversationAgent._build_history_string()``.
+    """
+    return [line for line in history.strip().split("\n") if line.strip()]
 
 
 def _reformulate_with_history(question: str, history: str) -> str:
