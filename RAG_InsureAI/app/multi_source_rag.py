@@ -741,10 +741,25 @@ async def _backend_completion(prompt: str, max_tokens: int, timeout: float, temp
                 timeout=_ah.ClientTimeout(total=timeout),
             ) as resp:
                 if resp.status != 200:
+                    # Silently returning None here (as before) is indistinguishable
+                    # from a network blip or timeout in logs — every caller treats
+                    # it as "the model said no" and refuses, so a sustained
+                    # condition (e.g. a rate/quota limit) looks identical to
+                    # ordinary occasional flakiness with no way to tell them apart
+                    # short of manually replaying the exact request outside the
+                    # app. Logging status + body once per failure costs nothing
+                    # on the happy path and turns "everything is mysteriously
+                    # refusing" into an immediately diagnosable log line.
+                    body = await resp.text()
+                    logger.warning(
+                        "[_backend_completion] %s returned status=%s (backend=%s model=%s): %s",
+                        url, resp.status, backend, model, body[:300],
+                    )
                     return None
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"].strip()
-    except Exception:
+    except Exception as exc:
+        logger.warning("[_backend_completion] request to %s failed (backend=%s): %s", url, backend, exc)
         return None
 
 
