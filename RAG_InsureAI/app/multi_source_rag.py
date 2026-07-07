@@ -202,6 +202,23 @@ def _word_matches(topic: str, chunk_word: str) -> bool:
       "deductible" / "deduction" / "deducted"  → share "deduct" ✓
       "nominate"   / "nomination"               → share "nomin"  ✓
       "tax"        / "taxation"                 → share "tax"    ✓ (exact)
+
+    Short topic words (< 5 chars, e.g. "term") never reach that prefix
+    heuristic, so they only ever match an EXACT identical word. Tried adding
+    a blanket trailing-"s" plural/singular rule to fix "term" vs "terms" —
+    reverted immediately: it let the topic "term insurance" pass on any
+    chunk containing the word "terms" in the totally unrelated sense of
+    "terms and conditions" (a near-universal phrase in every insurance
+    document, present on almost every page regardless of topic). Confirmed
+    live: this let a term-insurance claim question answer confidently using
+    retrieved MOTOR insurance claims content (driving license, FIR for
+    vehicle theft) — a wrong-topic answer, strictly worse than the refusal
+    it replaced. Exactly the "weak rider smuggles the query through" failure
+    mode already documented below for the no-claim-bonus case, just via
+    grammatical number instead of a generic rider word. A safe fix for the
+    "term"/"terms" case needs to be specific to that word pair (or require
+    the plural to appear near "insurance"/"policy" specifically), not a
+    general suffix rule — left as future work rather than shipping this.
     """
     if topic == chunk_word:
         return True
@@ -1112,6 +1129,57 @@ def _is_likely_followup(question: str) -> bool:
     return False
 
 
+# Specific insurance-type nouns, used only to deterministically re-anchor a
+# reformulated follow-up whose LLM rewrite silently dropped the topic — see
+# the repair step inside _reformulate_query for why this exists.
+_ANCHOR_TYPE_RE = re.compile(
+    r"\b(term|motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
+    r"life|whole\s*life|endowment|ulip|"
+    r"health|medical|"
+    r"travel|trip|"
+    r"home|house|property|"
+    r"marine|cargo|fire|"
+    r"liability|third.party|"
+    r"critical\s*illness|"
+    r"group|corporate|"
+    r"personal\s*accident|disability|"
+    r"retirement|pension|annuity|takaful)\b(\s+insurance)?",
+    re.IGNORECASE,
+)
+
+
+def _last_anchor_type_match(text: str) -> Optional[str]:
+    """Last (most recent) specific-insurance-type phrase mentioned in *text*,
+    or None.
+
+    Checks the most recent "User:" turn first — the user's own wording is
+    the authoritative signal for what topic they actually asked about. The
+    "Assistant:" turn often re-describes it via a broader category ("Term
+    insurance is a type of life insurance...") which, under a plain
+    last-match-anywhere search, would wrongly outrank the real, more
+    specific topic the user named ("term") just because "life insurance"
+    happens to appear later in the same turn's prose. Only falls back to
+    searching the whole text when the user's own turn has no type mention
+    (e.g. a topic introduced solely by the assistant, never restated).
+    """
+    user_turns = re.findall(r"User:\s*(.*?)(?=\n(?:User|Assistant):|\Z)", text, re.DOTALL)
+    if user_turns:
+        user_matches = list(_ANCHOR_TYPE_RE.finditer(user_turns[-1]))
+        if user_matches:
+            phrase = user_matches[-1].group(0).strip()
+            if not re.search(r"insurance\s*$", phrase, re.IGNORECASE):
+                phrase = f"{phrase} insurance"
+            return phrase
+
+    matches = list(_ANCHOR_TYPE_RE.finditer(text))
+    if not matches:
+        return None
+    phrase = matches[-1].group(0).strip()
+    if not re.search(r"insurance\s*$", phrase, re.IGNORECASE):
+        phrase = f"{phrase} insurance"
+    return phrase
+
+
 async def _reformulate_query(question: str, history: str) -> str:
     """Rewrite a follow-up question as a standalone, natural-language question
     using conversation history — used both for retrieval and, for detected
@@ -1197,6 +1265,32 @@ Search query:"""
     if reformulated:
         reformulated = reformulated.strip().strip('"\'')
         if len(reformulated) >= 3:
+            # Deterministic repair for a confirmed non-determinism gap: even
+            # at temperature=0, this call has been observed live to drop the
+            # topic anchor on the *same* input across repeated calls — e.g.
+            # "How to claim it?" after a term-insurance turn reformulated to
+            # the correctly-anchored "How is a claim for term insurance
+            # processed?" on one call, and the topic-less "What are the steps
+            # involved in submitting a claim?" moments later on an identical
+            # retry (same question, same history). A topic-less reformulation
+            # isn't a refusal — it's a *different, legitimately generic*
+            # question that goes on to confidently ground against whatever
+            # generic claims content ranks highest, a wrong-topic answer that
+            # nothing downstream can distinguish from an intentionally
+            # generic question. Only repair when the topic could ONLY have
+            # come from history (the raw follow-up itself names no specific
+            # type) and the rewrite dropped the type history established.
+            _hist_anchor = _last_anchor_type_match(recent)
+            if (
+                _hist_anchor
+                and not _ANCHOR_TYPE_RE.search(question)
+                and not _ANCHOR_TYPE_RE.search(reformulated)
+            ):
+                logger.info(
+                    "[REFORM] topic-anchor repair: %r missing %r from history — appending",
+                    reformulated, _hist_anchor,
+                )
+                reformulated = f"{reformulated.rstrip('?.! ')} for {_hist_anchor}?"
             logger.info("[REFORM] %r -> %r", question, reformulated)
             return reformulated
     return question
@@ -2771,7 +2865,30 @@ class MultiSourceRAG:
         # before refusing.  This is a CRAG-style fallback: a lightweight
         # classifier (heuristic) may be wrong; we verify by trying the
         # alternate strategy and checking if the result actually grounds.
-        if not ctx_covered and not document_filter and not _pasted_grounds_answer and _detected_as_followup:
+        #
+        # Only valid when the question COULD plausibly be self-contained.
+        # If it contains an explicit unresolved pronoun (_FOLLOWUP_SIGNALS —
+        # "it", "that", "this", "them"...), the "misclassified" premise
+        # can't hold: a genuinely standalone question wouldn't have a
+        # dangling pronoun with no antecedent in the first place. Retrying
+        # such text standalone strips the one content word that mattered
+        # ("it" contributes nothing after stopword-filtering) and leaves
+        # something like bare "claim" — which trivially lexically+
+        # semantically matches whatever generic claims content ranks
+        # highest in the KB. Confirmed live: "How to claim it?" after a
+        # term-insurance question retried as bare "claim", passed both the
+        # lexical AND semantic grounding checks 8/8 times in isolation
+        # testing (not a flaky/occasional pass — reliably wrong every
+        # time), and answered with confidently-blended motor-insurance
+        # claims content (driving license, FIR for vehicle theft) that has
+        # nothing to do with term insurance — a wrong-topic answer, strictly
+        # worse than the refusal it was replacing.
+        _question_tokens = {w.lower().strip('?.,!') for w in question.split()}
+        _has_unresolved_pronoun = bool(_question_tokens & _FOLLOWUP_SIGNALS)
+        if (
+            not ctx_covered and not document_filter and not _pasted_grounds_answer
+            and _detected_as_followup and not _has_unresolved_pronoun
+        ):
             _standalone_chunks = await self._retrieve_doc_chunks(
                 question, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
             )
