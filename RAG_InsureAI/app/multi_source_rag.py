@@ -1074,22 +1074,59 @@ def _is_likely_followup(question: str) -> bool:
             if not _INSURANCE_INDICATORS_LOCAL.search(q_lower):
                 return True
 
+    # A short question using only GENERIC insurance-process vocabulary
+    # ("claim", "premium", "documents", "cost"...) but no SPECIFIC
+    # insurance-type noun (motor, life, health, travel, home...) still
+    # depends on whatever type was being discussed — it isn't self-contained
+    # just because it contains an insurance word. Confirmed live: "How do I
+    # file a claim" asked right after "What is life insurance" fell through
+    # every check above (no follow-up opener, no _FOLLOWUP_KEYWORDS match,
+    # no detail/simple/example modifier) and was treated as a fresh,
+    # standalone question — so it skipped _reformulate_query entirely and
+    # retrieval ran on the bare, topic-less phrase, returning confident
+    # motor-insurance claim content (roadside assistance, police report)
+    # instead of anything about life insurance, or a refusal.
+    if len(words) <= 10:
+        _GENERIC_PROCESS_RE = re.compile(
+            r"\b(claim|claims|premium|premiums|deductible|deductibles|"
+            r"policy|policies|documents?|paperwork|process|renew|renewal|"
+            r"cancel|cancellation|cost|price|apply|application)\b"
+        )
+        _SPECIFIC_TYPE_RE = re.compile(
+            r"\b(motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
+            r"life|term\s*life|whole\s*life|endowment|ulip|"
+            r"health|medical|hospital|"
+            r"travel|trip|flight|baggage|"
+            r"home|house|property|landlord|tenant|"
+            r"marine|cargo|fire|"
+            r"liability|third.party|"
+            r"critical\s*illness|cancer|"
+            r"group|corporate|reinsurance|takaful|"
+            r"crop|agricultur\w*|"
+            r"personal\s*accident|disability|"
+            r"retirement|pension|annuity)\b"
+        )
+        if _GENERIC_PROCESS_RE.search(q_lower) and not _SPECIFIC_TYPE_RE.search(q_lower):
+            return True
+
     return False
 
 
 async def _reformulate_query(question: str, history: str) -> str:
-    """Rewrite a follow-up question as a standalone search query using conversation history.
+    """Rewrite a follow-up question as a standalone, natural-language question
+    using conversation history — used both for retrieval and, for detected
+    follow-ups, as the literal question text shown to the generation prompt.
 
     Examples:
       history: "User: tell me about life insurance\nLayla: Life insurance ..."
       question: "what about premiums?"
-      returns: "life insurance premiums"
+      returns: "What is the premium amount for life insurance?"
 
     Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
     Falls back to the original question on any error.
     """
-    # Use only the last 6 turns (3 Q&A pairs) of history to keep the prompt
-    # short. Used to slice by raw newline count instead of turn boundaries —
+    # Use only the last 2 turns (the single most recent Q&A pair) of history.
+    # Used to slice by raw newline count instead of turn boundaries —
     # confirmed live: a multi-paragraph, numbered-list detailed answer alone
     # spans more than 6 newlines, so "last 6 lines" only captured the tail
     # end of the MOST RECENT answer (e.g. "...the lump-sum payment helps
@@ -1100,26 +1137,56 @@ async def _reformulate_query(question: str, history: str) -> str:
     # so retrieval pulled unrelated content and the question was refused.
     # _split_history_turns() slices on "User:"/"Assistant:" boundaries so a
     # long answer is kept whole instead of being cut mid-turn.
-    recent = '\n'.join(_split_history_turns(history)[-6:])
-    prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
-Use precise insurance/legal terms that would appear in a textbook (not casual phrasing).
-Output ONLY the search query — no quotes, no explanation, nothing else.
+    #
+    # Window then narrowed 6 -> 2: confirmed live again with a longer, multi-
+    # topic conversation (marine insurance -> takaful -> an off-topic aside ->
+    # term insurance) — with 3 Q&A pairs of history in view, "explain in
+    # detail with an example" got reformulated to "takaful insurance
+    # principle example real case", pulling the more distinctive-sounding
+    # topic from two turns back instead of the actually-current one (term
+    # insurance) from the immediately preceding turn. Generic modifier-only
+    # follow-ups ("give me an example", "explain in detail") are asking about
+    # whatever was JUST discussed — the single most recent turn is both
+    # necessary and sufficient, and including more only risks the model
+    # anchoring on an earlier, more salient-sounding topic instead. This
+    # matches _contextualize_query's existing narrower window for the same
+    # reason.
+    recent = '\n'.join(_split_history_turns(history)[-2:])
+    # Output a complete, natural-language QUESTION — not a terse keyword
+    # string. The old prompt asked for compact "textbook vocabulary" phrases
+    # (e.g. "term insurance detailed explanation example"), which is exactly
+    # what the few-shot examples below used to demonstrate. Confirmed live:
+    # that exact keyword-salad phrase, tried directly against retrieval,
+    # returned an EMPTY context (no chunks matched well enough) even though
+    # the natural phrasing of the same request — "explain term insurance in
+    # detail with an example" — retrieved rich, correct content and answered
+    # fully. The embedding model matches natural sentences against this KB's
+    # prose far better than a stripped keyword list. This same string also
+    # doubles as the literal "question" shown to the generation prompt for
+    # follow-ups (see prompt_question below), where a keyword salad reads as
+    # not-a-real-question and biases the model toward refusing — a complete
+    # question fixes both problems at once.
+    prompt = f"""Rewrite the follow-up question as a complete, standalone, natural-language question using the conversation context.
+Use precise insurance/legal terms that would appear in a textbook, but phrase it as a real question a person would ask — not a keyword list.
+The conversation below is ONLY the single most recent exchange — always ground
+the follow-up in that topic, never in anything outside what's shown here.
+Output ONLY the rewritten question — no quotes, no explanation, nothing else.
 
 Examples:
   Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
-  Follow-up: "what about premiums?" → "life insurance premium amount"
+  Follow-up: "what about premiums?" → "What is the premium amount for life insurance?"
 
   Context: "User: explain life insurance\nLayla: Life insurance protects your family..."
-  Follow-up: "is it tax deductible?" → "life insurance premiums tax deductible section 80C income"
+  Follow-up: "is it tax deductible?" → "Are life insurance premiums tax deductible under section 80C?"
 
   Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers share risk..."
-  Follow-up: "is it legally required?" → "reinsurance legal requirement regulation"
+  Follow-up: "is it legally required?" → "Is reinsurance a legal requirement under regulation?"
 
   Context: "User: what is subrogation\nLayla: Subrogation means the insurer steps in..."
-  Follow-up: "give me an example" → "subrogation example real case"
+  Follow-up: "give me an example" → "Can you give a real-life example of subrogation?"
 
   Context: "User: what is a deductible\nLayla: A deductible is what you pay first..."
-  Follow-up: "how is it calculated?" → "deductible calculation formula percentage"
+  Follow-up: "how is it calculated?" → "How is a deductible amount calculated?"
 
 Conversation:
 {recent}
@@ -3130,6 +3197,15 @@ class MultiSourceRAG:
         # "done" fires, the user watched the example they asked for appear
         # then vanish. Prioritize not truncating requested content over
         # strict brevity here.
+        #
+        # Cap raised 4 -> 6: confirmed live again with a plain multi-step
+        # "how do I file a claim" question (no example/detail modifier at
+        # all) — a genuinely complete, naturally-finished 5-sentence answer
+        # (finish_reason='stop') still got chopped to 4, silently dropping a
+        # real step. Sequential how-to answers routinely need 4-6 steps to
+        # actually be complete; the 300-token budget upstream already bounds
+        # runaway length, so this cap only needs to catch actual rambling,
+        # not cut a legitimate last step.
         # Wrapped in try/except so any edge-case failure keeps the original reply.
         if not _keyword_detailed and not _kv_has_example:
             try:
@@ -3137,9 +3213,9 @@ class MultiSourceRAG:
                 _cap_src = (_corrected_text or _reply_stripped).strip()
                 if _cap_src:
                     # Simple split: find positions of sentence-ending punctuation
-                    # followed by whitespace, then take first 4 chunks.
+                    # followed by whitespace, then take first N chunks.
                     _sent_parts = _re.split(r'(?<=[.!?])\s+', _cap_src)
-                    _MAX_SENTENCES = 4
+                    _MAX_SENTENCES = 6
                     if len(_sent_parts) > _MAX_SENTENCES:
                         _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
                         # Ensure it ends cleanly
