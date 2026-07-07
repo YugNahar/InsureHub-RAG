@@ -968,15 +968,26 @@ async def _verify_suggestions_grounded(candidates: List[str], context: str) -> L
     if not candidates:
         return []
     numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(candidates))
+    # _GROUNDING_CONTEXT_CHARS (3000) is tuned for _verify_grounding()'s single-
+    # question check and is only half of the ~6000-char budget the context
+    # compressor actually gives full_context here. Truncating to 3000 made this
+    # verifier blind to whichever half of the real context didn't happen to
+    # come first — confirmed live: it rejected "What does cargo insurance
+    # cover?" and "What is hull insurance for?" as ungrounded, yet asking them
+    # directly answered both correctly from dedicated KB content the verifier
+    # never saw. Use the full budget so it judges against everything the
+    # answer was actually grounded in.
     prompt = (
-        f"Context:\n{context[:_GROUNDING_CONTEXT_CHARS]}\n\n"
+        f"Context:\n{context[:_SUGGESTION_VERIFY_CONTEXT_CHARS]}\n\n"
         f"Candidate follow-up questions:\n{numbered}\n\n"
-        "For each numbered question, could it be FULLY and SPECIFICALLY "
-        "answered using ONLY the context above — not just a topic the "
-        "context mentions in passing, but enough detail there to actually "
-        "answer it? Respond with ONLY the numbers of the questions that "
-        "CAN be fully answered, comma-separated (e.g. \"2,3\"). If none "
-        "can, respond with exactly: none"
+        "Judge each numbered question SEPARATELY and independently — one "
+        "question being unanswerable must NOT affect your judgment of the "
+        "others. For each one, could it be FULLY and SPECIFICALLY answered "
+        "using ONLY the context above — not just a topic the context "
+        "mentions in passing, but enough detail there to actually answer "
+        "it? Respond with ONLY the numbers of the questions that CAN be "
+        "fully answered, comma-separated (e.g. \"2,3\"). If none can, "
+        "respond with exactly: none"
     )
     try:
         raw = await _backend_completion(prompt, max_tokens=20, timeout=12)
@@ -1210,6 +1221,12 @@ async def _extract_intent_topics(question: str) -> set[str]:
 # earlier context[:1000] pattern elsewhere in this file bound auxiliary-call
 # input size for latency.
 _GROUNDING_CONTEXT_CHARS = 3000
+
+# _verify_suggestions_grounded() judges candidates against the SAME full_context
+# the answer was generated from (already capped at ~6000 chars by the context
+# compressor's budget), not a fresh single-question lookup — so it needs the
+# whole thing, not the smaller 3000-char slice tuned for _verify_grounding().
+_SUGGESTION_VERIFY_CONTEXT_CHARS = 6000
 
 
 async def _verify_grounding(question: str, context: str, backend_override: Optional[str] = None) -> bool:
