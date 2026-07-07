@@ -1074,6 +1074,41 @@ def _is_likely_followup(question: str) -> bool:
             if not _INSURANCE_INDICATORS_LOCAL.search(q_lower):
                 return True
 
+    # A short question using only GENERIC insurance-process vocabulary
+    # ("claim", "premium", "documents", "cost"...) but no SPECIFIC
+    # insurance-type noun (motor, life, health, travel, home...) still
+    # depends on whatever type was being discussed — it isn't self-contained
+    # just because it contains an insurance word. Confirmed live: "How do I
+    # file a claim" asked right after "What is life insurance" fell through
+    # every check above (no follow-up opener, no _FOLLOWUP_KEYWORDS match,
+    # no detail/simple/example modifier) and was treated as a fresh,
+    # standalone question — so it skipped _reformulate_query entirely and
+    # retrieval ran on the bare, topic-less phrase, returning confident
+    # motor-insurance claim content (roadside assistance, police report)
+    # instead of anything about life insurance, or a refusal.
+    if len(words) <= 10:
+        _GENERIC_PROCESS_RE = re.compile(
+            r"\b(claim|claims|premium|premiums|deductible|deductibles|"
+            r"policy|policies|documents?|paperwork|process|renew|renewal|"
+            r"cancel|cancellation|cost|price|apply|application)\b"
+        )
+        _SPECIFIC_TYPE_RE = re.compile(
+            r"\b(motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
+            r"life|term\s*life|whole\s*life|endowment|ulip|"
+            r"health|medical|hospital|"
+            r"travel|trip|flight|baggage|"
+            r"home|house|property|landlord|tenant|"
+            r"marine|cargo|fire|"
+            r"liability|third.party|"
+            r"critical\s*illness|cancer|"
+            r"group|corporate|reinsurance|takaful|"
+            r"crop|agricultur\w*|"
+            r"personal\s*accident|disability|"
+            r"retirement|pension|annuity)\b"
+        )
+        if _GENERIC_PROCESS_RE.search(q_lower) and not _SPECIFIC_TYPE_RE.search(q_lower):
+            return True
+
     return False
 
 
@@ -2975,6 +3010,15 @@ class MultiSourceRAG:
         # "done" fires, the user watched the example they asked for appear
         # then vanish. Prioritize not truncating requested content over
         # strict brevity here.
+        #
+        # Cap raised 4 -> 6: confirmed live again with a plain multi-step
+        # "how do I file a claim" question (no example/detail modifier at
+        # all) — a genuinely complete, naturally-finished 5-sentence answer
+        # (finish_reason='stop') still got chopped to 4, silently dropping a
+        # real step. Sequential how-to answers routinely need 4-6 steps to
+        # actually be complete; the 300-token budget upstream already bounds
+        # runaway length, so this cap only needs to catch actual rambling,
+        # not cut a legitimate last step.
         # Wrapped in try/except so any edge-case failure keeps the original reply.
         if not _keyword_detailed and not _kv_has_example:
             try:
@@ -2982,9 +3026,9 @@ class MultiSourceRAG:
                 _cap_src = (_corrected_text or _reply_stripped).strip()
                 if _cap_src:
                     # Simple split: find positions of sentence-ending punctuation
-                    # followed by whitespace, then take first 4 chunks.
+                    # followed by whitespace, then take first N chunks.
                     _sent_parts = _re.split(r'(?<=[.!?])\s+', _cap_src)
-                    _MAX_SENTENCES = 4
+                    _MAX_SENTENCES = 6
                     if len(_sent_parts) > _MAX_SENTENCES:
                         _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
                         # Ensure it ends cleanly
