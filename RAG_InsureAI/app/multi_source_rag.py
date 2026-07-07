@@ -2955,8 +2955,17 @@ class MultiSourceRAG:
         # ── Hard sentence cap (brief / conversational mode) ──────────────────
         # Conversational prompts instruct the model to write 3 sentences max.
         # This enforcer guarantees it regardless of model compliance.
+        # Skipped when the user explicitly asked for an example: "simple
+        # language with example" sets has_simple (not has_detail), so
+        # _keyword_detailed is False and this cap used to fire anyway —
+        # confirmed live, a simple+example answer (re-explanation + a
+        # concrete example, naturally 5-6 sentences) got chopped to 4, and
+        # since corrected_text replaces the already-streamed bubble once
+        # "done" fires, the user watched the example they asked for appear
+        # then vanish. Prioritize not truncating requested content over
+        # strict brevity here.
         # Wrapped in try/except so any edge-case failure keeps the original reply.
-        if not _keyword_detailed:
+        if not _keyword_detailed and not _kv_has_example:
             try:
                 import re as _re
                 _cap_src = (_corrected_text or _reply_stripped).strip()
