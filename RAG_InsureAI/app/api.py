@@ -482,6 +482,17 @@ async def session_request_handoff(session_id: str):
     return {"assigned": assigned, "status": session.status if session else "unknown"}
 
 
+@app.post("/session/{session_id}/cancel-handoff")
+async def session_cancel_handoff(session_id: str):
+    """HTTP fallback for cancelling a pending handoff when the user WebSocket
+    has dropped — without this, cancelHandoff() on the frontend had no way to
+    tell the server, so the session stayed "waiting" and the next poll tick
+    flipped the UI right back, making Cancel look completely unresponsive."""
+    cancelled = await _agent_hub.cancel_handoff(session_id)
+    session = _agent_hub.get_session(session_id)
+    return {"cancelled": cancelled, "status": session.status if session else "unknown"}
+
+
 @app.get("/session/{session_id}/poll")
 async def session_poll(session_id: str, after: int = 0):
     """
@@ -621,25 +632,12 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
                         })
             elif msg_type == "cancel_handoff":
                 # User explicitly cancelled waiting — send email and release back to AI
-                if session.status == "waiting":
-                    task = _agent_hub._pending_handoffs.pop(session_id, None)
-                    if task:
-                        task.cancel()
-                    session.status = "ai"
-                    session.handoff_exhausted = True
-                    session.email_sent = True
-                    _agent_hub._save_sessions()
-                    unanswerable = next(
-                        (m.content for m in reversed(session.history) if m.role == "user"), ""
-                    )
-                    asyncio.create_task(
-                        _agent_hub.trigger_offline_escalation(session_id, unanswerable)
-                    )
+                cancelled = await _agent_hub.cancel_handoff(session_id)
+                if cancelled:
                     await websocket.send_json({
                         "type": "handoff_timeout",
                         "message": "No problem! I've sent your question to our support team — someone will follow up with you soon. You can keep chatting with me in the meantime! 😊",
                     })
-                    await _agent_hub._broadcast_sessions_update()
             elif msg_type == "message":
                 content = (msg.get("content") or "").strip()
                 if content and session.status == "human":

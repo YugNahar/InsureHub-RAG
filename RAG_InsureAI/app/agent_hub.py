@@ -466,6 +466,36 @@ class AgentHub:
         await self._broadcast_sessions_update()
         return True
 
+    async def cancel_handoff(self, session_id: str) -> bool:
+        """User explicitly cancelled waiting for a human agent — release back
+        to AI and email the team, same outcome as a natural handoff timeout.
+        Shared by both the WebSocket handler and the HTTP fallback below (the
+        WS-only version had no fallback, so a dropped WebSocket meant Cancel
+        silently did nothing server-side — the client optimistically flipped
+        its own UI back to "ai", but the very next poll saw the session was
+        still "waiting" and flipped it right back, making the button look
+        completely unresponsive).
+
+        Returns True if there was an actual pending handoff cancelled, False
+        if the session wasn't in "waiting" state (nothing to do).
+        """
+        session = self._sessions.get(session_id)
+        if not session or session.status != "waiting":
+            return False
+        task = self._pending_handoffs.pop(session_id, None)
+        if task:
+            task.cancel()
+        session.status = "ai"
+        session.handoff_exhausted = True
+        session.email_sent = True
+        self._save_sessions()
+        unanswerable = next(
+            (m.content for m in reversed(session.history) if m.role == "user"), ""
+        )
+        asyncio.create_task(self.trigger_offline_escalation(session_id, unanswerable))
+        await self._broadcast_sessions_update()
+        return True
+
     async def _handoff_timeout(self, session_id: str, unanswerable_query: str):
         """Called after _HANDOFF_TIMEOUT seconds if no agent accepted the popup."""
         await asyncio.sleep(_HANDOFF_TIMEOUT)

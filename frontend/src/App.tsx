@@ -457,11 +457,25 @@ function ChatWidget({
 
   function cancelHandoff() {
     if (chatModeRef.current !== "waiting") return;
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "cancel_handoff" }));
-    }
-    // Optimistically reset — the WS reply will confirm with the email message
     setModeSync("ai");
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      // WS reply (type: "handoff_timeout") delivers the confirmation message.
+      wsRef.current.send(JSON.stringify({ type: "cancel_handoff" }));
+    } else {
+      // WebSocket dropped — use HTTP fallback. Without this, the server never
+      // learned about the cancellation, so the next poll tick (every 1s) saw
+      // status still "waiting" and flipped the UI right back — Cancel looked
+      // completely unresponsive. Push the confirmation locally since there's
+      // no WS to deliver the server's reply.
+      apiFetch(`/session/${sessionId}/cancel-handoff`, { method: "POST" }).catch(() => {});
+      setMessages((m) => [
+        ...m,
+        {
+          role: "system",
+          content: "No problem! I've sent your question to our support team — someone will follow up with you soon. You can keep chatting with me in the meantime! 😊",
+        },
+      ]);
+    }
   }
 
   async function send() {
