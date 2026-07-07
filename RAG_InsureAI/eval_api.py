@@ -91,6 +91,7 @@ _summary_store: Optional[SummaryStore]      = None
 _kv_cache:      Optional[QueryKVCache]      = None
 _compressor:    Optional[ContextCompressor] = None
 _llm_instance:  Optional[Any]               = None
+_multi_source_rag:  Optional[Any]           = None
 
 _KV_CACHE_PATH = os.path.join(_here, "app", "turbovec_data", "kv_cache.json")
 
@@ -146,6 +147,13 @@ def get_eval_llm():
         _llm_instance = None
     return _llm_instance
 
+def get_multi_source_rag():
+    global _multi_source_rag
+    if _multi_source_rag is None:
+        from app.multi_source_rag import MultiSourceRAG
+        _multi_source_rag = MultiSourceRAG()
+    return _multi_source_rag
+
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 from contextlib import asynccontextmanager
@@ -194,6 +202,16 @@ class EvalRequest(BaseModel):
     use_reranker: bool = True
     generate_answer: bool = True
     run_ragas: bool = True
+
+class EvalProductionRequest(BaseModel):
+    query: str
+    history: str = ""
+
+class EvalProductionResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    needs_human: bool
+    is_off_topic: bool
 
 class ChunkInfo(BaseModel):
     chunk_index: int
@@ -1436,6 +1454,22 @@ def eval_query(req: EvalRequest):
     except Exception as exc:
         logger.warning("[EVAL] KV cache store failed: %s", exc)
     return response
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCTION-GROUNDED EVALUATION ENDPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/eval/query-production", response_model=EvalProductionResponse, summary="Run RAG using production MultiSourceRAG pipeline")
+async def eval_query_production(req: EvalProductionRequest):
+    rag = get_multi_source_rag()
+    answer, sources, needs_human, is_off_topic = await rag.ask(
+        question=req.query, history=req.history
+    )
+    return EvalProductionResponse(
+        answer=answer, sources=sources,
+        needs_human=needs_human, is_off_topic=is_off_topic,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

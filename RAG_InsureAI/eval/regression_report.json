@@ -1,143 +1,85 @@
 {
-  "timestamp": "2026-07-06T11:36:19.943921Z",
+  "timestamp": "2026-07-07T07:41:43.302882Z",
   "host": "http://localhost:8002",
   "total": 39,
-  "passed": 12,
-  "failed": 14,
-  "skipped": 13,
+  "passed": 0,
+  "failed": 39,
+  "skipped": 0,
   "results": [
     {
       "id": "standalone_01",
       "category": "standalone",
       "query": "What is takaful insurance?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): Takaful insurance is a type of Islamic insurance that is based on the principles of mutual cooperation and solidarity among participants. It is an alternative to conventional insurance, where participants contribute to a common pool of funds to provide financial protection against unforeseen events. In a takaful system, participants pay premiums, known as contributions, into a fund, which is then used to pay out claims to those who experience a loss. The key difference between takaful and conventional insurance is that takaful is based on the principles of Shariah law, which prohibits the collection and payment of interest, and emphasizes fairness, transparency, and mutual cooperation. Takaful insurance is often used to provide coverage for health, life, and general insurance needs, and is popular in countries with large Muslim populations.",
-      "sources": [
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 4)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true,
         "must_not_contain": [
           "I don't have that specific information"
         ]
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=2"
-        },
-        {
-          "key": "must_not_contain",
-          "expected": [
-            "I don't have that specific information"
-          ],
-          "passed": true,
-          "detail": "all_absent"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "standalone_02",
       "category": "standalone",
       "query": "What is a deductible?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): A deductible is a specified amount of money that the insured must pay out of pocket for healthcare expenses before the insurance plan begins to cover the costs. It is a common feature in many health insurance plans, where the insured is responsible for paying a certain amount, and the insurance company covers the remaining eligible expenses. The deductible amount can vary depending on the insurance plan and provider.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "standalone_03",
       "category": "standalone",
       "query": "What is subrogation in insurance?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): Subrogation in insurance refers to the right of an insurance company to pursue a third party that has caused a loss to its insured, in order to recover the amount of the claim paid to the insured. This means that if an insured person is involved in an accident or suffers a loss due to the actions of another party, the insurance company may step in and take legal action against that party to recover the costs of the claim. The goal of subrogation is to allow the insurance company to recoup its losses and prevent unnecessary increases in premiums. Subrogation can occur in various types of insurance, including health, auto, and property insurance. It is an important concept in insurance law, as it helps to ensure that those responsible for a loss are held accountable and that insurance companies can manage their risks and costs effectively.",
-      "sources": [
-        "f0ba210dc6c1_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 4)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "standalone_04",
       "category": "standalone",
       "query": "What is the free look period?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): The free look period is a specified time frame, usually 15 to 30 days, during which a policyholder can review their insurance policy and cancel it if they are not satisfied. This period allows the policyholder to examine the policy's terms, conditions, and coverage to ensure it meets their needs. If the policyholder decides to cancel the policy during the free look period, they are typically entitled to a full refund of the premium paid, minus any applicable fees. The free look period is an essential consumer protection mechanism that enables policyholders to make informed decisions about their insurance purchases.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 4)",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "standalone_05",
       "category": "standalone",
       "query": "How do I file a claim?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): Filing a claim typically involves notifying the insurance company about the incident or event that triggered the claim, providing required documentation, and following the company's claims process. This usually starts with contacting the insurance provider to report the claim, then submitting supporting documents such as medical records, receipts, or police reports, depending on the type of claim. The insurance company will then review the claim, may request additional information, and eventually notify the policyholder of the claim's status. It's essential to carefully review the policy documents to understand the specific requirements and procedures for filing a claim with your particular insurance provider.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 3)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "follow_up_01",
       "category": "follow_up",
       "query": "What are its principles?",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -150,8 +92,8 @@
       "id": "follow_up_02",
       "category": "follow_up",
       "query": "is it legally required?",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -164,8 +106,8 @@
       "id": "follow_up_03",
       "category": "follow_up",
       "query": "how is it calculated?",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -178,8 +120,8 @@
       "id": "follow_up_04",
       "category": "follow_up",
       "query": "give me an example",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -192,8 +134,8 @@
       "id": "ordinal_01",
       "category": "ordinal",
       "query": "explain the second one",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -206,8 +148,8 @@
       "id": "ordinal_02",
       "category": "ordinal",
       "query": "tell me more about the first point",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -220,8 +162,8 @@
       "id": "ordinal_03",
       "category": "ordinal",
       "query": "what about the last one",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -234,259 +176,141 @@
       "id": "enumeration_01",
       "category": "enumeration",
       "query": "which insurers cover travel to South Africa?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): The provided CONTEXT does not explicitly mention coverage for travel to South Africa. However, it does mention the area of coverage for various plans, including the UAE, GCC, South East Asia, and the Middle East [Doc: 6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf, p.1]. Since South Africa is not listed as a covered area, it is unlikely that these plans cover travel to South Africa. But, emergency coverage is provided worldwide excluding USA & Canada [Doc: 6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf, p.1], which might imply that emergency services could be covered in South Africa. To confirm, it would be best to contact the insurer directly.",
-      "sources": [
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "named_entity_required": true
       },
-      "checks": [
-        {
-          "key": "named_entity_required",
-          "expected": true,
-          "passed": true,
-          "detail": "entity_in_answer=True"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "enumeration_02",
       "category": "enumeration",
       "query": "who offers motor insurance with zero depreciation cover?",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): Typically, motor insurance with zero depreciation cover is offered by various insurance companies, but the specific details and providers can vary depending on the region and market. Zero depreciation cover, also known as zero dep or bumper-to-bumper cover, is an add-on feature that can be included in a comprehensive motor insurance policy. It allows policyholders to claim the full cost of replacing damaged parts without any depreciation being applied, which can significantly reduce out-of-pocket expenses in the event of a claim. However, the CONTEXT provided does not contain information about motor insurance or zero depreciation cover, so it's not possible to identify a specific insurer from the given documents.",
-      "sources": [
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 1)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 3)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "named_entity_required": true
       },
-      "checks": [
-        {
-          "key": "named_entity_required",
-          "expected": true,
-          "passed": true,
-          "detail": "entity_in_answer=True"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "enumeration_03",
       "category": "enumeration",
       "query": "list the insurers that provide health insurance for senior citizens",
-      "status": "pass",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): The provided CONTEXT does not explicitly mention insurers that provide health insurance for senior citizens. However, in general, many health insurance companies offer plans for senior citizens, often with specific coverage and premium structures tailored to this demographic. Some common features of senior citizen health insurance plans include higher premiums due to the increased risk of health issues, coverage for age-related health concerns such as vision, hearing, and dental care, and sometimes, additional benefits like home care or long-term care. Examples of insurers that may offer such plans include major health insurance companies, but the specific details and availability can vary widely depending on the location and the insurer.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 4)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 3)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "named_entity_required": true
       },
-      "checks": [
-        {
-          "key": "named_entity_required",
-          "expected": true,
-          "passed": true,
-          "detail": "entity_in_answer=True"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "unsupported_01",
       "category": "unsupported",
       "query": "what is the GST rate on insurance premiums?",
-      "status": "fail",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): The GST (Goods and Services Tax) rate on insurance premiums varies by country. In some countries, such as India, the GST rate on insurance premiums is 18%. However, in other countries, such as the United Arab Emirates (where Dubai is located), VAT (Value-Added Tax) is applied at a rate of 5% on insurance premiums, rather than GST. It's essential to note that tax rates and regulations can change, and it's always best to consult with a tax professional or the relevant tax authority for the most up-to-date information.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 1)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse": true
       },
-      "checks": [
-        {
-          "key": "should_refuse",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "unsupported_02",
       "category": "unsupported",
       "query": "what is the current repo rate set by RBI?",
-      "status": "fail",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): The current repo rate set by the Reserve Bank of India (RBI) is not specified in the provided context, as the context appears to be related to health insurance plans and does not mention the RBI or repo rates. The RBI's repo rate is the rate at which the central bank lends money to commercial banks, and it can change over time based on monetary policy decisions. To find the current repo rate, you would need to check the RBI's official website or other reliable financial news sources for the most up-to-date information.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 4)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse": true
       },
-      "checks": [
-        {
-          "key": "should_refuse",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "unsupported_03",
       "category": "unsupported",
       "query": "who is the CEO of LIC right now?",
-      "status": "fail",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): The CEO of LIC (Life Insurance Corporation of India) is not specified in the provided context, and the documents appear to be related to health insurance plans offered by other companies. To find the current CEO of LIC, I would recommend checking the official LIC website or recent news articles for the most up-to-date information.",
-      "sources": [
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 1)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse": true
       },
-      "checks": [
-        {
-          "key": "should_refuse",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "unsupported_04",
       "category": "unsupported",
       "query": "what is IDV in motor insurance?",
-      "status": "fail",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): IDV in motor insurance stands for Insured Declared Value. It is the maximum amount that an insurance company will pay in the event of a claim, typically in cases of total loss or theft of the vehicle. The IDV is usually calculated based on the manufacturer's listed selling price of the vehicle, minus depreciation, and is used to determine the premium amount for the insurance policy. It represents the current market value of the vehicle at the time of policy purchase or renewal.",
-      "sources": [
-        "f0ba210dc6c1_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 6)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse": true
       },
-      "checks": [
-        {
-          "key": "should_refuse",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "greeting_01",
       "category": "greeting",
       "query": "hi",
-      "status": "fail",
-      "reason": "",
-      "answer": "Hello. How can I assist you with your insurance-related query today?",
-      "sources": [
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 1)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 6)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_greeting_response": true,
         "no_retrieval_expected": true
       },
-      "checks": [
-        {
-          "key": "is_greeting_response",
-          "expected": true,
-          "passed": true,
-          "detail": "MANUAL_REVIEW"
-        },
-        {
-          "key": "no_retrieval_expected",
-          "expected": true,
-          "passed": false,
-          "detail": "sources_empty=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "greeting_02",
       "category": "greeting",
       "query": "hello there",
-      "status": "fail",
-      "reason": "",
-      "answer": "Hello. How can I assist you with your insurance-related questions today?",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 6)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 5)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_greeting_response": true,
         "no_retrieval_expected": true
       },
-      "checks": [
-        {
-          "key": "is_greeting_response",
-          "expected": true,
-          "passed": true,
-          "detail": "MANUAL_REVIEW"
-        },
-        {
-          "key": "no_retrieval_expected",
-          "expected": true,
-          "passed": false,
-          "detail": "sources_empty=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "greeting_03",
       "category": "greeting",
       "query": "good morning",
-      "status": "fail",
-      "reason": "",
-      "answer": "Good morning. Is there something I can help you with regarding your insurance documents or would you like to ask a specific question?",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 3)",
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_greeting_response": true,
         "no_retrieval_expected": true
       },
-      "checks": [
-        {
-          "key": "is_greeting_response",
-          "expected": true,
-          "passed": true,
-          "detail": "MANUAL_REVIEW"
-        },
-        {
-          "key": "no_retrieval_expected",
-          "expected": true,
-          "passed": false,
-          "detail": "sources_empty=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "modifier_simple_01",
       "category": "modifier",
       "query": "explain in simple words",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -499,8 +323,8 @@
       "id": "modifier_detail_01",
       "category": "modifier",
       "query": "can you explain in more detail",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -513,8 +337,8 @@
       "id": "modifier_example_01",
       "category": "modifier",
       "query": "can you give me an example",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -527,99 +351,60 @@
       "id": "compound_01",
       "category": "compound",
       "query": "what is a deductible and what is the GST rate on insurance premiums",
-      "status": "fail",
-      "reason": "",
-      "answer": "General knowledge (not from uploaded documents): \n\nA deductible is a specific amount that the insured must pay out of pocket for a medical expense before the insurance coverage kicks in. It is a common feature in many health insurance plans, where the insured is required to pay a certain amount, and the insurance company covers the remaining amount up to the policy limits.\n\nThe GST (Goods and Services Tax) rate on insurance premiums varies by country. In the United Arab Emirates (UAE), where the documents appear to be from, the VAT (Value-Added Tax) rate is 5% on insurance premiums. However, this information is not explicitly mentioned in the provided context. \n\nNote: The provided context does not mention deductibles or GST rates on insurance premiums. The answer is based on general knowledge of insurance principles.",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf (page 2)",
-        "f0ba210dc6c1_Group_Medical_Insurance_RegionalandLocal_Plans.pdf (page 2)"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse": true
       },
-      "checks": [
-        {
-          "key": "should_refuse",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "compound_02",
       "category": "compound",
       "query": "what is a no-claim bonus and how are premiums calculated for fire insurance",
-      "status": "pass",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99856, Requested 1770. Please try again in 23m24.864s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf",
-        "f0ba210dc6c1_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "partial_grounding_review_needed": true
       },
-      "checks": [
-        {
-          "key": "partial_grounding_review_needed",
-          "expected": true,
-          "passed": true,
-          "detail": "MANUAL_REVIEW"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "quoted_comparison_01",
       "category": "quoted_comparison",
       "query": "difference between \"floater policy\" and \"specific policy\" in fire insurance",
-      "status": "fail",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99833, Requested 1928. Please try again in 25m21.504s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse_if_either_term_absent": true
       },
-      "checks": [
-        {
-          "key": "should_refuse_if_either_term_absent",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "quoted_comparison_02",
       "category": "quoted_comparison",
       "query": "what's the difference between \"reinsurance\" and \"coinsurance\"",
-      "status": "fail",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99821, Requested 1657. Please try again in 21m16.992s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_refuse_if_either_term_absent": true
       },
-      "checks": [
-        {
-          "key": "should_refuse_if_either_term_absent",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "short_followup_01",
       "category": "short_followup",
       "query": "yes",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -632,8 +417,8 @@
       "id": "short_followup_02",
       "category": "short_followup",
       "query": "why though",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -646,122 +431,73 @@
       "id": "typo_01",
       "category": "typo_correction",
       "query": "what is the deductable amount",
-      "status": "pass",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99782, Requested 1757. Please try again in 22m9.696s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=1"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "typo_02",
       "category": "typo_correction",
       "query": "is co insurance the same as re insurance",
-      "status": "pass",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99743, Requested 1783. Please try again in 21m58.464s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=2"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "off_topic_01",
       "category": "off_topic",
       "query": "what's the weather today",
-      "status": "fail",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99691, Requested 1861. Please try again in 22m20.928s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_off_topic_refusal": true
       },
-      "checks": [
-        {
-          "key": "is_off_topic_refusal",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "off_topic_02",
       "category": "off_topic",
       "query": "who won the cricket world cup",
-      "status": "fail",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99650, Requested 1914. Please try again in 22m31.296s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_off_topic_refusal": true
       },
-      "checks": [
-        {
-          "key": "is_off_topic_refusal",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "off_topic_03",
       "category": "off_topic",
       "query": "can you write me a python script",
-      "status": "fail",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99630, Requested 1755. Please try again in 19m56.639999999s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf",
-        "6f338c4e2583_Group_Medical_Insurance_RegionalandLocal_Plans.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_off_topic_refusal": true
       },
-      "checks": [
-        {
-          "key": "is_off_topic_refusal",
-          "expected": true,
-          "passed": false,
-          "detail": "refusal=False"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "fresh_topic_after_followup_01",
       "category": "topic_switch",
       "query": "what is the waiting period for maternity coverage?",
-      "status": "skipped",
-      "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
       "answer": "",
       "sources": [],
       "expect": {
@@ -774,52 +510,28 @@
       "id": "user_statement_01",
       "category": "user_statement",
       "query": "I recently bought a term life insurance plan",
-      "status": "fail",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99585, Requested 1775. Please try again in 19m35.04s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "is_acknowledgment_response": true,
         "no_retrieval_expected": true
       },
-      "checks": [
-        {
-          "key": "is_acknowledgment_response",
-          "expected": true,
-          "passed": true,
-          "detail": "MANUAL_REVIEW"
-        },
-        {
-          "key": "no_retrieval_expected",
-          "expected": true,
-          "passed": false,
-          "detail": "sources_empty=False  sources=1"
-        }
-      ]
+      "checks": []
     },
     {
       "id": "calculation_01",
       "category": "calculation",
       "query": "if my sum insured is 500000 and I have a 10% no-claim bonus, what is my total cover?",
-      "status": "pass",
-      "reason": "",
-      "answer": "[LLM error: Error code: 429 - {'error': {'message': 'Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01kwhwdzdefpmvn6zmhd2bsk89` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99562, Requested 1772. Please try again in 19m12.576s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}]",
-      "sources": [
-        "11d4cf2d1578_17-Health-Plus-TOB-Dubai-Feb-2022.pdf"
-      ],
+      "status": "error",
+      "reason": "HTTP 404 from http://localhost:8002/eval/query-production: {\"detail\":\"Not Found\"}",
+      "answer": "",
+      "sources": [],
       "expect": {
         "should_ground": true
       },
-      "checks": [
-        {
-          "key": "should_ground",
-          "expected": true,
-          "passed": true,
-          "detail": "grounded=True  refusal=False  sources=1"
-        }
-      ]
+      "checks": []
     }
   ]
 }

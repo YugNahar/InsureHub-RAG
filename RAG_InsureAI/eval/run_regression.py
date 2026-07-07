@@ -117,6 +117,15 @@ def _check_expectation(
         # phrase indicating the question is off-topic.
         return (is_refusal, f"refusal={is_refusal}")
 
+    if expect_key == "is_greeting_response":
+        # Production ask() doesn't have ask_stream()'s fast paths, so a
+        # greeting retrieves normally — just check it doesn't refuse.
+        return (not is_refusal, f"greeting_not_refused={not is_refusal}  refusal={is_refusal}")
+
+    if expect_key == "is_acknowledgment_response":
+        # Same loose check — just verify not a refusal.
+        return (not is_refusal, f"acknowledgment_not_refused={not is_refusal}  refusal={is_refusal}")
+
     if expect_key == "must_not_contain":
         # expect_value is a list of phrases; ALL must be absent from the
         # answer (case-insensitive). Passes if the list is empty.
@@ -131,16 +140,12 @@ def _check_expectation(
     return (True, "MANUAL_REVIEW")
 
 
-def _post_query(host: str, query: str) -> dict:
-    """POST a query to the eval API and return the parsed JSON response."""
-    url = f"{host.rstrip('/')}/eval/query"
+def _post_query(host: str, query: str, history: str = "") -> dict:
+    """POST a query to the production eval API and return the parsed JSON response."""
+    url = f"{host.rstrip('/')}/eval/query-production"
     payload = json.dumps({
         "query": query,
-        "top_k": 8,
-        "use_hybrid": True,
-        "use_reranker": True,
-        "generate_answer": True,
-        "run_ragas": False,
+        "history": history,
     }).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -212,31 +217,9 @@ def main() -> None:
 
         logger.info("[%s] %s  query=%r", category, case_id, query[:60])
 
-        # Check for history field — EvalRequest has no "history" field, so
-        # history-bearing cases must be skipped.
-        if history:
-            logger.warning(
-                "[%s] %s — SKIPPED (EvalRequest has no 'history' field)",
-                category, case_id,
-            )
-            result = {
-                "id": case_id,
-                "category": category,
-                "query": query,
-                "status": "skipped",
-                "reason": "EvalRequest has no 'history' field; history-bearing cases cannot be submitted via /eval/query",
-                "answer": "",
-                "sources": [],
-                "expect": expect,
-                "checks": [],
-            }
-            results.append(result)
-            skipped += 1
-            continue
-
-        # POST to API
+        # POST to API (history is passed through; empty string for history-less cases)
         try:
-            data = _post_query(host, query)
+            data = _post_query(host, query, history=history)
         except Exception as exc:
             logger.error("[%s] %s — ERROR: %s", category, case_id, exc)
             result = {
