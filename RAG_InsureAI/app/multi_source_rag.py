@@ -1088,8 +1088,19 @@ async def _reformulate_query(question: str, history: str) -> str:
     Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
     Falls back to the original question on any error.
     """
-    # Use only the last 6 lines (3 turns) of history to keep the prompt short
-    recent = '\n'.join(history.strip().split('\n')[-6:])
+    # Use only the last 6 turns (3 Q&A pairs) of history to keep the prompt
+    # short. Used to slice by raw newline count instead of turn boundaries —
+    # confirmed live: a multi-paragraph, numbered-list detailed answer alone
+    # spans more than 6 newlines, so "last 6 lines" only captured the tail
+    # end of the MOST RECENT answer (e.g. "...the lump-sum payment helps
+    # Sarah focus on recovery") and never saw the subject established earlier
+    # in that same answer ("critical illness insurance"). The follow-up "what
+    # is its purpose" got reformulated to "lump-sum payment purpose in
+    # insurance policy" — grammatically fine, but missing the actual topic —
+    # so retrieval pulled unrelated content and the question was refused.
+    # _split_history_turns() slices on "User:"/"Assistant:" boundaries so a
+    # long answer is kept whole instead of being cut mid-turn.
+    recent = '\n'.join(_split_history_turns(history)[-6:])
     prompt = f"""Rewrite the follow-up question as a short standalone search query using the conversation context.
 Use precise insurance/legal terms that would appear in a textbook (not casual phrasing).
 Output ONLY the search query — no quotes, no explanation, nothing else.
