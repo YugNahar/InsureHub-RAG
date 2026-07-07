@@ -1631,16 +1631,31 @@ def _extract_point_number(question: str) -> Optional[int]:
 
 
 def _extract_point_text_from_history(history: str, point_num: int) -> Optional[str]:
-    """Find the most recent assistant turn with a numbered list and return
-    just point *point_num*'s own text from it — None if no numbered list is
-    found, or that point number isn't in it."""
-    for turn in reversed(_split_history_turns(history)):
+    """Find point *point_num*'s own text in the MOST RECENT assistant turn's
+    numbered list — None if that turn isn't numbered, or that point number
+    isn't in it.
+
+    Deliberately does NOT keep searching older turns when the most recent
+    answer has no numbered list. Used to `continue` past it and grab a
+    numbered list from further back in history — confirmed live: the most
+    recent answer used a "Term: description" glossary-style format with no
+    digit markers (a real, separate formatting drift, tracked elsewhere),
+    so this fell through to a numbered list from an unrelated, much earlier
+    turn in the same long-running session (a property/fire insurance
+    example) and fed it into a follow-up about the CURRENT health insurance
+    answer — wrong-topic content injected as if it were "point 2" of what
+    the user was actually looking at. "Point 2" always means point 2 of the
+    answer on screen right now; if that answer isn't numbered, there's no
+    point 2 to find, full stop — don't guess from history.
+    """
+    turns = _split_history_turns(history)
+    for turn in reversed(turns):
         if not turn.startswith("Assistant:"):
             continue
         content = turn[len("Assistant:"):].strip()
         matches = list(_NUMBERED_POINT_RE.finditer(content))
         if not matches:
-            continue
+            return None
         for i, m in enumerate(matches):
             if int(m.group(1)) == point_num:
                 start = m.end()
