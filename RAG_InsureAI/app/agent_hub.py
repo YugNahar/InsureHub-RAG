@@ -25,7 +25,14 @@ _AGENT_ACTIVITY_FILE = os.path.join(_HERE, "agent_activity.json")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M")
+    # ISO 8601 with an explicit UTC offset (not a bare "HH:MM") so the frontend
+    # can actually convert it to the viewer's local time zone. A bare "HH:MM"
+    # string already threw away the date and offset, so any attempt to display
+    # it "in local time" was just echoing the server's UTC clock — every
+    # non-UTC viewer saw a wrong time with no way to correct for it after the
+    # fact. Every ChatMessage.timestamp goes through this function, so this is
+    # the single choke point for the fix.
+    return datetime.now(timezone.utc).isoformat()
 
 def _now_full() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -242,6 +249,25 @@ class AgentHub:
                 pass
         del self._sessions[session_id]
         self._save_sessions()
+        # Also prune this session from every agent's persistent chat-history log
+        # (_agent_records[name]["chats"]) — that log survives independently of
+        # self._sessions and used to be untouched by delete, so a deleted
+        # session's card stayed visible forever in the super-admin's per-agent
+        # "Chats" tab. Clicking Delete on that lingering card always failed
+        # with "not found" (the live session really was gone), which is where
+        # the confusing "already deleted" error was coming from. Pruning here
+        # makes the card disappear everywhere delete is expected to reach.
+        _records_changed = False
+        for rec in self._agent_records.values():
+            _chats = rec.get("chats")
+            if not _chats:
+                continue
+            _kept = [c for c in _chats if c.get("session_id") != session_id]
+            if len(_kept) != len(_chats):
+                rec["chats"] = _kept
+                _records_changed = True
+        if _records_changed:
+            self._save_agent_records()
         # Notify every connected agent to remove this session from their view immediately
         for agent in list(self._agents.values()):
             agent.monitoring.discard(session_id)

@@ -430,7 +430,7 @@ async function renderSessionMsgs(sid, viewMode) {
       ? filtered.map(renderAgentOnlyMsg).join('')
       : filtered.map(m => `
           <div class="msg role-${m.role}">
-            <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(m.timestamp||'')}</div>
+            <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(fmtTime(m.timestamp)||'')}</div>
             <div class="msg-bubble">${h(m.content)}</div>
           </div>`).join('');
   } catch(ex) {
@@ -683,9 +683,24 @@ function filterAgentOnly(messages) {
     if (m.role === 'agent') { out.push(m); continue; }
     if (m.role !== 'user') continue;
 
-    // Backend-tagged: email was sent but no agent responded
+    // Backend-tagged: email was sent because Layla couldn't answer. If an agent
+    // later resolved it from the "Unanswered Queries" panel, escalation_resolved
+    // is set and a linked agent reply (meta.answers_index === i) exists — show it
+    // as answered instead of leaving the stale "not answered" flag from when it
+    // was first escalated.
     if (m.meta && m.meta.escalation_sent) {
-      out.push({...m, _not_answered: true, _reason: 'email_sent'});
+      if (m.meta.escalation_resolved) {
+        const reply = messages.find(x => x.role === 'agent' && x.meta && x.meta.answers_index === i);
+        out.push({
+          ...m,
+          _answered: true,
+          _resolved_by: m.meta.resolved_by || '',
+          _answer_text: reply ? reply.content : '',
+          _answer_time: reply ? reply.timestamp : '',
+        });
+      } else {
+        out.push({...m, _not_answered: true, _reason: 'email_sent'});
+      }
       continue;
     }
 
@@ -726,16 +741,27 @@ function filterAgentOnly(messages) {
 
 function renderAgentOnlyMsg(m) {
   let badge = '';
+  let answerBlock = '';
   if (m._not_answered) {
     const label = m._reason === 'email_sent'
       ? '🔴 NOT ANSWERED — email sent, no agent responded'
       : '🔴 NOT ANSWERED — outside knowledge base, no agent was available';
     badge = `<span style="background:#ef444420;color:#ef4444;font-size:.65rem;font-weight:700;border-radius:4px;padding:1px 6px;margin-left:8px;border:1px solid #ef444440">${label}</span>`;
+  } else if (m._answered) {
+    const label = '🟢 ANSWERED' + (m._resolved_by ? ` by ${h(m._resolved_by)}` : '');
+    badge = `<span style="background:#22c55e20;color:#22c55e;font-size:.65rem;font-weight:700;border-radius:4px;padding:1px 6px;margin-left:8px;border:1px solid #22c55e40">${label}</span>`;
+    if (m._answer_text) {
+      answerBlock = `<div class="msg-bubble" style="margin-top:6px;border-left:3px solid #22c55e;background:#22c55e10">
+        <div style="font-size:.65rem;font-weight:700;color:#22c55e;margin-bottom:2px">ANSWER${m._answer_time ? ' · ' + h(fmtTime(m._answer_time)) : ''}</div>
+        ${h(m._answer_text)}
+      </div>`;
+    }
   }
   return `
     <div class="msg role-${m.role}">
-      <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(m.timestamp||'')}${badge}</div>
+      <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(fmtTime(m.timestamp)||'')}${badge}</div>
       <div class="msg-bubble">${h(m.content)}</div>
+      ${answerBlock}
     </div>`;
 }
 
@@ -759,7 +785,7 @@ async function loadChatMsgs(idx, sid, viewMode) {
       ? filtered.map(renderAgentOnlyMsg).join('')
       : filtered.map(m => `
           <div class="msg role-${m.role}">
-            <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(m.timestamp||'')}</div>
+            <div class="msg-header">${roleName(m.role)}&nbsp;&nbsp;${h(fmtTime(m.timestamp)||'')}</div>
             <div class="msg-bubble">${h(m.content)}</div>
           </div>`).join('');
   } catch(ex) {
@@ -776,8 +802,15 @@ async function doDeleteSession(sid, onSuccess) {
       headers: {'X-Super-Admin-Token': token},
     });
     const d = await r.json();
-    if (d.ok) { toast('Chat deleted'); onSuccess(); }
-    else toast('Session not found or already deleted.', true);
+    if (d.ok) {
+      toast('Chat deleted');
+    } else {
+      // Already gone server-side — the end state the user wants (card gone)
+      // is the same either way, so don't leave a stale card sitting there
+      // with a Delete button that will just fail again next time.
+      toast('Already removed from server', false);
+    }
+    onSuccess();
   } catch(ex) {
     toast('Delete failed — ' + ex.message, true);
   }
@@ -800,6 +833,17 @@ async function doAssign(sessionId, agentName) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+// Message timestamps are ISO 8601 with a UTC offset (e.g. "2026-07-07T14:23:45+00:00"),
+// so they can be converted to the viewer's local time zone. Older persisted
+// messages only have a bare "HH:MM" (no date/offset — the pre-fix format),
+// which can't be recovered or converted; those are shown as-is.
+function fmtTime(ts) {
+  if (!ts) return '';
+  if (!ts.includes('T')) return ts; // legacy bare "HH:MM", nothing to convert
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;
+  return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+}
 function roleName(role) {
   if (role === 'user')   return 'USER';
   if (role === 'agent')  return 'AGENT';
