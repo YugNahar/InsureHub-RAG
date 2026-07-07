@@ -2933,12 +2933,14 @@ class MultiSourceRAG:
         if not streamed_ok:
             # Fallback: regular invoke (no streaming) — only reached for
             # openai/anthropic backends, or if the vLLM/Groq streaming call
-            # above raised an exception.
+            # above raised an exception.  We buffer the full response and
+            # apply all post-processing (Rule4 strip, truncation detection,
+            # sentence cap) BEFORE yielding, so the client never sees raw
+            # un-corrected text.
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
             answer = _strip_markdown(_strip_model_preamble(answer))
             _kv_reply = answer
-            yield answer
 
         # ── Rule 4 fallback strip ─────────────────────────────────────────────
         # The 7B model sometimes generates real content from training knowledge
@@ -3037,6 +3039,16 @@ class MultiSourceRAG:
                         _kv_reply = _capped
             except Exception as _cap_exc:
                 logger.debug("[ask_stream] sentence cap skipped: %s", _cap_exc)
+
+        # ── Buffered-path single yield (after all corrections) ────────────────
+        # The non-streaming (buffered) path above stored the raw answer in
+        # _kv_reply but did NOT yield it — we waited until after Rule4 strip,
+        # truncation detection, and sentence cap so the client never sees
+        # un-vetted text even momentarily.  Yield exactly once, only for the
+        # buffered path; the live-streaming path already yielded tokens as
+        # they arrived and must NOT hit this yield.
+        if not streamed_ok:
+            yield (_corrected_text or _reply_stripped)
 
         # ── KV cache write ────────────────────────────────────────────────────
         # Only cache real answers, not handoff/fallback messages.
