@@ -1607,6 +1607,13 @@ _POINT_REFERENCE_RE = re.compile(
     r'\bpoint\s+(\d+)\b|'
     r'\bthe\s+(\d+)(?:st|nd|rd|th)?\s+point\b|'
     r'\bthe\s+(' + '|'.join(_ORDINAL_WORDS) + r')\s+point\b|'
+    # Bare "N point" with no leading "the" — e.g. "explain 2 point in detail".
+    # Confirmed live: "can you explain 2 point in simple language with
+    # example" fell through every existing alternative above (all require
+    # either "point N" ordering or a leading "the"), so _extract_point_number
+    # returned None, point-text extraction never ran, and the question
+    # reached the standalone-retry tier as an apparently topic-less query.
+    r'\b(\d+)(?:st|nd|rd|th)?\s+points?\b|'
     r'\bnumber\s+(\d+)\b|'
     r'\bthe\s+(\d+)(?:st|nd|rd|th)\b(?!\s+\w)',
     re.IGNORECASE,
@@ -2898,11 +2905,23 @@ class MultiSourceRAG:
         # claims content (driving license, FIR for vehicle theft) that has
         # nothing to do with term insurance — a wrong-topic answer, strictly
         # worse than the refusal it was replacing.
+        # A "point N" reference (_extract_point_number returning non-None) is
+        # just as structurally follow-up-dependent as a pronoun, even with no
+        # pronoun word present — "explain point 2" only means something
+        # relative to whatever numbered list is in history. Confirmed live:
+        # "can you explain 2 point in simple language with example" has no
+        # pronoun, so it passed the guard below unchanged, retried standalone
+        # on the bare topic-less text, and confidently answered about
+        # subrogation — a completely unrelated topic pulled from a generic
+        # "general insurance principles" section that ranks well for almost
+        # any vague "explain simply with an example" phrasing. Same failure
+        # mode as the pronoun case, just without a pronoun to catch it.
         _question_tokens = {w.lower().strip('?.,!') for w in question.split()}
         _has_unresolved_pronoun = bool(_question_tokens & _FOLLOWUP_SIGNALS)
+        _has_unresolved_point_ref = _extract_point_number(question) is not None
         if (
             not ctx_covered and not document_filter and not _pasted_grounds_answer
-            and _detected_as_followup and not _has_unresolved_pronoun
+            and _detected_as_followup and not _has_unresolved_pronoun and not _has_unresolved_point_ref
         ):
             _standalone_chunks = await self._retrieve_doc_chunks(
                 question, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
