@@ -2296,7 +2296,11 @@ class MultiSourceRAG:
             # needs_human=True so api.py's existing handoff-trigger logic fires.
             _wants_handoff = (
                 _q_stripped in _HANDOFF_AFFIRM
-                and "connect you with one" in _last_assistant_turn.lower()
+                and any(p in _last_assistant_turn.lower() for p in (
+                    "connect you with one",
+                    "let me get one of our agents",
+                    "let me get a human agent",
+                ))
             )
             if _wants_handoff:
                 import json as _json_s
