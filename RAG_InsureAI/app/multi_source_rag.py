@@ -2259,6 +2259,26 @@ class MultiSourceRAG:
             conditions = [{"source": {"$contains": doc}} for doc in document_filter]
             filter_meta = conditions[0] if len(conditions) == 1 else {"$or": conditions}
 
+        # ── Last assistant turn (for meta-conversation and handoff checks) ─────
+        # Compute once before any fast-path check so Parts 3 and 4 can reuse it.
+        _last_assistant_turn = ""
+        if history:
+            for _turn in reversed(_split_history_turns(history)):
+                if _turn.startswith("Assistant:"):
+                    _last_assistant_turn = _turn[len("Assistant:"):].strip()
+                    break
+        _last_was_refusal_or_error = any(
+            p in _last_assistant_turn.lower() for p in (
+                "i don't have that specific information",
+                "i don't have that in my knowledge base",
+                "let me get one of our agents",
+                "let me get a human agent",
+                "couldn't reach the ai model server",
+                "could not generate an answer",
+                "taking too long",
+            )
+        )
+
         # ── Pure conversational replies — no retrieval needed ─────────────────
         # "yes", "no", "ok", "thanks" etc. have zero retrieval value.
         _PURE_CONV = frozenset({
@@ -2267,8 +2287,26 @@ class MultiSourceRAG:
             "cool", "great", "nice", "fine", "good", "perfect", "awesome",
             "no thanks", "no thank you", "not really", "never mind", "nevermind",
         })
+        _HANDOFF_AFFIRM = frozenset({"yes", "sure", "ok", "okay", "yeah", "yep", "please", "yes please"})
         _q_stripped = question.strip().lower().strip("!.,?;:")
         if _q_stripped in _PURE_CONV:
+            # ── Handoff-affirm fast path (Part 4) ─────────────────────────
+            # If the last assistant message was a handoff offer and the user
+            # says "yes"/"sure"/etc., acknowledge the handoff request with
+            # needs_human=True so api.py's existing handoff-trigger logic fires.
+            _wants_handoff = (
+                _q_stripped in _HANDOFF_AFFIRM
+                and any(p in _last_assistant_turn.lower() for p in (
+                    "connect you with one",
+                    "let me get one of our agents",
+                    "let me get a human agent",
+                ))
+            )
+            if _wants_handoff:
+                import json as _json_s
+                yield "Sure thing! Connecting you with a human agent now — one moment. 😊"
+                yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
+                return
             if _q_stripped in {"yes", "sure", "ok", "okay", "alright", "cool", "great", "perfect", "awesome"}:
                 conv_reply = "Great! Let me know if you have any other questions about insurance. 😊"
             elif _q_stripped in {"no", "nope", "nah", "no thanks", "no thank you", "not really"}:
@@ -2279,6 +2317,29 @@ class MultiSourceRAG:
                 conv_reply = "Sure! Let me know if you have any other questions. 😊"
             import json as _json_s
             yield conv_reply
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+            return
+
+        # ── Meta-conversation clarification after refusal/error (Part 3) ──────
+        # If the previous assistant turn was a refusal/error/handoff message
+        # and the user's very next message is a short clarifying question about
+        # THAT message itself ("meaning?", "why?", "what does that mean"), answer
+        # conversationally instead of attempting KB retrieval on it.
+        _META_CLARIFY_PHRASES = frozenset({
+            "meaning", "meaning?", "what does that mean", "what does this mean",
+            "what do you mean", "why", "why not", "why is that", "what happened",
+            "what does that mean?", "i don't understand", "i dont understand",
+            "huh", "huh?", "what",
+        })
+        _q_meta_check = question.strip().lower().strip("!.,?;:")
+        if _last_was_refusal_or_error and _q_meta_check in _META_CLARIFY_PHRASES:
+            import json as _json_s
+            yield (
+                "Sorry about that! I meant I couldn't find specific details on that "
+                "topic in my knowledge base right now, so I wanted to loop in a human "
+                "agent who could help further. Want me to connect you with one, or "
+                "would you like to try asking in a different way?"
+            )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
@@ -2493,7 +2554,8 @@ class MultiSourceRAG:
             # served verbatim forever until its TTL naturally expires. Check and
             # clean it here too, then persist the corrected version under the
             # current exact key so future exact-match hits are already clean.
-            _r4_cached = _strip_rule4_fallback(_cached_answer)
+            _cached_trust = _kv_hit.get("top_rerank", 0.0) >= 0.05
+            _r4_cached = _strip_rule4_fallback(_cached_answer, trust_content=_cached_trust)
             if _r4_cached is not None:
                 _cached_answer = _r4_cached
                 logger.info("[ask_stream] stripped Rule4 fallback from cached answer (%d chars)", len(_r4_cached))
@@ -2661,6 +2723,7 @@ class MultiSourceRAG:
         ctx_covered = _lex_ok and _semantically_grounded
 
         _dropped_terms_note = None
+        _answered_via_standalone_retry = False
         if not ctx_covered and not document_filter and not _pasted_grounds_answer:
             # Before refusing, retry once with an LLM-cleaned, retrieval-
             # optimized rewrite — fixes general spelling mistakes and strips
@@ -2699,6 +2762,42 @@ class MultiSourceRAG:
                         retrieval_query = _cleaned_query
                         ctx_covered = True
                         _dropped_terms_note = _dropped
+
+        # ── Standalone-retry tier for misclassified follow-ups ──────────────
+        # When the follow-up classification/reformulation was wrong (the
+        # question looked like a pronoun-dependent follow-up but was actually
+        # a fresh standalone query), retry the ORIGINAL question text against
+        # the KB directly — ignoring history and contextualization entirely —
+        # before refusing.  This is a CRAG-style fallback: a lightweight
+        # classifier (heuristic) may be wrong; we verify by trying the
+        # alternate strategy and checking if the result actually grounds.
+        if not ctx_covered and not document_filter and not _pasted_grounds_answer and _detected_as_followup:
+            _standalone_chunks = await self._retrieve_doc_chunks(
+                question, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
+            )
+            _standalone_top = max(
+                (c.metadata.get("rerank_score", float("-inf"))
+                 for c in _standalone_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
+                default=float("-inf"),
+            )
+            if _standalone_top >= _rerank_gate:
+                _standalone_context_preview = "\n\n".join(
+                    c.page_content for c in _standalone_chunks if hasattr(c, "page_content")
+                )
+                # Check standalone against the ORIGINAL question text, not
+                # the followup-reformulated retrieval_query.
+                _standalone_lex_ok = (
+                    _context_covers_query(question, _standalone_chunks, llm_topics=None)
+                    and _quoted_comparison_covered(question, _standalone_chunks)
+                    and _enumeration_query_covered(question, _standalone_chunks)
+                )
+                _standalone_sem_grounded = await _verify_grounding(question, _standalone_context_preview)
+                if _standalone_lex_ok and _standalone_sem_grounded:
+                    all_chunks = _standalone_chunks
+                    retrieval_query = question
+                    ctx_covered = True
+                    _detected_as_followup = False  # answer as a fresh question, not a followup
+                    _answered_via_standalone_retry = True
 
         if not ctx_covered and not document_filter and not _pasted_grounds_answer:
             yield (
@@ -2811,6 +2910,21 @@ class MultiSourceRAG:
                     f"{prompt_question.rstrip(' .?')}. Note: this knowledge base does not have "
                     f"specific information about {_dropped_terms_note} — explicitly say that up front, "
                     f"then answer using the general information you do have."
+                )
+
+            # ── Standalone-retry hedge phrasing ────────────────────────────
+            # When the standalone retry saved the answer (the question was
+            # NOT actually a follow-up to the prior topic), acknowledge the
+            # ambiguity so the model doesn't confidently pretend it knew all
+            # along by opening with something like "If you're asking about
+            # {topic} generally, ..." (the model fills in the actual topic
+            # name itself).
+            if _answered_via_standalone_retry:
+                prompt_question = (
+                    f"{prompt_question.rstrip(' .?')} — this may be a new question "
+                    f"unrelated to the earlier conversation; if so, open your answer "
+                    f"with something like \"If you're asking about {{topic}} generally, \" "
+                    f"before answering, naming the actual topic instead of the placeholder."
                 )
 
             # ── Modifier-signal instruction injection ─────────────────────────
@@ -3161,6 +3275,7 @@ class MultiSourceRAG:
                         "detailed": _keyword_detailed,
                         "has_example": _kv_has_example,
                         "has_simple": _kv_has_simple,
+                        "top_rerank": max(_top_rerank, 0.0),  # persist decision-time confidence for cache-hit trust
                         "suggested_questions": _sugg,
                     },
                     query_embedding=_kv_q_emb,
