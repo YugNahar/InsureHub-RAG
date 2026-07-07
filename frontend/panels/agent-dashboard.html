@@ -1318,7 +1318,7 @@ function appendBubble(role, content, ts) {
     <div class="msg-body">
       <div class="role-label">${roleLabel[role] || role}</div>
       <div class="bubble">${esc(content)}</div>
-      ${ts ? `<div class="msg-meta">${ts}</div>` : ""}
+      ${ts ? `<div class="msg-meta">${esc(fmtTime(ts))}</div>` : ""}
     </div>`;
   row.innerHTML = role === "user"
     ? bodyHtml + `<div class="avatar user">${avatarText.user}</div>`
@@ -1331,7 +1331,7 @@ function appendBubble(role, content, ts) {
 // ── Unanswered Queries panel ───────────────────────────────────────────────────
 function findAnswerFor(index) {
   const reply = currentSessionHistory.find(m => m.role === "agent" && m.meta && m.meta.answers_index === index);
-  return reply ? reply.content : null;
+  return reply || null;
 }
 
 function renderUnansweredPanel() {
@@ -1365,7 +1365,7 @@ function renderUnansweredPanel() {
           <div class="unanswered-item-text">${esc(m.content)}</div>
         </div>
         ${resolved
-          ? `<div class="unanswered-item-answer">✓ Answered${m.meta.resolved_by ? " by " + esc(m.meta.resolved_by) : ""}${answer ? ": " + esc(answer) : ""}</div>`
+          ? `<div class="unanswered-item-answer">✓ Answered${m.meta.resolved_by ? " by " + esc(m.meta.resolved_by) : ""}${answer ? " at " + esc(fmtTime(answer.timestamp)) : ""}${answer ? ": " + esc(answer.content) : ""}</div>`
           : `<div class="unanswered-reply-row">
                <input type="text" placeholder="Type an answer for this query…" id="unanswered-input-${m.index}"
                       onkeydown="if(event.key==='Enter')submitUnansweredReply(${m.index})" />
@@ -1429,6 +1429,18 @@ function toggleSidebar() {
 // ── Util ──────────────────────────────────────────────────────────────────────
 function esc(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>");
+}
+
+// Message timestamps are ISO 8601 with a UTC offset (e.g. "2026-07-07T14:23:45+00:00"),
+// so they can be converted to the viewer's local time zone. Older persisted
+// messages only have a bare "HH:MM" (no date/offset — the pre-fix format),
+// which can't be recovered or converted; those are shown as-is.
+function fmtTime(ts) {
+  if (!ts) return "";
+  if (!ts.includes("T")) return ts; // legacy bare "HH:MM", nothing to convert
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;
+  return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 }
 
 // ── Tunnel URL bar ────────────────────────────────────────────────────────────
