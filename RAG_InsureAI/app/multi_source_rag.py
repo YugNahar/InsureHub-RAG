@@ -1542,26 +1542,24 @@ _RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
 
 def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
     """Handle the LLM appending the canned Rule 4 fallback ("Honestly/Honest,
-    I don't have that specific info...") after already writing something.
+    I don't have that specific info...") after already writing something, or
+    putting the refusal marker FIRST and real content AFTER it.
 
     Returns:
       None            — marker not found, caller should leave text untouched.
       non-empty str   — marker found, trust_content was True, and there was
-                         real content before it (>40 chars) — likely a
-                         genuinely grounded answer with a redundant refusal
-                         glued on; return the answer with the refusal removed.
-      ""              — marker found but trust_content was False (or there
-                         wasn't enough leading content) — the marker is the
-                         model's own admission the leading text isn't solidly
-                         grounded (e.g. it was built from a merely
-                         topic-adjacent chunk). Caller should discard the
-                         whole thing and show the standard refusal instead
-                         of serving an unconfirmed claim as fact.
+                         real content on at least one side of the marker
+                         (>40 chars) — return the best trustworthy content
+                         (before, after, or both joined).
+      ""              — marker found but trust_content was False (or neither
+                         side has enough content) — the marker is the model's
+                         own admission the text isn't solidly grounded.
+                         Caller should discard and show the standard refusal.
 
     trust_content should reflect independent evidence (e.g. a high reranker
-    score) that the leading text is actually grounded — text pattern
-    matching alone can't tell a correct answer with a pointless disclaimer
-    apart from a shaky inference with a legitimate one.
+    score) that the content is actually grounded — text pattern matching
+    alone can't tell a correct answer with a pointless disclaimer apart from
+    a shaky inference with a legitimate one.
 
     Applied both to freshly-generated answers AND to KV cache hits — a cache
     hit can replay an answer that was cached before this fix existed, so the
@@ -1569,12 +1567,41 @@ def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str
     """
     stripped = (text or "").rstrip()
     m = _RULE4_MARKER_RE.search(stripped)
-    if m:
-        real_before = stripped[:m.start()].strip()
-        if trust_content and len(real_before) > 40:
-            return real_before
+    if not m:
+        return None
+
+    real_before = stripped[:m.start()].strip()
+
+    # The refusal sentence itself can run several sentences past the
+    # marker start (e.g. "...I don't have that specific info right now.
+    # Let me get one of our agents on it!") before real content resumes.
+    # Find where the NEXT sentence after the marker begins so we don't
+    # keep fragments of the refusal itself in real_after.
+    tail = stripped[m.end():]
+    # Skip to the first sentence boundary in the tail (end of the
+    # refusal sentence/clause), then trim any immediately-following
+    # generic handoff filler sentence if present.
+    sentence_end = re.search(r'[.!?]\s+', tail)
+    real_after = tail[sentence_end.end():].strip() if sentence_end else ""
+    # Drop a leading handoff-filler sentence from real_after if the model
+    # chained it right after ("...Let me get one of our agents on it...")
+    handoff_lead = re.match(
+        r'(let me get (?:one of our agents|a human agent)[^.!?]*[.!?]\s*)',
+        real_after, re.IGNORECASE,
+    )
+    if handoff_lead:
+        real_after = real_after[handoff_lead.end():].strip()
+
+    if not trust_content:
         return ""
-    return None
+
+    if len(real_before) > 40 and len(real_after) > 40:
+        return f"{real_before} {real_after}".strip()
+    if len(real_before) > 40:
+        return real_before
+    if len(real_after) > 40:
+        return real_after
+    return ""
 
 
 # ── Short follow-up detection & reformulation ──────────────────────────────
@@ -2808,6 +2835,17 @@ class MultiSourceRAG:
         streamed_ok = False
         _kv_reply = ""  # buffer for cache write
 
+        # ── Trust gate: don't live-stream when content won't be trusted ───
+        # _top_rerank < 0.05 means the answer would be discarded if a Rule 4
+        # marker appears (see _r4_trusted below). Skip live token-by-token
+        # streaming in this case — buffer the full response, strip any
+        # refusal marker, THEN yield the clean result — so the user never
+        # sees bad text even momentarily. The non-streaming fallback block
+        # below already implements exactly this "generate fully, then strip,
+        # then yield" flow, so we just force it to run by leaving
+        # streamed_ok = False.
+        _trust_rerank = _top_rerank
+
         _active = _active_backend()
         _stream_url = None
         _stream_model = None
@@ -2828,7 +2866,12 @@ class MultiSourceRAG:
                 "Authorization": f"Bearer {GROQ_API_KEY}",
             }
 
-        if _stream_url:
+        # When the reranker confidence is low (_top_rerank < 0.05), skip
+        # live token-by-token streaming entirely. The non-streaming fallback
+        # below generates the full response, strips any Rule4 refusal marker,
+        # and THEN yields the clean text — so the user never sees bad text
+        # even momentarily. For high-confidence queries, stream live as before.
+        if _stream_url and _trust_rerank >= 0.05:
             model = _stream_model
             url = _stream_url
             payload = {
