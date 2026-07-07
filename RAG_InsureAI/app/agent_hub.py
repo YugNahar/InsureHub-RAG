@@ -856,6 +856,14 @@ class AgentHub:
 
         rec = self._ensure_agent_record(agent.name)
         rec["total_queries_answered"] = rec.get("total_queries_answered", 0) + 1
+        # This reply doesn't belong to any rec["chats"] entry — those track live
+        # session takeovers (agent_send_message), and this path deliberately does
+        # NOT assign/lock the session (see docstring above). get_super_admin_data's
+        # "Today Replies" stat sums chats[].reply_count, so a reply sent from here
+        # was previously invisible to it — total_queries_answered went up but the
+        # per-day count never moved. Log it separately so both are covered without
+        # forcing this into the chats structure's session-locking semantics.
+        rec.setdefault("unanswered_reply_log", []).append(_now_full())
         self._save_agent_records()
 
         await self._broadcast_message_meta_update(session_id, message_index, target.meta)
@@ -1010,6 +1018,10 @@ class AgentHub:
             today_logins = [s for s in rec.get("login_sessions", []) if s.get("login_time", "").startswith(today)]
             today_hours = round(sum(s.get("duration_minutes") or 0 for s in today_logins) / 60, 2)
             today_replies = sum(c.get("reply_count", 0) for c in rec.get("chats", []) if c.get("started_at", "").startswith(today))
+            # Replies sent from the "Unanswered Queries" panel (agent_answer_unanswered)
+            # never create/update a chats[] entry — that path intentionally doesn't take
+            # over the session — so they're logged separately and added here.
+            today_replies += sum(1 for ts in rec.get("unanswered_reply_log", []) if ts.startswith(today))
             cur_login = next((s for s in reversed(rec.get("login_sessions", [])) if s.get("logout_time") is None), None)
             agents_out.append({
                 "name": name,
