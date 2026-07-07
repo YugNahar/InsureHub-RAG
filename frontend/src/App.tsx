@@ -167,6 +167,10 @@ type Message = {
   role: "user" | "assistant" | "agent" | "system";
   content: string;
   agentName?: string;
+  // Set when an agent replies from the "Unanswered Queries" panel — the
+  // original question this reply answers, which may not be the user's most
+  // recent message if they kept chatting with Layla while waiting.
+  answersQuestion?: string;
 };
 
 // Session + history stored in both cookie (1 year) and localStorage.
@@ -326,12 +330,12 @@ function ChatWidget({
         }
 
         // Deliver agent messages not yet shown
-        const newMsgs: { role: string; content: string; timestamp: string }[] = data.messages || [];
+        const newMsgs: { role: string; content: string; timestamp: string; answers_question?: string }[] = data.messages || [];
         for (const m of newMsgs) {
           if (m.role === "agent") {
             setMessages((prev) => [
               ...prev,
-              { role: "agent", content: m.content, agentName: data.agent_name || "Agent" },
+              { role: "agent", content: m.content, agentName: data.agent_name || "Agent", answersQuestion: m.answers_question },
             ]);
           }
         }
@@ -656,7 +660,7 @@ function ChatWidget({
 }
 
 function MessageBubble({ message }: { message: Message }) {
-  const { role, content, agentName } = message;
+  const { role, content, agentName, answersQuestion } = message;
 
   if (role === "system") {
     return (
@@ -686,6 +690,11 @@ function MessageBubble({ message }: { message: Message }) {
       <div className={cn("flex min-w-0 flex-col gap-0.5", isUser ? "items-end w-full" : "flex-1")}>
         {isAgent && agentName && (
           <div className="text-[10px] font-medium text-blue-400 pl-1">{agentName}</div>
+        )}
+        {isAgent && answersQuestion && (
+          <div className="max-w-[85%] rounded-lg border border-blue-500/20 bg-blue-500/5 px-3 py-1.5 text-xs text-muted-foreground">
+            Re: <span className="italic">&ldquo;{answersQuestion}&rdquo;</span>
+          </div>
         )}
         <div
           className={cn(

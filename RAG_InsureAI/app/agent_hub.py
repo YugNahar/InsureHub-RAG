@@ -869,6 +869,7 @@ class AgentHub:
                     "type": "agent_message",
                     "content": content,
                     "agent_name": agent.name,
+                    "answers_question": target.content,
                 })
             except Exception:
                 pass

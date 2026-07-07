@@ -492,10 +492,17 @@ async def session_poll(session_id: str, after: int = 0):
     session = _agent_hub.get_session(session_id)
     if not session:
         return {"status": "ai", "agent_name": "", "messages": [], "total": 0}
-    msgs = [
-        {"role": m.role, "content": m.content, "timestamp": m.timestamp}
-        for m in session.history[after:]
-    ]
+    msgs = []
+    for m in session.history[after:]:
+        entry = {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+        # An agent reply from the "Unanswered Queries" panel answers a specific
+        # earlier question (meta.answers_index), not necessarily the user's most
+        # recent message — surface that question's text so the widget can show
+        # the user which of their (possibly several) questions this is replying to.
+        answers_index = m.meta.get("answers_index") if m.role == "agent" else None
+        if answers_index is not None and 0 <= answers_index < len(session.history):
+            entry["answers_question"] = session.history[answers_index].content
+        msgs.append(entry)
     agent_name = ""
     if session.agent_id and session.agent_id in _agent_hub._agents:
         agent_name = _agent_hub._agents[session.agent_id].name
