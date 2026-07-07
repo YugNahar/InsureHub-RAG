@@ -679,8 +679,16 @@ function filterAgentOnly(messages) {
   const out = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    // Always show agent replies
-    if (m.role === 'agent') { out.push(m); continue; }
+    // Always show agent replies — except ones already embedded inline in an
+    // answered question's card below (meta.answers_index links an "Unanswered
+    // Queries" panel reply back to its question). Pushing it here too showed
+    // the same answer twice: once inline with the question, once as its own
+    // bubble right after.
+    if (m.role === 'agent') {
+      if (m.meta && m.meta.answers_index != null) continue;
+      out.push(m);
+      continue;
+    }
     if (m.role !== 'user') continue;
 
     // Backend-tagged: email was sent because Layla couldn't answer. If an agent
