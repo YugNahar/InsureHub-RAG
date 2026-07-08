@@ -104,6 +104,7 @@ _DEFAULT_CORS_ORIGINS = [
     "https://insurehub-panels.vercel.app",
     # Direct IP access
     "http://123.253.124.14:8501",
+    "https://insurehubrag.nexsysit.co.in", 
 ]
 
 
