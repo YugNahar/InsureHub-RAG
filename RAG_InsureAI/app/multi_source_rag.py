@@ -1238,6 +1238,11 @@ async def _reformulate_query(question: str, history: str) -> str:
 Use precise insurance/legal terms that would appear in a textbook, but phrase it as a real question a person would ask — not a keyword list.
 The conversation below is ONLY the single most recent exchange — always ground
 the follow-up in that topic, never in anything outside what's shown here.
+Do NOT add a specific regulation, act, section, jurisdiction, or authority
+(e.g. "under federal law", "under section 80C", "under IRDA regulations")
+unless the conversation itself already named it — inventing one, even a
+plausible-sounding one, measurably hurts retrieval when the actual source
+material frames it differently or doesn't cite a specific provision at all.
 Output ONLY the rewritten question — no quotes, no explanation, nothing else.
 
 Examples:
@@ -1245,10 +1250,10 @@ Examples:
   Follow-up: "what about premiums?" → "What is the premium amount for life insurance?"
 
   Context: "User: explain life insurance\nLayla: Life insurance protects your family..."
-  Follow-up: "is it tax deductible?" → "Are life insurance premiums tax deductible under section 80C?"
+  Follow-up: "is it tax deductible?" → "Are life insurance premiums tax deductible?"
 
   Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers share risk..."
-  Follow-up: "is it legally required?" → "Is reinsurance a legal requirement under regulation?"
+  Follow-up: "is it legally required?" → "Is reinsurance a legal requirement?"
 
   Context: "User: what is subrogation\nLayla: Subrogation means the insurer steps in..."
   Follow-up: "give me an example" → "Can you give a real-life example of subrogation?"
