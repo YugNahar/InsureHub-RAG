@@ -1453,19 +1453,10 @@ async def ask_url(req: AskURLRequest):
             f"Text: {context}\n\n"
             f"Question: {question}\n\nAnswer:"
         )
-        from router import VLLM_API_KEY, VLLM_HOST, VLLM_MODEL
-        from langchain_openai import ChatOpenAI
+        from router import get_insurance_llm
         from langchain_core.messages import HumanMessage
 
-        llm = ChatOpenAI(
-            model=VLLM_MODEL,
-            base_url=f"{VLLM_HOST}/v1",
-            api_key=VLLM_API_KEY,
-            temperature=0.3,
-            max_tokens=200,
-            timeout=25,
-            max_retries=1,
-        )
+        llm = get_insurance_llm(temperature=0.3, max_tokens=200)
         try:
             response = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
             answer = response.content.strip()
