@@ -140,6 +140,27 @@
 
   .empty{color:var(--muted);font-size:.83rem;padding:20px;text-align:center}
   .online-since{color:var(--green);font-size:.82rem;margin-bottom:14px;display:flex;align-items:center;gap:6px}
+
+  /* Backend settings */
+  .settings-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 24px;max-width:480px;margin-bottom:16px}
+  .settings-card h3{font-size:.95rem;font-weight:700;margin-bottom:16px}
+  .settings-card label{font-size:.8rem;font-weight:600;color:var(--text);display:block;margin-bottom:4px}
+  .settings-card .field-group{margin-top:12px}
+  .settings-card input[type="text"],.settings-card input[type="password"]{background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 14px;font-size:.9rem;outline:none;width:100%;margin-top:4px;box-sizing:border-box}
+  .settings-card input:focus{border-color:var(--accent)}
+  .settings-card .radio-group{display:flex;gap:18px;flex-wrap:wrap;margin-top:8px}
+  .settings-card .radio-group label{display:flex;align-items:center;gap:6px;font-size:.85rem;font-weight:400;color:var(--text);cursor:pointer}
+  .settings-card .radio-group input[type="radio"]{accent-color:var(--accent);width:16px;height:16px;cursor:pointer;margin:0}
+  .settings-card .manual-fields{display:none}
+  .settings-card .manual-fields.visible{display:block}
+  .settings-card .api-key-set{font-size:.72rem;color:var(--green);margin-top:4px;display:flex;align-items:center;gap:4px}
+  .settings-card .active-backend{font-size:.85rem;color:var(--muted);margin:16px 0 0}
+  .settings-card .active-backend strong{color:var(--accent2)}
+  .settings-card .save-result{font-size:.83rem;font-weight:600;margin-top:14px;display:none}
+  .settings-card .save-result.success{color:var(--green);display:block}
+  .settings-card .save-result.error{color:var(--red);display:block}
+  .settings-card .btn-save{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px 24px;font-size:.85rem;font-weight:600;cursor:pointer;margin-top:18px}
+  .settings-card .btn-save:hover{background:var(--accent2)}
 </style>
 </head>
 <body>
@@ -165,6 +186,7 @@
     <div id="sidebar-tabs">
       <button class="s-tab active" id="s-tab-agents">Agents</button>
       <button class="s-tab" id="s-tab-sessions">All Sessions</button>
+      <button class="s-tab" id="s-tab-settings">Settings</button>
     </div>
     <div id="agent-list"></div>
     <div id="sessions-list" style="display:none"></div>
@@ -182,6 +204,36 @@
       </div>
       <div id="agent-detail"></div>
       <div id="session-detail"></div>
+      <div id="backend-settings" style="display:none">
+        <div class="settings-card">
+          <h3>Backend Settings</h3>
+          <label>Mode</label>
+          <div class="radio-group" id="bs-mode">
+            <label><input type="radio" name="bs-mode" value="auto" /> auto</label>
+            <label><input type="radio" name="bs-mode" value="vllm" /> vllm</label>
+            <label><input type="radio" name="bs-mode" value="groq" /> groq</label>
+            <label><input type="radio" name="bs-mode" value="manual" /> manual</label>
+          </div>
+          <div class="manual-fields" id="bs-manual-fields">
+            <div class="field-group">
+              <label for="bs-base-url">Base URL</label>
+              <input type="text" id="bs-base-url" placeholder="https://..." />
+            </div>
+            <div class="field-group">
+              <label for="bs-model">Model</label>
+              <input type="text" id="bs-model" placeholder="e.g. gpt-4" />
+            </div>
+            <div class="field-group">
+              <label for="bs-api-key">API Key</label>
+              <input type="password" id="bs-api-key" placeholder="•••• (leave blank to keep current)" />
+              <div id="bs-api-key-set" class="api-key-set" style="display:none">✓ API key is set</div>
+            </div>
+          </div>
+          <div class="active-backend" id="bs-active-backend">Currently active: <strong id="bs-active-label">—</strong></div>
+          <button class="btn-save" id="bs-save-btn">Save</button>
+          <div class="save-result" id="bs-result"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -236,6 +288,7 @@ function boot() {
 function setupSidebarTabs() {
   document.getElementById('s-tab-agents').onclick   = () => switchSidebarMode('agents');
   document.getElementById('s-tab-sessions').onclick = () => switchSidebarMode('sessions');
+  document.getElementById('s-tab-settings').onclick = () => switchSidebarMode('settings');
 }
 
 function switchSidebarMode(mode) {
@@ -244,7 +297,24 @@ function switchSidebarMode(mode) {
   document.getElementById('sessions-list').style.display = mode === 'sessions' ? '' : 'none';
   document.getElementById('s-tab-agents').classList.toggle('active',   mode === 'agents');
   document.getElementById('s-tab-sessions').classList.toggle('active', mode === 'sessions');
-  if (mode === 'sessions') renderSidebarSessions();
+  document.getElementById('s-tab-settings').classList.toggle('active', mode === 'settings');
+
+  // Hide all main views
+  document.getElementById('welcome-view').style.display = 'none';
+  document.getElementById('agent-detail').style.display = 'none';
+  document.getElementById('session-detail').style.display = 'none';
+  document.getElementById('backend-settings').style.display = 'none';
+
+  if (mode === 'sessions') {
+    renderSidebarSessions();
+  } else if (mode === 'settings') {
+    document.getElementById('main-title').textContent = 'Backend Settings';
+    document.getElementById('backend-settings').style.display = '';
+    loadBackendSettings();
+  } else {
+    document.getElementById('main-title').textContent = 'Overview';
+    document.getElementById('welcome-view').style.display = '';
+  }
 }
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
@@ -839,6 +909,122 @@ async function doAssign(sessionId, agentName) {
   const d = await r.json();
   toast(d.ok ? `Session assigned to ${agentName}` : 'Failed — agent may be offline or blocked.', !d.ok);
 }
+
+// ── Backend Settings ───────────────────────────────────────────────────────
+// Radio toggle — show/hide manual fields
+document.getElementById('bs-mode').addEventListener('change', e => {
+  const isManual = e.target.value === 'manual';
+  document.getElementById('bs-manual-fields').classList.toggle('visible', isManual);
+});
+
+async function loadBackendSettings() {
+  const resultEl = document.getElementById('bs-result');
+  resultEl.style.display = 'none';
+  try {
+    const r = await fetch('/super-admin/backend-settings', {
+      headers: { 'X-Super-Admin-Token': token },
+    });
+    if (!r.ok) {
+      const detail = await r.json().catch(() => ({ detail: 'Failed to load' }));
+      resultEl.className = 'save-result error';
+      resultEl.textContent = detail.detail || 'Failed to load settings';
+      resultEl.style.display = 'block';
+      return;
+    }
+    const data = await r.json();
+
+    // Set radio
+    document.querySelectorAll('#bs-mode input[type="radio"]').forEach(el => {
+      el.checked = el.value === data.mode;
+    });
+
+    // Toggle manual fields
+    document.getElementById('bs-manual-fields').classList.toggle('visible', data.mode === 'manual');
+
+    // Fill manual fields
+    document.getElementById('bs-base-url').value = data.manual_base_url || '';
+    document.getElementById('bs-model').value = data.manual_model || '';
+
+    // API key — always leave input empty, show label if set
+    document.getElementById('bs-api-key').value = '';
+    const apiKeyLabel = document.getElementById('bs-api-key-set');
+    if (data.manual_api_key_set) {
+      apiKeyLabel.style.display = '';
+    } else {
+      apiKeyLabel.style.display = 'none';
+    }
+
+    // Effective backend
+    document.getElementById('bs-active-label').textContent = data.effective_backend || data.mode;
+
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to load settings: ' + ex.message;
+    resultEl.style.display = 'block';
+  }
+}
+
+// Save button
+document.getElementById('bs-save-btn').onclick = async () => {
+  const resultEl = document.getElementById('bs-result');
+  resultEl.style.display = 'none';
+
+  // Gather selected mode
+  let mode = 'auto';
+  document.querySelectorAll('#bs-mode input[type="radio"]').forEach(el => {
+    if (el.checked) mode = el.value;
+  });
+
+  const body = {
+    mode: mode,
+    manual_api_key: document.getElementById('bs-api-key').value || '',
+    manual_base_url: document.getElementById('bs-base-url').value || '',
+    manual_model: document.getElementById('bs-model').value || '',
+  };
+
+  try {
+    const r = await fetch('/super-admin/backend-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Super-Admin-Token': token },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const detail = await r.json().catch(() => ({ detail: 'Failed to save' }));
+      resultEl.className = 'save-result error';
+      resultEl.textContent = detail.detail || 'Failed to save';
+      resultEl.style.display = 'block';
+      return;
+    }
+    const data = await r.json();
+
+    // Re-populate from response
+    document.querySelectorAll('#bs-mode input[type="radio"]').forEach(el => {
+      el.checked = el.value === data.mode;
+    });
+    document.getElementById('bs-manual-fields').classList.toggle('visible', data.mode === 'manual');
+    document.getElementById('bs-base-url').value = data.manual_base_url || '';
+    document.getElementById('bs-model').value = data.manual_model || '';
+    document.getElementById('bs-api-key').value = '';
+    const apiKeyLabel = document.getElementById('bs-api-key-set');
+    if (data.manual_api_key_set) {
+      apiKeyLabel.style.display = '';
+    } else {
+      apiKeyLabel.style.display = 'none';
+    }
+    document.getElementById('bs-active-label').textContent = data.effective_backend || data.mode;
+
+    // Show success
+    resultEl.className = 'save-result success';
+    resultEl.textContent = 'Saved ✓';
+    resultEl.style.display = 'block';
+    setTimeout(() => { resultEl.style.display = 'none'; }, 3000);
+
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to save: ' + ex.message;
+    resultEl.style.display = 'block';
+  }
+};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 // Message timestamps are ISO 8601 with a UTC offset (e.g. "2026-07-07T14:23:45+00:00"),
