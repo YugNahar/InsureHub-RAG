@@ -800,7 +800,7 @@ async def _backend_completion(
         return None
 
 
-async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]]:
+async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str], bool]:
     """Fallback query cleaner tried only when the primary retrieval attempt
     already failed coverage — fixes general spelling mistakes (not just the
     hand-curated insurance vocabulary _correct_typos() knows) and strips
@@ -817,20 +817,21 @@ async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]
     failing, not primary answer generation, and shouldn't compete for the
     same (rate-limited) Groq quota real answers need.
 
-    Returns (cleaned_query, dropped_terms_summary) — both None on any
-    failure, unconfigured backend, or empty response, so the caller falls
-    through to the existing refusal exactly as it did before this function
-    existed. dropped_terms_summary is computed programmatically from the
-    before/after diff (see _diff_dropped_terms), not self-reported by the
-    model — asking it to also report what it removed was tried first and
-    was unreliable, sometimes echoing the prompt's own example words
+    Returns (cleaned_query, dropped_terms_summary, dropped_has_proper_noun)
+    — cleaned_query and dropped_terms_summary are both None on any failure,
+    unconfigured backend, or empty response, so the caller falls through to
+    the existing refusal exactly as it did before this function existed.
+    dropped_terms_summary is computed programmatically from the before/
+    after diff (see _diff_dropped_terms), not self-reported by the model —
+    asking it to also report what it removed was tried first and was
+    unreliable, sometimes echoing the prompt's own example words
     ("affordable", "cheap", "best") as "dropped" even when they were never
     in the query, or weren't actually removed from the cleaned version.
     """
     import aiohttp as _ah
     from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
     if not VLLM_HOST:
-        return None, None
+        return None, None, False
     prompt = (
         f"Query: {question}\n\n"
         "This insurance-related search query may contain spelling mistakes, "
@@ -859,15 +860,16 @@ async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]
                 timeout=_ah.ClientTimeout(total=12),
             ) as resp:
                 if resp.status != 200:
-                    return None, None
+                    return None, None, False
                 data = await resp.json()
                 raw = data["choices"][0]["message"]["content"].strip()
     except Exception:
-        return None, None
+        return None, None, False
     cleaned = raw.strip().strip('"').strip("'").strip()
     if not cleaned:
-        return None, None
-    return cleaned, _diff_dropped_terms(question, cleaned)
+        return None, None, False
+    _dropped_note, _dropped_proper_noun = _diff_dropped_terms(question, cleaned)
+    return cleaned, _dropped_note, _dropped_proper_noun
 
 
 # Emphasis/qualifier words worth calling out by name if the cleaner drops
@@ -881,17 +883,28 @@ _EMPHASIS_WORDS = frozenset({
 })
 
 
-def _diff_dropped_terms(original: str, cleaned: str) -> Optional[str]:
-    """Return a short, comma-separated list of concrete terms present in
-    *original* but missing from *cleaned* — specifically capitalized words
-    other than the first (likely a proper noun: a country, city, or
-    provider name) and known emphasis words (_EMPHASIS_WORDS). Computed
-    directly from the text rather than trusted from the model's own
-    self-report (see _vllm_clean_query's docstring for why).
+def _diff_dropped_terms(original: str, cleaned: str) -> Tuple[Optional[str], bool]:
+    """Return (short comma-separated list of concrete terms present in
+    *original* but missing from *cleaned*, whether any of them is a likely
+    proper noun) — specifically capitalized words other than the first
+    (likely a proper noun: a country, city, or provider name) and known
+    emphasis words (_EMPHASIS_WORDS). Computed directly from the text
+    rather than trusted from the model's own self-report (see
+    _vllm_clean_query's docstring for why).
+
+    The proper-noun flag matters downstream: dropping "affordable"/"cheap"
+    to get a retrieval match is harmless (the KB's content on the core
+    topic is still factually complete, just not tagged "cheap"), but
+    dropping a country/city/provider name means the KB has no actual
+    content about that specific thing — answering with the generic
+    version and hoping the model remembers to disclose the gap is not
+    reliable enough to trust (see the caller in ask_stream for the
+    concrete failure this was measured against).
     """
     orig_words = original.split()
     clean_lower = cleaned.lower()
     dropped = []
+    has_proper_noun = False
     for i, w in enumerate(orig_words):
         w_clean = w.strip(".,!?;:()[]{}'\"")
         if not w_clean:
@@ -901,7 +914,9 @@ def _diff_dropped_terms(original: str, cleaned: str) -> Optional[str]:
         is_emphasis = w_lower in _EMPHASIS_WORDS
         if (is_proper_noun or is_emphasis) and w_lower not in clean_lower:
             dropped.append(w_clean)
-    return ", ".join(dict.fromkeys(dropped)) if dropped else None
+            if is_proper_noun:
+                has_proper_noun = True
+    return (", ".join(dict.fromkeys(dropped)) if dropped else None, has_proper_noun)
 
 
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
@@ -2968,12 +2983,29 @@ class MultiSourceRAG:
             # "best") that can tank the reranker's score even though the KB
             # covers the core topic well (see _vllm_clean_query's docstring
             # for measured examples). If the cleaned query now passes, the
-            # answer proceeds using it; if something concrete (like a country
-            # name) had to be dropped to get there, that's surfaced to the
-            # user as an explicit "not covered" note rather than silently
-            # answering as if it were specific to what was actually asked.
-            _cleaned_query, _dropped = await _vllm_clean_query(retrieval_query)
-            if _cleaned_query and _cleaned_query.strip().lower() != retrieval_query.strip().lower():
+            # answer proceeds using it — but ONLY when what got dropped was
+            # an emphasis word (affordable/cheap/best), not a proper noun
+            # (country/city/provider name). Confirmed live: a dropped
+            # proper noun means the KB has NO factual content about that
+            # specific thing at all — "which insurers cover travel to South
+            # Africa" cleaned down to "travel insurance", which the KB
+            # covers well, and the prompt-injected instruction to
+            # "explicitly say up front" that South Africa specifically
+            # isn't covered was silently ignored by the model 100% of the
+            # time it was actually exercised (this codebase's small vLLM
+            # model has repeatedly proven unreliable at honoring buried
+            # prompt instructions — see the nominee-caveat and Groq-
+            # hallucination investigations earlier this session). Rather
+            # than trust it to remember, a dropped proper noun is treated
+            # the same as "not covered" — the user gets a clean refusal/
+            # handoff instead of a generic answer standing in for the
+            # specific thing they actually asked about.
+            _cleaned_query, _dropped, _dropped_proper_noun = await _vllm_clean_query(retrieval_query)
+            if (
+                _cleaned_query
+                and not _dropped_proper_noun
+                and _cleaned_query.strip().lower() != retrieval_query.strip().lower()
+            ):
                 _fallback_chunks = await self._retrieve_doc_chunks(
                     _cleaned_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
                 )
