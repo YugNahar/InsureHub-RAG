@@ -1727,6 +1727,56 @@ def _extract_point_text_from_history(history: str, point_num: int) -> Optional[s
     return None
 
 
+_MEANING_QUERY_RE = re.compile(
+    r"^(?:"
+    r"what\s+(?:does|do|is)\s+(?:the\s+word\s+|the\s+term\s+)?"
+    r"['\"]?(?P<w1>[a-z][a-z\s'-]{0,40}?)['\"]?\s+mean\b"
+    r"|what\s+do\s+you\s+mean\s+by\s+['\"]?(?P<w2>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|what\s+is\s+the\s+meaning\s+of\s+['\"]?(?P<w3>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|meaning\s+of\s+['\"]?(?P<w4>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|define\s+['\"]?(?P<w5>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|what\s+does\s+['\"]?(?P<w6>[a-z][a-z\s'-]{0,40}?)['\"]?\s+stand\s+for\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Pronouns/generic fillers the regex above will happily capture as "the
+# word" (e.g. "what does that mean?" → w1="that") but that are never what
+# the user actually wants defined — that phrasing means "explain the thing
+# you just said differently", handled elsewhere by the meta-clarify and
+# contextualization paths, not "look up the dictionary meaning of 'that'".
+_MEANING_QUERY_STOPWORDS = frozenset({
+    "that", "this", "it", "they", "them", "he", "she", "we", "you", "i",
+    "something", "anything", "everything", "nothing", "one", "these", "those",
+})
+
+
+def _extract_meaning_query_word(question: str) -> Optional[str]:
+    """Return the word/short phrase *question* is asking the meaning of
+    ("what does X mean?", "meaning of X", "define X", "what does X stand
+    for?"), or None if it isn't that kind of question.
+
+    Deliberately narrow (anchored patterns, not a loose "contains 'mean'"
+    check) so it doesn't fire on unrelated sentences that happen to contain
+    the word "mean" (e.g. "what does this mean for my premium" — a real
+    coverage question, not a word-definition request). Also filters out
+    pronouns/fillers via _MEANING_QUERY_STOPWORDS, since the regex alone
+    can't distinguish "what does 'discount' mean?" (real word) from "what
+    does that mean?" (pronoun — regex would otherwise capture "that").
+    Callers should still verify the extracted word actually appears in
+    recent history before using it, same discipline as
+    _extract_point_number's callers.
+    """
+    m = _MEANING_QUERY_RE.match(question.strip())
+    if not m:
+        return None
+    for name in ("w1", "w2", "w3", "w4", "w5", "w6"):
+        w = m.group(name)
+        if w and w.strip() and w.strip().lower() not in _MEANING_QUERY_STOPWORDS:
+            return w.strip()
+    return None
+
+
 _HANDOFF_MSG = (
     "I don't have that in my knowledge base right now — "
     "let me get a human agent to help you! 😊"
@@ -3022,6 +3072,39 @@ class MultiSourceRAG:
                     _answered_via_standalone_retry = True
 
         if not ctx_covered and not document_filter and not _pasted_grounds_answer:
+            # Before refusing: "what does X mean?" / "define X" asked right
+            # after X appeared in the bot's own last answer is answerable
+            # even when X has no dedicated KB entry (e.g. "discount" in "a
+            # no-claim bonus is a discount on your premium") — X is an
+            # ordinary word, not an insurance concept, so retrieval finds
+            # nothing and the checks above correctly say "not covered by the
+            # KB". But refusing here is still wrong: the model can define an
+            # ordinary word from its own training knowledge just fine, it
+            # only needs to know WHAT WAS JUST SAID so the definition lands
+            # in the right context (premium discount, not a retail discount)
+            # instead of a generic, disconnected dictionary answer. Gated on
+            # the word actually appearing in the immediately preceding
+            # assistant turn — otherwise this would just be an ungrounded
+            # general-knowledge answer with no relation to what was asked.
+            _meaning_word = _extract_meaning_query_word(question)
+            if (
+                _meaning_word
+                and _last_assistant_turn
+                and re.search(r"\b" + re.escape(_meaning_word.lower()) + r"\b", _last_assistant_turn.lower())
+            ):
+                _meaning_prompt = (
+                    f"You just told the user this:\n\"{_last_assistant_turn}\"\n\n"
+                    f"They're now asking what \"{_meaning_word}\" means, as you just used it above. "
+                    f"Explain it in 1-2 short sentences, plain conversational language, "
+                    f"specifically in that same context — not a generic, unrelated dictionary "
+                    f"definition. You can use your own general knowledge; this word doesn't need "
+                    f"to come from any document."
+                )
+                _meaning_answer = await _backend_completion(_meaning_prompt, max_tokens=120, timeout=10.0)
+                if _meaning_answer and _meaning_answer.strip():
+                    yield _meaning_answer.strip()
+                    yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+                    return
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it — they'll be able to help you better! 😊"
