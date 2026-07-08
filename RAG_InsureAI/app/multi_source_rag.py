@@ -1886,6 +1886,12 @@ def _strip_model_preamble(text: str) -> str:
 
 _RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
 
+# Matches the filler-word usage of "honest," (comma right after, functioning
+# as a sentence-starting interjection) — not a legitimate adjective use like
+# "an honest answer". See the ask_stream call site for why this is fixed
+# deterministically instead of relying on the prompt instruction alone.
+_HONEST_FILLER_RE = re.compile(r"\b([Hh])onest,")
+
 
 def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
     """Handle the LLM appending the canned Rule 4 fallback ("Honestly/Honest,
@@ -3542,6 +3548,22 @@ class MultiSourceRAG:
         # means "relevant enough", just "not pure noise".
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
+
+        # The prompt explicitly says the filler word "honestly" must NEVER be
+        # shortened to "honest," — the model doesn't reliably follow that
+        # (confirmed live, same call, non-deterministic: "Honestly, it's..."
+        # on one run, "Honest, it's..." on the next, identical question and
+        # context). Same lesson as the Rule4/truncation fixes right below:
+        # don't trust a prompt instruction the model won't consistently
+        # honor — enforce it deterministically instead. Only matches the
+        # filler-word usage (comma immediately after "honest"), not a
+        # legitimate adjective use ("an honest answer").
+        _honest_fixed = _HONEST_FILLER_RE.sub(lambda m: f"{m.group(1)}onestly,", _reply_stripped)
+        if _honest_fixed != _reply_stripped:
+            _reply_stripped = _honest_fixed
+            _kv_reply = _honest_fixed
+            _corrected_text = _honest_fixed
+
         _rule4_discarded = False
         _r4_trusted = _top_rerank >= 0.05
         _r4_stripped = _strip_rule4_fallback(_reply_stripped, trust_content=_r4_trusted)
