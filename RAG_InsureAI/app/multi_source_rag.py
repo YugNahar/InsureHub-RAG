@@ -1196,6 +1196,21 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     return phrase
 
 
+# Legislative/tax/administrative boilerplate — a chunk matching this is
+# almost never what a consumer-facing question is actually asking about,
+# even when it happens to name the right insurance type (e.g. "the Act
+# guarantees amounts assured by LIC policies" mentions "life insurance"
+# but is about a government solvency guarantee, not payout amounts). See
+# _prioritize_topic_chunks's docstring for the concrete failure this fixes.
+_REGULATORY_BOILERPLATE_RE = re.compile(
+    r"\b(the act|the bill|stamp duty|income tax act|central government|"
+    r"section\s+\d+[a-z]?\b.{0,20}\bact\b|"
+    r"guarantee[sd]?\s+by\s+the\s+(central\s+)?government|"
+    r"amends?\b|gross\s+total\s+income)\b",
+    re.IGNORECASE,
+)
+
+
 def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     """Reorder *chunks* so ones whose content mentions the query's named
     insurance type (e.g. "health insurance") come before ones that don't —
@@ -1222,15 +1237,38 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
 
     A no-op when the query doesn't name a specific type (single-word
     concept lookups like "what is a deductible" are unaffected).
+
+    Chunks matching _REGULATORY_BOILERPLATE_RE never count as a "topic
+    match" for promotion, even when they literally contain the topic
+    phrase. Confirmed live: "How much does life insurance pay out?"
+    promoted a weak (0.10) chunk about the Insurance Act's central-
+    government solvency guarantee for LIC purely because it contains the
+    words "life insurance" — ahead of a higher-scoring but wrong-topic
+    (health insurance) chunk. That regulatory chunk doesn't answer "how
+    much", but the grounding check judged it "relevant enough" anyway
+    (reproduced 15/15 across 5 different prompt phrasings, including ones
+    naming this exact failure as an explicit exclusion — this is a hard
+    model limitation, not a prompt-wording gap, so it's addressed here at
+    the reordering step instead of asking the LLM to see through it).
+    Legislative/tax/administrative boilerplate is essentially never what a
+    consumer-facing "what/how much/how" question is looking for even when
+    it happens to name the right insurance type — see _reformulate_query's
+    existing "do not add a specific regulation, act, section... unless
+    already named" rule for the same underlying judgment applied earlier
+    in the pipeline.
     """
     m = _ANCHOR_TYPE_RE.search(retrieval_query)
     if not m:
         return chunks
     topic = m.group(0).lower()
-    return sorted(
-        chunks,
-        key=lambda c: 0 if topic in (getattr(c, "page_content", "") or "").lower() else 1,
-    )
+    def _rank(c) -> int:
+        content = (getattr(c, "page_content", "") or "").lower()
+        if topic not in content:
+            return 1
+        if _REGULATORY_BOILERPLATE_RE.search(content):
+            return 1
+        return 0
+    return sorted(chunks, key=_rank)
 
 
 async def _reformulate_query(question: str, history: str) -> str:
