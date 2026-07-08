@@ -1158,7 +1158,8 @@ _ANCHOR_TYPE_RE = re.compile(
     r"critical\s*illness|"
     r"group|corporate|"
     r"personal\s*accident|disability|"
-    r"retirement|pension|annuity|takaful)\b(\s+insurance)?",
+    r"retirement|pension|annuity|takaful|"
+    r"crop|agricultur\w*)\b(\s+insurance)?",
     re.IGNORECASE,
 )
 
@@ -1295,6 +1296,9 @@ Do NOT add a specific regulation, act, section, jurisdiction, or authority
 unless the conversation itself already named it — inventing one, even a
 plausible-sounding one, measurably hurts retrieval when the actual source
 material frames it differently or doesn't cite a specific provision at all.
+If the follow-up ALREADY asks about multiple things joined by "and" (e.g.
+"what is X and how to Y"), your rewritten question must keep EVERY part —
+never drop a part just because it resembles something already discussed.
 Output ONLY the rewritten question — no quotes, no explanation, nothing else.
 
 Examples:
@@ -1306,6 +1310,9 @@ Examples:
 
   Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers share risk..."
   Follow-up: "is it legally required?" → "Is reinsurance a legal requirement?"
+
+  Context: "User: what is term insurance\nLayla: Term insurance is a type of life insurance..."
+  Follow-up: "what is term insurance and how to claim it?" → "What is term insurance and how do you claim a term insurance policy?"
 
   Context: "User: what is subrogation\nLayla: Subrogation means the insurer steps in..."
   Follow-up: "give me an example" → "Can you give a real-life example of subrogation?"
