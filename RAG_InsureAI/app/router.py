@@ -41,6 +41,90 @@ OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001").strip()
 
+# ── Runtime backend override (Super Admin toggle) ──────────────────────────
+# Lets Super Admin switch backends (or swap in a manual API key) without a
+# redeploy — persisted to disk so it survives server restarts. Falls back to
+# the FORCE_BACKEND/env-based auto-detection below when mode is "auto" (or
+# never configured).
+_ROUTER_STATE_DIR = os.getenv("API_STATE_DIR", os.path.join(os.path.dirname(__file__), "state"))
+_ROUTER_SETTINGS_PATH = os.path.join(_ROUTER_STATE_DIR, "router_settings.json")
+
+_runtime_mode = "auto"          # "auto" | "vllm" | "groq" | "manual"
+_runtime_manual_api_key = ""
+_runtime_manual_base_url = "https://api.groq.com/openai/v1"
+_runtime_manual_model = GROQ_MODEL
+
+
+def _load_router_settings() -> None:
+    global _runtime_mode, _runtime_manual_api_key, _runtime_manual_base_url, _runtime_manual_model
+    try:
+        with open(_ROUTER_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _runtime_mode = data.get("mode", "auto")
+        _runtime_manual_api_key = data.get("manual_api_key", "")
+        _runtime_manual_base_url = data.get("manual_base_url") or "https://api.groq.com/openai/v1"
+        _runtime_manual_model = data.get("manual_model") or GROQ_MODEL
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("[router] failed to load router_settings.json: %s", exc)
+
+
+def _save_router_settings() -> None:
+    os.makedirs(_ROUTER_STATE_DIR, exist_ok=True)
+    data = {
+        "mode": _runtime_mode,
+        "manual_api_key": _runtime_manual_api_key,
+        "manual_base_url": _runtime_manual_base_url,
+        "manual_model": _runtime_manual_model,
+    }
+    tmp_path = f"{_ROUTER_SETTINGS_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp_path, _ROUTER_SETTINGS_PATH)
+
+
+_load_router_settings()
+
+
+def get_backend_settings() -> dict:
+    """Current runtime backend settings for the Super Admin panel.
+    manual_api_key is never returned in full — only whether one is set."""
+    return {
+        "mode": _runtime_mode,
+        "manual_api_key_set": bool(_runtime_manual_api_key),
+        "manual_base_url": _runtime_manual_base_url,
+        "manual_model": _runtime_manual_model,
+        "effective_backend": _active_backend(),
+    }
+
+
+def set_backend_settings(
+    mode: str,
+    manual_api_key: str | None = None,
+    manual_base_url: str | None = None,
+    manual_model: str | None = None,
+) -> dict:
+    """Update runtime backend settings from the Super Admin panel.
+
+    mode: "auto" | "vllm" | "groq" | "manual".
+    manual_api_key: only overwritten when a non-empty value is passed, so
+    re-saving other fields doesn't require re-entering the key every time.
+    """
+    global _runtime_mode, _runtime_manual_api_key, _runtime_manual_base_url, _runtime_manual_model
+    if mode not in {"auto", "vllm", "groq", "manual"}:
+        raise ValueError(f"Invalid backend mode: {mode!r}")
+    _runtime_mode = mode
+    if manual_api_key:
+        _runtime_manual_api_key = manual_api_key.strip()
+    if manual_base_url is not None and manual_base_url.strip():
+        _runtime_manual_base_url = manual_base_url.strip()
+    if manual_model is not None and manual_model.strip():
+        _runtime_manual_model = manual_model.strip()
+    _save_router_settings()
+    logger.info("[router] backend mode set to: %s", _runtime_mode)
+    return get_backend_settings()
+
 # Validated model — set once after checking against /v1/models, then cached.
 # Takes priority over VLLM_MODEL so a wrong env var never causes a 404.
 _resolved_model: str = ""
@@ -108,6 +192,12 @@ def _resolve_vllm_model() -> str:
 # ── Backend detection ──────────────────────────────────────────────────────────
 
 def _active_backend() -> str:
+    if _runtime_mode == "manual" and _runtime_manual_api_key:
+        return "manual"
+    if _runtime_mode == "vllm" and VLLM_HOST:
+        return "vllm"
+    if _runtime_mode == "groq" and GROQ_API_KEY:
+        return "groq"
     if FORCE_BACKEND == "groq" and GROQ_API_KEY:
         return "groq"
     if VLLM_HOST:
@@ -133,6 +223,8 @@ def get_active_model_info() -> dict:
         return {"backend": "openai", "model": OPENAI_MODEL}
     if backend == "anthropic":
         return {"backend": "anthropic", "model": ANTHROPIC_MODEL}
+    if backend == "manual":
+        return {"backend": "manual", "model": _runtime_manual_model, "base_url": _runtime_manual_base_url}
     return {"backend": "none", "model": None}
 
 
@@ -213,6 +305,20 @@ def get_insurance_llm(temperature: float = 0, max_tokens: int = 0):
             temperature=temperature,
             max_tokens=_mt,
             timeout=60,
+        )
+
+    if backend == "manual":
+        from langchain_openai import ChatOpenAI
+        _mt = max_tokens if max_tokens > 0 else 500
+        logger.debug("[LLM] Manual model=%s base_url=%s max_tokens=%d", _runtime_manual_model, _runtime_manual_base_url, _mt)
+        return ChatOpenAI(
+            model=_runtime_manual_model,
+            base_url=_runtime_manual_base_url,
+            api_key=_runtime_manual_api_key,
+            temperature=temperature,
+            max_tokens=_mt,
+            timeout=60,
+            max_retries=1,
         )
 
     raise RuntimeError(
