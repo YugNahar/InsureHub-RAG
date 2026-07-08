@@ -431,6 +431,33 @@ async def super_admin_delete_session(session_id: str, token: str = Depends(_chec
     return {"ok": ok}
 
 
+class BackendSettingsRequest(BaseModel):
+    mode: str                      # "auto" | "vllm" | "groq" | "manual"
+    manual_api_key: str = ""       # only sent when the admin is setting/changing it
+    manual_base_url: str = ""
+    manual_model: str = ""
+
+
+@app.get("/super-admin/backend-settings")
+async def super_admin_get_backend_settings(token: str = Depends(_check_super_admin)):
+    from router import get_backend_settings
+    return get_backend_settings()
+
+
+@app.post("/super-admin/backend-settings")
+async def super_admin_set_backend_settings(req: BackendSettingsRequest, token: str = Depends(_check_super_admin)):
+    from router import set_backend_settings
+    try:
+        return set_backend_settings(
+            mode=req.mode,
+            manual_api_key=req.manual_api_key,
+            manual_base_url=req.manual_base_url,
+            manual_model=req.manual_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.websocket("/ws/super-admin")
 async def ws_super_admin(websocket: WebSocket):
     await websocket.accept()
