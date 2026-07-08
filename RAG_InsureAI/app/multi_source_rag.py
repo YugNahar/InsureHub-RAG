@@ -2699,16 +2699,27 @@ class MultiSourceRAG:
             if retrieval_query != question:
                 _is_followup = True
             else:
-                # LLM reformulation failed (timeout / vLLM busy) — fall back to the
-                # last user question from history so "give me in detail" maps to the
-                # actual topic instead of colliding with every other detail request.
-                _last_user_q = next(
-                    (ln[len("User:"):].strip() for ln in reversed(history.split("\n"))
-                     if ln.startswith("User:")),
-                    None,
-                )
-                if _last_user_q and _last_user_q.lower() != question.lower():
-                    retrieval_query = _last_user_q
+                # LLM reformulation failed (timeout / vLLM busy) — fall back to
+                # merging the follow-up with the last assistant turn, via the
+                # same helper ask() already uses for this. NOT just "the last
+                # user question" (an earlier version of this fallback): that
+                # DISCARDS the actual follow-up entirely — for a generic
+                # modifier ("give me in detail") that's fine since it has no
+                # content of its own, but for a substantive follow-up ("how
+                # do I claim it?", "what does it not cover?") it silently
+                # re-asks the PREVIOUS question and ignores what was actually
+                # asked. Confirmed live: "What is motor insurance?" then "How
+                # do I claim it?" — when reformulation failed, retrieval_query
+                # became "What is motor insurance?" (Turn 1's exact text) via
+                # the old fallback, which then KV-cache-hit Turn 1's cached
+                # answer verbatim, so the claim question was never answered
+                # at all. _reformulate_with_history keeps the actual question
+                # (appended, not replaced) alongside topical context from the
+                # last answer, so it degrades gracefully for both cases
+                # instead of only the generic-modifier one.
+                _merged = _reformulate_with_history(question, history)
+                if _merged and _merged.lower() != question.lower():
+                    retrieval_query = _merged
                     _is_followup = True
         else:
             retrieval_query = corrected_question
