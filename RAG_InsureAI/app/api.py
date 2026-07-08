@@ -1969,22 +1969,13 @@ async def evaluate(req: EvaluateRequest):
             from datasets import Dataset
             from ragas import evaluate as ragas_evaluate
             from ragas.metrics import faithfulness, answer_relevancy, context_precision
-            from langchain_openai import ChatOpenAI
             from ragas.llms import LangchainLLMWrapper
             from ragas.embeddings import LangchainEmbeddingsWrapper
             from langchain_community.embeddings import HuggingFaceEmbeddings
 
-            from router import VLLM_HOST, VLLM_MODEL, VLLM_API_KEY
+            from router import get_insurance_llm
 
-            ragas_llm = ChatOpenAI(
-                model=VLLM_MODEL,
-                base_url=f"{VLLM_HOST}/v1",
-                api_key=VLLM_API_KEY,
-                temperature=0,
-                max_tokens=512,
-                timeout=60,
-                max_retries=1,
-            )
+            ragas_llm = get_insurance_llm(temperature=0, max_tokens=512)
             ragas_llm_wrapper = LangchainLLMWrapper(ragas_llm)
 
             embed_model = _get_pipeline().vector_store.embed_model
