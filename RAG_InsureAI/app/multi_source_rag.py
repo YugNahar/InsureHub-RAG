@@ -16,6 +16,7 @@ except ImportError:
     _APIStatusError = Exception
 
 from rapidfuzz import fuzz, process
+from turbovec_store import _rerank_windows
 
 logger = logging.getLogger(__name__)
 
@@ -1177,6 +1178,25 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     happens to appear later in the same turn's prose. Only falls back to
     searching the whole text when the user's own turn has no type mention
     (e.g. a topic introduced solely by the assistant, never restated).
+
+    The fallback (assistant-only) search requires the matched type to
+    appear at least twice in *text* — a single occurrence is often just an
+    illustrative aside within an otherwise generic answer, not the actual
+    established topic. Confirmed live: "What does the policy document
+    include?" (names no type) got an answer that mentioned "Fire Insurance"
+    exactly once, as a passing example among several ("...in Fire Insurance
+    the particulars of the building...", alongside a car-insurance example
+    in the same sentence) — a plain last-match-anywhere search still picked
+    it up as "the established topic" and the repair step below injected
+    "for fire insurance" into a follow-up about something else entirely
+    ("how can relatives be informed about the policy?"), reintroducing the
+    exact type-hallucination failure the _reformulate_query LLM-prompt
+    guardrail was built to prevent — this deterministic repair runs after
+    that LLM call and isn't covered by its prompt instructions at all. A
+    genuinely-established topic (the documented term-insurance/"how to
+    claim it?" case this repair exists for) is discussed substantively
+    enough to be named more than once, so the frequency check doesn't
+    weaken the intended case.
     """
     user_turns = re.findall(r"User:\s*(.*?)(?=\n(?:User|Assistant):|\Z)", text, re.DOTALL)
     if user_turns:
@@ -1190,7 +1210,13 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     matches = list(_ANCHOR_TYPE_RE.finditer(text))
     if not matches:
         return None
+    base_counts: dict = {}
+    for m in matches:
+        base = m.group(0).strip().lower().split()[0]
+        base_counts[base] = base_counts.get(base, 0) + 1
     phrase = matches[-1].group(0).strip()
+    if base_counts[phrase.lower().split()[0]] < 2:
+        return None
     if not re.search(r"insurance\s*$", phrase, re.IGNORECASE):
         phrase = f"{phrase} insurance"
     return phrase
@@ -1202,11 +1228,29 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
 # guarantees amounts assured by LIC policies" mentions "life insurance"
 # but is about a government solvency guarantee, not payout amounts). See
 # _prioritize_topic_chunks's docstring for the concrete failure this fixes.
+#
+# "ICP \d+" and "the supervisor" extend this to insurance-REGULATOR/
+# supervisory-framework boilerplate (IAIS Insurance Core Principles text —
+# licensing, board-member suitability, governance requirements aimed at
+# insurers-as-regulated-entities). Confirmed live: "How can relatives be
+# informed about the policy?" cross-encoder-scored a chunk about board-
+# member/significant-owner suitability licensing at 0.94 — higher than
+# every genuinely relevant chunk in the pool — even though the selected
+# rerank window didn't contain the word "relative" at all. Same underlying
+# judgment as the original regulatory-boilerplate case: this class of
+# supervisor-facing governance text is essentially never what a consumer
+# question wants, regardless of how the cross-encoder happens to score it.
+# "the supervisor" specifically (not "the regulator"/"the authority" more
+# broadly, which are too generic and risk false-positiving on unrelated
+# content) because in this KB's consumer-facing prose the acting party is
+# always "the insurer"/"the insured"/"the policyholder"/"the agent" — "the
+# supervisor" only appears in the regulatory-oversight framework sections.
 _REGULATORY_BOILERPLATE_RE = re.compile(
     r"\b(the act|the bill|stamp duty|income tax act|central government|"
     r"section\s+\d+[a-z]?\b.{0,20}\bact\b|"
     r"guarantee[sd]?\s+by\s+the\s+(central\s+)?government|"
-    r"amends?\b|gross\s+total\s+income)\b",
+    r"amends?\b|gross\s+total\s+income|"
+    r"icp\s*\d+|the\s+supervisor)\b",
     re.IGNORECASE,
 )
 
@@ -1256,16 +1300,24 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     existing "do not add a specific regulation, act, section... unless
     already named" rule for the same underlying judgment applied earlier
     in the pipeline.
+
+    The boilerplate deprioritization runs even when the query names NO
+    specific insurance type (topic is None below) — confirmed live with
+    "How can relatives be informed about the policy?" (no type mentioned
+    anywhere in the conversation): a supervisory-licensing boilerplate
+    chunk outranked every genuinely relevant chunk by cross-encoder score
+    alone, and topic-matching had nothing to gate on since there was no
+    named topic to check against. Boilerplate is a category judgment
+    independent of topic, so it applies unconditionally; only the topic
+    promotion half of this function needs a named type to compare against.
     """
     m = _ANCHOR_TYPE_RE.search(retrieval_query)
-    if not m:
-        return chunks
-    topic = m.group(0).lower()
+    topic = m.group(0).lower() if m else None
     def _rank(c) -> int:
         content = (getattr(c, "page_content", "") or "").lower()
-        if topic not in content:
-            return 1
         if _REGULATORY_BOILERPLATE_RE.search(content):
+            return 1
+        if topic and topic not in content:
             return 1
         return 0
     return sorted(chunks, key=_rank)
@@ -1334,6 +1386,14 @@ Do NOT add a specific regulation, act, section, jurisdiction, or authority
 unless the conversation itself already named it — inventing one, even a
 plausible-sounding one, measurably hurts retrieval when the actual source
 material frames it differently or doesn't cite a specific provision at all.
+Same rule for the insurance TYPE itself: do NOT introduce a specific
+product name (e.g. "fire insurance", "marine insurance") that appears
+NOWHERE in the conversation above AND nowhere in the follow-up itself —
+only reuse a product name that was already used somewhere. This is about
+not INVENTING a new product name out of nothing — it does not mean
+dropping words that already appear in the follow-up; always keep
+everything the follow-up itself asks about (e.g. "how can relatives be
+informed" must still mention relatives in your rewrite).
 If the follow-up ALREADY asks about multiple things joined by "and" (e.g.
 "what is X and how to Y"), your rewritten question must keep EVERY part —
 never drop a part just because it resembles something already discussed.
@@ -1382,6 +1442,58 @@ Search query:"""
             # generic question. Only repair when the topic could ONLY have
             # come from history (the raw follow-up itself names no specific
             # type) and the rewrite dropped the type history established.
+            # Deterministic repair for the inverse gap, also confirmed live
+            # (reproduced 3x, intermittently): the rewrite sometimes INVENTS
+            # a specific insurance type out of nothing — "How can relatives
+            # be informed about the policy?" after a generic policy-document
+            # turn (no type named anywhere in the conversation) reformulated
+            # to "...policy documents for fire insurance?", so retrieval
+            # pulled fire-insurance chunks, the semantic grounding check
+            # correctly rejected them, and the question was refused. The
+            # prompt above already forbids exactly this and the model still
+            # does it intermittently — same model limitation as the anchor-
+            # drop case below, so same remedy: enforce in code. Only phrases
+            # with an explicit "insurance" suffix are stripped; a bare type
+            # word ("property", "group", "fire") is too ambiguous to remove
+            # safely from an otherwise-good rewrite. Runs BEFORE the anchor-
+            # append repair so that when history DOES name a real type, a
+            # stripped wrong-type rewrite can still be re-anchored to it.
+            _known_topics = f"{question}\n{recent}"
+            for _ in range(3):  # rescan after each strip; bounded
+                _invented = next(
+                    (
+                        _m for _m in _ANCHOR_TYPE_RE.finditer(reformulated)
+                        if _m.group(2)
+                        and not re.search(
+                            rf"\b{re.escape(_m.group(1))}\b", _known_topics, re.IGNORECASE
+                        )
+                    ),
+                    None,
+                )
+                if _invented is None:
+                    break
+                _stripped = re.sub(
+                    rf"(?:\s+(?:for|of|in|under|on|about|regarding|with))?\s*\b{re.escape(_invented.group(0))}\b",
+                    "",
+                    reformulated,
+                    flags=re.IGNORECASE,
+                )
+                _stripped = re.sub(r"\s{2,}", " ", _stripped).strip(" ,;:")
+                if _invented.start() == 0 or len(re.findall(r"\w+", _stripped)) < 3:
+                    # Invented type was the sentence subject, or stripping
+                    # gutted the rewrite — the raw follow-up is safer than
+                    # either a wrong-topic or a broken query.
+                    logger.info(
+                        "[REFORM] invented-type repair: %r names %r found nowhere in the conversation — falling back to raw follow-up",
+                        reformulated, _invented.group(0),
+                    )
+                    reformulated = question
+                    break
+                logger.info(
+                    "[REFORM] invented-type repair: %r names %r found nowhere in the conversation — stripped to %r",
+                    reformulated, _invented.group(0), _stripped,
+                )
+                reformulated = _stripped
             _hist_anchor = _last_anchor_type_match(recent)
             if (
                 _hist_anchor
@@ -1496,6 +1608,35 @@ async def _extract_intent_topics(question: str) -> set[str]:
 # input size for latency.
 _GROUNDING_CONTEXT_CHARS = 3000
 
+
+def _build_grounding_context(query: str, chunks: list) -> str:
+    """Join *chunks* into a single preview string for _verify_grounding(),
+    using each chunk's most query-relevant excerpt (via _rerank_windows,
+    already computed cheaply during reranking with no extra model call)
+    instead of its raw, full page_content.
+
+    Confirmed live: with several full multi-hundred-word chunks joined and
+    then hard-capped at _GROUNDING_CONTEXT_CHARS, a genuinely answering
+    sentence sitting past the opening of a long chunk gets buried among
+    unrelated boilerplate (exam questions, generic definitions, other
+    chunks) ahead of it in the same budget — "How are relatives typically
+    notified about the contents of a policy document?" against a context
+    that DID contain "...kept in safe custody and in the knowledge of the
+    close relatives" still got NO from the grounding check, but the exact
+    same sentence, isolated from the surrounding noise, reliably got YES.
+    Using each chunk's best-matching window keeps the signal-to-noise ratio
+    high regardless of where in a long chunk the relevant sentence sits —
+    the same fix already proven for the reranker's own scoring step.
+    """
+    parts = []
+    for c in chunks:
+        text = getattr(c, "page_content", "") or ""
+        if not text:
+            continue
+        windows = _rerank_windows(text, query)
+        parts.append(windows[1] if len(windows) > 1 else windows[0])
+    return "\n\n".join(parts)
+
 # _verify_suggestions_grounded() judges candidates against the SAME full_context
 # the answer was generated from (already capped at ~6000 chars by the context
 # compressor's budget), not a fresh single-question lookup — so it needs the
@@ -1565,6 +1706,46 @@ async def _verify_grounding(question: str, context: str, backend_override: Optio
         return "yes" in words and "no" not in words
     except Exception:
         return False
+
+
+async def _verify_grounding_any_chunk(
+    question: str, chunks: list, backend_override: Optional[str] = None,
+) -> bool:
+    """Grounded if EITHER the full joined multi-chunk context grounds the
+    question OR the single top-ranked chunk alone does — checked in
+    parallel, not sequentially, so this costs no extra latency over the
+    plain multi-chunk check on the common (already-passing) path.
+
+    Chunks must already be sorted best-first (true of every caller — all
+    come from _rerank()/rerank_documents() output).
+
+    Confirmed live: joining even one additional, lower-relevance chunk
+    alongside the correct one can flip _verify_grounding()'s YES to a NO
+    for the WHOLE block — "How are relatives typically notified about the
+    contents of a policy documents?" against just the top chunk (containing
+    "...kept in safe custody and in the knowledge of the close relatives")
+    returned YES in isolation, but adding a second, merely-topically-
+    adjacent chunk (about policy document contents generally) flipped the
+    combined judgment to NO, even though the first chunk's relevant content
+    didn't change. This is a real limitation of this codebase's small model
+    when judging heterogeneous multi-chunk blocks (see _reformulate_query's
+    docstring for other confirmed instances of this model's unreliability
+    on nuanced multi-part judgments) — checking the strongest single
+    candidate on its own recovers the case without weakening the existing
+    multi-chunk check, which still runs and still catches genuinely
+    wrong-topic content (verified: an off-topic single chunk alone is still
+    correctly rejected, so this isn't a blanket loosening).
+    """
+    if not chunks:
+        return False
+    full_context = _build_grounding_context(question, chunks)
+    top_context = _build_grounding_context(question, chunks[:1])
+    full_result, top_result = await asyncio.gather(
+        _verify_grounding(question, full_context, backend_override=backend_override),
+        _verify_grounding(question, top_context, backend_override=backend_override),
+    )
+    return full_result or top_result
+
 
 async def _contextualize_query(question: str, history: str) -> str:
     """Rewrite the question into a standalone, self-contained form by
@@ -2045,12 +2226,31 @@ def _split_history_turns(history: str) -> list[str]:
     return [t.strip() for t in _HISTORY_TURN_BOUNDARY_RE.split(history.strip()) if t.strip()]
 
 
+_REFORMULATE_TOPIC_SNIPPET_CHARS = 120
+
+
 def _reformulate_with_history(question: str, history: str) -> str:
     """Merge a short follow-up with the last assistant turn from *history*.
 
     The returned string is used **only** for the retrieval query — the original
     *question* is still passed to the LLM prompt so the model answers what the
     user actually asked.
+
+    Only the opening _REFORMULATE_TOPIC_SNIPPET_CHARS of the last assistant
+    turn is used, not the full answer. This is the non-LLM fallback path —
+    used when the primary _reformulate_query() call times out — so a long,
+    detailed previous answer floods the retrieval query with unrelated detail
+    and buries the follow-up's own content words. Confirmed live: after a
+    multi-clause answer listing everything a policy document contains ("...the
+    name and address of the insured, sum insured, period of insurance, risk
+    covered, rate of premium, prescription of the subject matter..."), the
+    follow-up "How can relatives be informed about the policy?" merged into a
+    60+ word query where "relatives" was one word out of many — retrieval
+    confidently matched the policy-document-CONTENTS topic (0.78 score)
+    instead of anything about relatives. A short topic snippet still resolves
+    pronouns against the established subject (the scenario this function
+    exists for — see the call site's docstring) without drowning out a
+    substantive follow-up's own words.
     """
     lines = history.strip().split("\n")
     last_assistant = ""
@@ -2059,7 +2259,8 @@ def _reformulate_with_history(question: str, history: str) -> str:
             last_assistant = line[len("Assistant:"):].strip()
             break
     if last_assistant:
-        return f"{last_assistant} {question}"
+        topic_snippet = last_assistant[:_REFORMULATE_TOPIC_SNIPPET_CHARS]
+        return f"{topic_snippet} {question}"
     return question
 
 
@@ -3027,12 +3228,9 @@ class MultiSourceRAG:
                 and _quoted_comparison_covered(retrieval_query, all_chunks)
                 and _enumeration_query_covered(retrieval_query, all_chunks)
             )
-        _grounding_context_preview = "\n\n".join(
-            c.page_content for c in all_chunks if hasattr(c, "page_content")
-        )
         _lex_ok, _semantically_grounded = await asyncio.gather(
             _lexical_covered(),
-            _verify_grounding(retrieval_query, _grounding_context_preview),
+            _verify_grounding_any_chunk(retrieval_query, all_chunks),
         )
         ctx_covered = _lex_ok and _semantically_grounded
 
@@ -3077,16 +3275,13 @@ class MultiSourceRAG:
                     default=float("-inf"),
                 )
                 if _fallback_top >= _rerank_gate:
-                    _fallback_context_preview = "\n\n".join(
-                        c.page_content for c in _fallback_chunks if hasattr(c, "page_content")
-                    )
                     _fallback_lex_ok = (
                         _context_covers_query(_cleaned_query, _fallback_chunks, llm_topics=None)
                         and _quoted_comparison_covered(_cleaned_query, _fallback_chunks)
                         and _enumeration_query_covered(_cleaned_query, _fallback_chunks)
                     )
-                    _fallback_sem_grounded = await _verify_grounding(
-                        _cleaned_query, _fallback_context_preview, backend_override="vllm",
+                    _fallback_sem_grounded = await _verify_grounding_any_chunk(
+                        _cleaned_query, _fallback_chunks, backend_override="vllm",
                     )
                     if _fallback_lex_ok and _fallback_sem_grounded:
                         all_chunks = _fallback_chunks
@@ -3147,9 +3342,6 @@ class MultiSourceRAG:
                 default=float("-inf"),
             )
             if _standalone_top >= _rerank_gate:
-                _standalone_context_preview = "\n\n".join(
-                    c.page_content for c in _standalone_chunks if hasattr(c, "page_content")
-                )
                 # Check standalone against the ORIGINAL question text, not
                 # the followup-reformulated retrieval_query.
                 _standalone_lex_ok = (
@@ -3157,7 +3349,7 @@ class MultiSourceRAG:
                     and _quoted_comparison_covered(question, _standalone_chunks)
                     and _enumeration_query_covered(question, _standalone_chunks)
                 )
-                _standalone_sem_grounded = await _verify_grounding(question, _standalone_context_preview)
+                _standalone_sem_grounded = await _verify_grounding_any_chunk(question, _standalone_chunks)
                 if _standalone_lex_ok and _standalone_sem_grounded:
                     all_chunks = _standalone_chunks
                     retrieval_query = question
