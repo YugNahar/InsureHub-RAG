@@ -131,9 +131,80 @@ def _get_shared_reranker() -> CrossEncoder:
 # forward-pass cost well below the 512-token cap.
 _RERANK_TEXT_CHARS = 700
 
+# Minimum word length counted as a "distinctive" query term when picking a
+# rerank window — filters out short connective words (how, can, the, are)
+# that appear everywhere and would swamp a genuinely rare match.
+_MIN_KEYWORD_LEN = 4
+# Stride for the sliding window scan — smaller than _RERANK_TEXT_CHARS so
+# windows overlap and a match sitting near a boundary is never split across
+# two candidate windows and missed by both.
+_RERANK_WINDOW_STRIDE = _RERANK_TEXT_CHARS // 3
 
-def _truncate_for_rerank(text: str) -> str:
-    return text[:_RERANK_TEXT_CHARS] if text else text
+
+def _truncate_for_rerank(text: str, query: str = "") -> str:
+    """Return up to _RERANK_TEXT_CHARS of *text* for the cross-encoder's
+    scoring pass — same fixed budget as always (see the latency measurement
+    above _RERANK_TEXT_CHARS), but choosing WHICH _RERANK_TEXT_CHARS window
+    to send instead of blindly always taking the first one.
+
+    Always slicing text[:_RERANK_TEXT_CHARS] silently hides everything past
+    that point — for a real KB chunk (section chunker allows up to 2000
+    chars, some run past that) the ONLY sentence that actually answers a
+    given question can sit well beyond the cutoff. Confirmed live: "the
+    policy... needs to be kept in safe custody and in the knowledge of the
+    close relatives" — a direct, on-topic answer to "how can relatives be
+    informed about the policy?" — sat at character 1426 of a 2097-char
+    chunk. The reranker scored that (query, truncated-passage) pair 0.005-
+    0.013 (near-zero) purely because it never saw the one relevant sentence,
+    even though BM25 independently ranked this exact chunk #1 by keyword
+    match on the same query — proof the content match was there, just
+    invisible to the reranker.
+
+    Fix: scan overlapping _RERANK_TEXT_CHARS windows and keep the one with
+    the highest keyword-match weight — cheap pure-Python string scanning
+    done once per candidate before tokenization, negligible next to the
+    model forward pass that actually drives the measured latency. Each
+    keyword is weighted by 1/(its count in the full chunk): a term that
+    appears once (like "relatives" above) is far more distinctive — and a
+    far stronger signal for WHERE the relevant content actually is — than
+    one repeated throughout (like "policy", which would otherwise score
+    every window roughly equally and drown out the rare match's signal).
+    This is the same intuition as BM25's IDF weighting, approximated
+    locally within the chunk instead of needing corpus-wide statistics.
+    Ties prefer the later window over the default opening slice, since the
+    scan order means a later window can only tie (not just lose to) the
+    default if it independently contains an equally strong, different
+    match — worth surfacing rather than defaulting back to position 0.
+    Falls back to the plain start-of-text slice when the query is empty or
+    carries no usable keywords (keeps existing well-behaved cases, e.g. a
+    topic-establishing opening paragraph, exactly as before).
+    """
+    if not text:
+        return text
+    if len(text) <= _RERANK_TEXT_CHARS or not query:
+        return text[:_RERANK_TEXT_CHARS]
+
+    keywords = {w for w in re.findall(r"\w+", query.lower()) if len(w) >= _MIN_KEYWORD_LEN}
+    if not keywords:
+        return text[:_RERANK_TEXT_CHARS]
+
+    text_lower = text.lower()
+    weights = {w: 1.0 / text_lower.count(w) for w in keywords if w in text_lower}
+    if not weights:
+        return text[:_RERANK_TEXT_CHARS]
+
+    def _window_score(window: str) -> float:
+        return sum(wt for w, wt in weights.items() if w in window)
+
+    best_start = 0
+    best_score = _window_score(text_lower[:_RERANK_TEXT_CHARS])
+    last_start = len(text) - _RERANK_TEXT_CHARS
+    for start in list(range(0, last_start, _RERANK_WINDOW_STRIDE)) + [last_start]:
+        score = _window_score(text_lower[start:start + _RERANK_TEXT_CHARS])
+        if score >= best_score:
+            best_score, best_start = score, start
+
+    return text[best_start:best_start + _RERANK_TEXT_CHARS]
 
 
 class TurboVecStore:
@@ -800,7 +871,7 @@ class TurboVecStore:
         if not candidates:
             return []
         self._ensure_reranker()
-        pairs = [(query, _truncate_for_rerank(c[1])) for c in candidates]
+        pairs = [(query, _truncate_for_rerank(c[1], query)) for c in candidates]
         rerank_scores = self.reranker.predict(pairs)
         combined = list(zip(candidates, rerank_scores))
         combined.sort(key=lambda x: x[1], reverse=True)
@@ -820,7 +891,7 @@ class TurboVecStore:
         if not docs:
             return []
         self._ensure_reranker()
-        pairs = [(query, _truncate_for_rerank(doc.page_content)) for doc in docs]
+        pairs = [(query, _truncate_for_rerank(doc.page_content, query)) for doc in docs]
         scores = self.reranker.predict(pairs)
         ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
         result = []
