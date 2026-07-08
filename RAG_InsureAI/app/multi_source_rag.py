@@ -1180,6 +1180,43 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     return phrase
 
 
+def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
+    """Reorder *chunks* so ones whose content mentions the query's named
+    insurance type (e.g. "health insurance") come before ones that don't —
+    same relative order preserved within each group (stable sort), so this
+    only ever changes ORDER, never which chunks are included.
+
+    Exists for two related failure modes, both confirmed live:
+    (a) a generic, universal-to-any-policy glossary chunk outranking
+    genuinely topic-specific content sitting right next to it in the same
+    retrieved pool (see DETAILED_GROUNDED_PROMPT/STRICT_GROUNDED_PROMPT's
+    "prioritize topic-specific content" rule, which helped but wasn't
+    reliable alone), and (b) a chunk from a DIFFERENT insurance type
+    entirely outranking the correct one because the wording happens to be
+    lexically/semantically similar — confirmed with "are all types of
+    illness covered under health insurance?": the top-scoring chunk (0.78)
+    was travel insurance's exclusion list ("illnesses or injuries that
+    occurred... before the start of the journey"), correctly rejected by
+    the semantic grounding check as not actually about health insurance —
+    but that refusal meant a REAL health-insurance exclusion chunk sitting
+    lower in the same pool (0.10, cosmetic/aesthetic treatment exclusions)
+    never got a chance to ground the answer either. Reordering so the
+    correct-topic chunk is physically first gives it a chance to be what
+    the coverage/grounding checks and generation actually see and use.
+
+    A no-op when the query doesn't name a specific type (single-word
+    concept lookups like "what is a deductible" are unaffected).
+    """
+    m = _ANCHOR_TYPE_RE.search(retrieval_query)
+    if not m:
+        return chunks
+    topic = m.group(0).lower()
+    return sorted(
+        chunks,
+        key=lambda c: 0 if topic in (getattr(c, "page_content", "") or "").lower() else 1,
+    )
+
+
 async def _reformulate_query(question: str, history: str) -> str:
     """Rewrite a follow-up question as a standalone, natural-language question
     using conversation history — used both for retrieval and, for detected
@@ -1434,17 +1471,29 @@ async def _verify_grounding(question: str, context: str, backend_override: Optio
     """
     if not context or not context.strip():
         return False
+    # Framed as "is there relevant info here" rather than "can this EXACT
+    # question be answered" — the earlier "exact question" framing made the
+    # 7B model demand something close to a literal restatement of the
+    # question in the context. That broke down specifically on totality/
+    # completeness questions ("are all types of illness covered?") against
+    # a long, multi-topic joined context: an exclusions list is exactly the
+    # right way to answer such a question (implies "no, not everything —
+    # here are the exceptions"), but the model wouldn't credit it without
+    # an explicit "not all are covered" sentence to point to. Confirmed via
+    # a 3x-repeated, 4-case comparison (this exact case + 3 known-good
+    # regression cases) that the "exact question" framing failed the
+    # exclusions case 100% of the time regardless of added exclusion-list
+    # guidance, while this framing passes it and still correctly returns NO
+    # on genuinely wrong-topic context (Takaful/South-Africa mismatch case).
     prompt = (
         f"Context:\n{context[:_GROUNDING_CONTEXT_CHARS]}\n\n"
         f"Question: {question}\n\n"
-        "Can this exact question be answered using ONLY the information in "
-        "this context? Answer NO only if the question asks about something "
-        "MORE SPECIFIC than what the context covers — for example, the "
-        "question names a particular country, provider, or coverage detail "
-        "that the context never actually discusses. If the question itself "
-        "is a general question about a concept or model, and the context "
-        "explains that same concept or model, answer YES — a general "
-        "question does not need a more specific answer than what was asked. "
+        "Does this context contain information directly relevant to "
+        "answering this question — enough that someone could give a real, "
+        "specific answer (not necessarily complete or exhaustive)? Answer "
+        "NO only if the context is about a different, unrelated topic, or "
+        "the question asks for a specific fact (a country, provider, "
+        "number) that is simply absent. "
         "Answer with a single word: YES or NO."
     )
     try:
@@ -2816,6 +2865,23 @@ class MultiSourceRAG:
                 if c.metadata.get("rerank_score", _rerank_gate) >= _rerank_gate
             ]
 
+        # Reorder so chunks naming the query's specific insurance type sort
+        # first — matters here specifically because _verify_grounding below
+        # only looks at the first _GROUNDING_CONTEXT_CHARS (3000) of the
+        # joined context, in whatever order all_chunks is already in. If a
+        # wrong-topic-but-similarly-worded chunk from a DIFFERENT insurance
+        # type outranks the real one, the correct content can get pushed
+        # past that 3000-char cutoff and never even reach the grounding
+        # check. Confirmed live: "are all types of illness covered under
+        # health insurance?" top-scored (0.78) a TRAVEL insurance exclusion
+        # list — correctly rejected by _verify_grounding as not actually
+        # about health insurance — while a genuine health-insurance
+        # exclusion chunk (cosmetic/aesthetic treatment, 0.10) sat lower in
+        # the same pool and never got evaluated. Reordering doesn't change
+        # what's included, only gives the correct-topic content a chance to
+        # be seen by the checks that decide whether to answer at all.
+        all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
+
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
         # Lexical checks run alongside the semantic _verify_grounding() backstop
@@ -2981,6 +3047,10 @@ class MultiSourceRAG:
             all_chunks = self._compressor.compress_to_budget(
                 retrieval_query, all_chunks, max_total_chars=_context_budget
             )
+        # Re-apply after compression, which may not preserve the ordering
+        # from the earlier call — the generation prompt should see
+        # topic-specific content first too, not just the grounding check.
+        all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
 
         _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
         _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
