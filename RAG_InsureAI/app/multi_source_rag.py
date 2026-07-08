@@ -762,6 +762,11 @@ async def _backend_completion(
         url = "https://api.groq.com/openai/v1/chat/completions"
         model = GROQ_MODEL
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"}
+    elif backend == "manual":
+        from router import _runtime_manual_api_key, _runtime_manual_base_url, _runtime_manual_model
+        url = f"{_runtime_manual_base_url.rstrip('/')}/chat/completions"
+        model = _runtime_manual_model
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_runtime_manual_api_key}"}
     else:
         return None
     payload = {
@@ -3196,6 +3201,14 @@ class MultiSourceRAG:
             _stream_headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {GROQ_API_KEY}",
+            }
+        elif _active == "manual":
+            from router import _runtime_manual_api_key, _runtime_manual_base_url, _runtime_manual_model
+            _stream_model = _runtime_manual_model
+            _stream_url = f"{_runtime_manual_base_url.rstrip('/')}/chat/completions"
+            _stream_headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_runtime_manual_api_key}",
             }
 
         # When the reranker confidence is low (_top_rerank < 0.05), skip
