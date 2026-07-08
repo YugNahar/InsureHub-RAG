@@ -1269,12 +1269,24 @@ async def ask(req: AskRequest):
 
 @app.post("/conversation/reset/{session_id}")
 async def reset_conversation(session_id: str):
-    """Reset the conversational agent's state for a session (clears pending questions)."""
+    """Reset the conversational agent's state for a session (clears pending
+    questions and LLM-facing memory) — used when the user starts a New Chat.
+    The session itself (its agent_hub record and full transcript) is left
+    completely intact for Super Admin / Agent Dashboard visibility; only a
+    system marker is appended so admins can see where the reset occurred."""
     agent = _get_conversation_agent()
     agent.reset_session(session_id)
     await _delete_agent_session(session_id)
     # Also clear the stored conversation history if desired
     await _delete_conversation_history(session_id)
+    if session_id and session_id != "default":
+        try:
+            await _agent_hub.log_message(session_id, "system", "— New Chat started —")
+        except Exception:
+            logger.warning(
+                "[reset_conversation] Failed to log New Chat marker for session_id=%s",
+                session_id, exc_info=True,
+            )
     return {"status": "reset"}
 
 
