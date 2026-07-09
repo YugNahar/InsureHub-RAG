@@ -702,11 +702,51 @@ _CHIP_STOPWORDS = frozenset({
 })
 
 
+_DURATION_QUESTION_RE = re.compile(
+    r"\bhow long\b|\bhow many (?:years|months|days|weeks)\b|"
+    r"\bwhat is the (?:duration|term|period|length)\b",
+    re.IGNORECASE,
+)
+_DURATION_KEYWORD_RE = re.compile(r"\b(term|period|duration)\b", re.IGNORECASE)
+_DURATION_VALUE_RE = re.compile(
+    r"\d+\s*[- ]?(?:year|yr|month|day|week)s?\b|\bannual(?:ly)?\b|\byearly\b|"
+    r"\blifetime\b|\bwhole\s*life\b",
+    re.IGNORECASE,
+)
+
+
+def _has_nearby_duration_value(context: str, window: int = 60) -> bool:
+    """True if an explicit duration value (a number+unit, or annual/yearly/
+    lifetime) appears within *window* chars of "term"/"period"/"duration"
+    somewhere in *context*.
+    """
+    for m in _DURATION_KEYWORD_RE.finditer(context):
+        snippet = context[max(0, m.start() - window):m.end() + window]
+        if _DURATION_VALUE_RE.search(snippet):
+            return True
+    return False
+
+
 def _question_answerable_in_context(question: str, context: str) -> bool:
     """
     Return True when at least half the content words in *question* appear
     somewhere in *context*.  Cheap, no LLM call.  Content words = words
     longer than 3 chars that are not stopwords.
+
+    Duration-shaped questions ("how long is X", "what is the term/period of
+    X") additionally require an explicit duration VALUE near the word
+    "term"/"period"/"duration" in the context — not just that word's bare
+    presence. Confirmed live: "term" appears 5 times in a health-insurance
+    context purely as a generic placeholder ("during the term of the
+    policy...") with the actual duration never stated anywhere, which was
+    enough word-overlap to pass this filter (and, separately, enough to
+    fool _verify_grounding — even individually, not just when batched — 4/4
+    times in testing). This is a genuine gap between "topically mentions
+    the concept" and "states the specific fact asked for" that neither
+    prompt wording nor batched-vs-individual verification fixed, so it's
+    caught here deterministically instead, mirroring this session's other
+    grounding-check fixes (regulatory boilerplate, multi-chunk confusion)
+    that moved a judgment out of the unreliable small-model layer.
     """
     words = [w.lower().strip("?.,!;:'\"()") for w in question.split()]
     content_words = [w for w in words if len(w) >= 4 and w not in _CHIP_STOPWORDS]
@@ -714,7 +754,11 @@ def _question_answerable_in_context(question: str, context: str) -> bool:
         return False            # can't verify — drop it to be safe
     ctx_lower = context.lower()
     hits = sum(1 for w in content_words if w in ctx_lower)
-    return hits >= max(1, len(content_words) * 0.5)
+    if hits < max(1, len(content_words) * 0.5):
+        return False
+    if _DURATION_QUESTION_RE.search(question) and not _has_nearby_duration_value(context):
+        return False
+    return True
 
 
 async def _backend_completion(
