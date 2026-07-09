@@ -3,23 +3,72 @@ Email + PDF utilities for offline escalation.
 When no agent is online and the AI can't answer, this module:
   1. Generates a PDF transcript with the unanswerable query highlighted
   2. Uses the LLM to compose a professional email body
-  3. Sends the email + PDF to the configured agent email address
+  3. Sends the email + PDF to every agent listed in the agent-emails database
 """
 import logging
 import os
+import re
 import smtplib
 from datetime import datetime, timezone
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from typing import List
 
 logger = logging.getLogger(__name__)
 
 GMAIL_SENDER    = os.getenv("GMAIL_SENDER", "")
 GMAIL_PASSWORD  = os.getenv("GMAIL_APP_PASSWORD", "")
+# Legacy single-recipient fallback — only used if the agent-emails database
+# file itself doesn't exist yet (first-time setup). Once the file exists, it
+# is the sole source of truth, even if that means it's empty.
 AGENT_EMAIL     = os.getenv("AGENT_EMAIL", "lavishdevpura6@gmail.com")
 VLLM_HOST       = os.getenv("VLLM_HOST", "")
 VLLM_MODEL      = os.getenv("VLLM_MODEL", "")
+
+# Excel "database" of agent recipient emails — one email per row under an
+# "email" header in the first sheet. Edit this file (add/remove rows) to
+# change who gets escalation emails; no restart or code change needed, since
+# it's re-read from disk on every send rather than cached in memory.
+AGENT_EMAILS_FILE = os.getenv(
+    "AGENT_EMAILS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_emails.xlsx"),
+)
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _load_agent_emails() -> List[str]:
+    """Read the current list of agent recipient emails from AGENT_EMAILS_FILE.
+
+    Re-reads the file from disk on every call (no caching) so edits — adding
+    or removing a row — take effect on the very next email sent, without
+    needing a restart. Returns [] if the file is missing, unreadable, or has
+    no valid email rows; callers decide how to handle an empty list.
+    """
+    if not os.path.exists(AGENT_EMAILS_FILE):
+        return []
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(AGENT_EMAILS_FILE, read_only=True, data_only=True)
+        ws = wb.active
+        emails: List[str] = []
+        seen = set()
+        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+            cell = row[0]
+            if cell is None:
+                continue
+            email = str(cell).strip()
+            if not email or not _EMAIL_RE.match(email):
+                continue
+            key = email.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            emails.append(email)
+        return emails
+    except Exception:
+        logger.exception("Failed to read agent-emails database at %s", AGENT_EMAILS_FILE)
+        return []
 
 
 def _safe(text: str) -> str:
@@ -199,13 +248,34 @@ The full conversation transcript is attached as a PDF for your review.</p>
 
 def send_escalation_email(session_id: str, history, unanswerable_query: str) -> bool:
     """
-    Generate PDF + compose email body with LLM + send via Gmail SMTP.
-    Returns True on success, False on failure (logs the error).
+    Generate PDF + compose email body with LLM + send via Gmail SMTP to every
+    agent listed in the agent-emails database (AGENT_EMAILS_FILE).
+
+    No per-agent credentials are needed — the system sends FROM its own
+    GMAIL_SENDER account TO every address the database currently lists, so
+    adding or removing a row there changes who receives escalations without
+    touching any code or credentials.
+
+    Returns True on success, False on failure or if there are no recipients
+    (logs the reason either way).
     """
     if not GMAIL_SENDER or not GMAIL_PASSWORD:
         logger.warning(
             "Email escalation skipped — GMAIL_SENDER / GMAIL_APP_PASSWORD not set. "
             "Add these to your .env to enable email notifications."
+        )
+        return False
+
+    recipients = _load_agent_emails()
+    if not recipients and not os.path.exists(AGENT_EMAILS_FILE):
+        # Database file doesn't exist yet — fall back to the legacy single
+        # recipient so a fresh install isn't silently mute before anyone's
+        # created the file.
+        recipients = [AGENT_EMAIL] if AGENT_EMAIL else []
+    if not recipients:
+        logger.warning(
+            "Email escalation skipped for session %s — agent-emails database "
+            "at %s has no valid recipients.", session_id, AGENT_EMAILS_FILE,
         )
         return False
 
@@ -215,7 +285,10 @@ def send_escalation_email(session_id: str, history, unanswerable_query: str) -> 
 
         msg = MIMEMultipart("mixed")
         msg["From"]    = GMAIL_SENDER
-        msg["To"]      = AGENT_EMAIL
+        # Real recipients go in Bcc (the SMTP envelope below, not a visible
+        # header) so agents don't see each other's addresses. "To" needs
+        # *some* address to be a well-formed message — use the sender's own.
+        msg["To"]      = GMAIL_SENDER
         msg["Subject"] = f"[InsureHub] User Needs Help — Session #{session_id}"
 
         # HTML body
@@ -233,9 +306,12 @@ def send_escalation_email(session_id: str, history, unanswerable_query: str) -> 
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_SENDER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_SENDER, AGENT_EMAIL, msg.as_string())
+            server.sendmail(GMAIL_SENDER, recipients, msg.as_string())
 
-        logger.info("Escalation email sent for session %s → %s", session_id, AGENT_EMAIL)
+        logger.info(
+            "Escalation email sent for session %s → %d agent(s): %s",
+            session_id, len(recipients), ", ".join(recipients),
+        )
         return True
 
     except Exception:

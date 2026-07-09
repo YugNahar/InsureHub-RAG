@@ -54,5 +54,9 @@ frontend/*.local
 # Runtime agent-activity data
 RAG_InsureAI/app/agent_activity.json
 
+# Agent escalation-email recipient database — contains real email addresses,
+# kept local-only same as .env. See .env.example for the expected format.
+RAG_InsureAI/app/agent_emails.xlsx
+
 # Duplicate frontend build (served via bind mount from frontend/dist)
 RAG_InsureAI/app/frontend_dist/
