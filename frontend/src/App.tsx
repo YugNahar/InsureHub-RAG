@@ -15,6 +15,7 @@ import {
   XCircle,
   Loader2,
   Search,
+  MessageSquarePlus,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -478,6 +479,25 @@ function ChatWidget({
     }
   }
 
+  // "New Chat" clears the visible conversation and the backend's LLM-facing
+  // memory for this session, WITHOUT creating a new session_id. The session
+  // stays fully continuous in Super Admin / Agent Dashboard — the backend
+  // reset endpoint appends a "— New Chat started —" system marker there.
+  // Guarded to only run in plain "ai" mode so it can't interrupt an active
+  // human handoff (waiting/live-agent) conversation.
+  async function newChat() {
+    if (chatModeRef.current !== "ai" || sending) return;
+    try {
+      await apiFetch(`/conversation/reset/${sessionId}`, { method: "POST" });
+    } catch (err) {
+      console.error("Failed to reset conversation on server:", err);
+    }
+    setMessages([GREETING]);
+    setSuggestedQs([]);
+    setInput("");
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || sending) return;
@@ -607,6 +627,18 @@ function ChatWidget({
             </div>
             <div className="text-xs text-muted-foreground">{headerLabel}</div>
           </div>
+          {chatMode === "ai" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={newChat}
+              className="gap-1.5 shrink-0 text-muted-foreground hover:text-foreground"
+              aria-label="Start a new chat"
+            >
+              <MessageSquarePlus className="h-4 w-4" />
+              New Chat
+            </Button>
+          )}
         </div>
 
         <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">

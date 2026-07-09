@@ -104,6 +104,7 @@ _DEFAULT_CORS_ORIGINS = [
     "https://insurehub-panels.vercel.app",
     # Direct IP access
     "http://123.253.124.14:8501",
+    "https://insurehubrag.nexsysit.co.in", 
 ]
 
 
@@ -429,6 +430,33 @@ async def super_admin_assign(request: Request, token: str = Depends(_check_super
 async def super_admin_delete_session(session_id: str, token: str = Depends(_check_super_admin)):
     ok = await _agent_hub.delete_session(session_id)
     return {"ok": ok}
+
+
+class BackendSettingsRequest(BaseModel):
+    mode: str                      # "auto" | "vllm" | "groq" | "manual"
+    manual_api_key: str = ""       # only sent when the admin is setting/changing it
+    manual_base_url: str = ""
+    manual_model: str = ""
+
+
+@app.get("/super-admin/backend-settings")
+async def super_admin_get_backend_settings(token: str = Depends(_check_super_admin)):
+    from router import get_backend_settings
+    return get_backend_settings()
+
+
+@app.post("/super-admin/backend-settings")
+async def super_admin_set_backend_settings(req: BackendSettingsRequest, token: str = Depends(_check_super_admin)):
+    from router import set_backend_settings
+    try:
+        return set_backend_settings(
+            mode=req.mode,
+            manual_api_key=req.manual_api_key,
+            manual_base_url=req.manual_base_url,
+            manual_model=req.manual_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.websocket("/ws/super-admin")
@@ -1242,12 +1270,24 @@ async def ask(req: AskRequest):
 
 @app.post("/conversation/reset/{session_id}")
 async def reset_conversation(session_id: str):
-    """Reset the conversational agent's state for a session (clears pending questions)."""
+    """Reset the conversational agent's state for a session (clears pending
+    questions and LLM-facing memory) — used when the user starts a New Chat.
+    The session itself (its agent_hub record and full transcript) is left
+    completely intact for Super Admin / Agent Dashboard visibility; only a
+    system marker is appended so admins can see where the reset occurred."""
     agent = _get_conversation_agent()
     agent.reset_session(session_id)
     await _delete_agent_session(session_id)
     # Also clear the stored conversation history if desired
     await _delete_conversation_history(session_id)
+    if session_id and session_id != "default":
+        try:
+            await _agent_hub.log_message(session_id, "system", "— New Chat started —")
+        except Exception:
+            logger.warning(
+                "[reset_conversation] Failed to log New Chat marker for session_id=%s",
+                session_id, exc_info=True,
+            )
     return {"status": "reset"}
 
 
@@ -1426,19 +1466,10 @@ async def ask_url(req: AskURLRequest):
             f"Text: {context}\n\n"
             f"Question: {question}\n\nAnswer:"
         )
-        from router import VLLM_API_KEY, VLLM_HOST, VLLM_MODEL
-        from langchain_openai import ChatOpenAI
+        from router import get_insurance_llm
         from langchain_core.messages import HumanMessage
 
-        llm = ChatOpenAI(
-            model=VLLM_MODEL,
-            base_url=f"{VLLM_HOST}/v1",
-            api_key=VLLM_API_KEY,
-            temperature=0.3,
-            max_tokens=200,
-            timeout=25,
-            max_retries=1,
-        )
+        llm = get_insurance_llm(temperature=0.3, max_tokens=200)
         try:
             response = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
             answer = response.content.strip()
@@ -1951,22 +1982,13 @@ async def evaluate(req: EvaluateRequest):
             from datasets import Dataset
             from ragas import evaluate as ragas_evaluate
             from ragas.metrics import faithfulness, answer_relevancy, context_precision
-            from langchain_openai import ChatOpenAI
             from ragas.llms import LangchainLLMWrapper
             from ragas.embeddings import LangchainEmbeddingsWrapper
             from langchain_community.embeddings import HuggingFaceEmbeddings
 
-            from router import VLLM_HOST, VLLM_MODEL, VLLM_API_KEY
+            from router import get_insurance_llm
 
-            ragas_llm = ChatOpenAI(
-                model=VLLM_MODEL,
-                base_url=f"{VLLM_HOST}/v1",
-                api_key=VLLM_API_KEY,
-                temperature=0,
-                max_tokens=512,
-                timeout=60,
-                max_retries=1,
-            )
+            ragas_llm = get_insurance_llm(temperature=0, max_tokens=512)
             ragas_llm_wrapper = LangchainLLMWrapper(ragas_llm)
 
             embed_model = _get_pipeline().vector_store.embed_model
