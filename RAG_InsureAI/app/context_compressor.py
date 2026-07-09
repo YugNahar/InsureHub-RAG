@@ -171,12 +171,30 @@ class ContextCompressor:
         exceeds the LLM's context window.
 
         Steps:
-          1. Walk chunks in order (highest relevance first, caller's
-             responsibility to pre-sort).
-          2. If a chunk fits in the remaining budget, include it as-is.
-          3. If a chunk would exceed the remaining budget, keep only the
-             most query-relevant sentences from it that still fit.
+          1. Give every chunk a fair-share allocation (max_total_chars / N)
+             up front; any share left unused by a chunk smaller than its
+             allocation rolls over to chunks that need more, highest-
+             relevance-first (caller's pre-sort order).
+          2. For a chunk that fits within its final allocation, include it
+             as-is.
+          3. For a chunk that exceeds its allocation, keep only the most
+             query-relevant sentences from it that still fit.
           4. As a last resort, hard-truncate at a sentence boundary.
+
+        Fair-share replaces a strict "fill in rank order until the budget
+        runs out" pass — confirmed live: 10 chunks competing for a
+        6000-char budget left the 4th chunk with 20 characters and chunks
+        5-10 with none at all, discarding entire retrieved sources outright
+        even though they'd been relevant enough to be retrieved in the
+        first place. Every chunk now gets at least an equal cut up front,
+        so a wide candidate pool (detailed mode retrieves more chunks
+        specifically to have more material to draw from) actually gets
+        used instead of being crushed down to whichever 2-3 chunks
+        happened to sort first. This gracefully degrades back to the old
+        behavior whenever there's enough room for everyone — the
+        redistribution step still lets top-ranked chunks grow to their
+        full size first, exactly as before, once every chunk's minimum is
+        covered.
         """
         total = sum(len(d.page_content) for d in chunks)
         if total <= max_total_chars:
@@ -192,23 +210,34 @@ class ContextCompressor:
             [query], normalize_embeddings=True, show_progress_bar=False
         )[0]
 
-        budget = max_total_chars
+        sizes = [len(d.page_content) for d in chunks]
+        n = len(chunks)
+        fair_share = max_total_chars // n
+        allocations = [min(s, fair_share) for s in sizes]
+        leftover = max_total_chars - sum(allocations)
+        for i, s in enumerate(sizes):
+            if leftover <= 0:
+                break
+            if s > allocations[i]:
+                extra = min(leftover, s - allocations[i])
+                allocations[i] += extra
+                leftover -= extra
+
         final: List[Document] = []
 
-        for doc in chunks:
-            remaining = budget - sum(len(d.page_content) for d in final)
-            if remaining <= 0:
-                break
+        for doc, alloc in zip(chunks, allocations):
+            if alloc <= 0:
+                continue
 
             text = doc.page_content
 
-            # Chunk fits in remaining budget — include it as-is, no compression.
-            if len(text) <= remaining:
+            # Chunk fits in its allocation — include it as-is, no compression.
+            if len(text) <= alloc:
                 final.append(doc)
                 continue
 
-            # Chunk is too large for remaining budget — keep only the most
-            # query-relevant sentences that fit within `remaining` chars.
+            # Chunk is too large for its allocation — keep only the most
+            # query-relevant sentences that fit within `alloc` chars.
             is_yt = (
                 doc.metadata.get("doc_type") == "youtube"
                 or "youtube" in str(doc.metadata.get("source_type", "")).lower()
@@ -219,12 +248,12 @@ class ContextCompressor:
             if len(sentences) <= 1:
                 # Single atomic sentence — hard-truncate at the nearest
                 # sentence boundary rather than cutting mid-word.
-                truncated = text[:remaining].rsplit('. ', 1)[0] + '…'
+                truncated = text[:alloc].rsplit('. ', 1)[0] + '…'
                 final.append(Document(
                     page_content=truncated,
                     metadata={**doc.metadata, "hard_truncated": True},
                 ))
-                break
+                continue
 
             sent_embs = self._model.encode(
                 sentences, normalize_embeddings=True, batch_size=32, show_progress_bar=False
@@ -236,21 +265,21 @@ class ContextCompressor:
             used = 0
             for idx in ranked:
                 s = sentences[int(idx)]
-                if used + len(s) + 2 <= remaining:
+                if used + len(s) + 2 <= alloc:
                     kept_indices.add(int(idx))
                     used += len(s) + 2
-                if used >= remaining:
+                if used >= alloc:
                     break
 
             if not kept_indices:
                 # Even the single best sentence is too long — hard-truncate it.
                 best = sentences[int(ranked[0])]
-                truncated = best[:remaining] + '…'
+                truncated = best[:alloc] + '…'
                 final.append(Document(
                     page_content=truncated,
                     metadata={**doc.metadata, "hard_truncated": True},
                 ))
-                break
+                continue
 
             # Re-assemble in original document order (not relevance order)
             # so the LLM reads coherent prose, not a jumbled ranking.
