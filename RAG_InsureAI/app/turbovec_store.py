@@ -143,7 +143,26 @@ _RERANK_WINDOW_STRIDE = _RERANK_TEXT_CHARS // 3
 # the highest-scoring one becomes that candidate's final rerank score. Kept
 # small: this is what bounds the added forward-pass cost (see
 # _rerank_windows's docstring for why a bigger number wasn't needed).
-_RERANK_MAX_WINDOWS = 3
+#
+# 3 -> 2: measured live at detailed-mode candidate-pool scale (20 candidates,
+# _doc_top_k=14): multi-window reranking took 13.4s at 3 windows/candidate
+# vs 4.5s for plain single-window — a real, user-visible latency cost that
+# scales with pool size, not the "statistically indistinguishable" result
+# from an earlier smaller-scale measurement. Before cutting this, verified
+# window[1] (not window[2]) carries the signal for both confirmed bug cases
+# this session (the "relatives" case's window[2] is redundant with window[1]
+# — both contain the target sentence; the "personal accident" case's
+# window[1] alone already scores 0.942, still overwhelming versus any decoy,
+# even though window[2] scores marginally higher at 0.998). A capacity-based
+# optimization (rerank only the top-K candidates by a cheap first-pass
+# score) was tried and rejected first: the personal-accident target ranks
+# ~29th out of 38 candidates under single-window-only scoring, since its
+# opening window is generic administrative text — exactly the kind of
+# candidate a top-K prefilter would exclude, silently reintroducing the bug
+# it was built to fix. Cutting the window count uniformly (every candidate
+# still gets multiple windows, just fewer of them) doesn't have that
+# failure mode.
+_RERANK_MAX_WINDOWS = 2
 
 
 def _rerank_windows(text: str, query: str) -> List[str]:
