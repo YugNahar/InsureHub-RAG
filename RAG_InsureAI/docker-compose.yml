@@ -57,7 +57,7 @@ services:
     <<: *common
     container_name: insurehub_eval
     working_dir: /app
-    command: ["uvicorn", "eval_api:app", "--host", "0.0.0.0", "--port", "8001"]
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8501", "--ws-per-message-deflate", "False"]
     ports:
       - "8002:8001"
     volumes:
