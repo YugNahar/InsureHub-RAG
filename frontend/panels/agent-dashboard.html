@@ -810,9 +810,13 @@ function openWebSocket() {
 
   ws.onmessage = ev => handle(JSON.parse(ev.data));
 
-  ws.onerror = () => { /* onclose always fires after onerror — handled there */ };
+  ws.onerror = (err) => {
+    console.warn("[WS DEBUG] onerror fired:", err);
+    /* onclose always fires after onerror — handled there */
+  };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    console.warn("[WS DEBUG] onclose fired — code:", event.code, "reason:", JSON.stringify(event.reason), "wasClean:", event.wasClean);
     if (intentionalDisconnect) return;
     scheduleReconnect();
   };
