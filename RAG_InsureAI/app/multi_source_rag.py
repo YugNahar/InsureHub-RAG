@@ -3122,6 +3122,30 @@ class MultiSourceRAG:
                         _kv_related_ctx = "\n\n".join(_rel_parts)
             except Exception:
                 _kv_q_emb = None
+
+        # A cache hit can replay an answer that was itself truncated mid-
+        # generation when it was first cached (e.g. hit max_tokens). Serving
+        # it verbatim to a differently-worded follow-up ("explain fire
+        # insurance in detail" after "explain it in detail") silently
+        # repeats the bad answer instead of getting a fresh, complete one —
+        # confirmed live: a 2-sentence truncated answer with no closing line
+        # got replayed unchanged for a reworded repeat of the same question.
+        # DETAILED_GROUNDED_PROMPT always has the model end with a warm
+        # closing line; its absence is a reliable signal generation was cut
+        # short, so treat that as a cache miss and regenerate instead.
+        if _kv_hit is not None and _keyword_detailed:
+            _cached_ans_txt = (_kv_hit.get("answer") or "")
+            _cached_looks_incomplete = not re.search(
+                r"(hope that|let me know|feel free|hang tight|glad to|dig into any part|clears? it up)",
+                _cached_ans_txt[-250:], re.IGNORECASE,
+            )
+            if _cached_looks_incomplete:
+                logger.info(
+                    "[ask_stream] discarding cache hit that looks truncated/incomplete (len=%d)",
+                    len(_cached_ans_txt),
+                )
+                _kv_hit = None
+
         if _kv_hit is not None:
             import json as _json_s
             logger.info("[ask_stream] KV cache hit  query=%r detailed=%s", retrieval_query[:80], _keyword_detailed)
@@ -3751,7 +3775,13 @@ class MultiSourceRAG:
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "600") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "300")),
+                # 600 was cutting genuine 8-point detailed answers off
+                # mid-generation — an opener + 8 points + closer commonly
+                # runs 450-550 tokens on its own, before accounting for
+                # markdown bolding/bullets the model sometimes adds, which
+                # left little headroom. Confirmed live: a fire-insurance
+                # "explain in detail" answer was cut after ~2 points.
+                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "900") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "300")),
                 "stream": True,
             }
             headers = _stream_headers
@@ -3880,23 +3910,23 @@ class MultiSourceRAG:
                 _top_rerank,
             )
 
-        # ── Truncation detection ─────────────────────────────────────────────
-        # If the stream hit max_tokens mid-sentence, trim to the last complete
-        # sentence and tell the frontend to replace the displayed text.
+        # ── Truncation detection (log only, never discard content) ────────────
+        # Used to trim the answer down to its last complete sentence when the
+        # stream hit max_tokens mid-sentence. Explicitly disabled per user
+        # instruction: whatever was actually generated should reach the user,
+        # not be cut down further — the trim regularly threw away most of a
+        # detailed answer (an 8-point answer could end up as 2 sentences)
+        # whenever the real fix is raising max_tokens (done above) or
+        # investigating why generation stopped early, not hiding the result.
+        # Also mis-fired on ordinary complete answers ending in a trailing
+        # emoji ("...this. 😊") since "😊" isn't a sentence-ending character —
+        # kept only as a log signal for how often that's still happening.
         _SENT_ENDERS = frozenset('.!?…')
         if _reply_stripped and _reply_stripped[-1] not in _SENT_ENDERS:
-            # Response doesn't end at a sentence boundary — find the last one
-            _last_sent = max(
-                _reply_stripped.rfind('. '),
-                _reply_stripped.rfind('! '),
-                _reply_stripped.rfind('? '),
-                _reply_stripped.rfind('.\n'),
-                _reply_stripped.rfind('!\n'),
-                _reply_stripped.rfind('?\n'),
+            logger.info(
+                "[ask_stream] answer does not end at a sentence boundary (len=%d) — showing as generated",
+                len(_reply_stripped),
             )
-            if _last_sent > len(_reply_stripped) // 3:
-                _corrected_text = _reply_stripped[:_last_sent + 1].strip()
-                _kv_reply = _corrected_text  # cache the clean version
 
         # ── Numbered-list enforcement (detailed mode) ─────────────────────────
         # DETAILED_GROUNDED_PROMPT explicitly instructs "1. ... 2. ... 3. ..."
@@ -4024,7 +4054,25 @@ class MultiSourceRAG:
                     # two strings being compared) generalizes beyond this one
                     # spot — keep both sides passing through the exact same
                     # tokenizer in any future overlap/grounding check.
-                    _ctx_norm = " ".join(_re3.findall(r"\w+", full_context.lower()))
+                    # Light plural stemming, applied identically to both
+                    # sides (same principle as the punctuation fix above —
+                    # any asymmetry between the two strings being compared
+                    # creates false negatives). Confirmed live: the model
+                    # pluralized an entire near-verbatim peril-list point
+                    # ("explosion"->"explosions", "riot"->"riots", "storm"
+                    # ->"storms", etc. throughout), and exact-word 4-gram
+                    # matching against the KB's singular forms scored 0
+                    # matches out of 16 possible — the point was dropped
+                    # despite being genuine KB content, just re-pluralized.
+                    def _norm_word(w: str) -> str:
+                        if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+                            return w[:-1]
+                        return w
+
+                    def _norm_words(text: str) -> list[str]:
+                        return [_norm_word(w) for w in _re3.findall(r"\w+", text.lower())]
+
+                    _ctx_norm = " ".join(_norm_words(full_context))
                     _MIN_MATCHES = 5
                     _NGRAM = 4
                     # A short point (< 8 words) has fewer than 5 possible
@@ -4038,7 +4086,7 @@ class MultiSourceRAG:
                     _MIN_FRACTION = 0.6
 
                     def _matched_ngrams(text: str) -> tuple[int, int]:
-                        _words = _re3.findall(r"\w+", text.lower())
+                        _words = _norm_words(text)
                         if len(_words) < _NGRAM:
                             _content = [w for w in _words if len(w) >= 4]
                             _matched = sum(1 for w in _content if w in _ctx_norm)
