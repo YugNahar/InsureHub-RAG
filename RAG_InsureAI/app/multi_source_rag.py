@@ -16,6 +16,7 @@ except ImportError:
     _APIStatusError = Exception
 
 from rapidfuzz import fuzz, process
+from turbovec_store import _rerank_windows
 
 logger = logging.getLogger(__name__)
 
@@ -701,11 +702,51 @@ _CHIP_STOPWORDS = frozenset({
 })
 
 
+_DURATION_QUESTION_RE = re.compile(
+    r"\bhow long\b|\bhow many (?:years|months|days|weeks)\b|"
+    r"\bwhat is the (?:duration|term|period|length)\b",
+    re.IGNORECASE,
+)
+_DURATION_KEYWORD_RE = re.compile(r"\b(term|period|duration)\b", re.IGNORECASE)
+_DURATION_VALUE_RE = re.compile(
+    r"\d+\s*[- ]?(?:year|yr|month|day|week)s?\b|\bannual(?:ly)?\b|\byearly\b|"
+    r"\blifetime\b|\bwhole\s*life\b",
+    re.IGNORECASE,
+)
+
+
+def _has_nearby_duration_value(context: str, window: int = 60) -> bool:
+    """True if an explicit duration value (a number+unit, or annual/yearly/
+    lifetime) appears within *window* chars of "term"/"period"/"duration"
+    somewhere in *context*.
+    """
+    for m in _DURATION_KEYWORD_RE.finditer(context):
+        snippet = context[max(0, m.start() - window):m.end() + window]
+        if _DURATION_VALUE_RE.search(snippet):
+            return True
+    return False
+
+
 def _question_answerable_in_context(question: str, context: str) -> bool:
     """
     Return True when at least half the content words in *question* appear
     somewhere in *context*.  Cheap, no LLM call.  Content words = words
     longer than 3 chars that are not stopwords.
+
+    Duration-shaped questions ("how long is X", "what is the term/period of
+    X") additionally require an explicit duration VALUE near the word
+    "term"/"period"/"duration" in the context — not just that word's bare
+    presence. Confirmed live: "term" appears 5 times in a health-insurance
+    context purely as a generic placeholder ("during the term of the
+    policy...") with the actual duration never stated anywhere, which was
+    enough word-overlap to pass this filter (and, separately, enough to
+    fool _verify_grounding — even individually, not just when batched — 4/4
+    times in testing). This is a genuine gap between "topically mentions
+    the concept" and "states the specific fact asked for" that neither
+    prompt wording nor batched-vs-individual verification fixed, so it's
+    caught here deterministically instead, mirroring this session's other
+    grounding-check fixes (regulatory boilerplate, multi-chunk confusion)
+    that moved a judgment out of the unreliable small-model layer.
     """
     words = [w.lower().strip("?.,!;:'\"()") for w in question.split()]
     content_words = [w for w in words if len(w) >= 4 and w not in _CHIP_STOPWORDS]
@@ -713,7 +754,11 @@ def _question_answerable_in_context(question: str, context: str) -> bool:
         return False            # can't verify — drop it to be safe
     ctx_lower = context.lower()
     hits = sum(1 for w in content_words if w in ctx_lower)
-    return hits >= max(1, len(content_words) * 0.5)
+    if hits < max(1, len(content_words) * 0.5):
+        return False
+    if _DURATION_QUESTION_RE.search(question) and not _has_nearby_duration_value(context):
+        return False
+    return True
 
 
 async def _backend_completion(
@@ -805,7 +850,7 @@ async def _backend_completion(
         return None
 
 
-async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]]:
+async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str], bool]:
     """Fallback query cleaner tried only when the primary retrieval attempt
     already failed coverage — fixes general spelling mistakes (not just the
     hand-curated insurance vocabulary _correct_typos() knows) and strips
@@ -822,20 +867,21 @@ async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]
     failing, not primary answer generation, and shouldn't compete for the
     same (rate-limited) Groq quota real answers need.
 
-    Returns (cleaned_query, dropped_terms_summary) — both None on any
-    failure, unconfigured backend, or empty response, so the caller falls
-    through to the existing refusal exactly as it did before this function
-    existed. dropped_terms_summary is computed programmatically from the
-    before/after diff (see _diff_dropped_terms), not self-reported by the
-    model — asking it to also report what it removed was tried first and
-    was unreliable, sometimes echoing the prompt's own example words
+    Returns (cleaned_query, dropped_terms_summary, dropped_has_proper_noun)
+    — cleaned_query and dropped_terms_summary are both None on any failure,
+    unconfigured backend, or empty response, so the caller falls through to
+    the existing refusal exactly as it did before this function existed.
+    dropped_terms_summary is computed programmatically from the before/
+    after diff (see _diff_dropped_terms), not self-reported by the model —
+    asking it to also report what it removed was tried first and was
+    unreliable, sometimes echoing the prompt's own example words
     ("affordable", "cheap", "best") as "dropped" even when they were never
     in the query, or weren't actually removed from the cleaned version.
     """
     import aiohttp as _ah
     from router import VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
     if not VLLM_HOST:
-        return None, None
+        return None, None, False
     prompt = (
         f"Query: {question}\n\n"
         "This insurance-related search query may contain spelling mistakes, "
@@ -864,15 +910,16 @@ async def _vllm_clean_query(question: str) -> Tuple[Optional[str], Optional[str]
                 timeout=_ah.ClientTimeout(total=12),
             ) as resp:
                 if resp.status != 200:
-                    return None, None
+                    return None, None, False
                 data = await resp.json()
                 raw = data["choices"][0]["message"]["content"].strip()
     except Exception:
-        return None, None
+        return None, None, False
     cleaned = raw.strip().strip('"').strip("'").strip()
     if not cleaned:
-        return None, None
-    return cleaned, _diff_dropped_terms(question, cleaned)
+        return None, None, False
+    _dropped_note, _dropped_proper_noun = _diff_dropped_terms(question, cleaned)
+    return cleaned, _dropped_note, _dropped_proper_noun
 
 
 # Emphasis/qualifier words worth calling out by name if the cleaner drops
@@ -886,17 +933,28 @@ _EMPHASIS_WORDS = frozenset({
 })
 
 
-def _diff_dropped_terms(original: str, cleaned: str) -> Optional[str]:
-    """Return a short, comma-separated list of concrete terms present in
-    *original* but missing from *cleaned* — specifically capitalized words
-    other than the first (likely a proper noun: a country, city, or
-    provider name) and known emphasis words (_EMPHASIS_WORDS). Computed
-    directly from the text rather than trusted from the model's own
-    self-report (see _vllm_clean_query's docstring for why).
+def _diff_dropped_terms(original: str, cleaned: str) -> Tuple[Optional[str], bool]:
+    """Return (short comma-separated list of concrete terms present in
+    *original* but missing from *cleaned*, whether any of them is a likely
+    proper noun) — specifically capitalized words other than the first
+    (likely a proper noun: a country, city, or provider name) and known
+    emphasis words (_EMPHASIS_WORDS). Computed directly from the text
+    rather than trusted from the model's own self-report (see
+    _vllm_clean_query's docstring for why).
+
+    The proper-noun flag matters downstream: dropping "affordable"/"cheap"
+    to get a retrieval match is harmless (the KB's content on the core
+    topic is still factually complete, just not tagged "cheap"), but
+    dropping a country/city/provider name means the KB has no actual
+    content about that specific thing — answering with the generic
+    version and hoping the model remembers to disclose the gap is not
+    reliable enough to trust (see the caller in ask_stream for the
+    concrete failure this was measured against).
     """
     orig_words = original.split()
     clean_lower = cleaned.lower()
     dropped = []
+    has_proper_noun = False
     for i, w in enumerate(orig_words):
         w_clean = w.strip(".,!?;:()[]{}'\"")
         if not w_clean:
@@ -906,7 +964,9 @@ def _diff_dropped_terms(original: str, cleaned: str) -> Optional[str]:
         is_emphasis = w_lower in _EMPHASIS_WORDS
         if (is_proper_noun or is_emphasis) and w_lower not in clean_lower:
             dropped.append(w_clean)
-    return ", ".join(dict.fromkeys(dropped)) if dropped else None
+            if is_proper_noun:
+                has_proper_noun = True
+    return (", ".join(dict.fromkeys(dropped)) if dropped else None, has_proper_noun)
 
 
 async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
@@ -1148,7 +1208,8 @@ _ANCHOR_TYPE_RE = re.compile(
     r"critical\s*illness|"
     r"group|corporate|"
     r"personal\s*accident|disability|"
-    r"retirement|pension|annuity|takaful)\b(\s+insurance)?",
+    r"retirement|pension|annuity|takaful|"
+    r"crop|agricultur\w*)\b(\s+insurance)?",
     re.IGNORECASE,
 )
 
@@ -1166,6 +1227,25 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     happens to appear later in the same turn's prose. Only falls back to
     searching the whole text when the user's own turn has no type mention
     (e.g. a topic introduced solely by the assistant, never restated).
+
+    The fallback (assistant-only) search requires the matched type to
+    appear at least twice in *text* — a single occurrence is often just an
+    illustrative aside within an otherwise generic answer, not the actual
+    established topic. Confirmed live: "What does the policy document
+    include?" (names no type) got an answer that mentioned "Fire Insurance"
+    exactly once, as a passing example among several ("...in Fire Insurance
+    the particulars of the building...", alongside a car-insurance example
+    in the same sentence) — a plain last-match-anywhere search still picked
+    it up as "the established topic" and the repair step below injected
+    "for fire insurance" into a follow-up about something else entirely
+    ("how can relatives be informed about the policy?"), reintroducing the
+    exact type-hallucination failure the _reformulate_query LLM-prompt
+    guardrail was built to prevent — this deterministic repair runs after
+    that LLM call and isn't covered by its prompt instructions at all. A
+    genuinely-established topic (the documented term-insurance/"how to
+    claim it?" case this repair exists for) is discussed substantively
+    enough to be named more than once, so the frequency check doesn't
+    weaken the intended case.
     """
     user_turns = re.findall(r"User:\s*(.*?)(?=\n(?:User|Assistant):|\Z)", text, re.DOTALL)
     if user_turns:
@@ -1179,13 +1259,120 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     matches = list(_ANCHOR_TYPE_RE.finditer(text))
     if not matches:
         return None
+    base_counts: dict = {}
+    for m in matches:
+        base = m.group(0).strip().lower().split()[0]
+        base_counts[base] = base_counts.get(base, 0) + 1
     phrase = matches[-1].group(0).strip()
+    if base_counts[phrase.lower().split()[0]] < 2:
+        return None
     if not re.search(r"insurance\s*$", phrase, re.IGNORECASE):
         phrase = f"{phrase} insurance"
     return phrase
 
 
-async def _reformulate_query(question: str, history: str) -> str:
+# Legislative/tax/administrative boilerplate — a chunk matching this is
+# almost never what a consumer-facing question is actually asking about,
+# even when it happens to name the right insurance type (e.g. "the Act
+# guarantees amounts assured by LIC policies" mentions "life insurance"
+# but is about a government solvency guarantee, not payout amounts). See
+# _prioritize_topic_chunks's docstring for the concrete failure this fixes.
+#
+# "ICP \d+" and "the supervisor" extend this to insurance-REGULATOR/
+# supervisory-framework boilerplate (IAIS Insurance Core Principles text —
+# licensing, board-member suitability, governance requirements aimed at
+# insurers-as-regulated-entities). Confirmed live: "How can relatives be
+# informed about the policy?" cross-encoder-scored a chunk about board-
+# member/significant-owner suitability licensing at 0.94 — higher than
+# every genuinely relevant chunk in the pool — even though the selected
+# rerank window didn't contain the word "relative" at all. Same underlying
+# judgment as the original regulatory-boilerplate case: this class of
+# supervisor-facing governance text is essentially never what a consumer
+# question wants, regardless of how the cross-encoder happens to score it.
+# "the supervisor" specifically (not "the regulator"/"the authority" more
+# broadly, which are too generic and risk false-positiving on unrelated
+# content) because in this KB's consumer-facing prose the acting party is
+# always "the insurer"/"the insured"/"the policyholder"/"the agent" — "the
+# supervisor" only appears in the regulatory-oversight framework sections.
+_REGULATORY_BOILERPLATE_RE = re.compile(
+    r"\b(the act|the bill|stamp duty|income tax act|central government|"
+    r"section\s+\d+[a-z]?\b.{0,20}\bact\b|"
+    r"guarantee[sd]?\s+by\s+the\s+(central\s+)?government|"
+    r"amends?\b|gross\s+total\s+income|"
+    r"icp\s*\d+|the\s+supervisor)\b",
+    re.IGNORECASE,
+)
+
+
+def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
+    """Reorder *chunks* so ones whose content mentions the query's named
+    insurance type (e.g. "health insurance") come before ones that don't —
+    same relative order preserved within each group (stable sort), so this
+    only ever changes ORDER, never which chunks are included.
+
+    Exists for two related failure modes, both confirmed live:
+    (a) a generic, universal-to-any-policy glossary chunk outranking
+    genuinely topic-specific content sitting right next to it in the same
+    retrieved pool (see DETAILED_GROUNDED_PROMPT/STRICT_GROUNDED_PROMPT's
+    "prioritize topic-specific content" rule, which helped but wasn't
+    reliable alone), and (b) a chunk from a DIFFERENT insurance type
+    entirely outranking the correct one because the wording happens to be
+    lexically/semantically similar — confirmed with "are all types of
+    illness covered under health insurance?": the top-scoring chunk (0.78)
+    was travel insurance's exclusion list ("illnesses or injuries that
+    occurred... before the start of the journey"), correctly rejected by
+    the semantic grounding check as not actually about health insurance —
+    but that refusal meant a REAL health-insurance exclusion chunk sitting
+    lower in the same pool (0.10, cosmetic/aesthetic treatment exclusions)
+    never got a chance to ground the answer either. Reordering so the
+    correct-topic chunk is physically first gives it a chance to be what
+    the coverage/grounding checks and generation actually see and use.
+
+    A no-op when the query doesn't name a specific type (single-word
+    concept lookups like "what is a deductible" are unaffected).
+
+    Chunks matching _REGULATORY_BOILERPLATE_RE never count as a "topic
+    match" for promotion, even when they literally contain the topic
+    phrase. Confirmed live: "How much does life insurance pay out?"
+    promoted a weak (0.10) chunk about the Insurance Act's central-
+    government solvency guarantee for LIC purely because it contains the
+    words "life insurance" — ahead of a higher-scoring but wrong-topic
+    (health insurance) chunk. That regulatory chunk doesn't answer "how
+    much", but the grounding check judged it "relevant enough" anyway
+    (reproduced 15/15 across 5 different prompt phrasings, including ones
+    naming this exact failure as an explicit exclusion — this is a hard
+    model limitation, not a prompt-wording gap, so it's addressed here at
+    the reordering step instead of asking the LLM to see through it).
+    Legislative/tax/administrative boilerplate is essentially never what a
+    consumer-facing "what/how much/how" question is looking for even when
+    it happens to name the right insurance type — see _reformulate_query's
+    existing "do not add a specific regulation, act, section... unless
+    already named" rule for the same underlying judgment applied earlier
+    in the pipeline.
+
+    The boilerplate deprioritization runs even when the query names NO
+    specific insurance type (topic is None below) — confirmed live with
+    "How can relatives be informed about the policy?" (no type mentioned
+    anywhere in the conversation): a supervisory-licensing boilerplate
+    chunk outranked every genuinely relevant chunk by cross-encoder score
+    alone, and topic-matching had nothing to gate on since there was no
+    named topic to check against. Boilerplate is a category judgment
+    independent of topic, so it applies unconditionally; only the topic
+    promotion half of this function needs a named type to compare against.
+    """
+    m = _ANCHOR_TYPE_RE.search(retrieval_query)
+    topic = m.group(0).lower() if m else None
+    def _rank(c) -> int:
+        content = (getattr(c, "page_content", "") or "").lower()
+        if _REGULATORY_BOILERPLATE_RE.search(content):
+            return 1
+        if topic and topic not in content:
+            return 1
+        return 0
+    return sorted(chunks, key=_rank)
+
+
+async def _reformulate_query(question: str, history: str) -> Optional[str]:
     """Rewrite a follow-up question as a standalone, natural-language question
     using conversation history — used both for retrieval and, for detected
     follow-ups, as the literal question text shown to the generation prompt.
@@ -1196,7 +1383,20 @@ async def _reformulate_query(question: str, history: str) -> str:
       returns: "What is the premium amount for life insurance?"
 
     Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
-    Falls back to the original question on any error.
+
+    Returns None on genuine failure (backend call failed/timed out, or
+    returned degenerate output) — the caller then falls back to
+    _reformulate_with_history. Returns *question* UNCHANGED (not None) when
+    the model correctly determines no rewrite is needed — this is a
+    successful outcome, not a failure, and must not trigger that fallback:
+    the prompt below now explicitly instructs the model to echo an
+    already-self-contained follow-up back verbatim rather than force a
+    paraphrase (confirmed live: unnecessary rewrites of a fine question —
+    adding "typically", "regarding the details of" — introduced wording
+    that swung the downstream cross-encoder's relevance score by 10-30x for
+    no benefit). Collapsing "unchanged because unnecessary" into the same
+    signal as "failed" would defeat that fix by re-triggering the history-
+    snippet fallback for a question that didn't need any rewrite at all.
     """
     # Use only the last 2 turns (the single most recent Q&A pair) of history.
     # Used to slice by raw newline count instead of turn boundaries —
@@ -1241,19 +1441,49 @@ async def _reformulate_query(question: str, history: str) -> str:
     # question fixes both problems at once.
     prompt = f"""Rewrite the follow-up question as a complete, standalone, natural-language question using the conversation context.
 Use precise insurance/legal terms that would appear in a textbook, but phrase it as a real question a person would ask — not a keyword list.
+If the follow-up is ALREADY a complete, self-contained question that doesn't
+depend on anything in the conversation below to be understood — no pronoun,
+no missing topic, nothing implicit — output it EXACTLY AS-IS, character for
+character, changing nothing. Do not add hedging words ("typically",
+"usually"), do not add a topic that isn't needed, do not paraphrase just to
+sound more natural — an unnecessary rewrite is not an improvement, and
+different wording of an already-fine question can retrieve worse results
+than the original. Only rewrite when something genuinely needs resolving.
 The conversation below is ONLY the single most recent exchange — always ground
 the follow-up in that topic, never in anything outside what's shown here.
+Do NOT add a specific regulation, act, section, jurisdiction, or authority
+(e.g. "under federal law", "under section 80C", "under IRDA regulations")
+unless the conversation itself already named it — inventing one, even a
+plausible-sounding one, measurably hurts retrieval when the actual source
+material frames it differently or doesn't cite a specific provision at all.
+Same rule for the insurance TYPE itself: do NOT introduce a specific
+product name (e.g. "fire insurance", "marine insurance") that appears
+NOWHERE in the conversation above AND nowhere in the follow-up itself —
+only reuse a product name that was already used somewhere. This is about
+not INVENTING a new product name out of nothing — it does not mean
+dropping words that already appear in the follow-up; always keep
+everything the follow-up itself asks about (e.g. "how can relatives be
+informed" must still mention relatives in your rewrite).
+If the follow-up ALREADY asks about multiple things joined by "and" (e.g.
+"what is X and how to Y"), your rewritten question must keep EVERY part —
+never drop a part just because it resembles something already discussed.
 Output ONLY the rewritten question — no quotes, no explanation, nothing else.
 
 Examples:
+  Context: "User: what does the policy document include?\nLayla: The policy document includes the name and address of the insured, sum insured, period of insurance..."
+  Follow-up: "How can relatives be informed about the policy?" → "How can relatives be informed about the policy?" (already self-contained — output unchanged)
+
   Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
   Follow-up: "what about premiums?" → "What is the premium amount for life insurance?"
 
   Context: "User: explain life insurance\nLayla: Life insurance protects your family..."
-  Follow-up: "is it tax deductible?" → "Are life insurance premiums tax deductible under section 80C?"
+  Follow-up: "is it tax deductible?" → "Are life insurance premiums tax deductible?"
 
   Context: "User: explain reinsurance\nLayla: Reinsurance is when insurers share risk..."
-  Follow-up: "is it legally required?" → "Is reinsurance a legal requirement under regulation?"
+  Follow-up: "is it legally required?" → "Is reinsurance a legal requirement?"
+
+  Context: "User: what is term insurance\nLayla: Term insurance is a type of life insurance..."
+  Follow-up: "what is term insurance and how to claim it?" → "What is term insurance and how do you claim a term insurance policy?"
 
   Context: "User: what is subrogation\nLayla: Subrogation means the insurer steps in..."
   Follow-up: "give me an example" → "Can you give a real-life example of subrogation?"
@@ -1285,6 +1515,58 @@ Search query:"""
             # generic question. Only repair when the topic could ONLY have
             # come from history (the raw follow-up itself names no specific
             # type) and the rewrite dropped the type history established.
+            # Deterministic repair for the inverse gap, also confirmed live
+            # (reproduced 3x, intermittently): the rewrite sometimes INVENTS
+            # a specific insurance type out of nothing — "How can relatives
+            # be informed about the policy?" after a generic policy-document
+            # turn (no type named anywhere in the conversation) reformulated
+            # to "...policy documents for fire insurance?", so retrieval
+            # pulled fire-insurance chunks, the semantic grounding check
+            # correctly rejected them, and the question was refused. The
+            # prompt above already forbids exactly this and the model still
+            # does it intermittently — same model limitation as the anchor-
+            # drop case below, so same remedy: enforce in code. Only phrases
+            # with an explicit "insurance" suffix are stripped; a bare type
+            # word ("property", "group", "fire") is too ambiguous to remove
+            # safely from an otherwise-good rewrite. Runs BEFORE the anchor-
+            # append repair so that when history DOES name a real type, a
+            # stripped wrong-type rewrite can still be re-anchored to it.
+            _known_topics = f"{question}\n{recent}"
+            for _ in range(3):  # rescan after each strip; bounded
+                _invented = next(
+                    (
+                        _m for _m in _ANCHOR_TYPE_RE.finditer(reformulated)
+                        if _m.group(2)
+                        and not re.search(
+                            rf"\b{re.escape(_m.group(1))}\b", _known_topics, re.IGNORECASE
+                        )
+                    ),
+                    None,
+                )
+                if _invented is None:
+                    break
+                _stripped = re.sub(
+                    rf"(?:\s+(?:for|of|in|under|on|about|regarding|with))?\s*\b{re.escape(_invented.group(0))}\b",
+                    "",
+                    reformulated,
+                    flags=re.IGNORECASE,
+                )
+                _stripped = re.sub(r"\s{2,}", " ", _stripped).strip(" ,;:")
+                if _invented.start() == 0 or len(re.findall(r"\w+", _stripped)) < 3:
+                    # Invented type was the sentence subject, or stripping
+                    # gutted the rewrite — the raw follow-up is safer than
+                    # either a wrong-topic or a broken query.
+                    logger.info(
+                        "[REFORM] invented-type repair: %r names %r found nowhere in the conversation — falling back to raw follow-up",
+                        reformulated, _invented.group(0),
+                    )
+                    reformulated = question
+                    break
+                logger.info(
+                    "[REFORM] invented-type repair: %r names %r found nowhere in the conversation — stripped to %r",
+                    reformulated, _invented.group(0), _stripped,
+                )
+                reformulated = _stripped
             _hist_anchor = _last_anchor_type_match(recent)
             if (
                 _hist_anchor
@@ -1298,7 +1580,7 @@ Search query:"""
                 reformulated = f"{reformulated.rstrip('?.! ')} for {_hist_anchor}?"
             logger.info("[REFORM] %r -> %r", question, reformulated)
             return reformulated
-    return question
+    return None
 
 
 _INTENT_PROMPT = """\
@@ -1399,6 +1681,35 @@ async def _extract_intent_topics(question: str) -> set[str]:
 # input size for latency.
 _GROUNDING_CONTEXT_CHARS = 3000
 
+
+def _build_grounding_context(query: str, chunks: list) -> str:
+    """Join *chunks* into a single preview string for _verify_grounding(),
+    using each chunk's most query-relevant excerpt (via _rerank_windows,
+    already computed cheaply during reranking with no extra model call)
+    instead of its raw, full page_content.
+
+    Confirmed live: with several full multi-hundred-word chunks joined and
+    then hard-capped at _GROUNDING_CONTEXT_CHARS, a genuinely answering
+    sentence sitting past the opening of a long chunk gets buried among
+    unrelated boilerplate (exam questions, generic definitions, other
+    chunks) ahead of it in the same budget — "How are relatives typically
+    notified about the contents of a policy document?" against a context
+    that DID contain "...kept in safe custody and in the knowledge of the
+    close relatives" still got NO from the grounding check, but the exact
+    same sentence, isolated from the surrounding noise, reliably got YES.
+    Using each chunk's best-matching window keeps the signal-to-noise ratio
+    high regardless of where in a long chunk the relevant sentence sits —
+    the same fix already proven for the reranker's own scoring step.
+    """
+    parts = []
+    for c in chunks:
+        text = getattr(c, "page_content", "") or ""
+        if not text:
+            continue
+        windows = _rerank_windows(text, query)
+        parts.append(windows[1] if len(windows) > 1 else windows[0])
+    return "\n\n".join(parts)
+
 # _verify_suggestions_grounded() judges candidates against the SAME full_context
 # the answer was generated from (already capped at ~6000 chars by the context
 # compressor's budget), not a fresh single-question lookup — so it needs the
@@ -1434,17 +1745,29 @@ async def _verify_grounding(question: str, context: str, backend_override: Optio
     """
     if not context or not context.strip():
         return False
+    # Framed as "is there relevant info here" rather than "can this EXACT
+    # question be answered" — the earlier "exact question" framing made the
+    # 7B model demand something close to a literal restatement of the
+    # question in the context. That broke down specifically on totality/
+    # completeness questions ("are all types of illness covered?") against
+    # a long, multi-topic joined context: an exclusions list is exactly the
+    # right way to answer such a question (implies "no, not everything —
+    # here are the exceptions"), but the model wouldn't credit it without
+    # an explicit "not all are covered" sentence to point to. Confirmed via
+    # a 3x-repeated, 4-case comparison (this exact case + 3 known-good
+    # regression cases) that the "exact question" framing failed the
+    # exclusions case 100% of the time regardless of added exclusion-list
+    # guidance, while this framing passes it and still correctly returns NO
+    # on genuinely wrong-topic context (Takaful/South-Africa mismatch case).
     prompt = (
         f"Context:\n{context[:_GROUNDING_CONTEXT_CHARS]}\n\n"
         f"Question: {question}\n\n"
-        "Can this exact question be answered using ONLY the information in "
-        "this context? Answer NO only if the question asks about something "
-        "MORE SPECIFIC than what the context covers — for example, the "
-        "question names a particular country, provider, or coverage detail "
-        "that the context never actually discusses. If the question itself "
-        "is a general question about a concept or model, and the context "
-        "explains that same concept or model, answer YES — a general "
-        "question does not need a more specific answer than what was asked. "
+        "Does this context contain information directly relevant to "
+        "answering this question — enough that someone could give a real, "
+        "specific answer (not necessarily complete or exhaustive)? Answer "
+        "NO only if the context is about a different, unrelated topic, or "
+        "the question asks for a specific fact (a country, provider, "
+        "number) that is simply absent. "
         "Answer with a single word: YES or NO."
     )
     try:
@@ -1456,6 +1779,46 @@ async def _verify_grounding(question: str, context: str, backend_override: Optio
         return "yes" in words and "no" not in words
     except Exception:
         return False
+
+
+async def _verify_grounding_any_chunk(
+    question: str, chunks: list, backend_override: Optional[str] = None,
+) -> bool:
+    """Grounded if EITHER the full joined multi-chunk context grounds the
+    question OR the single top-ranked chunk alone does — checked in
+    parallel, not sequentially, so this costs no extra latency over the
+    plain multi-chunk check on the common (already-passing) path.
+
+    Chunks must already be sorted best-first (true of every caller — all
+    come from _rerank()/rerank_documents() output).
+
+    Confirmed live: joining even one additional, lower-relevance chunk
+    alongside the correct one can flip _verify_grounding()'s YES to a NO
+    for the WHOLE block — "How are relatives typically notified about the
+    contents of a policy documents?" against just the top chunk (containing
+    "...kept in safe custody and in the knowledge of the close relatives")
+    returned YES in isolation, but adding a second, merely-topically-
+    adjacent chunk (about policy document contents generally) flipped the
+    combined judgment to NO, even though the first chunk's relevant content
+    didn't change. This is a real limitation of this codebase's small model
+    when judging heterogeneous multi-chunk blocks (see _reformulate_query's
+    docstring for other confirmed instances of this model's unreliability
+    on nuanced multi-part judgments) — checking the strongest single
+    candidate on its own recovers the case without weakening the existing
+    multi-chunk check, which still runs and still catches genuinely
+    wrong-topic content (verified: an off-topic single chunk alone is still
+    correctly rejected, so this isn't a blanket loosening).
+    """
+    if not chunks:
+        return False
+    full_context = _build_grounding_context(question, chunks)
+    top_context = _build_grounding_context(question, chunks[:1])
+    full_result, top_result = await asyncio.gather(
+        _verify_grounding(question, full_context, backend_override=backend_override),
+        _verify_grounding(question, top_context, backend_override=backend_override),
+    )
+    return full_result or top_result
+
 
 async def _contextualize_query(question: str, history: str) -> str:
     """Rewrite the question into a standalone, self-contained form by
@@ -1678,6 +2041,56 @@ def _extract_point_text_from_history(history: str, point_num: int) -> Optional[s
     return None
 
 
+_MEANING_QUERY_RE = re.compile(
+    r"^(?:"
+    r"what\s+(?:does|do|is)\s+(?:the\s+word\s+|the\s+term\s+)?"
+    r"['\"]?(?P<w1>[a-z][a-z\s'-]{0,40}?)['\"]?\s+mean\b"
+    r"|what\s+do\s+you\s+mean\s+by\s+['\"]?(?P<w2>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|what\s+is\s+the\s+meaning\s+of\s+['\"]?(?P<w3>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|meaning\s+of\s+['\"]?(?P<w4>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|define\s+['\"]?(?P<w5>[a-z][a-z\s'-]{0,40}?)['\"]?\s*\??$"
+    r"|what\s+does\s+['\"]?(?P<w6>[a-z][a-z\s'-]{0,40}?)['\"]?\s+stand\s+for\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Pronouns/generic fillers the regex above will happily capture as "the
+# word" (e.g. "what does that mean?" → w1="that") but that are never what
+# the user actually wants defined — that phrasing means "explain the thing
+# you just said differently", handled elsewhere by the meta-clarify and
+# contextualization paths, not "look up the dictionary meaning of 'that'".
+_MEANING_QUERY_STOPWORDS = frozenset({
+    "that", "this", "it", "they", "them", "he", "she", "we", "you", "i",
+    "something", "anything", "everything", "nothing", "one", "these", "those",
+})
+
+
+def _extract_meaning_query_word(question: str) -> Optional[str]:
+    """Return the word/short phrase *question* is asking the meaning of
+    ("what does X mean?", "meaning of X", "define X", "what does X stand
+    for?"), or None if it isn't that kind of question.
+
+    Deliberately narrow (anchored patterns, not a loose "contains 'mean'"
+    check) so it doesn't fire on unrelated sentences that happen to contain
+    the word "mean" (e.g. "what does this mean for my premium" — a real
+    coverage question, not a word-definition request). Also filters out
+    pronouns/fillers via _MEANING_QUERY_STOPWORDS, since the regex alone
+    can't distinguish "what does 'discount' mean?" (real word) from "what
+    does that mean?" (pronoun — regex would otherwise capture "that").
+    Callers should still verify the extracted word actually appears in
+    recent history before using it, same discipline as
+    _extract_point_number's callers.
+    """
+    m = _MEANING_QUERY_RE.match(question.strip())
+    if not m:
+        return None
+    for name in ("w1", "w2", "w3", "w4", "w5", "w6"):
+        w = m.group(name)
+        if w and w.strip() and w.strip().lower() not in _MEANING_QUERY_STOPWORDS:
+            return w.strip()
+    return None
+
+
 _HANDOFF_MSG = (
     "I don't have that in my knowledge base right now — "
     "let me get a human agent to help you! 😊"
@@ -1726,6 +2139,12 @@ def _strip_model_preamble(text: str) -> str:
 
 
 _RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
+
+# Matches the filler-word usage of "honest," (comma right after, functioning
+# as a sentence-starting interjection) — not a legitimate adjective use like
+# "an honest answer". See the ask_stream call site for why this is fixed
+# deterministically instead of relying on the prompt instruction alone.
+_HONEST_FILLER_RE = re.compile(r"\b([Hh])onest,")
 
 
 def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
@@ -1880,12 +2299,31 @@ def _split_history_turns(history: str) -> list[str]:
     return [t.strip() for t in _HISTORY_TURN_BOUNDARY_RE.split(history.strip()) if t.strip()]
 
 
+_REFORMULATE_TOPIC_SNIPPET_CHARS = 120
+
+
 def _reformulate_with_history(question: str, history: str) -> str:
     """Merge a short follow-up with the last assistant turn from *history*.
 
     The returned string is used **only** for the retrieval query — the original
     *question* is still passed to the LLM prompt so the model answers what the
     user actually asked.
+
+    Only the opening _REFORMULATE_TOPIC_SNIPPET_CHARS of the last assistant
+    turn is used, not the full answer. This is the non-LLM fallback path —
+    used when the primary _reformulate_query() call times out — so a long,
+    detailed previous answer floods the retrieval query with unrelated detail
+    and buries the follow-up's own content words. Confirmed live: after a
+    multi-clause answer listing everything a policy document contains ("...the
+    name and address of the insured, sum insured, period of insurance, risk
+    covered, rate of premium, prescription of the subject matter..."), the
+    follow-up "How can relatives be informed about the policy?" merged into a
+    60+ word query where "relatives" was one word out of many — retrieval
+    confidently matched the policy-document-CONTENTS topic (0.78 score)
+    instead of anything about relatives. A short topic snippet still resolves
+    pronouns against the established subject (the scenario this function
+    exists for — see the call site's docstring) without drowning out a
+    substantive follow-up's own words.
     """
     lines = history.strip().split("\n")
     last_assistant = ""
@@ -1894,7 +2332,8 @@ def _reformulate_with_history(question: str, history: str) -> str:
             last_assistant = line[len("Assistant:"):].strip()
             break
     if last_assistant:
-        return f"{last_assistant} {question}"
+        topic_snippet = last_assistant[:_REFORMULATE_TOPIC_SNIPPET_CHARS]
+        return f"{topic_snippet} {question}"
     return question
 
 
@@ -2536,20 +2975,37 @@ class MultiSourceRAG:
         _detected_as_followup = bool(history and _is_likely_followup(question))
         _is_followup = False
         if _detected_as_followup:
-            retrieval_query = await _reformulate_query(question, history)
-            if retrieval_query != question:
-                _is_followup = True
+            _reformulated = await _reformulate_query(question, history)
+            if _reformulated is None:
+                # Genuine failure (backend call errored/timed out, or returned
+                # degenerate output) — distinct from the model correctly
+                # returning the question unchanged (see _reformulate_query's
+                # docstring). Only a real failure falls back to merging the
+                # follow-up with the last assistant turn, via the same helper
+                # ask() already uses for this. NOT just "the last user
+                # question" (an earlier version of this fallback): that
+                # DISCARDS the actual follow-up entirely — for a generic
+                # modifier ("give me in detail") that's fine since it has no
+                # content of its own, but for a substantive follow-up ("how
+                # do I claim it?", "what does it not cover?") it silently
+                # re-asks the PREVIOUS question and ignores what was actually
+                # asked. Confirmed live: "What is motor insurance?" then "How
+                # do I claim it?" — when reformulation failed, retrieval_query
+                # became "What is motor insurance?" (Turn 1's exact text) via
+                # the old fallback, which then KV-cache-hit Turn 1's cached
+                # answer verbatim, so the claim question was never answered
+                # at all. _reformulate_with_history keeps the actual question
+                # (appended, not replaced) alongside topical context from the
+                # last answer, so it degrades gracefully for both cases
+                # instead of only the generic-modifier one.
+                retrieval_query = question
+                _merged = _reformulate_with_history(question, history)
+                if _merged and _merged.lower() != question.lower():
+                    retrieval_query = _merged
+                    _is_followup = True
             else:
-                # LLM reformulation failed (timeout / vLLM busy) — fall back to the
-                # last user question from history so "give me in detail" maps to the
-                # actual topic instead of colliding with every other detail request.
-                _last_user_q = next(
-                    (ln[len("User:"):].strip() for ln in reversed(history.split("\n"))
-                     if ln.startswith("User:")),
-                    None,
-                )
-                if _last_user_q and _last_user_q.lower() != question.lower():
-                    retrieval_query = _last_user_q
+                retrieval_query = _reformulated
+                if retrieval_query != question:
                     _is_followup = True
         else:
             retrieval_query = corrected_question
@@ -2816,6 +3272,23 @@ class MultiSourceRAG:
                 if c.metadata.get("rerank_score", _rerank_gate) >= _rerank_gate
             ]
 
+        # Reorder so chunks naming the query's specific insurance type sort
+        # first — matters here specifically because _verify_grounding below
+        # only looks at the first _GROUNDING_CONTEXT_CHARS (3000) of the
+        # joined context, in whatever order all_chunks is already in. If a
+        # wrong-topic-but-similarly-worded chunk from a DIFFERENT insurance
+        # type outranks the real one, the correct content can get pushed
+        # past that 3000-char cutoff and never even reach the grounding
+        # check. Confirmed live: "are all types of illness covered under
+        # health insurance?" top-scored (0.78) a TRAVEL insurance exclusion
+        # list — correctly rejected by _verify_grounding as not actually
+        # about health insurance — while a genuine health-insurance
+        # exclusion chunk (cosmetic/aesthetic treatment, 0.10) sat lower in
+        # the same pool and never got evaluated. Reordering doesn't change
+        # what's included, only gives the correct-topic content a chance to
+        # be seen by the checks that decide whether to answer at all.
+        all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
+
         # Run coverage check on the pre-compression chunks so that video/webpage
         # chunks filling the budget first don't cause doc-chunk terms to go missing.
         # Lexical checks run alongside the semantic _verify_grounding() backstop
@@ -2834,12 +3307,9 @@ class MultiSourceRAG:
                 and _quoted_comparison_covered(retrieval_query, all_chunks)
                 and _enumeration_query_covered(retrieval_query, all_chunks)
             )
-        _grounding_context_preview = "\n\n".join(
-            c.page_content for c in all_chunks if hasattr(c, "page_content")
-        )
         _lex_ok, _semantically_grounded = await asyncio.gather(
             _lexical_covered(),
-            _verify_grounding(retrieval_query, _grounding_context_preview),
+            _verify_grounding_any_chunk(retrieval_query, all_chunks),
         )
         ctx_covered = _lex_ok and _semantically_grounded
 
@@ -2852,12 +3322,29 @@ class MultiSourceRAG:
             # "best") that can tank the reranker's score even though the KB
             # covers the core topic well (see _vllm_clean_query's docstring
             # for measured examples). If the cleaned query now passes, the
-            # answer proceeds using it; if something concrete (like a country
-            # name) had to be dropped to get there, that's surfaced to the
-            # user as an explicit "not covered" note rather than silently
-            # answering as if it were specific to what was actually asked.
-            _cleaned_query, _dropped = await _vllm_clean_query(retrieval_query)
-            if _cleaned_query and _cleaned_query.strip().lower() != retrieval_query.strip().lower():
+            # answer proceeds using it — but ONLY when what got dropped was
+            # an emphasis word (affordable/cheap/best), not a proper noun
+            # (country/city/provider name). Confirmed live: a dropped
+            # proper noun means the KB has NO factual content about that
+            # specific thing at all — "which insurers cover travel to South
+            # Africa" cleaned down to "travel insurance", which the KB
+            # covers well, and the prompt-injected instruction to
+            # "explicitly say up front" that South Africa specifically
+            # isn't covered was silently ignored by the model 100% of the
+            # time it was actually exercised (this codebase's small vLLM
+            # model has repeatedly proven unreliable at honoring buried
+            # prompt instructions — see the nominee-caveat and Groq-
+            # hallucination investigations earlier this session). Rather
+            # than trust it to remember, a dropped proper noun is treated
+            # the same as "not covered" — the user gets a clean refusal/
+            # handoff instead of a generic answer standing in for the
+            # specific thing they actually asked about.
+            _cleaned_query, _dropped, _dropped_proper_noun = await _vllm_clean_query(retrieval_query)
+            if (
+                _cleaned_query
+                and not _dropped_proper_noun
+                and _cleaned_query.strip().lower() != retrieval_query.strip().lower()
+            ):
                 _fallback_chunks = await self._retrieve_doc_chunks(
                     _cleaned_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
                 )
@@ -2867,16 +3354,13 @@ class MultiSourceRAG:
                     default=float("-inf"),
                 )
                 if _fallback_top >= _rerank_gate:
-                    _fallback_context_preview = "\n\n".join(
-                        c.page_content for c in _fallback_chunks if hasattr(c, "page_content")
-                    )
                     _fallback_lex_ok = (
                         _context_covers_query(_cleaned_query, _fallback_chunks, llm_topics=None)
                         and _quoted_comparison_covered(_cleaned_query, _fallback_chunks)
                         and _enumeration_query_covered(_cleaned_query, _fallback_chunks)
                     )
-                    _fallback_sem_grounded = await _verify_grounding(
-                        _cleaned_query, _fallback_context_preview, backend_override="vllm",
+                    _fallback_sem_grounded = await _verify_grounding_any_chunk(
+                        _cleaned_query, _fallback_chunks, backend_override="vllm",
                     )
                     if _fallback_lex_ok and _fallback_sem_grounded:
                         all_chunks = _fallback_chunks
@@ -2937,9 +3421,6 @@ class MultiSourceRAG:
                 default=float("-inf"),
             )
             if _standalone_top >= _rerank_gate:
-                _standalone_context_preview = "\n\n".join(
-                    c.page_content for c in _standalone_chunks if hasattr(c, "page_content")
-                )
                 # Check standalone against the ORIGINAL question text, not
                 # the followup-reformulated retrieval_query.
                 _standalone_lex_ok = (
@@ -2947,7 +3428,7 @@ class MultiSourceRAG:
                     and _quoted_comparison_covered(question, _standalone_chunks)
                     and _enumeration_query_covered(question, _standalone_chunks)
                 )
-                _standalone_sem_grounded = await _verify_grounding(question, _standalone_context_preview)
+                _standalone_sem_grounded = await _verify_grounding_any_chunk(question, _standalone_chunks)
                 if _standalone_lex_ok and _standalone_sem_grounded:
                     all_chunks = _standalone_chunks
                     retrieval_query = question
@@ -2956,6 +3437,39 @@ class MultiSourceRAG:
                     _answered_via_standalone_retry = True
 
         if not ctx_covered and not document_filter and not _pasted_grounds_answer:
+            # Before refusing: "what does X mean?" / "define X" asked right
+            # after X appeared in the bot's own last answer is answerable
+            # even when X has no dedicated KB entry (e.g. "discount" in "a
+            # no-claim bonus is a discount on your premium") — X is an
+            # ordinary word, not an insurance concept, so retrieval finds
+            # nothing and the checks above correctly say "not covered by the
+            # KB". But refusing here is still wrong: the model can define an
+            # ordinary word from its own training knowledge just fine, it
+            # only needs to know WHAT WAS JUST SAID so the definition lands
+            # in the right context (premium discount, not a retail discount)
+            # instead of a generic, disconnected dictionary answer. Gated on
+            # the word actually appearing in the immediately preceding
+            # assistant turn — otherwise this would just be an ungrounded
+            # general-knowledge answer with no relation to what was asked.
+            _meaning_word = _extract_meaning_query_word(question)
+            if (
+                _meaning_word
+                and _last_assistant_turn
+                and re.search(r"\b" + re.escape(_meaning_word.lower()) + r"\b", _last_assistant_turn.lower())
+            ):
+                _meaning_prompt = (
+                    f"You just told the user this:\n\"{_last_assistant_turn}\"\n\n"
+                    f"They're now asking what \"{_meaning_word}\" means, as you just used it above. "
+                    f"Explain it in 1-2 short sentences, plain conversational language, "
+                    f"specifically in that same context — not a generic, unrelated dictionary "
+                    f"definition. You can use your own general knowledge; this word doesn't need "
+                    f"to come from any document."
+                )
+                _meaning_answer = await _backend_completion(_meaning_prompt, max_tokens=120, timeout=10.0)
+                if _meaning_answer and _meaning_answer.strip():
+                    yield _meaning_answer.strip()
+                    yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+                    return
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it — they'll be able to help you better! 😊"
@@ -2981,6 +3495,10 @@ class MultiSourceRAG:
             all_chunks = self._compressor.compress_to_budget(
                 retrieval_query, all_chunks, max_total_chars=_context_budget
             )
+        # Re-apply after compression, which may not preserve the ordering
+        # from the earlier call — the generation prompt should see
+        # topic-specific content first too, not just the grounding check.
+        all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
 
         _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
         _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
@@ -3309,6 +3827,22 @@ class MultiSourceRAG:
         # means "relevant enough", just "not pure noise".
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
+
+        # The prompt explicitly says the filler word "honestly" must NEVER be
+        # shortened to "honest," — the model doesn't reliably follow that
+        # (confirmed live, same call, non-deterministic: "Honestly, it's..."
+        # on one run, "Honest, it's..." on the next, identical question and
+        # context). Same lesson as the Rule4/truncation fixes right below:
+        # don't trust a prompt instruction the model won't consistently
+        # honor — enforce it deterministically instead. Only matches the
+        # filler-word usage (comma immediately after "honest"), not a
+        # legitimate adjective use ("an honest answer").
+        _honest_fixed = _HONEST_FILLER_RE.sub(lambda m: f"{m.group(1)}onestly,", _reply_stripped)
+        if _honest_fixed != _reply_stripped:
+            _reply_stripped = _honest_fixed
+            _kv_reply = _honest_fixed
+            _corrected_text = _honest_fixed
+
         _rule4_discarded = False
         _r4_trusted = _top_rerank >= 0.05
         _r4_stripped = _strip_rule4_fallback(_reply_stripped, trust_content=_r4_trusted)

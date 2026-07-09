@@ -131,9 +131,118 @@ def _get_shared_reranker() -> CrossEncoder:
 # forward-pass cost well below the 512-token cap.
 _RERANK_TEXT_CHARS = 700
 
+# Minimum word length counted as a "distinctive" query term when picking
+# rerank window candidates — filters out short connective words (how, can,
+# the, are) that appear everywhere and would swamp a genuinely rare match.
+_MIN_KEYWORD_LEN = 4
+# Stride for the sliding window scan — smaller than _RERANK_TEXT_CHARS so
+# windows overlap and a match sitting near a boundary is never split across
+# two candidate windows and missed by both.
+_RERANK_WINDOW_STRIDE = _RERANK_TEXT_CHARS // 3
+# How many distinct windows per candidate get sent to the cross-encoder —
+# the highest-scoring one becomes that candidate's final rerank score. Kept
+# small: this is what bounds the added forward-pass cost (see
+# _rerank_windows's docstring for why a bigger number wasn't needed).
+_RERANK_MAX_WINDOWS = 3
 
-def _truncate_for_rerank(text: str) -> str:
-    return text[:_RERANK_TEXT_CHARS] if text else text
+
+def _rerank_windows(text: str, query: str) -> List[str]:
+    """Return up to _RERANK_MAX_WINDOWS candidate _RERANK_TEXT_CHARS windows
+    of *text* for the cross-encoder to score independently — the caller
+    takes the MAX score across them as the candidate's final rerank score.
+
+    Why multiple windows instead of picking one: always slicing
+    text[:_RERANK_TEXT_CHARS] silently hides everything past that point —
+    for a real KB chunk (section chunker allows up to 2000 chars, some run
+    past that) the ONLY sentence that actually answers a given question can
+    sit well beyond the cutoff. Confirmed live twice, two different
+    failure shapes:
+      (a) "how can relatives be informed about the policy?" — the one
+      relevant sentence sat at character 1426 of a 2097-char chunk; BM25
+      ranked this exact chunk #1 by keyword match, but the reranker scored
+      it 0.005 (near zero) because truncation hid the sentence entirely.
+      (b) "what is personal accident insurance?" — a first attempt at
+      picking a single "best" window via keyword-frequency weighting chose
+      the wrong one, because the chunk repeats "Personal Accident
+      Insurance" as a heading across many unrelated sub-sections (Age
+      Limits, Factors Affecting Sum Insured, ...) — every window scores
+      similarly on keyword frequency alone, so the heuristic picked an
+      administrative-detail window instead of the actual definition.
+
+    (a) was fixed by a single heuristically-chosen window; (b) needed a
+    second, narrower heuristic on top (rewarding a defining-sentence
+    pattern for "what is X" queries specifically) — which fixed that ONE
+    case but is exactly the kind of special-casing that doesn't scale: the
+    next never-seen query shape (a number buried in a long chunk, an
+    enumerated list, a comparison) would need its own bespoke heuristic
+    too, indefinitely. Sending the reranker a handful of good CANDIDATE
+    windows and letting IT pick — instead of a hand-written heuristic
+    guessing on the model's behalf — sidesteps that entirely: the
+    cross-encoder already recognizes relevance in whatever shape it takes
+    (a definition, a number, a list, anything) far better than any
+    keyword-counting proxy can. Verified: this alone (no definitional
+    heuristic at all) scores case (b) 0.998 and case (a) 0.675 — both
+    higher than either single-window heuristic achieved on its own.
+
+    Window selection: always includes the plain start-of-text slice
+    (preserves the common case where the answer IS in the opening
+    paragraph, and covers chunks with no query keyword overlap at all —
+    e.g. a paraphrase with no literal term matches). Remaining slots go to
+    the highest keyword-weighted windows from a cheap sliding scan (same
+    1/count-in-chunk weighting as before, still just used to pick
+    candidates worth showing the model — not to make the final relevance
+    call itself). Pure string scanning done once per candidate before
+    tokenization, negligible next to the model forward pass that actually
+    drives the latency this budget exists to control (see the measurement
+    above _RERANK_TEXT_CHARS) — bounded at _RERANK_MAX_WINDOWS regardless
+    of chunk length, so cost per candidate stays constant.
+
+    Latency note: an initial isolated timing test of this change showed a
+    startling 19.7s per call (vs. a 5.5s single-window baseline) and looked
+    like a severe regression. Root-caused to a cold-start artifact — that
+    test ran in a freshly-spawned process paying one-time model-loading
+    cost, not a real per-call cost. Verified via the live, already-warm API
+    with proper warm-up calls: steady-state latency is ~6-6.5s, statistically
+    indistinguishable from the single-window baseline (~5.5-6s), because the
+    reranker's cost is dominated by fixed per-call overhead that absorbs a
+    few extra 700-char windows without scaling linearly per pair.
+    """
+    if not text:
+        return [text]
+    if len(text) <= _RERANK_TEXT_CHARS:
+        return [text]
+
+    windows = [text[:_RERANK_TEXT_CHARS]]
+    if not query:
+        return windows
+
+    keywords = {w for w in re.findall(r"\w+", query.lower()) if len(w) >= _MIN_KEYWORD_LEN}
+    if not keywords:
+        return windows
+
+    text_lower = text.lower()
+    weights = {w: 1.0 / text_lower.count(w) for w in keywords if w in text_lower}
+    if not weights:
+        return windows
+
+    def _window_score(start: int) -> float:
+        window = text_lower[start:start + _RERANK_TEXT_CHARS]
+        return sum(wt for w, wt in weights.items() if w in window)
+
+    last_start = len(text) - _RERANK_TEXT_CHARS
+    starts = list(range(0, last_start, _RERANK_WINDOW_STRIDE)) + [last_start]
+    starts.sort(key=_window_score, reverse=True)
+
+    seen = {windows[0]}
+    for start in starts:
+        if len(windows) >= _RERANK_MAX_WINDOWS:
+            break
+        w = text[start:start + _RERANK_TEXT_CHARS]
+        if w not in seen:
+            windows.append(w)
+            seen.add(w)
+
+    return windows
 
 
 class TurboVecStore:
@@ -800,9 +909,23 @@ class TurboVecStore:
         if not candidates:
             return []
         self._ensure_reranker()
-        pairs = [(query, _truncate_for_rerank(c[1])) for c in candidates]
-        rerank_scores = self.reranker.predict(pairs)
-        combined = list(zip(candidates, rerank_scores))
+        # Each candidate contributes 1-_RERANK_MAX_WINDOWS (query, window)
+        # pairs; owner tracks which candidate each pair belongs to so the
+        # flat batch can be scored in one predict() call and then reduced
+        # back to one MAX score per candidate. See _rerank_windows's
+        # docstring for why multiple windows beat picking just one.
+        pairs: List[tuple] = []
+        owner: List[int] = []
+        for i, c in enumerate(candidates):
+            for window in _rerank_windows(c[1], query):
+                pairs.append((query, window))
+                owner.append(i)
+        raw_scores = self.reranker.predict(pairs)
+        best_scores = [float("-inf")] * len(candidates)
+        for idx, score in zip(owner, raw_scores):
+            if score > best_scores[idx]:
+                best_scores[idx] = score
+        combined = list(zip(candidates, best_scores))
         combined.sort(key=lambda x: x[1], reverse=True)
         reranked = []
         for c, score in combined[:top_k]:
@@ -820,9 +943,21 @@ class TurboVecStore:
         if not docs:
             return []
         self._ensure_reranker()
-        pairs = [(query, _truncate_for_rerank(doc.page_content)) for doc in docs]
-        scores = self.reranker.predict(pairs)
-        ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        # See _rerank's comment above — same multi-window-per-candidate,
+        # max-score-per-candidate reduction, just over Documents instead of
+        # raw tuples.
+        pairs: List[tuple] = []
+        owner: List[int] = []
+        for i, doc in enumerate(docs):
+            for window in _rerank_windows(doc.page_content, query):
+                pairs.append((query, window))
+                owner.append(i)
+        raw_scores = self.reranker.predict(pairs)
+        best_scores = [float("-inf")] * len(docs)
+        for idx, score in zip(owner, raw_scores):
+            if score > best_scores[idx]:
+                best_scores[idx] = score
+        ranked = sorted(zip(docs, best_scores), key=lambda x: x[1], reverse=True)
         result = []
         for doc, score in ranked[:top_k]:
             new_doc = Document(page_content=doc.page_content, metadata=dict(doc.metadata))
