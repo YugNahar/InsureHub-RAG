@@ -2299,6 +2299,121 @@ def _split_history_turns(history: str) -> list[str]:
     return [t.strip() for t in _HISTORY_TURN_BOUNDARY_RE.split(history.strip()) if t.strip()]
 
 
+def _last_user_question(history: str) -> str:
+    """Text of the most recent USER turn in *history*, "User: " prefix stripped."""
+    for turn in reversed(_split_history_turns(history)):
+        if turn.startswith("User:"):
+            return turn[len("User:"):].strip()
+    return ""
+
+
+def _history_last_assistant_turn(history: str) -> str:
+    """Text of the most recent ASSISTANT turn in *history*, prefix stripped.
+
+    Named distinctly from the unrelated local variable `_last_assistant_turn`
+    already used inside ask_stream() — Python's local-scope rules mean a
+    same-named local variable anywhere in that function shadows a module-
+    level function of the same name for the function's entire body, which
+    broke this call with `TypeError: 'str' object is not callable` when
+    first written as `_last_assistant_turn`.
+    """
+    for turn in reversed(_split_history_turns(history)):
+        if turn.startswith("Assistant:"):
+            return turn[len("Assistant:"):].strip()
+    return ""
+
+
+# A generic "elaborate on whatever we were just discussing" follow-up, as
+# opposed to a follow-up that names its own specific new content ("how do I
+# claim it?", "is it tax deductible?"). Only THIS class of follow-up is
+# ambiguous about *which part* of a compound prior question the user wants
+# more on — a substantive follow-up already says what it's asking about.
+_ELABORATION_FOLLOWUP_RE = re.compile(
+    r"\b(explain.{0,15}in detail|more detail|tell me more|elaborate|"
+    r"go (?:into|in)\s+detail|detailed explanation|explain (?:it|that|this)\b)",
+    re.IGNORECASE,
+)
+
+# Matches messages that START WITH one of these phrases — not a full-string
+# match — because the "Both" clarify chip's own label ("Both — give me the
+# full picture", set below in _CLARIFY_OPTIONS suffix) is sent verbatim as
+# the user's message when clicked. An exact full-phrase match (the original
+# design) missed that: "Both — give me the full picture" starts with "both"
+# but has trailing text a `$`-anchored pattern rejects. Still narrow enough
+# not to false-positive on a genuine question — real questions don't
+# normally open with "both"/"everything" as their first word.
+_BOTH_REPLY_RE = re.compile(
+    r"^\s*(both\b|all of them\b|everything\b|"
+    r"(?:give|answer|tell)\s+me\s+both\b|i\s+want\s+both\b)",
+    re.IGNORECASE,
+)
+
+# Distinctive enough to reliably identify our own clarification message in
+# history (used to recover the two sub-questions for a "both" reply) without
+# false-matching on an ordinary answer that happens to contain "both".
+_CLARIFY_TEMPLATE = (
+    'Happy to go deeper — did you want more on "{q1}" or "{q2}"? '
+    'Click one below, or just say "both" for the full picture on each.'
+)
+_CLARIFY_PARSE_RE = re.compile(r'more on "(.+?)" or "(.+?)"\?', re.IGNORECASE)
+
+# Structural signal for "this question asks two separate things": a
+# wh-word/auxiliary-verb question trigger, then "and", then ANOTHER such
+# trigger within a short span — "What is X and what does X cover" has two
+# (what...and what), "What is home and fire insurance" has only one (the
+# "and" just joins two nouns). Deliberately NOT delegated to an LLM
+# yes/no judgment call: tested live, the model classified "What is fire
+# insurance and what does it covers?" as NO despite it being nearly
+# identical to a worked YES example in the prompt — the same
+# unreliable-at-binary-classification pattern seen elsewhere this session
+# (e.g. the grounding-check prompt). A structural check is deterministic
+# and, unlike the model, actually gets this right.
+_COMPOUND_STRUCTURE_RE = re.compile(
+    r"\b(what|how|when|where|why|does|do|did|is|are|was|were|can|could|will|would|should)\b"
+    r".{2,60}?\band\b.{0,20}?"
+    r"\b(what|how|when|where|why|does|do|did|is|are|was|were|can|could|will|would|should)\b",
+    re.IGNORECASE,
+)
+
+
+async def _split_compound_question(question: str) -> Optional[tuple[str, str]]:
+    """If *question* asks two genuinely separate, independently-answerable
+    things (not just two nouns/topics mentioned together — "home and fire
+    insurance" is one ask about two topics, not two asks), return the two
+    as complete standalone questions. Otherwise return None.
+
+    The IS-it-compound decision is the deterministic regex above, not the
+    LLM — only the SPLIT (rephrasing into two clean standalone questions,
+    resolving any pronoun) is delegated to the model, which this session
+    has repeatedly shown to be reliable at rephrasing but not at binary
+    classification.
+    """
+    if not _COMPOUND_STRUCTURE_RE.search(question):
+        return None
+    # Ends with a plain instruction, not a "continue after this label" cue —
+    # tested live: a trailing "\nLine 1:" completion-style prompt confused
+    # this chat model into echoing "Line 1:"/"Line 2:" back garbled into the
+    # answer text itself ('What is fire insurance? Line 1: \n\nWhat does it
+    # cover? Line 2:'). The plain-instruction style already proven reliable
+    # for _generate_suggestions' multi-line output works cleanly here too.
+    prompt = (
+        f"Question: {question}\n\n"
+        "Split this into its two separate questions. Resolve any pronoun so "
+        "each question stands alone with no other context needed.\n"
+        "Output only the two questions, one per line, no numbering, no labels, no explanation:"
+    )
+    raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+    if not raw:
+        return None
+    lines = [ln.strip().strip('"') for ln in raw.strip().split("\n") if ln.strip()]
+    lines = [re.sub(r"^(line\s*\d\s*:\s*|\d+[.)]\s*)", "", ln, flags=re.IGNORECASE) for ln in lines]
+    if len(lines) != 2:
+        return None
+    if not lines[0].endswith("?") or not lines[1].endswith("?"):
+        return None
+    return (lines[0], lines[1])
+
+
 _REFORMULATE_TOPIC_SNIPPET_CHARS = 120
 
 
@@ -2962,6 +3077,39 @@ class MultiSourceRAG:
         if pasted_context:
             _pasted_grounds_answer = await _verify_grounding(question, pasted_context)
 
+        # ── Compound-question disambiguation ───────────────────────────────────
+        # A generic elaboration follow-up ("explain it in detail") after a
+        # compound prior question ("What is fire insurance and what does it
+        # cover?") is ambiguous about which part the user wants more on —
+        # confirmed live: it silently picked one interpretation and answered
+        # only that, with no way for the user to signal they wanted the other
+        # part (or both). Detect this and ask, the same way suggested-question
+        # chips already ask — rather than guessing.
+        _force_both_detailed = False
+        if history:
+            if _BOTH_REPLY_RE.match(question):
+                _clarify_match = _CLARIFY_PARSE_RE.search(_history_last_assistant_turn(history))
+                if _clarify_match:
+                    _q1, _q2 = _clarify_match.group(1), _clarify_match.group(2)
+                    question = f"{_q1.rstrip('?')}, and {_q2.rstrip('?')}?"
+                    _force_both_detailed = True
+            elif _ELABORATION_FOLLOWUP_RE.search(question):
+                _last_q = _last_user_question(history)
+                if _last_q:
+                    _split = await _split_compound_question(_last_q)
+                    if _split:
+                        _q1, _q2 = _split
+                        _clarify_text = _CLARIFY_TEMPLATE.format(q1=_q1.rstrip("?"), q2=_q2.rstrip("?"))
+                        import json as _json_clarify
+                        yield _clarify_text
+                        yield "\n\n" + _json_clarify.dumps({
+                            "sources": [],
+                            "done": True,
+                            "needs_human": False,
+                            "clarify_options": [_q1, _q2, "Both — give me the full picture"],
+                        })
+                        return
+
         # ── Typo correction for retrieval query ───────────────────────────────
         # Apply _correct_typos() to build a corrected question used ONLY for
         # the retrieval_query, not for the final LLM prompt (original question
@@ -3029,7 +3177,11 @@ class MultiSourceRAG:
         # ── Keyword detailed check — must run BEFORE cache ───────────────────
         # So the cache key correctly separates brief vs. detailed for the same
         # topic ("what is health insurance" vs "explain health insurance in detail").
-        _keyword_detailed = _needs_detailed_answer(question)
+        # _force_both_detailed: a "both" reply to the compound-question
+        # disambiguation above always wants the full picture on each part,
+        # regardless of whether the combined question happens to match
+        # _needs_detailed_answer()'s own signals.
+        _keyword_detailed = _needs_detailed_answer(question) or _force_both_detailed
         _doc_top_k   = 14 if _keyword_detailed else 8
         _chunk_limit = 12 if _keyword_detailed else 8
         # Trimmed from 5/4 — video/webpage search()'s internal reranking

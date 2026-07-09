@@ -227,6 +227,7 @@ function ChatWidget({
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [suggestedQs, setSuggestedQs] = useState<string[]>([]);
+  const [clarifyOptions, setClarifyOptions] = useState<string[]>([]);
   const [sessionId, setSessionId] = useState<string>("default");
   const [chatMode, setChatMode] = useState<ChatMode>("ai");
   const [agentName, setAgentName] = useState<string | null>(null);
@@ -494,17 +495,19 @@ function ChatWidget({
     }
     setMessages([GREETING]);
     setSuggestedQs([]);
+    setClarifyOptions([]);
     setInput("");
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
-  async function send() {
-    const text = input.trim();
+  async function send(overrideText?: string) {
+    const text = (overrideText ?? input).trim();
     if (!text || sending) return;
 
     setMessages((m) => [...m, { role: "user", content: text }]);
     setInput("");
     setSuggestedQs([]);
+    setClarifyOptions([]);
 
     // In human mode, send via WebSocket directly
     if (chatMode === "human" && wsRef.current?.readyState === WebSocket.OPEN) {
@@ -556,6 +559,9 @@ function ChatWidget({
           }
           if (meta.suggested_questions?.length) {
             setSuggestedQs(meta.suggested_questions);
+          }
+          if (meta.clarify_options?.length) {
+            setClarifyOptions(meta.clarify_options);
           }
         },
         (errMsg) => {
@@ -658,6 +664,19 @@ function ChatWidget({
                   key={i}
                   className="follow-chip"
                   onClick={() => { setInput(q); setSuggestedQs([]); setTimeout(() => inputRef.current?.focus(), 0); }}
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          )}
+          {!sending && clarifyOptions.length > 0 && (
+            <div className="follow-chips-row">
+              {clarifyOptions.map((q, i) => (
+                <button
+                  key={i}
+                  className="clarify-chip"
+                  onClick={() => { setClarifyOptions([]); send(q); }}
                 >
                   {q}
                 </button>

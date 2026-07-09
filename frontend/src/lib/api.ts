@@ -52,6 +52,7 @@ export interface StreamMeta {
   offline_escalated: boolean;
   corrected_text?: string;
   suggested_questions?: string[];
+  clarify_options?: string[];
 }
 
 /** Derive WebSocket base URL from the current page origin when no API_URL is set. */
@@ -119,6 +120,7 @@ export async function apiStream(
           offline_escalated: meta.offline_escalated ?? false,
           corrected_text: meta.corrected_text,
           suggested_questions: meta.suggested_questions,
+          clarify_options: meta.clarify_options,
         });
       } catch {
         onDone({ sources: [], needs_human: false, offline_escalated: false });
