@@ -3690,17 +3690,33 @@ class MultiSourceRAG:
         streamed_ok = False
         _kv_reply = ""  # buffer for cache write
 
-        # ── Trust gate: don't live-stream when content won't be trusted ───
-        # _top_rerank < 0.05 means the answer would be discarded if a Rule 4
-        # marker appears (see _r4_trusted below). Skip live token-by-token
-        # streaming in this case — buffer the full response, strip any
-        # refusal marker, THEN yield the clean result — so the user never
-        # sees bad text even momentarily. The non-streaming fallback block
-        # below already implements exactly this "generate fully, then strip,
-        # then yield" flow, so we just force it to run by leaving
-        # streamed_ok = False.
-        _trust_rerank = _top_rerank
-
+        # Streaming is always attempted below — always-stream, not gated on
+        # _top_rerank. A prior version skipped live streaming when
+        # _top_rerank < 0.05, reasoning that a low-confidence answer might
+        # get a Rule 4 marker stripped afterward and the user shouldn't see
+        # the raw pre-strip text flash by. That gate had a false-positive
+        # problem specific to detailed answers: _top_rerank is the score of
+        # the SINGLE best-matching chunk, but detailed mode deliberately
+        # retrieves from a much wider pool (_doc_top_k=14 vs 8) and builds
+        # its context from many chunks combined — so the top single chunk
+        # can legitimately score low even when the combined context is rich
+        # and the generated answer is fully correct. Confirmed live: "can
+        # you explain it in detail" after "What is motor insurance?" scored
+        # _top_rerank=0.003 (gate would block streaming) yet produced a
+        # complete, accurate, well-grounded answer citing the Motor
+        # Vehicles Act — the gate was blocking exactly the case it was
+        # never meant to catch, forcing every detailed answer through the
+        # blocking, buffer-then-dump `llm.invoke()` fallback below (all-at-
+        # once after the full ~600-token generation, instead of live).
+        # Removing the gate doesn't remove the safety property it existed
+        # for: the Rule4-strip/truncation-fix correction below still runs
+        # unconditionally on the accumulated text regardless of whether it
+        # was streamed, and the frontend already does a full atomic replace
+        # of the displayed message when a corrected_text arrives (see
+        # App.tsx) — so a rare low-confidence live-streamed answer that
+        # needs correcting still gets fixed, exactly as before, it just
+        # streams live first instead of staying invisible for the whole
+        # generation.
         _active = _active_backend()
         _stream_url = None
         _stream_model = None
@@ -3729,12 +3745,7 @@ class MultiSourceRAG:
                 "Authorization": f"Bearer {_runtime_manual_api_key}",
             }
 
-        # When the reranker confidence is low (_top_rerank < 0.05), skip
-        # live token-by-token streaming entirely. The non-streaming fallback
-        # below generates the full response, strips any Rule4 refusal marker,
-        # and THEN yields the clean text — so the user never sees bad text
-        # even momentarily. For high-confidence queries, stream live as before.
-        if _stream_url and _trust_rerank >= 0.05:
+        if _stream_url:
             model = _stream_model
             url = _stream_url
             payload = {
@@ -3886,6 +3897,52 @@ class MultiSourceRAG:
             if _last_sent > len(_reply_stripped) // 3:
                 _corrected_text = _reply_stripped[:_last_sent + 1].strip()
                 _kv_reply = _corrected_text  # cache the clean version
+
+        # ── Numbered-list enforcement (detailed mode) ─────────────────────────
+        # DETAILED_GROUNDED_PROMPT explicitly instructs "1. ... 2. ... 3. ..."
+        # numbered points with worked right/wrong examples — the model doesn't
+        # reliably follow it (confirmed live: a well-grounded, factually
+        # correct detailed answer about motor insurance came back as one
+        # unbroken paragraph despite the prompt's explicit numbering
+        # instruction and examples). Same lesson as every other formatting-
+        # compliance gap fixed this session (the "honestly"->"honest" filler
+        # word, Rule4 markers, truncation) — don't trust a prompt instruction
+        # this model won't consistently honor, enforce it deterministically
+        # after the fact instead. Only fires when the answer has NO numbered
+        # points at all (a real "1. " or "\n1." pattern) so an already-correct
+        # numbered response is left untouched. Splits on sentence boundaries,
+        # treats the first sentence as the warm opener the prompt asks for
+        # (left unnumbered), the closing farewell line as unnumbered too, and
+        # numbers everything in between — mirroring the prompt's own intended
+        # structure rather than inventing a different one.
+        if _keyword_detailed:
+            try:
+                import re as _re
+                _num_src = (_corrected_text or _reply_stripped).strip()
+                _already_numbered = bool(_re.search(r'(?:^|\n)\s*1\.\s', _num_src))
+                if _num_src and not _already_numbered:
+                    _sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', _num_src) if s.strip()]
+                    _CLOSING_RE = _re.compile(
+                        r'^(hope that|let me know|feel free|hang tight|glad to)', _re.IGNORECASE,
+                    )
+                    _closing_parts = []
+                    while len(_sentences) > 1 and _CLOSING_RE.match(_sentences[-1]):
+                        _closing_parts.insert(0, _sentences.pop())
+                    _closing = " ".join(_closing_parts)
+                    # Need at least 2 sentences left after removing the opener
+                    # to make numbering worthwhile — a 1-2 sentence answer is
+                    # already effectively "one point", forcing "1. " on it
+                    # would look broken rather than helpful.
+                    if len(_sentences) >= 3:
+                        _opener = _sentences.pop(0)
+                        _points = "\n".join(f"{i}. {s}" for i, s in enumerate(_sentences, 1))
+                        _rebuilt = _opener + "\n\n" + _points
+                        if _closing:
+                            _rebuilt += "\n\n" + _closing
+                        _corrected_text = _rebuilt
+                        _kv_reply = _rebuilt
+            except Exception as _num_exc:
+                logger.debug("[ask_stream] numbered-list enforcement skipped: %s", _num_exc)
 
         # ── Hard sentence cap (brief / conversational mode) ──────────────────
         # Conversational prompts instruct the model to write 3 sentences max.
