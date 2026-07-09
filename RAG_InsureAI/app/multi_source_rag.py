@@ -1323,7 +1323,7 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     return sorted(chunks, key=_rank)
 
 
-async def _reformulate_query(question: str, history: str) -> str:
+async def _reformulate_query(question: str, history: str) -> Optional[str]:
     """Rewrite a follow-up question as a standalone, natural-language question
     using conversation history — used both for retrieval and, for detected
     follow-ups, as the literal question text shown to the generation prompt.
@@ -1334,7 +1334,20 @@ async def _reformulate_query(question: str, history: str) -> str:
       returns: "What is the premium amount for life insurance?"
 
     Uses max_tokens=30 and a 4-second timeout so it adds <0.5 s to latency.
-    Falls back to the original question on any error.
+
+    Returns None on genuine failure (backend call failed/timed out, or
+    returned degenerate output) — the caller then falls back to
+    _reformulate_with_history. Returns *question* UNCHANGED (not None) when
+    the model correctly determines no rewrite is needed — this is a
+    successful outcome, not a failure, and must not trigger that fallback:
+    the prompt below now explicitly instructs the model to echo an
+    already-self-contained follow-up back verbatim rather than force a
+    paraphrase (confirmed live: unnecessary rewrites of a fine question —
+    adding "typically", "regarding the details of" — introduced wording
+    that swung the downstream cross-encoder's relevance score by 10-30x for
+    no benefit). Collapsing "unchanged because unnecessary" into the same
+    signal as "failed" would defeat that fix by re-triggering the history-
+    snippet fallback for a question that didn't need any rewrite at all.
     """
     # Use only the last 2 turns (the single most recent Q&A pair) of history.
     # Used to slice by raw newline count instead of turn boundaries —
@@ -1379,6 +1392,14 @@ async def _reformulate_query(question: str, history: str) -> str:
     # question fixes both problems at once.
     prompt = f"""Rewrite the follow-up question as a complete, standalone, natural-language question using the conversation context.
 Use precise insurance/legal terms that would appear in a textbook, but phrase it as a real question a person would ask — not a keyword list.
+If the follow-up is ALREADY a complete, self-contained question that doesn't
+depend on anything in the conversation below to be understood — no pronoun,
+no missing topic, nothing implicit — output it EXACTLY AS-IS, character for
+character, changing nothing. Do not add hedging words ("typically",
+"usually"), do not add a topic that isn't needed, do not paraphrase just to
+sound more natural — an unnecessary rewrite is not an improvement, and
+different wording of an already-fine question can retrieve worse results
+than the original. Only rewrite when something genuinely needs resolving.
 The conversation below is ONLY the single most recent exchange — always ground
 the follow-up in that topic, never in anything outside what's shown here.
 Do NOT add a specific regulation, act, section, jurisdiction, or authority
@@ -1400,6 +1421,9 @@ never drop a part just because it resembles something already discussed.
 Output ONLY the rewritten question — no quotes, no explanation, nothing else.
 
 Examples:
+  Context: "User: what does the policy document include?\nLayla: The policy document includes the name and address of the insured, sum insured, period of insurance..."
+  Follow-up: "How can relatives be informed about the policy?" → "How can relatives be informed about the policy?" (already self-contained — output unchanged)
+
   Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
   Follow-up: "what about premiums?" → "What is the premium amount for life insurance?"
 
@@ -1507,7 +1531,7 @@ Search query:"""
                 reformulated = f"{reformulated.rstrip('?.! ')} for {_hist_anchor}?"
             logger.info("[REFORM] %r -> %r", question, reformulated)
             return reformulated
-    return question
+    return None
 
 
 _INTENT_PROMPT = """\
@@ -2902,14 +2926,15 @@ class MultiSourceRAG:
         _detected_as_followup = bool(history and _is_likely_followup(question))
         _is_followup = False
         if _detected_as_followup:
-            retrieval_query = await _reformulate_query(question, history)
-            if retrieval_query != question:
-                _is_followup = True
-            else:
-                # LLM reformulation failed (timeout / vLLM busy) — fall back to
-                # merging the follow-up with the last assistant turn, via the
-                # same helper ask() already uses for this. NOT just "the last
-                # user question" (an earlier version of this fallback): that
+            _reformulated = await _reformulate_query(question, history)
+            if _reformulated is None:
+                # Genuine failure (backend call errored/timed out, or returned
+                # degenerate output) — distinct from the model correctly
+                # returning the question unchanged (see _reformulate_query's
+                # docstring). Only a real failure falls back to merging the
+                # follow-up with the last assistant turn, via the same helper
+                # ask() already uses for this. NOT just "the last user
+                # question" (an earlier version of this fallback): that
                 # DISCARDS the actual follow-up entirely — for a generic
                 # modifier ("give me in detail") that's fine since it has no
                 # content of its own, but for a substantive follow-up ("how
@@ -2924,9 +2949,14 @@ class MultiSourceRAG:
                 # (appended, not replaced) alongside topical context from the
                 # last answer, so it degrades gracefully for both cases
                 # instead of only the generic-modifier one.
+                retrieval_query = question
                 _merged = _reformulate_with_history(question, history)
                 if _merged and _merged.lower() != question.lower():
                     retrieval_query = _merged
+                    _is_followup = True
+            else:
+                retrieval_query = _reformulated
+                if retrieval_query != question:
                     _is_followup = True
         else:
             retrieval_query = corrected_question
