@@ -748,22 +748,39 @@ document.getElementById("login-btn").addEventListener("click", doLogin);
 document.getElementById("inp-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
 
 async function doLogin() {
+  const btn = document.getElementById("login-btn");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const nameInp = document.getElementById("inp-name");
+  const passInp = document.getElementById("inp-pass");
+  nameInp.disabled = true;
+  passInp.disabled = true;
+
   const backend = getBackendUrl();
-  const name = document.getElementById("inp-name").value.trim();
-  const pass = document.getElementById("inp-pass").value;
-  if (!name) return showErr("Please enter your name.");
-  if (!pass) return showErr("Please enter the agent password.");
+  const name = nameInp.value.trim();
+  const pass = passInp.value;
+  if (!name) { showErr("Please enter your name."); btn.disabled = false; nameInp.disabled = false; passInp.disabled = false; return; }
+  if (!pass) { showErr("Please enter the agent password."); btn.disabled = false; nameInp.disabled = false; passInp.disabled = false; return; }
   clearErr();
 
+  let success = false;
   try {
     const r = await fetch(`${backend}/auth/agent-login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: "agent", password: pass }),
     });
-    if (!r.ok) return showErr("Wrong password. Please try again.");
+    if (!r.ok) { showErr("Wrong password. Please try again."); return; }
+    success = true;
   } catch {
-    return showErr("Cannot reach the server. Is the backend running?");
+    showErr("Cannot reach the server. Is the backend running?");
+    return;
+  } finally {
+    if (!success) {
+      btn.disabled = false;
+      nameInp.disabled = false;
+      passInp.disabled = false;
+    }
   }
 
   myName = name;
