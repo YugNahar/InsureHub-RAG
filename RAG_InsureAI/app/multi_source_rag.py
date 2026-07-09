@@ -3944,6 +3944,137 @@ class MultiSourceRAG:
             except Exception as _num_exc:
                 logger.debug("[ask_stream] numbered-list enforcement skipped: %s", _num_exc)
 
+        # ── Drop ungrounded padding points (detailed mode) ────────────────────
+        # DETAILED_GROUNDED_PROMPT already says "cover only the points the
+        # KNOWLEDGE BASE actually makes... every added sentence is another
+        # chance to say something unsupported" and "never pad or invent to
+        # reach 8" — the model doesn't reliably follow it. Confirmed live on a
+        # genuinely well-grounded fire insurance answer: 5 of 8 points were
+        # near-verbatim KB text, but 3 were generic wrap-up filler ("makes it
+        # a versatile option for property owners", "can be tailored to meet
+        # the specific needs...", "will help you choose the right policy...
+        # effectively") that restated nothing specific from the source, just
+        # padding to make the list look longer/more complete.
+        #
+        # Enforced deterministically: a point survives only if it shares
+        # enough substantial (4-word) phrases with the actual retrieved
+        # context — genuine KB content, even paraphrased, keeps some exact
+        # source wording; invented summary sentences don't. Uses an absolute
+        # match count, not a ratio, because a long near-verbatim point
+        # naturally has a lower MATCHED/TOTAL fraction than a short
+        # half-invented one simply from length — confirmed live: the
+        # genuinely-grounded points scored 11-31 matched 4-grams each, while
+        # the 3 padding points scored 0-4, a clean, wide gap. A point that
+        # opens with a real KB phrase then pivots to an invented claim (the
+        # "versatile option" case: matched=4, borderline) is intentionally
+        # held to the same bar as pure invention — partial grounding for one
+        # clause doesn't excuse fabricating the rest of the sentence.
+        # A shorter, fully-grounded list beats a longer one with invented
+        # filler — matches the user's explicit "fewer points is fine, just
+        # don't invent" instruction.
+        if _keyword_detailed:
+            try:
+                import re as _re3
+                _filter_src = (_corrected_text or _reply_stripped).strip()
+                _lines = _filter_src.split("\n")
+                _point_line_re = _re3.compile(r"^\s*(\d+)\.\s+(.*)$")
+                _opener_lines, _point_texts, _closer_lines = [], [], []
+                _seen_point = False
+                for _line in _lines:
+                    _m = _point_line_re.match(_line)
+                    if _m:
+                        _seen_point = True
+                        _point_texts.append(_m.group(2).strip())
+                        continue
+                    if not _seen_point:
+                        _opener_lines.append(_line)
+                        continue
+                    _stripped_line = _line.strip()
+                    if not _stripped_line:
+                        continue
+                    # A line after the first numbered point is either a
+                    # sub-item of that point (indented, or a "-"/"*"/"a."
+                    # bullet — models often break a point's detail into a
+                    # nested list) or genuine trailing closer prose. Folding
+                    # sub-items into the parent point's text keeps them
+                    # grounding-checked together and prevents them being
+                    # orphaned as unnumbered fragments glued onto the end of
+                    # the answer — confirmed live: a "Principles of
+                    # Insurance" point with indented "- Utmost Good Faith:
+                    # ..." sub-bullets otherwise split into a dropped header
+                    # plus 4 floating, contextless bullet lines.
+                    _is_continuation = _line[:1].isspace() or _stripped_line.startswith(("-", "*", "•"))
+                    if _is_continuation and _point_texts:
+                        _point_texts[-1] = _point_texts[-1] + " " + _stripped_line
+                    else:
+                        _closer_lines.append(_line)
+                if len(_point_texts) >= 2 and full_context and full_context.strip():
+                    # Must strip punctuation the same way on both sides.
+                    # full_context is raw KB prose, dense with commas
+                    # ("lightning, explosion, aircraft damage, riot..."),
+                    # while _matched_ngrams() below extracts \w+ words from
+                    # each point and joins with plain spaces. Whitespace-only
+                    # normalization here left commas in _ctx_norm, so nearly
+                    # every 4-word window straddling a comma failed to match
+                    # even when copied verbatim — confirmed live: a genuine
+                    # peril-list point (identical wording to the source, just
+                    # reformatted with "and"/commas) scored 1 matched 4-gram
+                    # instead of 14, and got wrongly dropped as "ungrounded".
+                    # This class of bug (asymmetric normalization between the
+                    # two strings being compared) generalizes beyond this one
+                    # spot — keep both sides passing through the exact same
+                    # tokenizer in any future overlap/grounding check.
+                    _ctx_norm = " ".join(_re3.findall(r"\w+", full_context.lower()))
+                    _MIN_MATCHES = 5
+                    _NGRAM = 4
+                    # A short point (< 8 words) has fewer than 5 possible
+                    # 4-word windows in total, so a flat "matched >= 5" bar
+                    # is mathematically unreachable no matter how grounded
+                    # it is — every concise point would be dropped on
+                    # length alone, not on content. Scale the bar down for
+                    # short points (requiring a high fraction of their own
+                    # max instead of a fixed count) so brevity isn't
+                    # penalized; long points keep the proven absolute bar.
+                    _MIN_FRACTION = 0.6
+
+                    def _matched_ngrams(text: str) -> tuple[int, int]:
+                        _words = _re3.findall(r"\w+", text.lower())
+                        if len(_words) < _NGRAM:
+                            _content = [w for w in _words if len(w) >= 4]
+                            _matched = sum(1 for w in _content if w in _ctx_norm)
+                            return _matched, len(_content)
+                        _total = len(_words) - _NGRAM + 1
+                        _count = 0
+                        for _i in range(_total):
+                            if " ".join(_words[_i:_i + _NGRAM]) in _ctx_norm:
+                                _count += 1
+                        return _count, _total
+
+                    def _point_grounded(text: str) -> bool:
+                        _matched, _total = _matched_ngrams(text)
+                        if _total <= 0:
+                            return False
+                        # ceil(total * 0.6) via integer math: ceil(total*3/5)
+                        _frac_threshold = -(-(_total * 3) // 5)
+                        _threshold = min(_MIN_MATCHES, max(1, _frac_threshold))
+                        return _matched >= _threshold
+
+                    _kept_points = [p for p in _point_texts if _point_grounded(p)]
+                    if _kept_points and len(_kept_points) < len(_point_texts):
+                        _opener_part = "\n".join(_opener_lines).strip()
+                        _closer_part = "\n".join(_closer_lines).strip()
+                        _rebuilt_points = "\n".join(f"{i}. {p}" for i, p in enumerate(_kept_points, 1))
+                        _pieces = [p for p in (_opener_part, _rebuilt_points, _closer_part) if p]
+                        _rebuilt3 = "\n\n".join(_pieces)
+                        _corrected_text = _rebuilt3
+                        _kv_reply = _rebuilt3
+                        logger.info(
+                            "[ask_stream] dropped %d ungrounded point(s) from detailed answer",
+                            len(_point_texts) - len(_kept_points),
+                        )
+            except Exception as _filter_exc:
+                logger.debug("[ask_stream] ungrounded-point filter skipped: %s", _filter_exc)
+
         # ── Hard sentence cap (brief / conversational mode) ──────────────────
         # Conversational prompts instruct the model to write 3 sentences max.
         # This enforcer guarantees it regardless of model compliance.
