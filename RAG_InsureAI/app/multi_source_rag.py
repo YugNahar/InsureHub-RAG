@@ -2961,6 +2961,7 @@ class MultiSourceRAG:
         # paste alone already supports an answer, independent of whatever
         # fresh KB retrieval turns up.
         pasted_context, question = await _extract_pasted_followup(question)
+        _pasted_is_point_reference = False
         if pasted_context is None:
             # No literal paste in this message — but a short "explain point 2"
             # style follow-up references a numbered list from the PREVIOUS
@@ -2971,9 +2972,70 @@ class MultiSourceRAG:
             _point_num = _extract_point_number(question)
             if _point_num is not None and history:
                 pasted_context = _extract_point_text_from_history(history, _point_num)
+                _pasted_is_point_reference = pasted_context is not None
         _pasted_grounds_answer = False
         if pasted_context:
             _pasted_grounds_answer = await _verify_grounding(question, pasted_context)
+        # For a point-reference follow-up specifically, fetch supplementary
+        # KB content using the POINT'S OWN TEXT as the retrieval query, not
+        # the vague "explain point 3 in more detail" phrasing the main
+        # pipeline's retrieval further down would otherwise use. Confirmed
+        # live this distinction matters, not just as a precaution: with the
+        # main pipeline's generically-retrieved content merged in instead
+        # of this, "explain point 3" (about machinery breakdown / boiler /
+        # electronic equipment risks) came back answering about the
+        # indemnity principle instead — an entirely different KB chunk that
+        # happened to rank for the vague follow-up text, silently
+        # overriding what the user actually asked about. Retrieving with
+        # the point's own subject matter as the query keeps whatever
+        # supplementary content is found on-topic.
+        _point_ref_context = ""
+        _point_ref_sources: list = []
+        if _pasted_is_point_reference and pasted_context:
+            try:
+                _point_ref_chunks = await self._retrieve_doc_chunks(
+                    pasted_context, filter_meta, document_filter, doc_top_k=6, summary_top_k=2,
+                )
+                # Retrieving with the point's own text as the query narrows
+                # the candidate pool, but embedding similarity alone can
+                # still rank a DIFFERENT, merely topically-adjacent policy
+                # type highly (both live under the same "engineering
+                # insurance" umbrella) — confirmed live: point 3 was about
+                # the project-stage/procurement risks, but a chunk about
+                # Business Interruption Insurance (no real overlap in
+                # subject matter, just the same broad section of the KB)
+                # still made it through and the model answered about THAT
+                # instead. Re-use the same significant-word-overlap check
+                # the padding filter uses (project_padding_filter_over_
+                # aggressive.md) to keep only chunks that actually share
+                # vocabulary with the point's own text, not just its
+                # neighborhood in embedding space.
+                _point_words = {
+                    w for w in re.findall(r"\w+", pasted_context.lower()) if len(w) >= 5
+                }
+                def _shares_vocabulary(text: str) -> bool:
+                    if not _point_words:
+                        return True
+                    chunk_words = {w for w in re.findall(r"\w+", text.lower()) if len(w) >= 5}
+                    return len(_point_words & chunk_words) >= min(3, max(1, len(_point_words) // 4))
+                _point_ref_chunks = [
+                    c for c in _point_ref_chunks
+                    if _shares_vocabulary(getattr(c, "page_content", ""))
+                ]
+                if _point_ref_chunks:
+                    _point_ref_context = "\n\n".join(
+                        c.page_content for c in _point_ref_chunks if getattr(c, "page_content", "")
+                    )[:4000]
+                    # Citation accuracy: these are the chunks the answer will
+                    # actually be grounded in for this branch, not whatever
+                    # the main pipeline's (mistargeted, for this case)
+                    # retrieval further down finds.
+                    for c in _point_ref_chunks:
+                        src = c.metadata.get("source", "Unknown")
+                        page = c.metadata.get("page", "?")
+                        _point_ref_sources.append(f"{src} (page {page})")
+            except Exception:
+                pass
 
         # ── Compound-question disambiguation ───────────────────────────────────
         # A generic elaboration follow-up ("explain it in detail") after a
@@ -3699,13 +3761,44 @@ class MultiSourceRAG:
         # but its output would only dilute an already-sufficient answer with
         # unrelated KB noise. When it isn't enough on its own, keep both:
         # this context plus whatever fresh KB content retrieval found.
+        #
+        # EXCEPT for a point-reference follow-up ("explain point 3 in more
+        # detail"): the point's own text trivially "grounds" a question
+        # about itself — asking to explain X using a sentence about X always
+        # passes _verify_grounding — so this branch's sole-context shortcut
+        # left the model with literally nothing but that one sentence to
+        # work from. Confirmed live: "explain point 3 in more detail" came
+        # back as a near-verbatim reword of the original point ("covers the
+        # entire lifecycle... from planning and financing to testing and
+        # commissioning" -> "covers the entire journey... starting from
+        # planning and financing right through to testing and
+        # commissioning") — a paraphrase, not the additional depth the user
+        # actually asked for. A genuine user-pasted block is different: the
+        # user deliberately supplied that exact text as the thing to answer
+        # from, so restricting to it is correct there. For a point
+        # reference, always keep fresh retrieval alongside it so there's
+        # real additional material to expand into when the KB has more to
+        # say about that point's specific sub-topic.
         if pasted_context:
-            if _pasted_grounds_answer:
+            if _pasted_grounds_answer and not _pasted_is_point_reference:
                 full_context = "[Context from an earlier answer]\n" + pasted_context
                 # The answer draws only from this, not from retrieval —
                 # citing KB documents that were fetched but never actually
                 # used would be a misleading source list.
                 sources = []
+            elif _pasted_is_point_reference:
+                # Use the point-targeted retrieval from above, not the main
+                # pipeline's full_context — that was retrieved using the
+                # vague follow-up phrasing ("explain point 3 in more
+                # detail") and can rank unrelated KB content ahead of
+                # anything about the point's actual subject matter.
+                full_context = (
+                    "[Context from an earlier answer]\n"
+                    + pasted_context
+                    + ("\n\n[Related knowledge base content]\n" + _point_ref_context if _point_ref_context else "")
+                )
+                if _point_ref_sources:
+                    sources = _point_ref_sources
             else:
                 full_context = (
                     "[Context from an earlier answer]\n"
