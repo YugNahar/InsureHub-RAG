@@ -1043,6 +1043,21 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
             q.strip().lstrip("0123456789.-) ").strip()
             for q in _text.split("\n") if q.strip()
         ]
+        # Same vLLM language-leakage artifact as _NON_LATIN_SCRIPT_RE
+        # (defined below, near the ask_stream corrections it was built
+        # for) — confirmed live in a suggestion chip: "Would the
+        # insurance cover重建费用?" (Chinese for "rebuilding costs" fused
+        # directly onto the English question with no space). That fix
+        # only touches the main reply text, not this separate LLM call,
+        # so the same corruption reaches the user here too. Strip to
+        # empty rather than a space — these are short, space-sensitive
+        # phrases where the CJK run is typically fused to an adjacent
+        # word or punctuation mark with no surrounding whitespace at
+        # all, unlike the paragraph-length main-reply case.
+        _candidates = [
+            re.sub(r"\s+", " ", _NON_LATIN_SCRIPT_RE.sub("", q)).strip()
+            for q in _candidates
+        ]
         _candidates = [q for q in _candidates if 2 <= len(q.split()) <= 10]
         # Cheap lexical pre-filter before spending an LLM call on verification
         _candidates = [q for q in _candidates if _question_answerable_in_context(q, context)]
