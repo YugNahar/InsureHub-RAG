@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import List, Tuple, Optional
 
 try:
@@ -737,75 +738,6 @@ _FOLLOWUP_KEYWORDS = frozenset({
 })
 
 
-_CHIP_STOPWORDS = frozenset({
-    "what", "is", "are", "the", "a", "an", "how", "why", "when", "where",
-    "which", "does", "do", "can", "will", "would", "should", "be", "to",
-    "of", "in", "for", "and", "or", "on", "at", "by", "with", "that",
-    "this", "it", "its", "has", "have", "had", "was", "were", "i", "me",
-    "my", "your", "their", "there", "from", "about", "if", "tell", "explain",
-    "give", "get", "any", "more",
-})
-
-
-_DURATION_QUESTION_RE = re.compile(
-    r"\bhow long\b|\bhow many (?:years|months|days|weeks)\b|"
-    r"\bwhat is the (?:duration|term|period|length)\b",
-    re.IGNORECASE,
-)
-_DURATION_KEYWORD_RE = re.compile(r"\b(term|period|duration)\b", re.IGNORECASE)
-_DURATION_VALUE_RE = re.compile(
-    r"\d+\s*[- ]?(?:year|yr|month|day|week)s?\b|\bannual(?:ly)?\b|\byearly\b|"
-    r"\blifetime\b|\bwhole\s*life\b",
-    re.IGNORECASE,
-)
-
-
-def _has_nearby_duration_value(context: str, window: int = 60) -> bool:
-    """True if an explicit duration value (a number+unit, or annual/yearly/
-    lifetime) appears within *window* chars of "term"/"period"/"duration"
-    somewhere in *context*.
-    """
-    for m in _DURATION_KEYWORD_RE.finditer(context):
-        snippet = context[max(0, m.start() - window):m.end() + window]
-        if _DURATION_VALUE_RE.search(snippet):
-            return True
-    return False
-
-
-def _question_answerable_in_context(question: str, context: str) -> bool:
-    """
-    Return True when at least half the content words in *question* appear
-    somewhere in *context*.  Cheap, no LLM call.  Content words = words
-    longer than 3 chars that are not stopwords.
-
-    Duration-shaped questions ("how long is X", "what is the term/period of
-    X") additionally require an explicit duration VALUE near the word
-    "term"/"period"/"duration" in the context — not just that word's bare
-    presence. Confirmed live: "term" appears 5 times in a health-insurance
-    context purely as a generic placeholder ("during the term of the
-    policy...") with the actual duration never stated anywhere, which was
-    enough word-overlap to pass this filter (and, separately, enough to
-    fool _verify_grounding — even individually, not just when batched — 4/4
-    times in testing). This is a genuine gap between "topically mentions
-    the concept" and "states the specific fact asked for" that neither
-    prompt wording nor batched-vs-individual verification fixed, so it's
-    caught here deterministically instead, mirroring this session's other
-    grounding-check fixes (regulatory boilerplate, multi-chunk confusion)
-    that moved a judgment out of the unreliable small-model layer.
-    """
-    words = [w.lower().strip("?.,!;:'\"()") for w in question.split()]
-    content_words = [w for w in words if len(w) >= 4 and w not in _CHIP_STOPWORDS]
-    if not content_words:
-        return False            # can't verify — drop it to be safe
-    ctx_lower = context.lower()
-    hits = sum(1 for w in content_words if w in ctx_lower)
-    if hits < max(1, len(content_words) * 0.5):
-        return False
-    if _DURATION_QUESTION_RE.search(question) and not _has_nearby_duration_value(context):
-        return False
-    return True
-
-
 async def _backend_completion(
     prompt: str, max_tokens: int, timeout: float, temperature: float = 0,
     backend_override: Optional[str] = None,
@@ -816,9 +748,9 @@ async def _backend_completion(
     or unconfigured/unsupported backend.
 
     Used for short, best-effort auxiliary calls (topic extraction, query
-    reformulation, suggested-question generation) that should follow the
-    SAME backend as the main answer generation, not be pinned to vLLM
-    regardless of FORCE_BACKEND. An earlier version hardcoded these to
+    reformulation) that should follow the SAME backend as the main
+    answer generation, not be pinned to vLLM regardless of FORCE_BACKEND.
+    An earlier version hardcoded these to
     always use vLLM specifically to keep a Groq-vs-vLLM generation-fidelity
     A/B test uncontaminated by a different topic-extraction model also
     changing retrieval-gating behavior. That trade-off made sense for a
@@ -1012,154 +944,6 @@ def _diff_dropped_terms(original: str, cleaned: str) -> Tuple[Optional[str], boo
             if is_proper_noun:
                 has_proper_noun = True
     return (", ".join(dict.fromkeys(dropped)) if dropped else None, has_proper_noun)
-
-
-async def _generate_suggestions(
-    rag_self,
-    question: str,
-    answer: str,
-    context: str = "",
-    filter_meta: Optional[dict] = None,
-    document_filter: Optional[List[str]] = None,
-) -> list:
-    """
-    Generate follow-up chip questions grounded in the answer just given.
-
-    Steps:
-      1. Ask the LLM to produce 5 candidate questions from the answer text.
-      2. Cheap pre-filter: drop candidates whose content words don't even
-         lexically appear in the retrieved context (no LLM call).
-      3. Real verification (_candidate_survives_real_pipeline): actually
-         retrieve for each surviving candidate and run it through the SAME
-         gates a real question goes through — rerank-score gate, lexical
-         coverage checks, and semantic grounding — instead of asking an
-         LLM to judge the candidate against the ANSWER-GIVING question's
-         already-retrieved context.
-         That older approach checked the wrong thing: clicking a chip
-         sends the candidate as a brand-new question, which triggers its
-         OWN fresh retrieval — not a reuse of the parent question's
-         chunks. A candidate could pass "is this covered by the context
-         that already answered something else" while its own independent
-         retrieval pulls different, weaker, or off-topic chunks that
-         don't actually ground it. Confirmed live (2026-07-10, reported
-         directly by the user testing in the browser): a suggested chip
-         was shown, and clicking it returned "I don't have that specific
-         information in my knowledge base" — the exact failure this
-         function exists to prevent, still slipping through the
-         judgment-based check. Running the real pipeline per candidate is
-         the only way to know a suggestion will actually answer before
-         showing it — see the user's explicit instruction: only suggest
-         a question if it demonstrably gets grounded chunks when run for
-         real, otherwise drop it silently (never show a chip that leads
-         to a fabricated or made-up answer, and never alter how a
-         directly-typed user question is handled — this only changes
-         which suggestions get shown).
-      4. Return up to 3 verified questions.
-    """
-    try:
-        if not context or not context.strip():
-            return []
-        if not answer or not answer.strip():
-            return []
-        # Ground generation in the ANSWER the user actually read, not the raw
-        # retrieved-chunk pool. context[:1000] used to be fed to the LLM
-        # instead — but retrieval returns several chunks (often 2000-4400
-        # chars each), so the first 1000 chars is effectively just whichever
-        # chunk landed first in the pool, which is frequently NOT what the
-        # conversational answer was actually grounded in (e.g. a thin-KB
-        # topic like Takaful pulling in an unrelated "types of insurance"
-        # chunk that also mentions motor insurance as an example). The
-        # `answer` param was already being passed in but never referenced in
-        # the prompt, so suggestions had no connection to what the user
-        # actually read. Context is still used below, only for verification.
-        ans_snippet = answer[:800].strip()
-        prompt = (
-            f"User asked: {question}\n\n"
-            f"They were given this answer:\n{ans_snippet}\n\n"
-            "Write 5 short follow-up questions (max 8 words each) that:\n"
-            "1. Ask about specific facts, terms, or details actually mentioned in the answer above — not other topics.\n"
-            "2. A user would naturally ask AFTER reading that exact answer.\n"
-            "3. Do not repeat the original question or invent unrelated topics.\n"
-            "4. Each question must name the specific product/topic (e.g. the insurance type) instead of using 'it'/'its' — a reader must understand it with no other context, since clicking it sends it as a brand-new question.\n"
-            "Output only the questions, one per line, no numbering, no bullets, no explanations:"
-        )
-        _text = await _backend_completion(prompt, max_tokens=120, timeout=12)
-        if not _text:
-            return []
-        # Parse and clean candidates
-        _candidates = [
-            q.strip().lstrip("0123456789.-) ").strip()
-            for q in _text.split("\n") if q.strip()
-        ]
-        # Same vLLM language-leakage artifact as _NON_LATIN_SCRIPT_RE
-        # (defined below, near the ask_stream corrections it was built
-        # for) — confirmed live in a suggestion chip: "Would the
-        # insurance cover重建费用?" (Chinese for "rebuilding costs" fused
-        # directly onto the English question with no space). That fix
-        # only touches the main reply text, not this separate LLM call,
-        # so the same corruption reaches the user here too. Strip to
-        # empty rather than a space — these are short, space-sensitive
-        # phrases where the CJK run is typically fused to an adjacent
-        # word or punctuation mark with no surrounding whitespace at
-        # all, unlike the paragraph-length main-reply case.
-        _candidates = [
-            re.sub(r"\s+", " ", _NON_LATIN_SCRIPT_RE.sub("", q)).strip()
-            for q in _candidates
-        ]
-        _candidates = [q for q in _candidates if 2 <= len(q.split()) <= 10]
-        # Cheap lexical pre-filter before spending a retrieval call on verification
-        _candidates = [q for q in _candidates if _question_answerable_in_context(q, context)]
-        if not _candidates:
-            return []
-        _results = await asyncio.gather(*[
-            _candidate_survives_real_pipeline(rag_self, q, filter_meta, document_filter)
-            for q in _candidates
-        ])
-        _verified = [q for q, ok in zip(_candidates, _results) if ok]
-        return _verified[:3]
-    except Exception:
-        pass
-    return []
-
-
-async def _candidate_survives_real_pipeline(
-    rag_self, candidate: str, filter_meta: Optional[dict], document_filter: Optional[List[str]],
-) -> bool:
-    """Would this candidate question actually get a grounded answer if a
-    user clicked it right now? Runs the identical gates ask_stream applies
-    to a real question — rerank-score gate, lexical coverage checks, and
-    semantic grounding — against a FRESH retrieval for the candidate's own
-    text, not the parent question's already-retrieved chunks. Fails safe
-    to False on any retrieval/verification error: showing no chip beats
-    showing one that dead-ends.
-    """
-    try:
-        chunks = await rag_self._retrieve_doc_chunks(
-            candidate, filter_meta, document_filter, doc_top_k=8, summary_top_k=2,
-        )
-    except Exception:
-        return False
-    if not chunks:
-        return False
-    _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.0005"))
-    top_rerank = max(
-        (c.metadata.get("rerank_score", float("-inf"))
-         for c in chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
-        default=float("-inf"),
-    )
-    if top_rerank < _rerank_gate:
-        return False
-    lex_ok = (
-        _context_covers_query(candidate, chunks, llm_topics=None)
-        and _quoted_comparison_covered(candidate, chunks)
-        and _enumeration_query_covered(candidate, chunks)
-    )
-    if not lex_ok:
-        return False
-    try:
-        return await _verify_grounding_any_chunk(candidate, chunks)
-    except Exception:
-        return False
 
 
 def _is_likely_followup(question: str) -> bool:
@@ -1754,9 +1538,8 @@ async def _extract_intent_topics(question: str) -> set[str]:
 
 # Context passed to the grounding-check prompt is capped so this stays a
 # fast, cheap call (max_tokens=10 output either way) — not specified by the
-# original design, but consistent with how _generate_suggestions() and the
-# earlier context[:1000] pattern elsewhere in this file bound auxiliary-call
-# input size for latency.
+# original design, but consistent with the context[:1000] pattern elsewhere
+# in this file bounding auxiliary-call input size for latency.
 _GROUNDING_CONTEXT_CHARS = 3000
 
 
@@ -2495,7 +2278,7 @@ async def _split_compound_question(question: str) -> Optional[tuple[str, str]]:
     # this chat model into echoing "Line 1:"/"Line 2:" back garbled into the
     # answer text itself ('What is fire insurance? Line 1: \n\nWhat does it
     # cover? Line 2:'). The plain-instruction style already proven reliable
-    # for _generate_suggestions' multi-line output works cleanly here too.
+    # for other multi-line LLM outputs in this file works cleanly here too.
     prompt = (
         f"Question: {question}\n\n"
         "Split this into its two separate questions. Resolve any pronoun so "
@@ -3028,6 +2811,21 @@ class MultiSourceRAG:
         # We call ask() with a sentinel and intercept just before llm.invoke.
         # Simpler: duplicate the prompt-building block here (it's fast, <1s).
 
+        # Per-phase latency tracking (2026-07-10, explicit user request) — a
+        # single consolidated log line at the end of the main generation
+        # path breaking down where the request's wall-clock time actually
+        # went (retrieval, grounding checks, LLM generation), so a slow
+        # request can be diagnosed from logs alone instead of guessing.
+        # Left as None on the fast early-return paths
+        # (cache hit, refusal) since those aren't the latency problem this
+        # was asked for — they're already fast, and instrumenting every one
+        # of this function's many early returns would add a lot of noise
+        # for no diagnostic value.
+        _t_request_start = time.time()
+        _t_retrieval_ms = None
+        _t_grounding_ms = None
+        _t_llm_ms = None
+
         retrieval_query = question
         filter_meta = None
         if document_filter:
@@ -3183,8 +2981,8 @@ class MultiSourceRAG:
         # cover?") is ambiguous about which part the user wants more on —
         # confirmed live: it silently picked one interpretation and answered
         # only that, with no way for the user to signal they wanted the other
-        # part (or both). Detect this and ask, the same way suggested-question
-        # chips already ask — rather than guessing.
+        # part (or both). Detect this and ask the user which part they mean
+        # via clickable chips, rather than guessing.
         # A single clarify chip click ("What does travel insurance cover?")
         # sends that exact question text as a normal message, indistinguishable
         # from the user typing it themselves — which meant it could semantic-
@@ -3302,7 +3100,14 @@ class MultiSourceRAG:
         # regardless of whether the combined question happens to match
         # _needs_detailed_answer()'s own signals.
         _keyword_detailed = _needs_detailed_answer(question) or _force_both_detailed
-        _doc_top_k   = 14 if _keyword_detailed else 8
+        # Reduced 14/8 -> 8/6 (2026-07-10, explicit user latency request) —
+        # each unit of doc_top_k adds a vector-search candidate that then
+        # has to be reranked (multi-window reranking is the dominant cost
+        # here, see turbovec_store.py's ~13s-at-3-windows measurement), so
+        # this is the single biggest lever on retrieval latency. Retested
+        # the full regression suite plus a broad-topic detailed-mode batch
+        # at the new values before shipping — see the commit for results.
+        _doc_top_k   = 8 if _keyword_detailed else 6
         _chunk_limit = 12 if _keyword_detailed else 8
         # Trimmed from 5/4 — video/webpage search()'s internal reranking
         # candidate pool is 2x this value (safe_k = min(2*top_k, count)), so
@@ -3461,9 +3266,6 @@ class MultiSourceRAG:
                 "done": True,
                 "needs_human": False,
             }
-            _cached_sugg = _kv_hit.get("suggested_questions")
-            if _cached_sugg:
-                _cache_payload["suggested_questions"] = _cached_sugg
             yield "\n\n" + _json_s.dumps(_cache_payload)
             return
 
@@ -3475,6 +3277,7 @@ class MultiSourceRAG:
         # every answer verbose), so it was purely wasted latency: a full
         # extra round-trip to the LLM server on every query for a result
         # nothing read. Removed.
+        _t_retrieval_start = time.time()
         if not document_filter:
             # Local reranking (doc, video, webpage) all share one CrossEncoder
             # model running on CPU. Firing all three concurrently via
@@ -3513,6 +3316,7 @@ class MultiSourceRAG:
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
+        _t_retrieval_ms = round((time.time() - _t_retrieval_start) * 1000)
         detailed = _keyword_detailed
 
         # Prefer BGE rerank_score when available (set by rerank_documents).
@@ -3617,10 +3421,12 @@ class MultiSourceRAG:
                 and _quoted_comparison_covered(retrieval_query, all_chunks)
                 and _enumeration_query_covered(retrieval_query, all_chunks)
             )
+        _t_grounding_start = time.time()
         _lex_ok, _semantically_grounded = await asyncio.gather(
             _lexical_covered(),
             _verify_grounding_any_chunk(retrieval_query, all_chunks),
         )
+        _t_grounding_ms = round((time.time() - _t_grounding_start) * 1000)
         ctx_covered = _lex_ok and _semantically_grounded
 
         _dropped_terms_note = None
@@ -4047,7 +3853,7 @@ class MultiSourceRAG:
         # the raw pre-strip text flash by. That gate had a false-positive
         # problem specific to detailed answers: _top_rerank is the score of
         # the SINGLE best-matching chunk, but detailed mode deliberately
-        # retrieves from a much wider pool (_doc_top_k=14 vs 8) and builds
+        # retrieves from a wider pool (_doc_top_k=8 vs 6) and builds
         # its context from many chunks combined — so the top single chunk
         # can legitimately score low even when the combined context is rich
         # and the generated answer is fully correct. Confirmed live: "can
@@ -4095,6 +3901,7 @@ class MultiSourceRAG:
                 "Authorization": f"Bearer {_runtime_manual_api_key}",
             }
 
+        _t_llm_start = time.time()
         if _stream_url:
             model = _stream_model
             url = _stream_url
@@ -4171,6 +3978,7 @@ class MultiSourceRAG:
             answer = response.content if hasattr(response, "content") else str(response)
             answer = _strip_markdown(_strip_model_preamble(answer))
             _kv_reply = answer
+        _t_llm_ms = round((time.time() - _t_llm_start) * 1000)
 
         # ── Rule 4 fallback strip ─────────────────────────────────────────────
         # The 7B model sometimes generates real content from training knowledge
@@ -4574,19 +4382,6 @@ class MultiSourceRAG:
             "don't have that right now",
             "i don't have that right now",
         )
-        # Suggestions are generated once here (not in the KV-hit branch above)
-        # and cached alongside the answer, so a cache hit on a later, identical
-        # question still gets chips instead of silently having none — the
-        # KV-hit early-return never re-derives full_context, so without this
-        # the suggestion pipeline would only ever run on the first ask.
-        _reply_for_chips = (_corrected_text or _kv_reply or "").strip()
-        _sugg: list = []
-        if _reply_for_chips and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
-            _sugg = await _generate_suggestions(
-                self, question, _reply_for_chips, context=full_context,
-                filter_meta=filter_meta, document_filter=document_filter,
-            )
-
         if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases):
             try:
                 _kv.put(
@@ -4599,7 +4394,6 @@ class MultiSourceRAG:
                         "has_example": _kv_has_example,
                         "has_simple": _kv_has_simple,
                         "top_rerank": max(_top_rerank, 0.0),  # persist decision-time confidence for cache-hit trust
-                        "suggested_questions": _sugg,
                     },
                     query_embedding=_kv_q_emb,
                     query_text=retrieval_query,
@@ -4607,6 +4401,28 @@ class MultiSourceRAG:
                 logger.info("[ask_stream] KV cache stored for query=%r", retrieval_query[:80])
             except Exception as _exc:
                 logger.debug("[ask_stream] KV cache write failed: %s", _exc)
+
+        _t_total_ms = round((time.time() - _t_request_start) * 1000)
+        # Single consolidated timing line per request rather than one log
+        # line per phase — makes it possible to `grep TIMING` and sort/
+        # aggregate by whichever phase is actually the bottleneck across a
+        # batch of requests, and per-phase numbers that don't sum to the
+        # total (there's always some untimed glue code, plus the fallback/
+        # standalone-retry tiers upstream aren't separately measured) are
+        # expected — "other" below is exactly that gap, not a bug.
+        _t_other_ms = _t_total_ms - sum(
+            v for v in (_t_retrieval_ms, _t_grounding_ms, _t_llm_ms) if v is not None
+        )
+        logger.info(
+            "[ask_stream] TIMING total=%dms retrieval=%s grounding=%s llm=%s other=%dms detailed=%s query=%r",
+            _t_total_ms,
+            f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
+            f"{_t_grounding_ms}ms" if _t_grounding_ms is not None else "n/a",
+            f"{_t_llm_ms}ms" if _t_llm_ms is not None else "n/a",
+            _t_other_ms,
+            _keyword_detailed,
+            retrieval_query[:80],
+        )
 
         _final_payload: dict = {
             "sources": [] if _rule4_discarded else unique_sources,
@@ -4616,8 +4432,6 @@ class MultiSourceRAG:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
-        if _sugg:
-            _final_payload["suggested_questions"] = _sugg
         yield "\n\n" + _json.dumps(_final_payload)
 
     # Management methods (keep as before)

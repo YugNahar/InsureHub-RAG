@@ -51,7 +51,6 @@ export interface StreamMeta {
   needs_human: boolean;
   offline_escalated: boolean;
   corrected_text?: string;
-  suggested_questions?: string[];
   clarify_options?: string[];
 }
 
@@ -119,7 +118,6 @@ export async function apiStream(
           needs_human: meta.needs_human ?? false,
           offline_escalated: meta.offline_escalated ?? false,
           corrected_text: meta.corrected_text,
-          suggested_questions: meta.suggested_questions,
           clarify_options: meta.clarify_options,
         });
       } catch {

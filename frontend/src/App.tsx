@@ -226,7 +226,6 @@ function ChatWidget({
   const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [suggestedQs, setSuggestedQs] = useState<string[]>([]);
   const [clarifyOptions, setClarifyOptions] = useState<string[]>([]);
   const [sessionId, setSessionId] = useState<string>("default");
   const [chatMode, setChatMode] = useState<ChatMode>("ai");
@@ -494,7 +493,6 @@ function ChatWidget({
       console.error("Failed to reset conversation on server:", err);
     }
     setMessages([GREETING]);
-    setSuggestedQs([]);
     setClarifyOptions([]);
     setInput("");
     requestAnimationFrame(() => inputRef.current?.focus());
@@ -506,7 +504,6 @@ function ChatWidget({
 
     setMessages((m) => [...m, { role: "user", content: text }]);
     setInput("");
-    setSuggestedQs([]);
     setClarifyOptions([]);
 
     // In human mode, send via WebSocket directly
@@ -556,9 +553,6 @@ function ChatWidget({
               }
               return updated;
             });
-          }
-          if (meta.suggested_questions?.length) {
-            setSuggestedQs(meta.suggested_questions);
           }
           if (meta.clarify_options?.length) {
             setClarifyOptions(meta.clarify_options);
@@ -655,19 +649,6 @@ function ChatWidget({
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <TypingDots />
               <span>{chatMode === "human" ? `${agentName} is typing…` : "Layla is typing…"}</span>
-            </div>
-          )}
-          {!sending && suggestedQs.length > 0 && (
-            <div className="follow-chips-row">
-              {suggestedQs.map((q, i) => (
-                <button
-                  key={i}
-                  className="follow-chip"
-                  onClick={() => { setInput(q); setSuggestedQs([]); setTimeout(() => inputRef.current?.focus(), 0); }}
-                >
-                  {q}
-                </button>
-              ))}
             </div>
           )}
           {!sending && clarifyOptions.length > 0 && (
