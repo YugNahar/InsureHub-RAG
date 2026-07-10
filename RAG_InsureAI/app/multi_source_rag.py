@@ -3666,6 +3666,46 @@ class MultiSourceRAG:
             _MAX_INPUT_TOKENS - _PROMPT_TEMPLATE_TOKENS - _history_tokens_est - _output_reserve,
         )
         _context_budget = min(6000, _context_token_budget * 4)  # tokens → chars
+
+        # Drop near-zero-relevance VIDEO/WEBPAGE chunks before fair-share
+        # compression gives every SURVIVING chunk a guaranteed slice of the
+        # context budget. Confirmed live: a "how to claim life insurance"
+        # query's candidate pool included YouTube transcripts about health
+        # and car insurance claims scoring 0.004-0.015 on the reranker,
+        # versus 0.15-0.91 for the genuinely relevant life-insurance
+        # chunks — a decisive 10x+ gap. Before this filter, fair-share
+        # (previous commit) guaranteed those near-zero-relevance chunks a
+        # slice too, and their off-topic claim-procedure language bled
+        # into the generated answer ("whether it's for life insurance or
+        # health insurance"). The old greedy-fill compression had
+        # accidentally masked this by crushing low-ranked chunks to
+        # nothing — fair-share fixed that for genuinely relevant content
+        # but also removed that accidental protection for actual noise.
+        #
+        # Scoped to video/webpage sources ONLY, never document/PDF chunks
+        # — confirmed live this matters: a 0.05 threshold applied to ALL
+        # source types wrongly excluded the correct "relatives" answer (a
+        # PDF chunk scoring 0.028, a previously-fixed, documented case of
+        # a genuinely-relevant chunk the reranker underscores because its
+        # key sentence is buried past an unrelated opening section) while
+        # every confirmed noise chunk in testing was a YouTube transcript.
+        # Unlike the curated, structured PDF course material, video
+        # transcripts run continuously across unrelated topics, so a
+        # low score on them is a much more reliable "actually irrelevant"
+        # signal than the same score on a document chunk.
+        _MIN_RERANK_SCORE = 0.05
+        _NON_DOCUMENT_SOURCE_TYPES = {"video", "youtube_transcript", "youtube", "webpage", "web"}
+
+        def _keep_chunk(c) -> bool:
+            if str(c.metadata.get("source_type", "document")).lower() not in _NON_DOCUMENT_SOURCE_TYPES:
+                return True
+            _score = c.metadata.get("rerank_score")
+            return _score is None or _score >= _MIN_RERANK_SCORE
+
+        _relevant_chunks = [c for c in all_chunks if _keep_chunk(c)]
+        if _relevant_chunks:
+            all_chunks = _relevant_chunks
+
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
             all_chunks = self._compressor.compress_to_budget(
