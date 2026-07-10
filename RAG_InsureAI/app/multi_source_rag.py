@@ -41,6 +41,32 @@ _INSURANCE_VOCAB = [
     "calculation", "formula", "amount", "documents", "process", "settlement",
 ]
 
+# Ordinary English words that fuzzy-match an _INSURANCE_VOCAB entry above
+# the 85 threshold but are never actually a typo of it — raising the
+# threshold from 80 to 85 (see _correct_typos) closed off the "detail" ->
+# "dental" class of false positive, but a systematic scan of the top
+# 10,000 most common English words turned up 19 more words that still
+# score >=85, in the same range as genuine typos ("nominie" -> "nominee"
+# also scores 85.7), so no threshold value can separate them from real
+# typo-correction coverage. These are hand-verified as real, common
+# words that would never legitimately need fixing to the paired vocab
+# term, and are excluded outright before the fuzzy match ever runs.
+# Worst cases if left unprotected: "injured" -> "insured" (opposite-ish
+# meaning, and "injured" is one of the most common words in accident/
+# health queries), "requirement" -> "retirement" (silently redirects an
+# eligibility question into unrelated retirement-planning content),
+# "description" -> "prescription", "copy" -> "copay". A few borderline
+# scan hits ("heath" -> "health", "accent" -> "accident", "cove" ->
+# "cover") were deliberately left OUT of this set: in an insurance-chat
+# context a typo is far more likely than the literal rare word, so
+# correction is still the right default for those three.
+_TYPO_CORRECTION_PROTECTED_WORDS = frozenset({
+    "injured", "requirement", "requirements", "description", "descriptions",
+    "copy", "copies", "converted", "convert", "projection", "projections",
+    "beneficial", "renewable", "document", "ride", "rides", "saving",
+    "broke", "protecting", "tension", "meditation", "calculator",
+})
+
 
 # ── Casual greetings (fuzzy-matched) ─────────────────────────────────────────────
 _CASUAL_GREETINGS = frozenset({
@@ -77,6 +103,8 @@ def _join_split_compounds(text: str) -> str:
     """
     def _try_join(m: re.Match) -> str:
         prefix, rest = m.group(1), m.group(2)
+        if rest.lower() in _TYPO_CORRECTION_PROTECTED_WORDS:
+            return m.group(0)
         result = process.extractOne(rest, _INSURANCE_VOCAB, scorer=fuzz.ratio)
         if result is not None:
             best_match, score, _ = result
@@ -140,7 +168,7 @@ def _correct_typos(text: str) -> str:
     corrected = []
     for w in words:
         stripped = w.strip(".,!?;:()[]{}'\"")
-        if len(stripped) >= 4:
+        if len(stripped) >= 4 and stripped.lower() not in _TYPO_CORRECTION_PROTECTED_WORDS:
             result = process.extractOne(stripped, _INSURANCE_VOCAB, scorer=fuzz.ratio)
             if result is not None:
                 best_match, score, _ = result
