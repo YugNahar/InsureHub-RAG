@@ -2146,6 +2146,34 @@ _RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
 # deterministically instead of relying on the prompt instruction alone.
 _HONEST_FILLER_RE = re.compile(r"\b([Hh])onest,")
 
+# The frontend renders assistant messages as plain text (no markdown
+# parser) — confirmed live: the model sometimes writes "**Legal
+# Expenses**: ..." for emphasis, which the chat UI shows as literal
+# asterisks around the words instead of bold text. Stripped
+# deterministically rather than adding markdown rendering to the
+# frontend, consistent with how this session has handled every other
+# case of "the model does something the display layer doesn't expect."
+# Non-greedy and requires the pair to close on the same line so it
+# can't accidentally swallow unrelated text if the model ever emits an
+# unpaired "**".
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*([^\n*]+?)\*\*")
+
+# The vLLM backend (Qwen2.5-7B) occasionally code-switches into Chinese
+# mid-response even though the question and the rest of the answer are
+# English — confirmed live: "...plus any bonuses累积的。具体金额取决于
+# 你的保单条款..." tacked onto an otherwise-complete English sentence.
+# Re-running the identical question 4/4 times came back clean English,
+# so this is a non-deterministic generation-sampling artifact, not a
+# retrieval or prompt bug worth chasing upstream. Stripped
+# deterministically like every other display-layer mismatch this
+# session: delete the non-Latin-script run and clean up what's left
+# rather than showing garbled mixed-language text. Covers CJK ideographs
+# plus Japanese kana, Hangul, and CJK/fullwidth punctuation so it isn't
+# tied to this one Chinese-specific incident.
+_NON_LATIN_SCRIPT_RE = re.compile(
+    r"[　-〿぀-ヿ㐀-䶿一-鿿가-힯＀-￯]+"
+)
+
 
 def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
     """Handle the LLM appending the canned Rule 4 fallback ("Honestly/Honest,
@@ -4109,6 +4137,41 @@ class MultiSourceRAG:
             _reply_stripped = _honest_fixed
             _kv_reply = _honest_fixed
             _corrected_text = _honest_fixed
+
+        _unbolded = _MARKDOWN_BOLD_RE.sub(r"\1", _reply_stripped)
+        if _unbolded != _reply_stripped:
+            _reply_stripped = _unbolded
+            _kv_reply = _unbolded
+            _corrected_text = _unbolded
+
+        # See _NON_LATIN_SCRIPT_RE above: rare vLLM language-leakage
+        # artifact where the model tacks on a CJK-script tail (or, more
+        # rarely, a mid-sentence run) after an otherwise-English answer.
+        # Replace each matched run with a single space rather than
+        # deleting it outright, so words on either side of a mid-string
+        # occurrence don't get jammed together. Only apply the fix if
+        # it preserves at least 40% of the original content — if more
+        # than that was non-Latin script, the generation is corrupted
+        # beyond a simple trim and it's safer to leave the text
+        # untouched (and visible for debugging) than to silently emit a
+        # near-empty answer.
+        _relatinized = _NON_LATIN_SCRIPT_RE.sub(" ", _reply_stripped)
+        _relatinized = re.sub(r"\s+", " ", _relatinized).strip()
+        _relatinized = re.sub(r"[\s,;:\-–—]+$", "", _relatinized)
+        if (
+            _relatinized
+            and _relatinized != _reply_stripped
+            and len(_relatinized) >= 0.4 * len(_reply_stripped)
+        ):
+            if _relatinized[-1].isalnum():
+                _relatinized += "."
+            logger.warning(
+                "[ask_stream] stripped non-Latin-script text from reply (%d -> %d chars) — vLLM language-leakage artifact",
+                len(_reply_stripped), len(_relatinized),
+            )
+            _reply_stripped = _relatinized
+            _kv_reply = _relatinized
+            _corrected_text = _relatinized
 
         _rule4_discarded = False
         _r4_trusted = _top_rerank >= 0.05
