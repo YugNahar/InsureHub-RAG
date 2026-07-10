@@ -71,15 +71,16 @@ def _join_split_compounds(text: str) -> str:
     token the knowledge base actually uses, instead of two separate ones.
 
     Only joins when the word after the prefix fuzzy-matches a vocab entry
-    (score >= 80); an unrelated word right after "re"/"co"/etc. ("re apply",
-    "co pay" -> "pay" is too short to check) is left untouched.
+    (score >= 85 — see _correct_typos for why this was raised from 80);
+    an unrelated word right after "re"/"co"/etc. ("re apply", "co pay" ->
+    "pay" is too short to check) is left untouched.
     """
     def _try_join(m: re.Match) -> str:
         prefix, rest = m.group(1), m.group(2)
         result = process.extractOne(rest, _INSURANCE_VOCAB, scorer=fuzz.ratio)
         if result is not None:
             best_match, score, _ = result
-            if score >= 80:
+            if score >= 85:
                 return f"{prefix.lower()}{best_match}"
         return m.group(0)
 
@@ -91,7 +92,7 @@ def _correct_typos(text: str) -> str:
 
     Splits *text* into words. For each word of length >= 4, finds the best
     match in ``_INSURANCE_VOCAB`` using ``rapidfuzz`` with ``fuzz.ratio``.
-    If the best match score >= 80 and is not already exact, replaces the
+    If the best match score >= 85 and is not already exact, replaces the
     word with the correctly-spelled vocabulary term. Returns the corrected
     sentence with original word order preserved.
 
@@ -117,6 +118,22 @@ def _correct_typos(text: str) -> str:
     over the policy term"). Real typos almost never drop exactly the
     leading character(s) of a word; that's specifically the shape of an
     unrelated, independently-valid short word.
+
+    Threshold raised 80 -> 85 after finding this was silently corrupting
+    ordinary English words that happen to be near-neighbors of a vocab
+    term, with no unusual-shape guard able to catch it since these are
+    same-length substitutions, structurally identical to a real typo.
+    Confirmed live: "explain fire insurance in detail" retrieved as
+    "...in dental" (score 83.3 against "dental") and returned a flat "not
+    in my knowledge base" refusal for a topic the KB actually covers well
+    — silently corrupted before retrieval ever ran, so nothing downstream
+    had a chance to catch it. A vocabulary scan turned up "company" ->
+    "copay" (83.3) and "order" -> "rider" (80.0) as the same class of
+    false positive. Every genuine typo this function is meant to catch
+    ("deductable", "insurence", "premiu", "materinty", "hospitl", ...)
+    scored 85.7 or higher in the same scan, so 85 cleanly separates real
+    typos from coincidental collisions with common English words without
+    losing any tested correction case.
     """
     text = _join_split_compounds(text)
     words = text.split()
@@ -137,7 +154,7 @@ def _correct_typos(text: str) -> str:
                     len(best_match) > len(stripped)
                     and best_match_lower.endswith(stripped_lower)
                 )
-                if (score >= 80 and best_match != stripped
+                if (score >= 85 and best_match != stripped
                         and not is_compound_extension and not is_truncated_vocab_word):
                     prefix = w[:len(w) - len(w.lstrip(".,!?;:()[]{}'\""))]
                     suffix = w[len(w.rstrip(".,!?;:()[]{}'\"") or len(w)):]
