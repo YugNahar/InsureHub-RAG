@@ -3085,7 +3085,19 @@ class MultiSourceRAG:
         # only that, with no way for the user to signal they wanted the other
         # part (or both). Detect this and ask, the same way suggested-question
         # chips already ask — rather than guessing.
+        # A single clarify chip click ("What does travel insurance cover?")
+        # sends that exact question text as a normal message, indistinguishable
+        # from the user typing it themselves — which meant it could semantic-
+        # cache-hit the ORIGINAL broader compound question's cached answer
+        # (they're highly similar) and silently replay it verbatim. Confirmed
+        # live: clicking "What does travel insurance cover?" after "What is
+        # travel insurance and what does it cover?" returned the exact same
+        # cached brief answer instead of a fresh, focused one — defeating the
+        # entire point of asking which part the user wanted. Detected the
+        # same way the "both" reply is recovered: parse the two sub-questions
+        # back out of our own clarify message and check for an exact match.
         _force_both_detailed = False
+        _bypass_cache_for_chip_click = False
         if history:
             if _BOTH_REPLY_RE.match(question):
                 _clarify_match = _CLARIFY_PARSE_RE.search(_history_last_assistant_turn(history))
@@ -3093,7 +3105,15 @@ class MultiSourceRAG:
                     _q1, _q2 = _clarify_match.group(1), _clarify_match.group(2)
                     question = f"{_q1.rstrip('?')}, and {_q2.rstrip('?')}?"
                     _force_both_detailed = True
-            elif _ELABORATION_FOLLOWUP_RE.search(question):
+            else:
+                _clarify_match = _CLARIFY_PARSE_RE.search(_history_last_assistant_turn(history))
+                if _clarify_match:
+                    _q1, _q2 = _clarify_match.group(1), _clarify_match.group(2)
+                    _norm_q = question.strip().rstrip("?").lower()
+                    if _norm_q in (_q1.rstrip("?").lower(), _q2.rstrip("?").lower()):
+                        _force_both_detailed = True
+                        _bypass_cache_for_chip_click = True
+            if _ELABORATION_FOLLOWUP_RE.search(question) and not _force_both_detailed:
                 _last_q = _last_user_question(history)
                 if _last_q:
                     _split = await _split_compound_question(_last_q)
@@ -3297,6 +3317,20 @@ class MultiSourceRAG:
                     len(_cached_ans_txt),
                 )
                 _kv_hit = None
+
+        # Clicking a single clarify-disambiguation chip must always get a
+        # fresh, focused answer — never a cache replay. A chip's question
+        # text is semantically close enough to the original broader
+        # compound question (that's precisely why disambiguation was
+        # needed) to trigger a semantic cache hit on its cached answer,
+        # confirmed live: clicking "What does travel insurance cover?"
+        # right after "What is travel insurance and what does it cover?"
+        # returned that exact same cached brief answer verbatim, silently
+        # ignoring that the user specifically asked for more on just this
+        # part.
+        if _kv_hit is not None and _bypass_cache_for_chip_click:
+            logger.info("[ask_stream] bypassing cache hit for clarify-chip click: %r", retrieval_query[:80])
+            _kv_hit = None
 
         if _kv_hit is not None:
             import json as _json_s
