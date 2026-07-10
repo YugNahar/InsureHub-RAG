@@ -4147,31 +4147,43 @@ class MultiSourceRAG:
         # See _NON_LATIN_SCRIPT_RE above: rare vLLM language-leakage
         # artifact where the model tacks on a CJK-script tail (or, more
         # rarely, a mid-sentence run) after an otherwise-English answer.
+        # Gated on an explicit .search() first — confirmed live this was
+        # a real bug, not just a defensive habit: the unconditional
+        # `re.sub(r"\s+", " ", ...)` cleanup ran on every reply
+        # regardless of whether anything matched, collapsing the "\n\n"
+        # before numbered-list items into a single space even on
+        # perfectly clean English answers. That erased the newline the
+        # downstream numbered-list-enforcement check relies on to
+        # recognize an already-numbered list, which misfired and shredded
+        # every "N. " marker into its own fragment — corrupting detailed
+        # answers (health/claim-steps) that had nothing to do with
+        # language leakage at all. Only touch the text, and only collapse
+        # whitespace, when the CJK regex actually found something.
         # Replace each matched run with a single space rather than
         # deleting it outright, so words on either side of a mid-string
-        # occurrence don't get jammed together. Only apply the fix if
-        # it preserves at least 40% of the original content — if more
-        # than that was non-Latin script, the generation is corrupted
-        # beyond a simple trim and it's safer to leave the text
+        # occurrence don't get jammed together. Horizontal whitespace
+        # (spaces/tabs) only — newlines are left alone so list/paragraph
+        # structure elsewhere in the reply survives untouched. Only apply
+        # the fix if it preserves at least 40% of the original content —
+        # if more than that was non-Latin script, the generation is
+        # corrupted beyond a simple trim and it's safer to leave the text
         # untouched (and visible for debugging) than to silently emit a
         # near-empty answer.
-        _relatinized = _NON_LATIN_SCRIPT_RE.sub(" ", _reply_stripped)
-        _relatinized = re.sub(r"\s+", " ", _relatinized).strip()
-        _relatinized = re.sub(r"[\s,;:\-–—]+$", "", _relatinized)
-        if (
-            _relatinized
-            and _relatinized != _reply_stripped
-            and len(_relatinized) >= 0.4 * len(_reply_stripped)
-        ):
-            if _relatinized[-1].isalnum():
-                _relatinized += "."
-            logger.warning(
-                "[ask_stream] stripped non-Latin-script text from reply (%d -> %d chars) — vLLM language-leakage artifact",
-                len(_reply_stripped), len(_relatinized),
-            )
-            _reply_stripped = _relatinized
-            _kv_reply = _relatinized
-            _corrected_text = _relatinized
+        if _NON_LATIN_SCRIPT_RE.search(_reply_stripped):
+            _relatinized = _NON_LATIN_SCRIPT_RE.sub(" ", _reply_stripped)
+            _relatinized = re.sub(r"[ \t]+", " ", _relatinized)
+            _relatinized = re.sub(r"[ \t]*\n[ \t]*", "\n", _relatinized).strip()
+            _relatinized = re.sub(r"[\s,;:\-–—]+$", "", _relatinized)
+            if _relatinized and len(_relatinized) >= 0.4 * len(_reply_stripped):
+                if _relatinized[-1].isalnum():
+                    _relatinized += "."
+                logger.warning(
+                    "[ask_stream] stripped non-Latin-script text from reply (%d -> %d chars) — vLLM language-leakage artifact",
+                    len(_reply_stripped), len(_relatinized),
+                )
+                _reply_stripped = _relatinized
+                _kv_reply = _relatinized
+                _corrected_text = _relatinized
 
         _rule4_discarded = False
         _r4_trusted = _top_rerank >= 0.05
