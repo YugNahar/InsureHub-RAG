@@ -1014,7 +1014,14 @@ def _diff_dropped_terms(original: str, cleaned: str) -> Tuple[Optional[str], boo
     return (", ".join(dict.fromkeys(dropped)) if dropped else None, has_proper_noun)
 
 
-async def _generate_suggestions(question: str, answer: str, context: str = "") -> list:
+async def _generate_suggestions(
+    rag_self,
+    question: str,
+    answer: str,
+    context: str = "",
+    filter_meta: Optional[dict] = None,
+    document_filter: Optional[List[str]] = None,
+) -> list:
     """
     Generate follow-up chip questions grounded in the answer just given.
 
@@ -1022,18 +1029,31 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
       1. Ask the LLM to produce 5 candidate questions from the answer text.
       2. Cheap pre-filter: drop candidates whose content words don't even
          lexically appear in the retrieved context (no LLM call).
-      3. Semantic verification (_verify_suggestions_grounded): a candidate
-         can pass step 2 on a passing mention alone — e.g. the answer says
-         "...follows Islamic principles and Sharia law..." in one sentence,
-         which is enough word-overlap for "What are Islamic principles?" to
-         look "covered", but the KB has no dedicated content actually
-         explaining Islamic principles, only insurance content that
-         mentions them in passing. Confirmed live: this exact suggestion
-         was shown, and clicking it produced a refusal — the KB genuinely
-         can't answer it. Step 2 alone can't tell "mentioned in passing"
-         from "actually explained", so a real judgment call (the same kind
-         _verify_grounding already makes for real questions) is needed
-         before a suggestion reaches the user.
+      3. Real verification (_candidate_survives_real_pipeline): actually
+         retrieve for each surviving candidate and run it through the SAME
+         gates a real question goes through — rerank-score gate, lexical
+         coverage checks, and semantic grounding — instead of asking an
+         LLM to judge the candidate against the ANSWER-GIVING question's
+         already-retrieved context.
+         That older approach checked the wrong thing: clicking a chip
+         sends the candidate as a brand-new question, which triggers its
+         OWN fresh retrieval — not a reuse of the parent question's
+         chunks. A candidate could pass "is this covered by the context
+         that already answered something else" while its own independent
+         retrieval pulls different, weaker, or off-topic chunks that
+         don't actually ground it. Confirmed live (2026-07-10, reported
+         directly by the user testing in the browser): a suggested chip
+         was shown, and clicking it returned "I don't have that specific
+         information in my knowledge base" — the exact failure this
+         function exists to prevent, still slipping through the
+         judgment-based check. Running the real pipeline per candidate is
+         the only way to know a suggestion will actually answer before
+         showing it — see the user's explicit instruction: only suggest
+         a question if it demonstrably gets grounded chunks when run for
+         real, otherwise drop it silently (never show a chip that leads
+         to a fabricated or made-up answer, and never alter how a
+         directly-typed user question is handled — this only changes
+         which suggestions get shown).
       4. Return up to 3 verified questions.
     """
     try:
@@ -1087,61 +1107,59 @@ async def _generate_suggestions(question: str, answer: str, context: str = "") -
             for q in _candidates
         ]
         _candidates = [q for q in _candidates if 2 <= len(q.split()) <= 10]
-        # Cheap lexical pre-filter before spending an LLM call on verification
+        # Cheap lexical pre-filter before spending a retrieval call on verification
         _candidates = [q for q in _candidates if _question_answerable_in_context(q, context)]
         if not _candidates:
             return []
-        _verified = await _verify_suggestions_grounded(_candidates, context)
+        _results = await asyncio.gather(*[
+            _candidate_survives_real_pipeline(rag_self, q, filter_meta, document_filter)
+            for q in _candidates
+        ])
+        _verified = [q for q, ok in zip(_candidates, _results) if ok]
         return _verified[:3]
     except Exception:
         pass
     return []
 
 
-async def _verify_suggestions_grounded(candidates: List[str], context: str) -> List[str]:
-    """Semantic filter for suggested follow-up chips — same judgment
-    _verify_grounding() makes for a real question ("can this be FULLY
-    answered from this context, not just topically adjacent"), batched into
-    one call for all candidates instead of one round-trip per candidate so
-    it doesn't multiply suggestion-generation latency by the candidate
-    count. Fails safe to an empty list on any error, timeout, or
-    unparseable response — showing no chips beats showing ones that dead-end.
+async def _candidate_survives_real_pipeline(
+    rag_self, candidate: str, filter_meta: Optional[dict], document_filter: Optional[List[str]],
+) -> bool:
+    """Would this candidate question actually get a grounded answer if a
+    user clicked it right now? Runs the identical gates ask_stream applies
+    to a real question — rerank-score gate, lexical coverage checks, and
+    semantic grounding — against a FRESH retrieval for the candidate's own
+    text, not the parent question's already-retrieved chunks. Fails safe
+    to False on any retrieval/verification error: showing no chip beats
+    showing one that dead-ends.
     """
-    if not candidates:
-        return []
-    numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(candidates))
-    # _GROUNDING_CONTEXT_CHARS (3000) is tuned for _verify_grounding()'s single-
-    # question check and is only half of the ~6000-char budget the context
-    # compressor actually gives full_context here. Truncating to 3000 made this
-    # verifier blind to whichever half of the real context didn't happen to
-    # come first — confirmed live: it rejected "What does cargo insurance
-    # cover?" and "What is hull insurance for?" as ungrounded, yet asking them
-    # directly answered both correctly from dedicated KB content the verifier
-    # never saw. Use the full budget so it judges against everything the
-    # answer was actually grounded in.
-    prompt = (
-        f"Context:\n{context[:_SUGGESTION_VERIFY_CONTEXT_CHARS]}\n\n"
-        f"Candidate follow-up questions:\n{numbered}\n\n"
-        "Judge each numbered question SEPARATELY and independently — one "
-        "question being unanswerable must NOT affect your judgment of the "
-        "others. For each one, could it be FULLY and SPECIFICALLY answered "
-        "using ONLY the context above — not just a topic the context "
-        "mentions in passing, but enough detail there to actually answer "
-        "it? Respond with ONLY the numbers of the questions that CAN be "
-        "fully answered, comma-separated (e.g. \"2,3\"). If none can, "
-        "respond with exactly: none"
-    )
     try:
-        raw = await _backend_completion(prompt, max_tokens=20, timeout=12)
+        chunks = await rag_self._retrieve_doc_chunks(
+            candidate, filter_meta, document_filter, doc_top_k=8, summary_top_k=2,
+        )
     except Exception:
-        return []
-    if not raw or raw.strip().lower() == "none":
-        return []
-    keep_indices = {
-        int(tok) - 1 for tok in re.findall(r"\d+", raw)
-        if tok.isdigit() and 0 < int(tok) <= len(candidates)
-    }
-    return [q for i, q in enumerate(candidates) if i in keep_indices]
+        return False
+    if not chunks:
+        return False
+    _rerank_gate = float(os.getenv("RERANK_GATE_THRESHOLD", "0.0005"))
+    top_rerank = max(
+        (c.metadata.get("rerank_score", float("-inf"))
+         for c in chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
+        default=float("-inf"),
+    )
+    if top_rerank < _rerank_gate:
+        return False
+    lex_ok = (
+        _context_covers_query(candidate, chunks, llm_topics=None)
+        and _quoted_comparison_covered(candidate, chunks)
+        and _enumeration_query_covered(candidate, chunks)
+    )
+    if not lex_ok:
+        return False
+    try:
+        return await _verify_grounding_any_chunk(candidate, chunks)
+    except Exception:
+        return False
 
 
 def _is_likely_followup(question: str) -> bool:
@@ -1769,12 +1787,6 @@ def _build_grounding_context(query: str, chunks: list) -> str:
         windows = _rerank_windows(text, query)
         parts.append(windows[1] if len(windows) > 1 else windows[0])
     return "\n\n".join(parts)
-
-# _verify_suggestions_grounded() judges candidates against the SAME full_context
-# the answer was generated from (already capped at ~6000 chars by the context
-# compressor's budget), not a fresh single-question lookup — so it needs the
-# whole thing, not the smaller 3000-char slice tuned for _verify_grounding().
-_SUGGESTION_VERIFY_CONTEXT_CHARS = 6000
 
 
 async def _verify_grounding(question: str, context: str, backend_override: Optional[str] = None) -> bool:
@@ -4403,28 +4415,28 @@ class MultiSourceRAG:
                     # Must strip punctuation the same way on both sides.
                     # full_context is raw KB prose, dense with commas
                     # ("lightning, explosion, aircraft damage, riot..."),
-                    # while _matched_ngrams() below extracts \w+ words from
-                    # each point and joins with plain spaces. Whitespace-only
-                    # normalization here left commas in _ctx_norm, so nearly
-                    # every 4-word window straddling a comma failed to match
-                    # even when copied verbatim — confirmed live: a genuine
-                    # peril-list point (identical wording to the source, just
-                    # reformatted with "and"/commas) scored 1 matched 4-gram
-                    # instead of 14, and got wrongly dropped as "ungrounded".
-                    # This class of bug (asymmetric normalization between the
-                    # two strings being compared) generalizes beyond this one
-                    # spot — keep both sides passing through the exact same
-                    # tokenizer in any future overlap/grounding check.
+                    # while _matched_words() below extracts \w+ words from
+                    # each point. This class of bug (asymmetric normalization
+                    # between the two strings being compared) generalizes
+                    # beyond this one spot — keep both sides passing through
+                    # the exact same tokenizer in any future overlap/
+                    # grounding check.
                     # Light plural stemming, applied identically to both
-                    # sides (same principle as the punctuation fix above —
-                    # any asymmetry between the two strings being compared
-                    # creates false negatives). Confirmed live: the model
-                    # pluralized an entire near-verbatim peril-list point
-                    # ("explosion"->"explosions", "riot"->"riots", "storm"
-                    # ->"storms", etc. throughout), and exact-word 4-gram
-                    # matching against the KB's singular forms scored 0
+                    # sides (same principle as the punctuation handling above
+                    # — any asymmetry between the two strings being compared
+                    # creates false negatives). Confirmed live, back when
+                    # this check still matched exact 4-word phrases rather
+                    # than plain words: the model pluralized an entire near-
+                    # verbatim peril-list point ("explosion"->"explosions",
+                    # "riot"->"riots", "storm"->"storms", etc. throughout),
+                    # and matching against the KB's singular forms scored 0
                     # matches out of 16 possible — the point was dropped
                     # despite being genuine KB content, just re-pluralized.
+                    # Kept even after switching to word-level overlap (see
+                    # _matched_words below): plain word overlap is far more
+                    # forgiving of reordering than phrase matching was, but
+                    # an un-stemmed "explosions" still wouldn't equal a
+                    # singular "explosion" token without this.
                     def _norm_word(w: str) -> str:
                         if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
                             return w[:-1]
@@ -4433,38 +4445,51 @@ class MultiSourceRAG:
                     def _norm_words(text: str) -> list[str]:
                         return [_norm_word(w) for w in _re3.findall(r"\w+", text.lower())]
 
-                    _ctx_norm = " ".join(_norm_words(full_context))
-                    _MIN_MATCHES = 5
-                    _NGRAM = 4
-                    # A short point (< 8 words) has fewer than 5 possible
-                    # 4-word windows in total, so a flat "matched >= 5" bar
-                    # is mathematically unreachable no matter how grounded
-                    # it is — every concise point would be dropped on
-                    # length alone, not on content. Scale the bar down for
-                    # short points (requiring a high fraction of their own
-                    # max instead of a fixed count) so brevity isn't
-                    # penalized; long points keep the proven absolute bar.
-                    _MIN_FRACTION = 0.6
+                    _ctx_word_set = set(_norm_words(full_context))
+                    # Switched from exact 4-word phrase matching to plain
+                    # significant-word overlap after the phrase-based check
+                    # proved fundamentally too brittle to fix by threshold
+                    # tuning alone — confirmed live (2026-07-10) with paired
+                    # measurements on the same real answer: one point scored
+                    # 2/12 matched 4-word phrases (would fail even a loosened
+                    # bar) but 9/9 (100%) of its individual significant words
+                    # appeared in the context — every word was genuine, just
+                    # not in the same 4-word sequences as the source, which
+                    # is exactly what normal paraphrasing does. Every point
+                    # in that test scored 62-100% word overlap regardless of
+                    # phrase-match score, meaning word overlap correctly
+                    # recognized all of them as grounded while phrase
+                    # matching arbitrarily rejected most. Order/adjacency-
+                    # sensitive matching was never the right test for "did
+                    # this paraphrase come from the source" — a sentence can
+                    # rearrange every clause and still say only what the KB
+                    # says.
+                    # Threshold picked from the same measurement: confirmed-
+                    # genuine points scored 62-100%, so 50% leaves real
+                    # margin below the observed floor while still requiring
+                    # a point draw the clear majority of its content words
+                    # from the actual retrieved text — a point built from
+                    # invented specifics (numbers, product names, claims not
+                    # in the source) won't clear that bar just by reusing
+                    # generic insurance vocabulary that happens to appear in
+                    # any context on the topic.
+                    _MIN_MATCHES = 4
+                    _MIN_FRACTION = 0.5
 
-                    def _matched_ngrams(text: str) -> tuple[int, int]:
+                    def _matched_words(text: str) -> tuple[int, int]:
                         _words = _norm_words(text)
-                        if len(_words) < _NGRAM:
-                            _content = [w for w in _words if len(w) >= 4]
-                            _matched = sum(1 for w in _content if w in _ctx_norm)
-                            return _matched, len(_content)
-                        _total = len(_words) - _NGRAM + 1
-                        _count = 0
-                        for _i in range(_total):
-                            if " ".join(_words[_i:_i + _NGRAM]) in _ctx_norm:
-                                _count += 1
-                        return _count, _total
+                        _content = {w for w in _words if len(w) >= 4}
+                        if not _content:
+                            return 0, 0
+                        _matched = sum(1 for w in _content if w in _ctx_word_set)
+                        return _matched, len(_content)
 
                     def _point_grounded(text: str) -> bool:
-                        _matched, _total = _matched_ngrams(text)
+                        _matched, _total = _matched_words(text)
                         if _total <= 0:
                             return False
-                        # ceil(total * 0.6) via integer math: ceil(total*3/5)
-                        _frac_threshold = -(-(_total * 3) // 5)
+                        # ceil(total * 0.5) via integer math
+                        _frac_threshold = -(-_total // 2)
                         _threshold = min(_MIN_MATCHES, max(1, _frac_threshold))
                         return _matched >= _threshold
 
@@ -4557,7 +4582,10 @@ class MultiSourceRAG:
         _reply_for_chips = (_corrected_text or _kv_reply or "").strip()
         _sugg: list = []
         if _reply_for_chips and not any(p in _reply_for_chips.lower() for p in _handoff_phrases):
-            _sugg = await _generate_suggestions(question, _reply_for_chips, context=full_context)
+            _sugg = await _generate_suggestions(
+                self, question, _reply_for_chips, context=full_context,
+                filter_meta=filter_meta, document_filter=document_filter,
+            )
 
         if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases):
             try:
