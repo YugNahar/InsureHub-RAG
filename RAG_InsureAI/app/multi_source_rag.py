@@ -3242,13 +3242,15 @@ class MultiSourceRAG:
         # quality higher after seeing this evidence.
         _doc_top_k   = 14 if _keyword_detailed else 8
         _chunk_limit = 12 if _keyword_detailed else 8
-        # Trimmed from 5/4 — video/webpage search()'s internal reranking
-        # candidate pool is 2x this value (safe_k = min(2*top_k, count)), so
-        # this alone controls how many chunks each source reranks before
-        # picking the best ones. Fewer candidates = faster reranking, traded
-        # against a small chance of missing a good chunk further down the
-        # similarity ranking.
-        _media_top_k = 4 if _keyword_detailed else 3
+        # Restored 4/3 -> 5/4 (2026-07-13, same request/evidence as the
+        # _doc_top_k restore above) — this was trimmed by commit ec8bc3a
+        # (2026-07-03) for the same "smaller candidate pool = faster
+        # reranking, small chance of missing a good chunk" trade later
+        # shown to actually bite in practice for _doc_top_k. video/webpage
+        # search()'s internal reranking candidate pool is 2x this value
+        # (safe_k = min(2*top_k, count)), so this alone controls how many
+        # chunks each source reranks before picking the best ones.
+        _media_top_k = 5 if _keyword_detailed else 4
 
         # Apply typo correction to the retrieval_query before KV cache and retrieval
         retrieval_query = _correct_typos(retrieval_query)
@@ -3455,15 +3457,22 @@ class MultiSourceRAG:
             # network call, not CPU-bound — so it still runs in genuine
             # parallel via its own task while the CPU-bound retrieval work
             # below proceeds sequentially.
+            # summary_top_k restored 2 -> 3 (2026-07-13, same revert as
+            # _doc_top_k/_media_top_k above) — only these two primary
+            # retrieval call sites were part of commit ec8bc3a's 3->2 cut;
+            # the fallback-tier _retrieve_doc_chunks calls further down
+            # (query-clean retry, standalone-retry) were written with
+            # summary_top_k=2 independently and were never 3, so they're
+            # untouched here.
             _topics_task = asyncio.create_task(_extract_intent_topics(question))
-            doc_chunks = await self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2)
+            doc_chunks = await self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3)
             video_chunks = await asyncio.to_thread(self.video_store.search, _search_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
             webpage_chunks = await asyncio.to_thread(self.webpage_store.search, _search_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
             llm_topics = await _topics_task
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
             doc_chunks, llm_topics = await asyncio.gather(
-                self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2),
+                self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
@@ -4036,7 +4045,7 @@ class MultiSourceRAG:
         # the raw pre-strip text flash by. That gate had a false-positive
         # problem specific to detailed answers: _top_rerank is the score of
         # the SINGLE best-matching chunk, but detailed mode deliberately
-        # retrieves from a wider pool (_doc_top_k=8 vs 6) and builds
+        # retrieves from a wider pool (_doc_top_k=14 vs 8) and builds
         # its context from many chunks combined — so the top single chunk
         # can legitimately score low even when the combined context is rich
         # and the generated answer is fully correct. Confirmed live: "can
