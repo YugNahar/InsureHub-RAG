@@ -3241,7 +3241,22 @@ class MultiSourceRAG:
         # 2026-07-10 change traded away) but the user weighed answer
         # quality higher after seeing this evidence.
         _doc_top_k   = 14 if _keyword_detailed else 8
-        _chunk_limit = 12 if _keyword_detailed else 8
+        # Trimmed 12/8 -> 8/5 (2026-07-13) — the final merged-and-reranked
+        # pool actually sent to the LLM, kept deliberately separate from
+        # _doc_top_k/_media_top_k above (which stay wide so the reranker
+        # sees a big enough candidate pool to find the true best chunk).
+        # Reranking still runs across the full wide pool before this final
+        # cut, so this doesn't give up the structural-exclusion fix — it
+        # only tightens which of the now-well-reranked chunks reach the
+        # prompt. Verified live this reduces noise the wider candidate pool
+        # can pull in: re-running "Explain liability insurance in detail"
+        # (which had picked up an off-topic fire-insurance point right
+        # after _doc_top_k was widened) with this tighter limit came back
+        # clean, and "Explain engineering insurance in detail" correctly
+        # gave 4 focused points instead of padding to 8 with vague filler.
+        # Regression suite plus 8 more brief/detailed spot checks across
+        # varied topics all held up or improved.
+        _chunk_limit = 8 if _keyword_detailed else 5
         # Restored 4/3 -> 5/4 (2026-07-13, same request/evidence as the
         # _doc_top_k restore above) — this was trimmed by commit ec8bc3a
         # (2026-07-03) for the same "smaller candidate pool = faster
