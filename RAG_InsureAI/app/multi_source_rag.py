@@ -4426,7 +4426,14 @@ class MultiSourceRAG:
                 _num_src = (_corrected_text or _reply_stripped).strip()
                 _already_numbered = bool(_re.search(r'(?:^|\n)\s*1\.\s', _num_src))
                 if _num_src and not _already_numbered:
-                    _sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', _num_src) if s.strip()]
+                    # (?<!\d\.) — same fix as the sentence cap below: don't
+                    # treat a bare numbered-list marker as its own sentence
+                    # boundary. Less likely to bite here since this branch
+                    # only runs when the answer has NO numbering yet, but a
+                    # stray "Section 5. of the Act..." or similar could still
+                    # trip the naive version, so keep both occurrences
+                    # consistent.
+                    _sentences = [s.strip() for s in _re.split(r'(?<=[.!?])(?<!\d\.)\s+', _num_src) if s.strip()]
                     _CLOSING_RE = _re.compile(
                         r'^(hope that|let me know|feel free|hang tight|glad to)', _re.IGNORECASE,
                     )
@@ -4640,7 +4647,19 @@ class MultiSourceRAG:
                 if _cap_src:
                     # Simple split: find positions of sentence-ending punctuation
                     # followed by whitespace, then take first N chunks.
-                    _sent_parts = _re.split(r'(?<=[.!?])\s+', _cap_src)
+                    # (?<!\d\.) excludes a split right after a bare numbered-list
+                    # marker ("1.", "2.", "3.") — without it, a genuinely-complete
+                    # numbered answer gets miscounted as having way more
+                    # "sentences" than it does (each marker counts as its own
+                    # fragment on top of its content), so this cap fires when it
+                    # shouldn't and cuts mid-list. Confirmed live: a correct,
+                    # fully-generated 4-point "what documents do I need" answer
+                    # (finish_reason=stop, nothing wrong with the generation)
+                    # got miscounted as 10 "sentences" — 4 real ones plus each
+                    # "1./2./3./4." marker split off on its own — and the cap
+                    # chopped it right after the stray "3." marker, discarding
+                    # points 3 and 4 the model had already finished writing.
+                    _sent_parts = _re.split(r'(?<=[.!?])(?<!\d\.)\s+', _cap_src)
                     _MAX_SENTENCES = 6
                     if len(_sent_parts) > _MAX_SENTENCES:
                         _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
