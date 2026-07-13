@@ -1235,6 +1235,23 @@ _REGULATORY_BOILERPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Chapter-end review/index material — never substantive answer content, but
+# can still slip past the topic-match check above because it name-drops
+# every type covered in that chapter as part of a summary or self-test
+# question ("5. What do you mean by Motor Insurance?"). Confirmed live:
+# "Explain motor insurance in detail" top-scored (0.475, the single
+# highest-ranked candidate) a chunk that is actually a "General Insurance
+# Products" survey listing crop and fidelity insurance, plus its chapter's
+# self-test questions — it only survived the topic filter because "Motor
+# Insurance" happens to appear inside one of those review questions, not
+# because the chunk is actually about motor insurance. A chunk whose real
+# subject is a review/index of MULTIPLE topics should never outrank one
+# that's actually about the queried topic, regardless of what it name-drops.
+_CHAPTER_REVIEW_RE = re.compile(
+    r"\b(self.test questions?|lesson round.?up|(?:are\s+)?meant\s+for\s+re.capitulation)\b",
+    re.IGNORECASE,
+)
+
 
 def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     """Reorder *chunks* so ones whose content mentions the query's named
@@ -1296,7 +1313,7 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     topic = m.group(0).lower() if m else None
     def _rank(c) -> int:
         content = (getattr(c, "page_content", "") or "").lower()
-        if _REGULATORY_BOILERPLATE_RE.search(content):
+        if _REGULATORY_BOILERPLATE_RE.search(content) or _CHAPTER_REVIEW_RE.search(content):
             return 1
         if topic and topic not in content:
             return 1
@@ -4634,6 +4651,104 @@ class MultiSourceRAG:
                         )
             except Exception as _filter_exc:
                 logger.debug("[ask_stream] ungrounded-point filter skipped: %s", _filter_exc)
+
+        # ── Drop cross-topic-contaminated points (detailed mode) ──────────────
+        # The padding-point filter above only catches points that AREN'T
+        # grounded in full_context at all. It can't catch a point that IS
+        # genuinely grounded — because a generic, legitimately-relevant chunk
+        # (e.g. "how a policy schedule's terms & conditions are documented")
+        # got retrieved alongside the topic-specific chunks, but that generic
+        # chunk used a DIFFERENT insurance type as its own illustrative
+        # example, and the model reproduced that example as if it described
+        # the topic actually being asked about. Confirmed live: "Explain
+        # motor insurance in detail" produced a point about "marine cargo
+        # policies... whether the cover is under ICC (A) or ICC (B)" — real
+        # KB text, just from a generic underwriting-practices chunk's own
+        # marine-insurance example, not from anything about motor insurance.
+        # A second point the same run stated motor insurance "typically
+        # cover[s] expenses related to hospitalization or domiciliary
+        # hospitalization for illnesses" — health-insurance phrasing
+        # (confirmed: a health-insurance exclusions chunk was genuinely in
+        # the retrieved pool for that request) misapplied to a vehicle policy.
+        # Also confirmed on a different topic: "Explain engineering insurance
+        # in detail" stated "Hull insurance is a component of marine
+        # insurance" and, in a later retry, "Cargo insurance within marine
+        # insurance covers..." — same failure shape, different specific
+        # jargon and different attribution phrasing each time ("component
+        # of"/"aspect of"/"within"). Matching the literal type name itself
+        # ("marine insurance") rather than trying to enumerate every possible
+        # attribution phrase is what actually generalizes across phrasing —
+        # there's essentially no legitimate reason an answer about a
+        # DIFFERENT topic would explicitly name "marine insurance" at all.
+        #
+        # Enforced with a small, high-confidence list of jargon terms that
+        # are essentially unique to one insurance type — checked against
+        # whether the QUERY itself also names that type (so a genuine
+        # comparison answer, "how does X differ from Y", is never affected,
+        # since both type names would legitimately appear in the query).
+        if _keyword_detailed:
+            try:
+                import re as _re4
+                _TYPE_GIVEAWAY_TERMS = {
+                    "marine": ("marine insurance", "marine cargo", "icc (a)", "icc (b)", "institute cargo clause", "bill of lading", "voyage policy", "hull insurance"),
+                    "health": ("domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"),
+                    "crop": ("agriculturist", "crop failure", "sowing/planting", "loanee"),
+                    "fidelity": ("employee dishonesty", "embezzlement"),
+                    "transit": ("import covers by sea", "inland transit clause"),
+                }
+                _query_lower = retrieval_query.lower()
+                _contam_src = (_corrected_text or _reply_stripped).strip()
+                _contam_lines = _contam_src.split("\n")
+                _contam_point_re = _re4.compile(r"^\s*(\d+)\.\s+(.*)$")
+                # Same opener/points/closer split as the padding-point filter
+                # above, including folding indented or "-"/"*"/"•" continuation
+                # lines into their parent point — otherwise a dropped
+                # contaminated point could leave its own sub-bullets behind as
+                # orphaned, contextless fragments.
+                _contam_opener, _contam_points, _contam_closer = [], [], []
+                _contam_seen_point = False
+                for _line in _contam_lines:
+                    _m = _contam_point_re.match(_line)
+                    if _m:
+                        _contam_seen_point = True
+                        _contam_points.append(_m.group(2).strip())
+                        continue
+                    if not _contam_seen_point:
+                        _contam_opener.append(_line)
+                        continue
+                    _stripped = _line.strip()
+                    if not _stripped:
+                        continue
+                    _is_continuation = _line[:1].isspace() or _stripped.startswith(("-", "*", "•"))
+                    if _is_continuation and _contam_points:
+                        _contam_points[-1] = _contam_points[-1] + " " + _stripped
+                    else:
+                        _contam_closer.append(_line)
+
+                def _is_contaminated(point_text: str) -> bool:
+                    _point_lower = point_text.lower()
+                    return any(
+                        term in _point_lower
+                        for _type_name, _terms in _TYPE_GIVEAWAY_TERMS.items()
+                        if _type_name not in _query_lower
+                        for term in _terms
+                    )
+
+                _clean_points = [p for p in _contam_points if not _is_contaminated(p)]
+                if _clean_points and len(_clean_points) < len(_contam_points):
+                    _opener_part = "\n".join(_contam_opener).strip()
+                    _closer_part = "\n".join(_contam_closer).strip()
+                    _rebuilt_points = "\n".join(f"{i}. {p}" for i, p in enumerate(_clean_points, 1))
+                    _pieces = [p for p in (_opener_part, _rebuilt_points, _closer_part) if p]
+                    _rebuilt4 = "\n\n".join(_pieces)
+                    _corrected_text = _rebuilt4
+                    _kv_reply = _rebuilt4
+                    logger.info(
+                        "[ask_stream] dropped %d cross-topic-contaminated point(s) from detailed answer",
+                        len(_contam_points) - len(_clean_points),
+                    )
+            except Exception as _contam_exc:
+                logger.debug("[ask_stream] cross-topic contamination filter skipped: %s", _contam_exc)
 
         # ── Strip stray numbered-list markers (brief / conversational mode) ───
         # CONVERSATIONAL_RAG_PROMPT explicitly forbids numbered lists ("No
