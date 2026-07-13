@@ -7,9 +7,12 @@ Two lookup modes
             Instant O(1) hit for identical re-queries.
 2. Semantic — cosine similarity between the incoming query embedding and all
               stored query embeddings.  Returns the best match above a
-              configurable threshold (default 0.92).  Catches rephrased queries
-              that mean the same thing ("What is the grace period?" vs "How
-              many days is the grace period?").
+              configurable threshold (default 0.94).  Catches rephrased
+              queries that mean the same thing ("What is home insurance?"
+              vs "What does home insurance cover?" scored 0.896 live —
+              genuinely the same intent, different wording, though below
+              even this threshold; direct serving is deliberately reserved
+              for near-identical phrasing only).
 
 Cache key still includes the sorted source list so adding a new document
 automatically invalidates all cached answers for the same query.
@@ -29,7 +32,17 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _CACHE_VERSION = 2          # bumped because entry schema changed (added query_embedding)
-_SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
+# Raised 0.92 -> 0.94 (2026-07-13, explicit user request after a stale
+# templated answer got replayed for a semantically-related-but-distinct
+# question). Live measurement showed genuinely different questions on the
+# same topic ("What is life insurance?" vs "What are the benefits of the
+# life insurance?") scoring 0.75-0.78 — well clear of even the old
+# threshold — so this alone wasn't the direct-hit mechanism responsible;
+# see semantic_get_related's lower_threshold below for the actual fix.
+# Raised anyway for a wider safety margin on direct serving specifically,
+# since a direct hit skips generation entirely and shows the user the
+# OLD answer verbatim — that path should require very high confidence.
+_SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.94"))
 
 
 class QueryKVCache:
@@ -186,8 +199,8 @@ class QueryKVCache:
     def semantic_get_related(
         self,
         query_embedding: np.ndarray,
-        lower_threshold: float = 0.60,
-        upper_threshold: float = 0.92,
+        lower_threshold: float = 0.80,
+        upper_threshold: float = 0.94,
         top_k: int = 2,
     ) -> List[Dict[str, Any]]:
         """
@@ -199,6 +212,20 @@ class QueryKVCache:
         identical* — used as supplementary context for the LLM rather than as
         direct answers.  Returns a list of (value_dict, query_text) pairs sorted
         by similarity descending.
+
+        lower_threshold raised 0.60 -> 0.80 (2026-07-13) — this, not the
+        direct-hit threshold, was the actual mechanism behind a real
+        complaint: a stale, oddly-templated cached answer ("proposal
+        form... honestly, this can seem a bit complex...") got pulled in
+        as "related" context for several genuinely different follow-up
+        questions on the same broad topic, and the model's fresh
+        generation ended up imitating that old answer's phrasing almost
+        verbatim. Measured live: "What is life insurance?" vs "What are
+        the benefits of the life insurance?" — a clearly different
+        question, same topic — scored 0.75-0.78, comfortably inside the
+        old [0.60, 0.92) window. 0.80 excludes that measured case with a
+        margin while still allowing genuinely close paraphrases through
+        as supplementary context.
         """
         if not self._data:
             return []

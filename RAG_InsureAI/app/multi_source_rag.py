@@ -3268,9 +3268,13 @@ class MultiSourceRAG:
                     )[0]
                 )
                 # Higher threshold for detailed queries so "life insurance in detail"
-                # doesn't hit "health insurance in detail" just because topics are close.
-                _sem_thr = 0.90 if _keyword_detailed else None
-                _sem_thr_actual = _sem_thr if _sem_thr is not None else 0.92
+                # doesn't hit "health insurance in detail" just because topics are
+                # close — was inverted (0.90, LOWER than the 0.92 base) until
+                # 2026-07-13, doing the opposite of what this comment always said;
+                # fixed to genuinely exceed the base threshold now that both moved
+                # (base 0.92 -> 0.94, detailed 0.90 -> 0.97).
+                _sem_thr = 0.97 if _keyword_detailed else None
+                _sem_thr_actual = _sem_thr if _sem_thr is not None else 0.94
 
                 # ── Semantic exact hit: same intent → serve directly ──────────
                 _kv_hit = _kv.semantic_get(_kv_q_emb, threshold=_sem_thr)
@@ -3282,13 +3286,18 @@ class MultiSourceRAG:
                     _kv_hit = None
 
                 # ── Semantic related: different question, overlapping topic ───
-                # Collect entries in [0.60, sem_threshold) — related but not
+                # Collect entries in [0.80, sem_threshold) — related but not
                 # identical.  Feed them to the LLM as supplementary context
                 # alongside fresh KB chunks; never short-circuit the answer.
+                # Lower bound raised 0.60 -> 0.80 (2026-07-13) — see
+                # semantic_get_related's docstring in kv_cache.py for the live
+                # measurement that motivated this; this was the actual
+                # mechanism behind a stale answer's phrasing bleeding into
+                # fresh generations for a genuinely different question.
                 if _kv_hit is None:
                     _related = _kv.semantic_get_related(
                         _kv_q_emb,
-                        lower_threshold=0.60,
+                        lower_threshold=0.80,
                         upper_threshold=_sem_thr_actual,
                         top_k=2,
                     )
