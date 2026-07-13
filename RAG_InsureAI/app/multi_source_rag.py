@@ -4618,6 +4618,35 @@ class MultiSourceRAG:
             except Exception as _filter_exc:
                 logger.debug("[ask_stream] ungrounded-point filter skipped: %s", _filter_exc)
 
+        # ── Strip stray numbered-list markers (brief / conversational mode) ───
+        # CONVERSATIONAL_RAG_PROMPT explicitly forbids numbered lists ("No
+        # bullet points... Plain conversational prose only"), but the model
+        # doesn't reliably follow that — confirmed live repeatedly this
+        # session (e.g. "what documents do I need" answers). Worse, whether
+        # each marker is separated from the previous point by a newline or
+        # just a space is itself inconsistent from one generation to the
+        # next, so a genuinely complete answer could render as either a
+        # readable list or a confusing run-on ("...manufacture. 3. Copy of
+        # your license...") purely by luck — the SAME question asked twice
+        # could look fine once and broken the next. Rather than trying to
+        # reliably render something the format rules say shouldn't exist in
+        # the first place, strip the markers entirely so the text reads as
+        # the flowing prose the prompt actually asked for, regardless of
+        # which separator the model happened to use.
+        if not _keyword_detailed:
+            try:
+                import re as _delist_re
+                _list_src = (_corrected_text or _reply_stripped)
+                _delisted = _delist_re.sub(r'^\d{1,2}\.\s+', '', _list_src)
+                _delisted = _delist_re.sub(r'\n\s*\d{1,2}\.\s+', ' ', _delisted)
+                _delisted = _delist_re.sub(r'(?<=[.\s])\d{1,2}\.\s+(?=[A-Z])', ' ', _delisted)
+                _delisted = _delist_re.sub(r'\s{2,}', ' ', _delisted).strip()
+                if _delisted and _delisted != _list_src.strip():
+                    _corrected_text = _delisted
+                    _kv_reply = _delisted
+            except Exception as _delist_exc:
+                logger.debug("[ask_stream] numbered-list marker strip skipped: %s", _delist_exc)
+
         # ── Hard sentence cap (brief / conversational mode) ──────────────────
         # Conversational prompts instruct the model to write 3 sentences max.
         # This enforcer guarantees it regardless of model compliance.
