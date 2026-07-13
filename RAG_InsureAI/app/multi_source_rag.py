@@ -2044,8 +2044,30 @@ def _strip_markdown(text: str) -> str:
 
     The chat prompt forbids bullet points and bold, but the model sometimes
     ignores that — especially when the retrieved context itself contains
-    formatted content. This cleanup runs on every token so the user never
-    sees raw markdown.
+    formatted content. Called by api.py's streaming handler on each small
+    flushed chunk of the response as it streams (not the whole response at
+    once), so the user never sees raw markdown mid-stream.
+
+    Deliberately does NOT strip numbered-list markers ("1. ", "2. ") the
+    way it used to — DETAILED_GROUNDED_PROMPT explicitly wants numbered
+    points, and ask_stream() already handles both directions correctly on
+    the complete response before this ever runs: it enforces numbering
+    deterministically when a detailed answer's model output didn't use it,
+    and strips stray markers when a brief answer's shouldn't have any (see
+    multi_source_rag.py's "Strip stray numbered-list markers" section).
+    Stripping markers here too, on arbitrary small per-flush chunks, was
+    actively harmful rather than redundant: since api.py flushes as soon as
+    a chunk contains ANY space or newline, whether "\n2. " for a genuinely
+    correct detailed-mode point landed inside the SAME flush as its
+    trailing space (letting this regex match and destroy it) or got split
+    across two separate flushes (leaving it untouched) came down to
+    arbitrary token-boundary luck for that specific generation — confirmed
+    live: the exact same "explain in detail" request rendered as a clean
+    numbered list in some runs and a single unbroken paragraph in others,
+    with no difference in the underlying model output's actual formatting.
+    That, in turn, silently broke follow-up "explain point N" references,
+    since the numbering that later parsing depends on had already been
+    destroyed before it was ever saved to conversation history.
     """
     import re
     # Remove bold/italic markers
@@ -2054,8 +2076,6 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r'^#{1,4}\s+', '', text, flags=re.MULTILINE)
     # Convert bullet list items to flowing prose: "- item" or "* item" -> "item, "
     text = re.sub(r'\n\s*[-*]\s+', ' ', text)
-    # Numbered list items: "\n1. " -> " "
-    text = re.sub(r'\n\s*\d+\.\s+', ' ', text)
     # Inline code backticks
     text = re.sub(r'`([^`]+)`', r'\1', text)
     # Collapse 3+ newlines -> 2
@@ -4052,7 +4072,28 @@ class MultiSourceRAG:
             # so the model sees the actual topic, not the vague follow-up phrase.
             # _detected_as_followup is used (not _is_followup) so the fix applies
             # even when we fell back to history-based topic extraction.
-            prompt_question = retrieval_query if _detected_as_followup else question
+            #
+            # A point-reference ("explain point 2 with an example") is a
+            # SPECIAL case of this: retrieval_query comes from an LLM
+            # reformulation step that's supposed to resolve "point 2" into
+            # the point's actual subject, but that's exactly the kind of
+            # instruction this model doesn't reliably follow (same lesson
+            # as every other formatting-compliance gap fixed this session).
+            # pasted_context, by contrast, is the point's exact text pulled
+            # out by deterministic regex, not an LLM call — anchoring
+            # prompt_question directly to it guarantees the model is always
+            # told precisely what "point 2" IS, instead of trusting the
+            # reformulation to have carried that meaning through correctly.
+            # Confirmed live: without this, "explain point 2 with an
+            # example" (point 2 being "also referred to as Medical
+            # Insurance or Mediclaim") came back with a generic health-
+            # insurance hospitalization example — a real example, just not
+            # of what was actually asked about, because prompt_question
+            # never explicitly said what point 2 was.
+            if _pasted_is_point_reference and pasted_context:
+                prompt_question = f'Explain this specific point: "{pasted_context}"'
+            else:
+                prompt_question = retrieval_query if _detected_as_followup else question
 
             # The fallback query-cleaning above may have dropped a specific
             # detail (a country/city name, "affordable"/"cheap"/"best") to
@@ -4117,11 +4158,37 @@ class MultiSourceRAG:
                         "Then give one concrete real-life example to illustrate it clearly."
                     )
                 elif _has_example:
-                    _mod_instr = (
-                        "The user already understands this concept from the previous answer. "
-                        "Do NOT re-explain or repeat the definition. "
-                        "Give ONLY one concrete real-life example that illustrates it clearly."
-                    )
+                    if _pasted_is_point_reference:
+                        # A point reference needs a stronger anchor than the
+                        # general case below — confirmed live: even with
+                        # prompt_question explicitly quoting the point's
+                        # exact text ('Explain this specific point: "It is
+                        # also known as Medical Insurance or Mediclaim."'),
+                        # the model still drifted to a generic hospital-
+                        # coverage example instead of illustrating THAT
+                        # specific fact. Some points (naming facts,
+                        # definitional details) don't have a natural
+                        # real-world scenario at all — forcing "a concrete
+                        # real-life example" onto "it's also called X" was
+                        # part of what pushed the model toward inventing an
+                        # unrelated scenario instead. Giving it permission to
+                        # clarify/illustrate the fact directly when a
+                        # scenario doesn't fit keeps the answer on-topic
+                        # either way.
+                        _mod_instr = (
+                            "Give ONLY an example or illustration of THIS EXACT POINT quoted "
+                            "above — not a general example of the broader topic. If this point "
+                            "is a naming fact, a definition detail, or something else without a "
+                            "natural real-world scenario, clarify or illustrate that specific "
+                            "fact directly instead of inventing an unrelated scenario. "
+                            "Do NOT re-explain or repeat the definition first."
+                        )
+                    else:
+                        _mod_instr = (
+                            "The user already understands this concept from the previous answer. "
+                            "Do NOT re-explain or repeat the definition. "
+                            "Give ONLY one concrete real-life example that illustrates it clearly."
+                        )
                 elif _has_simple:
                     _mod_instr = (
                         "Re-explain this in very simple, everyday language. "
