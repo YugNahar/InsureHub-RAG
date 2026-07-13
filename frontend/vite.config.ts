@@ -19,6 +19,7 @@ export default defineConfig({
       "/ask-stream": BACKEND_URL,
       "/auth": BACKEND_URL,
       "/admin": BACKEND_URL,
+      "/conversation": BACKEND_URL,
       "/docs": BACKEND_URL,
       "/session": BACKEND_URL,
       "/upload": BACKEND_URL,
