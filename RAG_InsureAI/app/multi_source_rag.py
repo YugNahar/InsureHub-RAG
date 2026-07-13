@@ -89,24 +89,41 @@ _COMPOUND_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The only roots that actually form a real compound word with one of the
+# prefixes above. Deliberately NOT the full _INSURANCE_VOCAB — that was
+# the bug: matching against all 40+ vocab entries meant ANY of them
+# following "under"/"re"/"co"/etc. got silently glued together, including
+# words that don't form a real compound at all. Confirmed live: "covered
+# under health insurance" got rewritten to "covered underhealth
+# insurance" — "health" is a legitimate vocab entry on its own, but
+# "underhealth" isn't a word, and the garbled query made retrieval
+# unreliable (intermittent reranker-gate refusals on a question the KB
+# answers fine). Same failure shape as "reinsurance" -> "insurance" in
+# _correct_typos below: a broad match target catching real domain words
+# that happen to sit near a prefix, not just genuine split compounds.
+_COMPOUND_ROOTS = ["insurance", "insured", "insurer", "writing", "write"]
+
 
 def _join_split_compounds(text: str) -> str:
     """Re-join a compound prefix ("re", "co", "un", "under", "over", "non")
-    that was typed with a space or hyphen before a word matching an
-    _INSURANCE_VOCAB entry — "re insurance" / "re-insurance" -> "reinsurance",
+    that was typed with a space or hyphen before a word matching a
+    _COMPOUND_ROOTS entry — "re insurance" / "re-insurance" -> "reinsurance",
     "under insured" -> "underinsured" — so retrieval sees the same single
     token the knowledge base actually uses, instead of two separate ones.
 
-    Only joins when the word after the prefix fuzzy-matches a vocab entry
-    (score >= 85 — see _correct_typos for why this was raised from 80);
-    an unrelated word right after "re"/"co"/etc. ("re apply", "co pay" ->
-    "pay" is too short to check) is left untouched.
+    Only joins when the word after the prefix fuzzy-matches one of the
+    small set of roots that actually form a real compound (score >= 85 —
+    see _correct_typos for why this was raised from 80) — NOT the full
+    insurance vocabulary, which would match ordinary domain words that
+    happen to follow a prefix without forming any real compound term
+    ("under health" is not "underhealth"). An unrelated word right after
+    "re"/"co"/etc. ("re apply") is left untouched either way.
     """
     def _try_join(m: re.Match) -> str:
         prefix, rest = m.group(1), m.group(2)
         if rest.lower() in _TYPO_CORRECTION_PROTECTED_WORDS:
             return m.group(0)
-        result = process.extractOne(rest, _INSURANCE_VOCAB, scorer=fuzz.ratio)
+        result = process.extractOne(rest, _COMPOUND_ROOTS, scorer=fuzz.ratio)
         if result is not None:
             best_match, score, _ = result
             if score >= 85:
