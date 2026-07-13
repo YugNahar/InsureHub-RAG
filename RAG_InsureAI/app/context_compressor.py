@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from langchain_core.documents import Document
@@ -111,6 +111,20 @@ class ContextCompressor:
         self._min_sents = min_sentences
         self._max_sents = max_sentences
         self._skip_below = max_chars_per_chunk
+        # KB chunk text is static (sourced from ingested documents), so the
+        # same chunk's sentences were being re-split and re-embedded from
+        # scratch on every request that retrieved it — measured live at
+        # ~8s for a single request's worth of sentences on this
+        # deployment's CPU (transformer inference here is generally slow,
+        # see the reranker-serialization comment in multi_source_rag.py's
+        # ask_stream for a related measurement). Only the QUERY changes
+        # between requests, not the chunk content, so caching each chunk's
+        # (sentences, embeddings) by its own text means that cost is paid
+        # once ever per chunk instead of once per request. Bounded FIFO,
+        # not LRU: simpler, and good enough since the KB itself is a
+        # bounded, mostly-static set of chunks.
+        self._sent_cache: Dict[tuple, tuple] = {}
+        self._sent_cache_max = 3000
 
     # ------------------------------------------------------------------
     # Public API
@@ -223,9 +237,18 @@ class ContextCompressor:
                 allocations[i] += extra
                 leftover -= extra
 
-        final: List[Document] = []
+        # Pass 1: classify each chunk without touching the model yet. For a
+        # chunk needing sentence-level ranking, reuse its cached
+        # (sentences, embeddings) if this exact chunk text was compressed
+        # before — the KB itself doesn't change between requests, only the
+        # query does, so cache hits are the common case after warm-up.
+        # Only genuine cache misses get queued for the model; those are
+        # still batched into one encode() call rather than one per chunk.
+        _slots: List[Optional[Dict[str, Any]]] = [None] * n
+        _all_sentences: List[str] = []
+        _offsets: List[tuple] = []  # (slot_index, start, end) into _all_sentences
 
-        for doc, alloc in zip(chunks, allocations):
+        for i, (doc, alloc) in enumerate(zip(chunks, allocations)):
             if alloc <= 0:
                 continue
 
@@ -233,7 +256,7 @@ class ContextCompressor:
 
             # Chunk fits in its allocation — include it as-is, no compression.
             if len(text) <= alloc:
-                final.append(doc)
+                _slots[i] = {"kind": "asis", "doc": doc}
                 continue
 
             # Chunk is too large for its allocation — keep only the most
@@ -243,21 +266,71 @@ class ContextCompressor:
                 or "youtube" in str(doc.metadata.get("source_type", "")).lower()
                 or "whisper" in str(doc.metadata.get("source_type", "")).lower()
             )
+            _cache_key = (text, is_yt)
+            _cached = self._sent_cache.get(_cache_key)
+            if _cached is not None:
+                sentences, sent_embs = _cached
+                if len(sentences) <= 1:
+                    truncated = text[:alloc].rsplit('. ', 1)[0] + '…'
+                    _slots[i] = {"kind": "hard_truncate", "doc": doc, "text": truncated}
+                    continue
+                _slots[i] = {
+                    "kind": "rank", "doc": doc, "alloc": alloc,
+                    "sentences": sentences, "sent_embs": sent_embs,
+                }
+                continue
+
             sentences = _split_sentences(text, for_youtube=is_yt)
 
             if len(sentences) <= 1:
                 # Single atomic sentence — hard-truncate at the nearest
                 # sentence boundary rather than cutting mid-word.
                 truncated = text[:alloc].rsplit('. ', 1)[0] + '…'
-                final.append(Document(
-                    page_content=truncated,
-                    metadata={**doc.metadata, "hard_truncated": True},
-                ))
+                _slots[i] = {
+                    "kind": "hard_truncate",
+                    "doc": doc,
+                    "text": truncated,
+                }
+                self._sent_cache[_cache_key] = (sentences, None)
                 continue
 
-            sent_embs = self._model.encode(
-                sentences, normalize_embeddings=True, batch_size=32, show_progress_bar=False
+            start = len(_all_sentences)
+            _all_sentences.extend(sentences)
+            end = len(_all_sentences)
+            _offsets.append((i, start, end))
+            _slots[i] = {
+                "kind": "rank",
+                "doc": doc,
+                "alloc": alloc,
+                "sentences": sentences,
+                "cache_key": _cache_key,
+            }
+
+        # Pass 2: one batched encode() call for every cache-miss sentence
+        # collected above.
+        if _all_sentences:
+            _all_sent_embs = self._model.encode(
+                _all_sentences, normalize_embeddings=True, batch_size=32, show_progress_bar=False
             )
+        else:
+            _all_sent_embs = None
+
+        for slot_idx, start, end in _offsets:
+            slot = _slots[slot_idx]
+            sent_embs = _all_sent_embs[start:end]
+            slot["sent_embs"] = sent_embs
+            _cache_key = slot.pop("cache_key")
+            if len(self._sent_cache) >= self._sent_cache_max:
+                self._sent_cache.pop(next(iter(self._sent_cache)))
+            self._sent_cache[_cache_key] = (slot["sentences"], sent_embs)
+
+        for i, slot in enumerate(_slots):
+            if slot is None or slot["kind"] != "rank":
+                continue
+            doc = slot["doc"]
+            alloc = slot["alloc"]
+            sentences = slot["sentences"]
+            sent_embs = slot["sent_embs"]
             scores = np.dot(sent_embs, query_emb)
             ranked = np.argsort(scores)[::-1]
 
@@ -275,19 +348,38 @@ class ContextCompressor:
                 # Even the single best sentence is too long — hard-truncate it.
                 best = sentences[int(ranked[0])]
                 truncated = best[:alloc] + '…'
-                final.append(Document(
-                    page_content=truncated,
-                    metadata={**doc.metadata, "hard_truncated": True},
-                ))
+                _slots[i] = {
+                    "kind": "hard_truncate",
+                    "doc": doc,
+                    "text": truncated,
+                }
                 continue
 
             # Re-assemble in original document order (not relevance order)
             # so the LLM reads coherent prose, not a jumbled ranking.
-            kept_text = ' '.join(sentences[i] for i in sorted(kept_indices))
-            final.append(Document(
-                page_content=kept_text,
-                metadata={**doc.metadata, "budget_trimmed": True},
-            ))
+            kept_text = ' '.join(sentences[j] for j in sorted(kept_indices))
+            _slots[i] = {
+                "kind": "ranked_result",
+                "doc": doc,
+                "text": kept_text,
+            }
+
+        final: List[Document] = []
+        for slot in _slots:
+            if slot is None:
+                continue
+            if slot["kind"] == "asis":
+                final.append(slot["doc"])
+            elif slot["kind"] == "hard_truncate":
+                final.append(Document(
+                    page_content=slot["text"],
+                    metadata={**slot["doc"].metadata, "hard_truncated": True},
+                ))
+            elif slot["kind"] == "ranked_result":
+                final.append(Document(
+                    page_content=slot["text"],
+                    metadata={**slot["doc"].metadata, "budget_trimmed": True},
+                ))
 
         return final
 

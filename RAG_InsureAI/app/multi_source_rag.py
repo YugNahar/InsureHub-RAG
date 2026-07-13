@@ -2878,6 +2878,9 @@ class MultiSourceRAG:
         _t_retrieval_ms = None
         _t_grounding_ms = None
         _t_llm_ms = None
+        _t_preprocess_ms = None
+        _t_promptbuild_ms = None
+        _t_postllm_ms = None
 
         retrieval_query = question
         filter_meta = None
@@ -3401,6 +3404,7 @@ class MultiSourceRAG:
         # every answer verbose), so it was purely wasted latency: a full
         # extra round-trip to the LLM server on every query for a result
         # nothing read. Removed.
+        _t_preprocess_ms = round((time.time() - _t_request_start) * 1000)
         _t_retrieval_start = time.time()
         # Only fed to the actual search calls below, never to retrieval_query
         # itself — retrieval_query still drives the KV cache key, the lexical
@@ -3559,6 +3563,7 @@ class MultiSourceRAG:
             _verify_grounding_any_chunk(retrieval_query, all_chunks),
         )
         _t_grounding_ms = round((time.time() - _t_grounding_start) * 1000)
+        _t_promptbuild_start = time.time()
         ctx_covered = _lex_ok and _semantically_grounded
 
         _dropped_terms_note = None
@@ -4064,6 +4069,7 @@ class MultiSourceRAG:
                 "Authorization": f"Bearer {_runtime_manual_api_key}",
             }
 
+        _t_promptbuild_ms = round((time.time() - _t_promptbuild_start) * 1000)
         _t_llm_start = time.time()
         if _stream_url:
             model = _stream_model
@@ -4142,6 +4148,7 @@ class MultiSourceRAG:
             answer = _strip_markdown(_strip_model_preamble(answer))
             _kv_reply = answer
         _t_llm_ms = round((time.time() - _t_llm_start) * 1000)
+        _t_postllm_start = time.time()
 
         # ── Rule 4 fallback strip ─────────────────────────────────────────────
         # The 7B model sometimes generates real content from training knowledge
@@ -4566,6 +4573,7 @@ class MultiSourceRAG:
                 logger.debug("[ask_stream] KV cache write failed: %s", _exc)
 
         _t_total_ms = round((time.time() - _t_request_start) * 1000)
+        _t_postllm_ms = round((time.time() - _t_postllm_start) * 1000)
         # Single consolidated timing line per request rather than one log
         # line per phase — makes it possible to `grep TIMING` and sort/
         # aggregate by whichever phase is actually the bottleneck across a
@@ -4577,12 +4585,16 @@ class MultiSourceRAG:
             v for v in (_t_retrieval_ms, _t_grounding_ms, _t_llm_ms) if v is not None
         )
         logger.info(
-            "[ask_stream] TIMING total=%dms retrieval=%s grounding=%s llm=%s other=%dms detailed=%s query=%r",
+            "[ask_stream] TIMING total=%dms retrieval=%s grounding=%s llm=%s other=%dms "
+            "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r",
             _t_total_ms,
             f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
             f"{_t_grounding_ms}ms" if _t_grounding_ms is not None else "n/a",
             f"{_t_llm_ms}ms" if _t_llm_ms is not None else "n/a",
             _t_other_ms,
+            f"{_t_preprocess_ms}ms" if _t_preprocess_ms is not None else "n/a",
+            f"{_t_promptbuild_ms}ms" if _t_promptbuild_ms is not None else "n/a",
+            f"{_t_postllm_ms}ms" if _t_postllm_ms is not None else "n/a",
             _keyword_detailed,
             retrieval_query[:80],
         )
