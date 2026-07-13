@@ -2545,6 +2545,104 @@ class MultiSourceRAG:
                     seen[h] = chunk
         return list(seen.values())
 
+    async def _retrieve_all_sources_combined(
+        self,
+        retrieval_query: str,
+        filter_meta: Optional[dict],
+        doc_top_k: int,
+        summary_top_k: int,
+        media_top_k: int,
+        chunk_limit: int,
+    ) -> List[Document]:
+        """
+        Fetch raw (unreranked) candidates from doc, video, and webpage
+        stores, merge them, and rerank ONCE across the combined pool —
+        instead of the previous approach of reranking each source
+        separately (doc via rerank_documents, video/webpage each via
+        their own search(use_reranker=True) call).
+
+        doc, video, and webpage all share ONE process-wide CrossEncoder
+        instance (_get_shared_reranker in turbovec_store.py), so three
+        separate reranking calls each pay their own fixed per-call
+        overhead on this deployment's CPU regardless of candidate count
+        — confirmed live: an isolated warm-steady-state video
+        search+rerank call alone measured ~7s on every single call, for
+        a 28-chunk store that showed up in a final answer's citations in
+        roughly 1 of 30+ test questions that day. Reranking everything
+        together pays that fixed cost once.
+
+        This also directly implements "only retrieve what actually
+        supports the answer, not a fixed count per source": a source
+        with nothing genuinely relevant to this query contributes zero
+        chunks to the final answer on its own merits — its candidates
+        simply score too low against the rest of the combined pool in
+        the SAME ranking — rather than doc/video/webpage each always
+        claiming their own fixed number of slots in the final context
+        regardless of whether anything in a given source is actually
+        useful for this specific question.
+        """
+        doc_raw = await asyncio.to_thread(
+            self.doc_pipeline._vector_store.search,
+            retrieval_query, top_k=doc_top_k, use_hybrid=True, use_reranker=False,
+            filter_metadata=filter_meta,
+        )
+
+        # Skip a store entirely when it's empty — search() would return []
+        # almost instantly anyway (count()==0 early return), but this also
+        # means an empty store never even reaches the asyncio.to_thread
+        # dispatch, and stays skipped automatically once the store has
+        # exactly zero content, without ever needing separate code to
+        # re-enable it if content gets added later.
+        video_raw: List[Document] = []
+        if self.video_store.count() > 0:
+            video_raw = await asyncio.to_thread(
+                self.video_store.search, retrieval_query, top_k=media_top_k, use_hybrid=True, use_reranker=False,
+            )
+        webpage_raw: List[Document] = []
+        if self.webpage_store.count() > 0:
+            webpage_raw = await asyncio.to_thread(
+                self.webpage_store.search, retrieval_query, top_k=media_top_k, use_hybrid=True, use_reranker=False,
+            )
+
+        # Stage-1 summary-boost guarantee (same logic as _retrieve_doc_chunks):
+        # a summary-identified document's best-matching chunk may not have
+        # ranked highly enough in the raw top-k search to be included, so
+        # fetch its top 2 chunks directly and fold them into the combined
+        # pool — unreranked, they get scored fairly alongside everything
+        # else in the single rerank call below.
+        if self.doc_pipeline._summary_store.count() > 0:
+            try:
+                relevant_summaries = await asyncio.to_thread(
+                    self.doc_pipeline._summary_store.search, retrieval_query, summary_top_k
+                )
+                seen_summary_srcs: set = set()
+                for summary_doc in relevant_summaries:
+                    src = summary_doc.metadata.get("source", "")
+                    if not src or src in seen_summary_srcs:
+                        continue
+                    seen_summary_srcs.add(src)
+                    boost = await asyncio.to_thread(
+                        self.doc_pipeline._vector_store.search,
+                        retrieval_query, 2, {"source": {"$eq": src}}, True, False,
+                    )
+                    if boost:
+                        existing = {d.page_content[:80] for d in doc_raw}
+                        new_boost = [d for d in boost if d.page_content[:80] not in existing]
+                        for d in new_boost:
+                            d.metadata["stage1_boost"] = True
+                        doc_raw = doc_raw + new_boost
+            except Exception as _exc:
+                logger.debug("[MultiSourceRAG] stage-1 guarantee skipped: %s", _exc)
+
+        combined = self._merge_chunks(doc_raw + video_raw + webpage_raw)
+        if not combined:
+            return []
+
+        return await asyncio.to_thread(
+            self.doc_pipeline._vector_store.rerank_documents,
+            retrieval_query, combined, chunk_limit,
+        )
+
     async def _retrieve_doc_chunks(
         self,
         retrieval_query: str,
@@ -3447,44 +3545,31 @@ class MultiSourceRAG:
         # model is told the user asked.
         _search_query = _expand_abbreviations(retrieval_query)
         if not document_filter:
-            # Local reranking (doc, video, webpage) all share one CrossEncoder
-            # model running on CPU. Firing all three concurrently via
-            # asyncio.gather looks parallel but isn't a clean speedup here —
-            # each call's own internal PyTorch/OpenMP threading tries to use
-            # every available core, so "concurrent" execution causes
-            # contention (isolated measurement on this deployment: ~16.6s
-            # concurrent vs ~9.8s sequential for the same reranking work).
-            # Tried capping each call's thread budget via OMP_NUM_THREADS
-            # instead of serializing — that caused requests to hang outright
-            # (reranker calls stuck at 0% progress, a real deadlock under
-            # concurrent low-thread-count execution), so that approach was
-            # reverted. Serializing avoids the deadlock risk entirely and is
-            # never worse than the contended-concurrent version, though
-            # end-to-end wins are inconsistent in practice — actual per-query
-            # cost varies a lot because the stage-1 summary-boost step inside
-            # _retrieve_doc_chunks() pulls in a variable, sometimes large,
-            # number of extra candidates before reranking (measured 8 vs an
-            # actual 18 for the same query), so this alone does not reliably
-            # hit any specific latency target — it removes one real risk
-            # (contention/deadlock), not the whole bottleneck.
+            # Doc/video/webpage used to each pay their own separate
+            # reranking call against the SAME shared process-wide
+            # CrossEncoder — three fixed-overhead-dominated calls instead
+            # of one, and each source always claimed its own fixed number
+            # of final slots regardless of whether it had anything
+            # genuinely relevant. Replaced with _retrieve_all_sources_
+            # combined() (2026-07-13, evidence: isolated warm video
+            # search+rerank measured ~7s on every call for a 28-chunk
+            # store that contributed to ~1 of 30+ test answers that day)
+            # — fetch raw candidates from every source, merge, and rerank
+            # ONCE across the combined pool, so the final chunk_limit
+            # slots go to whatever's actually most relevant regardless of
+            # source, and a source with nothing relevant this time
+            # contributes nothing on its own merits rather than by a
+            # separate fixed quota.
             #
-            # The LLM topic-extraction call has no such conflict — it's a
-            # network call, not CPU-bound — so it still runs in genuine
-            # parallel via its own task while the CPU-bound retrieval work
-            # below proceeds sequentially.
-            # summary_top_k restored 2 -> 3 (2026-07-13, same revert as
-            # _doc_top_k/_media_top_k above) — only these two primary
-            # retrieval call sites were part of commit ec8bc3a's 3->2 cut;
-            # the fallback-tier _retrieve_doc_chunks calls further down
-            # (query-clean retry, standalone-retry) were written with
-            # summary_top_k=2 independently and were never 3, so they're
-            # untouched here.
+            # The LLM topic-extraction call has no CPU-reranking conflict
+            # — it's a network call — so it still runs in genuine parallel
+            # via its own task while retrieval proceeds.
             _topics_task = asyncio.create_task(_extract_intent_topics(question))
-            doc_chunks = await self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3)
-            video_chunks = await asyncio.to_thread(self.video_store.search, _search_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
-            webpage_chunks = await asyncio.to_thread(self.webpage_store.search, _search_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
+            all_chunks = await self._retrieve_all_sources_combined(
+                _search_query, filter_meta, doc_top_k=_doc_top_k, summary_top_k=3,
+                media_top_k=_media_top_k, chunk_limit=_chunk_limit,
+            )
             llm_topics = await _topics_task
-            all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
             doc_chunks, llm_topics = await asyncio.gather(
                 self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
