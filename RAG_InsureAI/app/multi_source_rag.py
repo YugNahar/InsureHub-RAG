@@ -193,6 +193,59 @@ def _correct_typos(text: str) -> str:
     return " ".join(corrected)
 
 
+# Bidirectional abbreviation <-> full-term expansion, appended to (never
+# replacing) the retrieval query — confirmed live (2026-07-13): a KB
+# document titled "Major Insurance Brokers in the GCC" ranked BELOW an
+# unrelated, generic PDF when the user asked about "the Gulf Cooperation
+# Council" instead of "GCC". The document's own text only ever uses the
+# abbreviation, so a query using the spelled-out form has no lexical
+# match against it at all — embedding similarity alone wasn't enough to
+# keep it top-ranked against exact-term competition elsewhere in the KB.
+# Appending the counterpart form (in whichever direction the query used)
+# gives retrieval a lexical match against source documents that only
+# ever use one form or the other. Appending rather than substituting
+# keeps the original query intact for every other check downstream
+# (lexical coverage, grounding, KV cache key) — this only adds extra
+# surface area for the vector/hybrid search to match against.
+_ABBREVIATION_EXPANSIONS = {
+    "gcc": "gulf cooperation council",
+    "uae": "united arab emirates",
+    "ksa": "kingdom of saudi arabia",
+    "irdai": "insurance regulatory and development authority of india",
+}
+_ABBREVIATION_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in _ABBREVIATION_EXPANSIONS) + r')\b',
+    re.IGNORECASE,
+)
+_EXPANSION_TO_ABBR = {v: k.upper() for k, v in _ABBREVIATION_EXPANSIONS.items()}
+_EXPANSION_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(v) for v in _ABBREVIATION_EXPANSIONS.values()) + r')\b',
+    re.IGNORECASE,
+)
+
+
+def _expand_abbreviations(text: str) -> str:
+    """Append the counterpart form (abbreviation <-> spelled-out term) for
+    any known regional/regulatory term found in *text*, so retrieval
+    matches KB documents using either form. New abbreviations can be added
+    to _ABBREVIATION_EXPANSIONS as they're found to matter for documents
+    actually in the KB — this isn't meant to be an exhaustive dictionary,
+    just a targeted fix for the specific class of mismatch confirmed live.
+    """
+    additions = []
+    for m in _ABBREVIATION_RE.finditer(text):
+        full = _ABBREVIATION_EXPANSIONS[m.group(1).lower()]
+        if full not in additions:
+            additions.append(full)
+    for m in _EXPANSION_RE.finditer(text):
+        abbr = _EXPANSION_TO_ABBR[m.group(1).lower()]
+        if abbr not in additions:
+            additions.append(abbr)
+    if not additions:
+        return text
+    return text + " " + " ".join(additions)
+
+
 # ── Context coverage check ────────────────────────────────────────────────────
 # Domain-generic terms that appear in virtually every insurance chunk and
 # therefore give no signal about whether a chunk covers the specific query topic.
@@ -3340,6 +3393,14 @@ class MultiSourceRAG:
         # extra round-trip to the LLM server on every query for a result
         # nothing read. Removed.
         _t_retrieval_start = time.time()
+        # Only fed to the actual search calls below, never to retrieval_query
+        # itself — retrieval_query still drives the KV cache key, the lexical
+        # coverage checks (fine either way, but unmodified matches user
+        # expectations for what "the question" was), and prompt_question for
+        # follow-ups further down. Keeping the expansion scoped to just the
+        # search call avoids the appended text ever showing up in what the
+        # model is told the user asked.
+        _search_query = _expand_abbreviations(retrieval_query)
         if not document_filter:
             # Local reranking (doc, video, webpage) all share one CrossEncoder
             # model running on CPU. Firing all three concurrently via
@@ -3367,14 +3428,14 @@ class MultiSourceRAG:
             # parallel via its own task while the CPU-bound retrieval work
             # below proceeds sequentially.
             _topics_task = asyncio.create_task(_extract_intent_topics(question))
-            doc_chunks = await self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2)
-            video_chunks = await asyncio.to_thread(self.video_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
-            webpage_chunks = await asyncio.to_thread(self.webpage_store.search, retrieval_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
+            doc_chunks = await self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2)
+            video_chunks = await asyncio.to_thread(self.video_store.search, _search_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
+            webpage_chunks = await asyncio.to_thread(self.webpage_store.search, _search_query, top_k=_media_top_k, use_hybrid=True, use_reranker=True)
             llm_topics = await _topics_task
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
             doc_chunks, llm_topics = await asyncio.gather(
-                self._retrieve_doc_chunks(retrieval_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2),
+                self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2),
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
