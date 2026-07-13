@@ -4832,6 +4832,82 @@ class MultiSourceRAG:
             except Exception as _cap_exc:
                 logger.debug("[ask_stream] sentence cap skipped: %s", _cap_exc)
 
+        # ── Drop sentences/points with an ungrounded currency figure ──────────
+        # Every prompt's grounding rules say "never state a number... unless
+        # that exact figure appears literally in the CONTEXT — no estimates,
+        # no exceptions, ever", but the model doesn't reliably follow this
+        # when asked for an illustrative example. Confirmed live twice:
+        # "explain 'excess' with an example" invented "₹10,000" as a sample
+        # amount, and separately "explain Liability Only Policy with an
+        # example" invented "$10,000" in medical costs for a pedestrian
+        # scenario — neither figure appears anywhere in full_context, and
+        # the second one even uses the wrong currency for this KB (this is
+        # India-context content that uses ₹, never $). A hypothetical
+        # SCENARIO ("imagine you hit a pedestrian...") is exactly what
+        # "explain with an example" is asking for and is left untouched;
+        # the problem is a SPECIFIC invented figure stated as if real,
+        # which a reader could mistake for an actual policy limit or
+        # typical claim size rather than an arbitrary placeholder.
+        #
+        # Scoped to currency figures specifically (₹/$/Rs/INR + digits) —
+        # deliberately NOT percentages or day/year counts, since those
+        # routinely appear in this KB written out as words ("within
+        # fourteen days") rather than digits, and a naive digit-only check
+        # would have no way to confirm a word-form figure is grounded,
+        # risking false-positive drops of genuinely correct content.
+        try:
+            import re as _re5
+            _CURRENCY_RE = _re5.compile(r'(?:[₹$£€]|\bRs\.?\b|\bINR\b)\s?([\d,]+(?:\.\d+)?)', _re5.IGNORECASE)
+            _num_src = (_corrected_text or _reply_stripped).strip()
+            _ctx_digits = _re5.sub(r'\D', '', full_context or '')
+
+            def _currency_grounded(num_str: str) -> bool:
+                digits = num_str.replace(',', '').split('.')[0]
+                return bool(digits) and digits in _ctx_digits
+
+            # Detailed-mode numbered lists are split on the newline before
+            # each marker (preserving list structure on rejoin); everything
+            # else falls back to the same numbered-list-aware sentence split
+            # used by the cap above, rejoined with spaces like normal prose.
+            _has_points = bool(_re5.search(r'(?:^|\n)\s*\d+\.\s', _num_src))
+            if _has_points:
+                _units = _re5.split(r'\n(?=\s*\d+\.\s)', _num_src)
+            else:
+                _units = _re5.split(r'(?<=[.!?])(?<!\d\.)\s+', _num_src)
+
+            _kept_units, _dropped_num = [], 0
+            for _unit in _units:
+                _found = _CURRENCY_RE.findall(_unit)
+                if _found and not any(_currency_grounded(f) for f in _found):
+                    _dropped_num += 1
+                    continue
+                _kept_units.append(_unit)
+
+            if _dropped_num and _kept_units:
+                if _has_points:
+                    _point_re5 = _re5.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re5.DOTALL)
+                    _renumbered5, _next_n = [], 1
+                    for _unit in _kept_units:
+                        _m = _point_re5.match(_unit)
+                        if _m:
+                            _renumbered5.append(f"{_m.group(1)}{_next_n}{_m.group(3)}{_m.group(4)}")
+                            _next_n += 1
+                        else:
+                            _renumbered5.append(_unit)
+                    _rebuilt5 = "\n".join(_renumbered5).strip()
+                else:
+                    _rebuilt5 = " ".join(_kept_units).strip()
+                    if _rebuilt5 and _rebuilt5[-1] not in ".!?":
+                        _rebuilt5 += "."
+                _corrected_text = _rebuilt5
+                _kv_reply = _rebuilt5
+                logger.info(
+                    "[ask_stream] dropped %d unit(s) containing an ungrounded currency figure",
+                    _dropped_num,
+                )
+        except Exception as _num_exc:
+            logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
+
         # ── Buffered-path single yield (after all corrections) ────────────────
         # The non-streaming (buffered) path above stored the raw answer in
         # _kv_reply but did NOT yield it — we waited until after Rule4 strip,
