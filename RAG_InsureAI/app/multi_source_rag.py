@@ -3218,14 +3218,29 @@ class MultiSourceRAG:
         # regardless of whether the combined question happens to match
         # _needs_detailed_answer()'s own signals.
         _keyword_detailed = _needs_detailed_answer(question) or _force_both_detailed
-        # Reduced 14/8 -> 8/6 (2026-07-10, explicit user latency request) —
-        # each unit of doc_top_k adds a vector-search candidate that then
-        # has to be reranked (multi-window reranking is the dominant cost
-        # here, see turbovec_store.py's ~13s-at-3-windows measurement), so
-        # this is the single biggest lever on retrieval latency. Retested
-        # the full regression suite plus a broad-topic detailed-mode batch
-        # at the new values before shipping — see the commit for results.
-        _doc_top_k   = 8 if _keyword_detailed else 6
+        # Restored 8/6 -> 14/8 (2026-07-13, explicit user request after a
+        # broad quality sweep). The 2026-07-10 reduction to 8/6 traded
+        # quality for latency in a way that wasn't just "fewer results" —
+        # turbovec_store.py's search() sets safe_k = min(2*top_k, count)
+        # for the DENSE CANDIDATE POOL fed into reranking, so a smaller
+        # top_k shrinks how many candidates the reranker even gets to see,
+        # not just how many it returns. Confirmed live: for "Explain
+        # liability insurance in detail", the single best-matching chunk
+        # (insurance hb 1101.pdf p.20, cross-encoder rerank_score=0.79,
+        # far above every other candidate) was completely absent from
+        # top_k=8's results — it doesn't rank in the top-16 by raw dense/
+        # BM25 similarity, so it never reached the reranker at all to get
+        # the high score reflecting its real relevance. That's a
+        # structural exclusion, not the reranker correctly judging it
+        # weaker. Manifested as generic/padded-feeling detailed answers
+        # for topics whose best chunk isn't a strong lexical/dense match
+        # (e.g. liability, engineering insurance) even though the answer
+        # format rules already explicitly permit shorter answers — the
+        # model wasn't padding by choice, it was working with objectively
+        # worse source material. Latency cost is real (this is what the
+        # 2026-07-10 change traded away) but the user weighed answer
+        # quality higher after seeing this evidence.
+        _doc_top_k   = 14 if _keyword_detailed else 8
         _chunk_limit = 12 if _keyword_detailed else 8
         # Trimmed from 5/4 — video/webpage search()'s internal reranking
         # candidate pool is 2x this value (safe_k = min(2*top_k, count)), so
