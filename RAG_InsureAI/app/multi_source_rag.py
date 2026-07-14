@@ -5348,6 +5348,25 @@ class MultiSourceRAG:
         # actually be complete; the 300-token budget upstream already bounds
         # runaway length, so this cap only needs to catch actual rambling,
         # not cut a legitimate last step.
+        #
+        # Cap raised 6 -> 9 -> 14: confirmed live a third time with a
+        # genuinely new question shape — a compound two-part question
+        # ("what's the difference between fire and burglary insurance, AND
+        # which should a small shop owner get"). First retry needed 8
+        # sentences (compare-fire + compare-burglary + recommendation +
+        # sign-off) and got chopped at 6; a second retry of the SAME
+        # question — same nondeterminism this codebase has hit repeatedly
+        # elsewhere (see vLLM nondeterministic quality glitches) — produced
+        # an even longer 11-sentence answer (it added a "which one should
+        # you get?" rhetorical beat) and still got chopped at 9, dropping
+        # the actual recommendation and sign-off a second time. Bumping by
+        # 1-3 each time a slightly-longer legitimate answer surfaces is a
+        # losing game against generation variance; raised further this time
+        # so the cap only catches genuine multi-paragraph rambling, not any
+        # answer that happens to cover 2 sub-questions plus a natural
+        # wrap-up. The 300-token budget upstream (not this cap) is the
+        # actual bound on runaway length — this only exists to catch
+        # rambling well past that.
         # Wrapped in try/except so any edge-case failure keeps the original reply.
         if not _keyword_detailed and not _kv_has_example:
             try:
@@ -5369,7 +5388,7 @@ class MultiSourceRAG:
                     # chopped it right after the stray "3." marker, discarding
                     # points 3 and 4 the model had already finished writing.
                     _sent_parts = _re.split(r'(?<=[.!?])(?<!\d\.)\s+', _cap_src)
-                    _MAX_SENTENCES = 6
+                    _MAX_SENTENCES = 14
                     if len(_sent_parts) > _MAX_SENTENCES:
                         _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
                         # Ensure it ends cleanly
