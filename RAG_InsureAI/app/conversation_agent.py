@@ -405,7 +405,7 @@ class ConversationAgent:
         # ----- KNOWLEDGE_BASE: user asking about capabilities / what I know / how I work -----
         # ----- ILLEGAL: harmful or dangerous content -----
         if intent == "ILLEGAL":
-            illegal_msg = "I'm only here to help with insurance questions. Please keep our conversation focused on insurance — I'm happy to help with policies, coverage, claims, and more! 😊"
+            illegal_msg = "I'm only here to help with insurance questions. Let's keep our conversation focused on insurance, I'm happy to help with policies, coverage, claims, and more! 😊"
             self._append_turn(session_id, user_message, illegal_msg)
             return {
                 "message": illegal_msg,
@@ -418,7 +418,7 @@ class ConversationAgent:
 
         # ----- OFF_TOPIC: general knowledge questions -----
         if intent == "OFF_TOPIC":
-            off_topic_msg = "That's a bit outside what I do! I'm Layla, your insurance advisor — happy to help with anything insurance-related. 😊"
+            off_topic_msg = "That's a bit outside what I do! I'm Layla, your insurance advisor, happy to help with anything insurance-related. 😊"
             self._append_turn(session_id, user_message, off_topic_msg)
             return {
                 "message": off_topic_msg,
@@ -517,7 +517,7 @@ class ConversationAgent:
             if is_off_topic:
                 off_topic_msg = (
                     "Ha, that's a bit outside my lane! 😄 I'm best with insurance "
-                    "questions — policies, coverage, claims, premiums. Anything "
+                    "questions, policies, coverage, claims, premiums. Anything "
                     "insurance-related I can help you with?"
                 )
                 self._append_turn(session_id, user_message, off_topic_msg)

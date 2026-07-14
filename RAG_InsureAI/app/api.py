@@ -631,7 +631,7 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
                 if session.handoff_exhausted:
                     await websocket.send_json({
                         "type": "handoff_timeout",
-                        "message": "No agent is available right now. We've emailed our support team — someone will reach out to you soon!",
+                        "message": "No agent is available right now. We've emailed our support team, someone will reach out to you soon!",
                     })
                 elif session.status == "human":
                     # Agent already joined before WS connected
@@ -656,7 +656,7 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
                         )
                         await websocket.send_json({
                             "type": "handoff_timeout",
-                            "message": "No agent is available right now. We've emailed our support team — someone will reach out to you soon!",
+                            "message": "No agent is available right now. We've emailed our support team, someone will reach out to you soon!",
                         })
             elif msg_type == "cancel_handoff":
                 # User explicitly cancelled waiting — send email and release back to AI
@@ -664,7 +664,7 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
                 if cancelled:
                     await websocket.send_json({
                         "type": "handoff_timeout",
-                        "message": "No problem! I've sent your question to our support team — someone will follow up with you soon. You can keep chatting with me in the meantime! 😊",
+                        "message": "No problem! I've sent your question to our support team, someone will follow up with you soon. You can keep chatting with me in the meantime! 😊",
                     })
             elif msg_type == "message":
                 content = (msg.get("content") or "").strip()
@@ -1535,7 +1535,7 @@ def _greeting_reply(question: str) -> str | None:
             "All good here! What can I help you with today?",
         ])
     if any(w in q for w in ["start", "restart", "reset", "menu", "back"]):
-        return "Sure! Ask me anything about insurance — policies, coverage, claims, I've got you. 😊"
+        return "Sure! Ask me anything about insurance, policies, coverage, claims, I've got you. 😊"
     return random.choice([
         "Hey! 👋 What insurance question can I help you with today?",
         "Hi there! Got an insurance question? I'm all ears. 😊",
@@ -1563,7 +1563,7 @@ async def ask_stream(req: AskRequest):
                 _ag = next((a for a in _agent_hub._agents.values() if a.agent_id == _hub_sess.agent_id), None)
                 if _ag:
                     _agent_name = f" with {_ag.name}"
-            _block_msg = f"You're connected{_agent_name} right now — please use the chat above to message the agent directly."
+            _block_msg = f"You're connected{_agent_name} right now. Please use the chat above to message the agent directly."
             # Forward user's message to the agent so they can see it
             _q = req.question
             _sid = req.session_id
@@ -1586,7 +1586,7 @@ async def ask_stream(req: AskRequest):
     )
     if _ILLEGAL_PATTERNS.search(req.question.lower()):
         async def _illegal_gen():
-            yield "I'm only here to help with insurance questions — please keep our conversation focused on insurance. 😊"
+            yield "I'm only here to help with insurance questions. Let's keep our conversation focused on insurance. 😊"
             yield "\n\n" + _json.dumps({"sources": [], "done": True, "needs_human": False})
         return StreamingResponse(
             _illegal_gen(),
@@ -1604,7 +1604,7 @@ async def ask_stream(req: AskRequest):
     )
     if _OFF_TOPIC_PATTERNS.search(req.question.lower()):
         async def _offtopic_gen():
-            yield "That's a bit outside what I do! I'm Layla, your insurance advisor — happy to help with anything insurance-related. 😊"
+            yield "That's a bit outside what I do! I'm Layla, your insurance advisor, happy to help with anything insurance-related. 😊"
             yield "\n\n" + _json.dumps({"sources": [], "done": True, "needs_human": False})
         return StreamingResponse(
             _offtopic_gen(),

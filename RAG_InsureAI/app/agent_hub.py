@@ -519,7 +519,7 @@ class AgentHub:
                 break
         _timeout_msg = {
             "type": "handoff_timeout",
-            "message": "No agent responded in time. We've emailed our support team — someone will reach out to you soon.",
+            "message": "No agent responded in time. We've emailed our support team, someone will reach out to you soon.",
         }
         delivered = False
         if session.user_ws:
