@@ -4561,6 +4561,20 @@ class MultiSourceRAG:
                             _rebuilt += "\n\n" + _closing
                         _corrected_text = _rebuilt
                         _kv_reply = _rebuilt
+                elif _re.match(r'^\s*1\.\s', _num_src):
+                    # The model numbers correctly but sometimes skips the
+                    # warm opener FORMAT also asks for — confirmed live: a
+                    # fresh "Explain X in detail" query (not a follow-up)
+                    # reliably returned "1. Fire insurance is a type of..."
+                    # / "1. Travel insurance offers..." with nothing before
+                    # the numbering, 2/2 on different topics, while the same
+                    # request phrased as a follow-up ("Can you explain it in
+                    # detail.") reliably included an opener. Same lesson as
+                    # the block above: don't trust prompt-only compliance
+                    # this model treats as conditional on phrasing.
+                    _rebuilt = f"Sure, here's a detailed breakdown:\n\n{_num_src}"
+                    _corrected_text = _rebuilt
+                    _kv_reply = _rebuilt
             except Exception as _num_exc:
                 logger.debug("[ask_stream] numbered-list enforcement skipped: %s", _num_exc)
 
