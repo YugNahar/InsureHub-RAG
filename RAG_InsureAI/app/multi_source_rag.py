@@ -2627,6 +2627,23 @@ from prompt_template import (
 from context_compressor import ContextCompressor
 from rag import LLM_CONTEXT_WINDOW_CHARS
 
+# ask_stream()'s dynamic context budget (below) used to reserve a flat,
+# hardcoded 700 tokens for "prompt template boilerplate" regardless of
+# which of the three prompts actually gets used. That number went stale
+# the moment the tone/warmth rewrite grew all three templates well past it
+# (measured: STRICT_GROUNDED_PROMPT ~1205, DETAILED_GROUNDED_PROMPT
+# ~1234, CONVERSATIONAL_RAG_PROMPT ~1889 tokens) — confirmed live: a real
+# user's "explain point 4 with an example" follow-up in an active session
+# with real accumulated history hit the model's 4096-token ceiling and
+# crashed with "internal error", because the budget calculation thought
+# it only needed to reserve 700 tokens for the template it was about to
+# use and left too much room for history + context. Computed here from
+# the actual prompt strings (not hardcoded) so this can't silently go
+# stale again the next time any of the three templates changes size.
+_STRICT_PROMPT_TOKENS_EST = len(STRICT_GROUNDED_PROMPT) // 4
+_DETAILED_PROMPT_TOKENS_EST = len(DETAILED_GROUNDED_PROMPT) // 4
+_CONVERSATIONAL_PROMPT_TOKENS_EST = len(CONVERSATIONAL_RAG_PROMPT) // 4
+
 class MultiSourceRAG:
     def __init__(self):
         self.doc_pipeline = RAGPipeline()
@@ -4022,9 +4039,41 @@ class MultiSourceRAG:
         # context window (~4096 tokens for Qwen2.5-7B; use 3900 as safe ceiling).
         # 4 chars ≈ 1 token (Qwen SentencePiece approximation).
         _MAX_INPUT_TOKENS = 3900
-        _PROMPT_TEMPLATE_TOKENS = 700       # boilerplate across all prompt templates
+        # Picks the estimate for whichever prompt template this request will
+        # actually use (same document_filter/detailed branching as the
+        # prompt-selection block further down) — was a single flat 700-token
+        # guess for all three, which drifted badly out of date and caused a
+        # real production crash; see the constants' definition near the
+        # prompt_template import for the full story.
+        if document_filter:
+            _PROMPT_TEMPLATE_TOKENS = _STRICT_PROMPT_TOKENS_EST
+        elif detailed:
+            _PROMPT_TEMPLATE_TOKENS = _DETAILED_PROMPT_TOKENS_EST
+        else:
+            _PROMPT_TEMPLATE_TOKENS = _CONVERSATIONAL_PROMPT_TOKENS_EST
         _output_reserve = 1500 if detailed else 300
         _history_tokens_est = len(history) // 4 if history else 0
+
+        # If template + history + output_reserve alone already leave no
+        # room even for the 300-token context floor below, the floor stops
+        # context from shrinking further but does NOT stop the total from
+        # exceeding the model's window — confirmed live: this is exactly
+        # what crashed a real, long-running user conversation (session
+        # continued well past a few turns) with an "internal error" on a
+        # point-reference follow-up. Truncate history from the OLDEST
+        # turns (keep the most recent ones — history is used for context on
+        # follow-ups, and the most recent turns matter most for that) until
+        # there's guaranteed room, rather than trusting the floor alone.
+        _min_reserve_without_history = _PROMPT_TEMPLATE_TOKENS + 300 + _output_reserve
+        _max_history_tokens = max(0, _MAX_INPUT_TOKENS - _min_reserve_without_history)
+        _max_history_chars = _max_history_tokens * 4
+        if history and len(history) > _max_history_chars:
+            history = history[-_max_history_chars:]
+            _first_newline = history.find("\n")
+            if _first_newline != -1:
+                history = history[_first_newline + 1:]
+            _history_tokens_est = len(history) // 4
+
         _context_token_budget = max(
             300,  # always keep at least a bit of context
             _MAX_INPUT_TOKENS - _PROMPT_TEMPLATE_TOKENS - _history_tokens_est - _output_reserve,
