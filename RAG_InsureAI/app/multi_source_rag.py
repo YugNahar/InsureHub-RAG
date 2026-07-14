@@ -5194,11 +5194,29 @@ class MultiSourceRAG:
         if _keyword_detailed:
             try:
                 import re as _re4
+                # "fidelity insurance" itself added after a confirmed live
+                # miss: "Explain burglary insurance in detail" pulled a
+                # "Lesson Round Up" chapter-summary chunk (already partly
+                # handled by _CHAPTER_REVIEW_RE below, which only
+                # deprioritizes such chunks rather than excluding them) and
+                # reproduced its fidelity-insurance bullet verbatim as a
+                # numbered point about burglary insurance: "Fidelity
+                # insurance protects organizations from loss of money,
+                # securities, or inventory resulting from crime." That exact
+                # sentence doesn't contain "employee dishonesty" or
+                # "embezzlement" — those appear in the chunk's NEXT sentence,
+                # which the model didn't reproduce — so the existing terms
+                # missed it even though "fidelity" was already a tracked
+                # type. The type name itself is the one giveaway phrase that
+                # will always be present regardless of which specific
+                # sentence from a fidelity-insurance chunk gets echoed,
+                # matching how "marine insurance" is already used for the
+                # marine case above.
                 _TYPE_GIVEAWAY_TERMS = {
                     "marine": ("marine insurance", "marine cargo", "icc (a)", "icc (b)", "institute cargo clause", "bill of lading", "voyage policy", "hull insurance"),
                     "health": ("domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"),
                     "crop": ("agriculturist", "crop failure", "sowing/planting", "loanee"),
-                    "fidelity": ("employee dishonesty", "embezzlement"),
+                    "fidelity": ("fidelity insurance", "employee dishonesty", "embezzlement"),
                     "transit": ("import covers by sea", "inland transit clause"),
                 }
                 _query_lower = retrieval_query.lower()
