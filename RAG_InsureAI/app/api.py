@@ -874,7 +874,7 @@ class URLRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 # MultiSourceRAG, VideoStore, WebpageStore
 # ══════════════════════════════════════════════════════════════════════════════
-from multi_source_rag import MultiSourceRAG
+from multi_source_rag import MultiSourceRAG, _reset_dynamic_anchor_cache
 from document_loader import (
     ALLOWED_EXTENSIONS,
     FileValidationError,
@@ -1792,6 +1792,10 @@ async def clear_kv_cache(_: str = Depends(require_auth)):
     if cache is None:
         raise HTTPException(status_code=503, detail="Cache not available.")
     await asyncio.to_thread(cache.clear)
+    # Also re-scan the KB for insurance-type anchors (see
+    # _get_dynamic_anchor_pattern) so newly-added/removed documents' topic
+    # types are picked up without needing a full container restart.
+    _reset_dynamic_anchor_cache()
     return {"status": "cleared"}
 
 

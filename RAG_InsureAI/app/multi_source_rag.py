@@ -1197,15 +1197,158 @@ _ANCHOR_TYPE_RE = re.compile(
     r"critical\s*illness|"
     r"group|corporate|micro|"
     r"personal\s*accident|disability|workmen.?s?\s*compensation|"
-    r"employer.?s?\s*liability|fidelity(\s*guarantee)?|"
+    r"employer.?s?\s*liability|fidelity(?:\s*guarantee)?|"
     r"engineering|business\s*interruption|"
     r"retirement|pension|annuity|takaful|"
     r"crop|agricultur\w*)\b(\s+insurance)?",
     re.IGNORECASE,
 )
 
+# The hardcoded list above will keep having this exact gap for every future
+# insurance type a new KB document introduces — it was already missed once
+# for 9 real, well-represented types before anyone noticed. Rather than
+# relying solely on a human to notice and patch the list again next time,
+# derive additional candidate types directly from the KB's own document
+# text at runtime, so a newly-added document's type is picked up
+# automatically without a code change. This is intentionally additive
+# (union with the hardcoded list, never a replacement) — the hardcoded list
+# is a reliable floor; the mined list only ever adds coverage on top of it,
+# so a bad or missing mined term can't remove something that used to work.
+_STOPWORD_TAIL_RE = re.compile(
+    r"^(the|a|an|in|on|at|for|to|and|or|with|by|from|as|is|are|was|were|"
+    r"this|that|these|those|notes?|project|safe|duty|double|effective|"
+    r"comprehensive|differentiation|construction|energy|other|all|each|"
+    r"such|said|above|below|certain|various|special|select|digital|"
+    r"modified|pure|floater|united|india|royal|london|globe|triton|"
+    r"oriental|indian|mercantile|national|public|sector|commercial|"
+    r"operational|variable|savings|regulations?|affecting|framework|"
+    r"governance|licensing|provisions|categor(?:y|ies)|role|history|"
+    r"report|period|preconditions|commencement|registration|"
+    r"certification|coverage|course|application|countering|fraud|agents|"
+    r"appointed|controller|fellow|wing)$"
+)
+_KB_TYPE_PHRASE_RE = re.compile(r"\b((?:[A-Z][a-z]+'?s?\s+){0,2}[A-Z][a-z]+)\s+Insurance\b")
+_MIN_KB_TYPE_FREQ = 3
 
-def _last_anchor_type_match(text: str) -> Optional[str]:
+def _discover_kb_anchor_types(vector_store) -> set:
+    """Mine specific insurance-type phrases directly from the KB's chunk
+    text, to extend _ANCHOR_TYPE_RE with types no one has hardcoded yet.
+
+    Looks for 1-3 capitalized words immediately before "Insurance" (e.g.
+    "Aviation Insurance", "Officers Liability Insurance") — requiring
+    capitalization is what keeps this clean without heavy NLP: genuine
+    product/type names are capitalized in this KB's prose, while stray
+    connector words ("the", "of the", "an") almost never are. What survives
+    that filter still needs two more passes to be usable as a topic anchor:
+    a small blocklist for document-structure/regulatory vocabulary and
+    insurer company names that happen to be capitalized too ("Oriental
+    Insurance", "United India Insurance" are companies, not types), and a
+    minimum-frequency bar to drop one-off mentions. A last pass drops any
+    bare single word that's just a fragment of an already-accepted
+    multi-word phrase (e.g. bare "linked" once "unit linked" is present) —
+    single words carry the most false-positive risk since they're most
+    likely to also be ordinary English words.
+    """
+    counts: dict = {}
+    try:
+        docs = vector_store.get_all_by_filter({})
+    except Exception:
+        logger.debug("[_discover_kb_anchor_types] KB scan failed, using hardcoded list only", exc_info=True)
+        return set()
+    for doc in docs:
+        text = getattr(doc, "page_content", "") or ""
+        for m in _KB_TYPE_PHRASE_RE.finditer(text):
+            phrase = m.group(1).strip().lower()
+            if len(phrase) < 3:
+                continue
+            if any(_STOPWORD_TAIL_RE.match(w) for w in phrase.split()):
+                continue
+            counts[phrase] = counts.get(phrase, 0) + 1
+    clean = {p for p, c in counts.items() if c >= _MIN_KB_TYPE_FREQ}
+    multiword = {p for p in clean if " " in p}
+    final = set()
+    for p in clean:
+        if " " not in p and any(p in mw.split() for mw in multiword):
+            continue
+        final.add(p)
+    return final
+
+
+_dynamic_anchor_pattern_cache: Optional[re.Pattern] = None
+
+def _get_dynamic_anchor_pattern(vector_store) -> re.Pattern:
+    """_ANCHOR_TYPE_RE extended with types mined live from the KB, computed
+    once per process and cached — the KB doesn't change size often enough
+    to justify re-scanning every request. Call _reset_dynamic_anchor_cache()
+    after adding new documents to pick up their types without a restart.
+    Falls back to the bare hardcoded pattern on any failure so a KB-scan
+    problem degrades to the old (safe, previously-shipped) behavior rather
+    than breaking reformulation entirely.
+    """
+    global _dynamic_anchor_pattern_cache
+    if _dynamic_anchor_pattern_cache is not None:
+        return _dynamic_anchor_pattern_cache
+    try:
+        discovered = _discover_kb_anchor_types(vector_store)
+        new_terms = sorted(discovered - _hardcoded_anchor_terms())
+        if new_terms:
+            logger.info("[_get_dynamic_anchor_pattern] mined %d new anchor type(s) from KB: %r", len(new_terms), new_terms)
+        if new_terms:
+            extra = "|".join(re.escape(t) for t in new_terms)
+            pattern = re.compile(
+                _ANCHOR_TYPE_RE.pattern.replace(r")\b(\s+insurance)?", f"|{extra})\\b(\\s+insurance)?"),
+                re.IGNORECASE,
+            )
+        else:
+            pattern = _ANCHOR_TYPE_RE
+        _dynamic_anchor_pattern_cache = pattern
+        return pattern
+    except Exception:
+        logger.debug("[_get_dynamic_anchor_pattern] falling back to hardcoded pattern", exc_info=True)
+        return _ANCHOR_TYPE_RE
+
+
+# Plain-text mirror of the alternatives inside _ANCHOR_TYPE_RE, used only to
+# avoid logging an already-hardcoded term as "newly discovered" from the KB.
+# Kept as an explicit set rather than reverse-parsed from the compiled
+# pattern's regex source — an earlier version tried stripping backslashes
+# out of the pattern string directly, which mangled `\s*`-joined terms
+# ("personal\s*accident" -> "personalsaccident" instead of "personal
+# accident") and made genuinely-already-hardcoded terms look new in the
+# discovery log. This set going stale (someone edits _ANCHOR_TYPE_RE
+# without updating it) only costs a cosmetic duplicate log line, never
+# breaks matching — the dynamic pattern still unions in the "duplicate"
+# term harmlessly.
+_HARDCODED_ANCHOR_TERMS = {
+    "term", "motor", "car", "vehicle", "auto", "bike", "two wheeler", "four wheeler",
+    "life", "whole life", "endowment", "ulip", "unit linked",
+    "health", "medical",
+    "travel", "trip", "aviation",
+    "home", "house", "property", "householder",
+    "marine", "cargo", "fire", "burglary",
+    "liability", "third party", "public liability",
+    "critical illness",
+    "group", "corporate", "micro",
+    "personal accident", "disability", "workmens compensation",
+    "employers liability", "fidelity", "fidelity guarantee",
+    "engineering", "business interruption",
+    "retirement", "pension", "annuity", "takaful",
+    "crop", "agriculture",
+}
+
+def _hardcoded_anchor_terms() -> set:
+    return _HARDCODED_ANCHOR_TERMS
+
+
+def _reset_dynamic_anchor_cache() -> None:
+    """Force the next _get_dynamic_anchor_pattern() call to re-scan the KB —
+    call this after documents are added/removed so new types are picked up
+    without a container restart."""
+    global _dynamic_anchor_pattern_cache
+    _dynamic_anchor_pattern_cache = None
+
+
+def _last_anchor_type_match(text: str, pattern: re.Pattern = _ANCHOR_TYPE_RE) -> Optional[str]:
     """Last (most recent) specific-insurance-type phrase mentioned in *text*,
     or None.
 
@@ -1240,14 +1383,14 @@ def _last_anchor_type_match(text: str) -> Optional[str]:
     """
     user_turns = re.findall(r"User:\s*(.*?)(?=\n(?:User|Assistant):|\Z)", text, re.DOTALL)
     if user_turns:
-        user_matches = list(_ANCHOR_TYPE_RE.finditer(user_turns[-1]))
+        user_matches = list(pattern.finditer(user_turns[-1]))
         if user_matches:
             phrase = user_matches[-1].group(0).strip()
             if not re.search(r"insurance\s*$", phrase, re.IGNORECASE):
                 phrase = f"{phrase} insurance"
             return phrase
 
-    matches = list(_ANCHOR_TYPE_RE.finditer(text))
+    matches = list(pattern.finditer(text))
     if not matches:
         return None
     base_counts: dict = {}
@@ -1380,7 +1523,7 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     return sorted(chunks, key=_rank)
 
 
-async def _reformulate_query(question: str, history: str) -> Optional[str]:
+async def _reformulate_query(question: str, history: str, anchor_pattern: re.Pattern = _ANCHOR_TYPE_RE) -> Optional[str]:
     """Rewrite a follow-up question as a standalone, natural-language question
     using conversation history — used both for retrieval and, for detected
     follow-ups, as the literal question text shown to the generation prompt.
@@ -1543,7 +1686,7 @@ Search query:"""
             for _ in range(3):  # rescan after each strip; bounded
                 _invented = next(
                     (
-                        _m for _m in _ANCHOR_TYPE_RE.finditer(reformulated)
+                        _m for _m in anchor_pattern.finditer(reformulated)
                         if _m.group(2)
                         and not re.search(
                             rf"\b{re.escape(_m.group(1))}\b", _known_topics, re.IGNORECASE
@@ -1575,11 +1718,11 @@ Search query:"""
                     reformulated, _invented.group(0), _stripped,
                 )
                 reformulated = _stripped
-            _hist_anchor = _last_anchor_type_match(recent)
+            _hist_anchor = _last_anchor_type_match(recent, pattern=anchor_pattern)
             if (
                 _hist_anchor
-                and not _ANCHOR_TYPE_RE.search(question)
-                and not _ANCHOR_TYPE_RE.search(reformulated)
+                and not anchor_pattern.search(question)
+                and not anchor_pattern.search(reformulated)
             ):
                 logger.info(
                     "[REFORM] topic-anchor repair: %r missing %r from history — appending",
@@ -3457,7 +3600,8 @@ class MultiSourceRAG:
         )
         _is_followup = False
         if _detected_as_followup:
-            _reformulated = await _reformulate_query(question, history)
+            _anchor_pattern = _get_dynamic_anchor_pattern(self.doc_pipeline.vector_store)
+            _reformulated = await _reformulate_query(question, history, anchor_pattern=_anchor_pattern)
             if _reformulated is None:
                 # Genuine failure (backend call errored/timed out, or returned
                 # degenerate output) — distinct from the model correctly
