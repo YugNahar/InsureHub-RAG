@@ -5489,21 +5489,135 @@ class MultiSourceRAG:
         # which a reader could mistake for an actual policy limit or
         # typical claim size rather than an arbitrary placeholder.
         #
-        # Scoped to currency figures specifically (₹/$/Rs/INR + digits) —
+        # Scoped to currency figures specifically (₹/$/Rs/INR/EUR + digits) —
         # deliberately NOT percentages or day/year counts, since those
         # routinely appear in this KB written out as words ("within
         # fourteen days") rather than digits, and a naive digit-only check
         # would have no way to confirm a word-form figure is grounded,
         # risking false-positive drops of genuinely correct content.
+        # "EUR" added alongside "€" — found live via the qualifier-mismatch
+        # investigation below that this KB's Travel Insurance Guide writes
+        # amounts as both "€100" and "EUR 100" (2 occurrences of the text
+        # form), and the text form wasn't recognized at all before this,
+        # silently exempting those figures from every check in this block.
         try:
             import re as _re5
-            _CURRENCY_RE = _re5.compile(r'(?:[₹$£€]|\bRs\.?\b|\bINR\b)\s?([\d,]+(?:\.\d+)?)', _re5.IGNORECASE)
+            _CURRENCY_RE = _re5.compile(r'(?:[₹$£€]|\bRs\.?\b|\bINR\b|\bEUR\b)\s?([\d,]+(?:\.\d+)?)', _re5.IGNORECASE)
             _num_src = (_corrected_text or _reply_stripped).strip()
             _ctx_digits = _re5.sub(r'\D', '', full_context or '')
 
             def _currency_grounded(num_str: str) -> bool:
                 digits = num_str.replace(',', '').split('.')[0]
                 return bool(digits) and digits in _ctx_digits
+
+            # A figure passing the digit-presence check above is grounded in
+            # the sense that it appears SOMEWHERE in the retrieved text, but
+            # says nothing about whether it's the RIGHT figure for what was
+            # asked. Confirmed live: "how much would they pay if my luggage
+            # gets lost" got answered with "up to EUR 100... when required
+            # due to bedbugs" — a real, in-context figure, but scoped to an
+            # unrelated narrow clause (luggage CLEANING after a bedbug
+            # infestation) sitting in the same KB paragraph as two other
+            # distinct compensation clauses (delayed luggage: €80/day up to
+            # €320; general lost/damaged property: value-based, no fixed
+            # cap) — the model picked the wrong one. Confirmed this isn't a
+            # one-off: the KB has at least 3 other currency figures scoped
+            # to an explicit narrow "due to X"/"in case of X" condition (a
+            # dental-specific $225 cap, an illness-triggered €5,000 cap),
+            # each a candidate for the identical misattribution against a
+            # differently-phrased question.
+            #
+            # First attempt at this only checked whether the REPLY's own
+            # sentence spelled out a "due to X"/"in case of X" qualifier —
+            # too narrow. Confirmed live across repeated retries of the
+            # exact same lost-luggage question: the model doesn't reliably
+            # repeat the source's own qualifying phrase in its paraphrase.
+            # "the insurance will pay up to EUR 100... to cover the cost of
+            # necessities" (no "bedbugs" mentioned anywhere in that reply
+            # sentence) is just as wrong as the version that DOES say "due
+            # to bedbugs" — the reply-text-only check missed it entirely,
+            # keeping the fabricated-sounding "necessities" framing paired
+            # with the wrong figure.
+            #
+            # Checks the SOURCE text directly instead of the reply's own
+            # phrasing: for each currency figure the reply cites, find that
+            # exact figure in full_context, take the 2-sentence window
+            # ending at its own sentence (its own sentence plus the one
+            # immediately before — this KB's benefit clauses routinely put
+            # the trigger condition in the sentence before the amount,
+            # e.g. "...if luggage is delayed by more than six hours.
+            # Compensation of EUR 80/day is paid... up to EUR 320."), and
+            # extract any CLAIM-SCENARIO trigger words found there (lost,
+            # delayed, bedbugs, dental, etc. — a closed, project-specific
+            # list, not general vocabulary). If that source window names a
+            # specific trigger and none of it matches anything in the
+            # user's own question, the figure is scoped to a condition the
+            # user didn't ask about. A window with NO trigger words at all
+            # (a general, unscoped statement) is left alone — this only
+            # fires when the source itself signals a narrow condition.
+            # Scoped to whichever figure occurrence in context looks most
+            # compatible (a number can legitimately appear more than once
+            # for different clauses) — only drops when EVERY occurrence of
+            # that figure is scoped to something the question didn't ask.
+            _TRIGGER_WORDS = frozenset({
+                'lost', 'lose', 'losing', 'stolen', 'steal', 'theft', 'damaged',
+                'damage', 'delayed', 'delay', 'cancelled', 'cancel', 'cancellation',
+                'interrupted', 'interrupt', 'interruption', 'bedbug', 'bedbugs',
+                'infest', 'infested', 'missed', 'miss', 'injury', 'injured',
+                'illness', 'ill', 'hospitalization', 'hospitalized', 'death',
+                'deceased', 'accident', 'breakdown', 'cleaning', 'clean', 'repair',
+                'replace', 'replacement', 'evacuation', 'evacuated', 'quarantine',
+                'epidemic', 'disaster', 'terrorism', 'conflict', 'snowfall',
+                'weather', 'dental', 'crisis',
+            })
+
+            def _extract_triggers(text: str) -> set:
+                words = _re5.findall(r'\b[a-z]+\b', (text or '').lower())
+                found = set()
+                for w in words:
+                    stem = w[:-1] if w.endswith('s') and len(w) > 4 else w
+                    if w in _TRIGGER_WORDS:
+                        found.add(w)
+                    elif stem in _TRIGGER_WORDS:
+                        found.add(stem)
+                return found
+
+            def _source_window(ctx: str, start: int, end: int) -> str:
+                right = ctx.find('.', end)
+                right2 = ctx.find('\n', end)
+                _candidates = [r for r in (right, right2) if r != -1]
+                right = min(_candidates) if _candidates else len(ctx)
+                cur_left = max(ctx.rfind('.', 0, start), ctx.rfind('\n', 0, start))
+                prev_left = max(ctx.rfind('.', 0, cur_left), ctx.rfind('\n', 0, cur_left))
+                return ctx[prev_left + 1:right + 1]
+
+            _question_triggers = _extract_triggers(question or '')
+
+            def _qualifier_mismatched(unit: str) -> bool:
+                if not _question_triggers:
+                    return False
+                _figs = _CURRENCY_RE.findall(unit)
+                if not _figs:
+                    return False
+                for _fig in _figs:
+                    _digits = _fig.replace(',', '').split('.')[0]
+                    if not _digits:
+                        continue
+                    _fig_re = _re5.compile(
+                        r'(?:[₹$£€]|\bRs\.?\b|\bINR\b|\bEUR\b)\s?' + _re5.escape(_digits) + r'\b',
+                        _re5.IGNORECASE,
+                    )
+                    _any_occurrence = False
+                    _any_compatible = False
+                    for _m in _fig_re.finditer(full_context or ''):
+                        _any_occurrence = True
+                        _window_triggers = _extract_triggers(_source_window(full_context, _m.start(), _m.end()))
+                        if not _window_triggers or (_window_triggers & _question_triggers):
+                            _any_compatible = True
+                            break
+                    if _any_occurrence and not _any_compatible:
+                        return True
+                return False
 
             # Detailed-mode numbered lists are split on the newline before
             # each marker (preserving list structure on rejoin); everything
@@ -5518,7 +5632,7 @@ class MultiSourceRAG:
             _kept_units, _dropped_num = [], 0
             for _unit in _units:
                 _found = _CURRENCY_RE.findall(_unit)
-                if _found and not any(_currency_grounded(f) for f in _found):
+                if _found and (not any(_currency_grounded(f) for f in _found) or _qualifier_mismatched(_unit)):
                     _dropped_num += 1
                     continue
                 _kept_units.append(_unit)
@@ -5537,14 +5651,52 @@ class MultiSourceRAG:
                     _rebuilt5 = "\n".join(_renumbered5).strip()
                 else:
                     _rebuilt5 = " ".join(_kept_units).strip()
-                    if _rebuilt5 and _rebuilt5[-1] not in ".!?":
-                        _rebuilt5 += "."
+                    # Checking the literal last character breaks when the
+                    # kept text ends in an emoji sign-off ("...details! 😊")
+                    # — the emoji, not "!", is _rebuilt5[-1], so this always
+                    # added a redundant period after it ("...details! 😊.").
+                    # Strip trailing emoji/whitespace first so the check
+                    # looks at the actual last word character.
+                    _trailing_m = _re5.search(r'([\s\U0001F300-\U0001FAFF☀-➿]+)$', _rebuilt5)
+                    _trailing_suffix = _trailing_m.group(1) if _trailing_m else ''
+                    _core = _rebuilt5[:len(_rebuilt5) - len(_trailing_suffix)] if _trailing_suffix else _rebuilt5
+                    if _core and _core[-1] not in ".!?":
+                        _rebuilt5 = _core + "." + _trailing_suffix
                 _corrected_text = _rebuilt5
                 _kv_reply = _rebuilt5
                 logger.info(
                     "[ask_stream] dropped %d unit(s) containing an ungrounded currency figure",
                     _dropped_num,
                 )
+                # Dropping the FIRST unit often means dropping the sentence
+                # that carried the warm lead-in the earlier fallback already
+                # added or confirmed was present — confirmed live: dropping
+                # a mismatched "So, ... EUR 100 ... due to bedbugs." opener
+                # left the reply starting mid-thought with "For other types
+                # of loss or damage...", no lead-in at all. Re-run the same
+                # check now that the text has changed shape, rather than
+                # duplicating the full lead-in-fallback block — this only
+                # fires when a drop actually happened, not on every reply.
+                if not _keyword_detailed:
+                    _rl_src = _corrected_text.strip()
+                    _rl_natural_starts = (
+                        "hmm,", "i'm only set up", "that's a bit outside",
+                        "i'm sorry", "no problem!", "sure thing! connecting",
+                    )
+                    _rl_lead_re = _re5.compile(
+                        r'^(so|good question|sure thing|right|ah)[,.!]', _re5.IGNORECASE,
+                    )
+                    if _rl_src and not any(_rl_src.lower().startswith(p) for p in _rl_natural_starts) and not _rl_lead_re.match(_rl_src):
+                        _rl_candidates = ("So,", "Good question,", "Right,", "Sure thing,")
+                        _rl_window = _rl_src[:200].lower()
+                        _rl_chosen = _rl_candidates[0]
+                        for _rl_cand in _rl_candidates:
+                            _rl_word = _rl_cand.rstrip(",").lower()
+                            if not _re5.search(r'\b' + _re5.escape(_rl_word) + r'\b,', _rl_window):
+                                _rl_chosen = _rl_cand
+                                break
+                        _corrected_text = f"{_rl_chosen} {_rl_src}"
+                        _kv_reply = _corrected_text
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
@@ -5592,7 +5744,16 @@ class MultiSourceRAG:
                 ).strip()
                 _word_count = len(_hollow_re.findall(r'\w+', _content_only))
                 _has_domain_word = any(term in _content_only.lower() for term in _INSURANCE_VOCAB)
-                if _content_only and _word_count < 12 and not _has_domain_word:
+                # Gate on the ORIGINAL text being non-empty, not on content
+                # surviving the lead-in/sign-off strip — confirmed live: a
+                # reply that was NOTHING but lead-in + sign-off ("So, Let me
+                # know if you want more details! 😊", every other unit
+                # dropped upstream by the currency-mismatch filter) strips
+                # down to an empty _content_only, and "empty and < 12 words
+                # and no domain word" is the MOST hollow case there is —
+                # but gating on `_content_only` being truthy first meant
+                # this exact case short-circuited past the check entirely.
+                if _hollow_src and _word_count < 12 and not _has_domain_word:
                     _refusal_text = (
                         "Hmm, I don't have that specific information in my knowledge base right now. "
                         "Let me get one of our agents on it, they'll be able to help you better! 😊"
