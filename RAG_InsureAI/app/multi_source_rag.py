@@ -1168,17 +1168,37 @@ def _is_conversational_reaction(question: str) -> bool:
 # Specific insurance-type nouns, used only to deterministically re-anchor a
 # reformulated follow-up whose LLM rewrite silently dropped the topic — see
 # the repair step inside _reformulate_query for why this exists.
+#
+# This list is fixed-phrase and therefore fragile by construction (same
+# class as _SIMPLE_SIGNALS/_DETAIL_SIGNALS — see the fragile-signal-lists
+# note elsewhere in this file): any KB topic missing from it is invisible to
+# both the "does the question already name a type" check AND the "what type
+# did history establish" check below. Confirmed live: "actually never mind
+# that, what does aviation insurance cover" (a self-contained, explicitly
+# topic-switched question) failed BOTH checks because "aviation" wasn't
+# here, so the repair below wrongly force-appended "medical insurance" left
+# over from the prior turn — corrupting retrieval into pulling travel-
+# insurance chunks and answering with travel-insurance content (medical
+# evacuation, air ambulance) under the "aviation insurance" heading. Cross-
+# checked the KB's actual document text for other real, well-represented
+# (7+ chunk) types missing here — aviation, burglary, workmen's
+# compensation, fidelity guarantee, engineering, business interruption,
+# micro-insurance, and unit-linked all had solid, dedicated content and
+# were missing; added all of them rather than just the one that happened to
+# get hit, per the standing instruction to fix the whole bug class.
 _ANCHOR_TYPE_RE = re.compile(
     r"\b(term|motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
-    r"life|whole\s*life|endowment|ulip|"
+    r"life|whole\s*life|endowment|ulip|unit.linked|"
     r"health|medical|"
-    r"travel|trip|"
-    r"home|house|property|"
-    r"marine|cargo|fire|"
-    r"liability|third.party|"
+    r"travel|trip|aviation|"
+    r"home|house|property|householder|"
+    r"marine|cargo|fire|burglary|"
+    r"liability|third.party|public\s*liability|"
     r"critical\s*illness|"
-    r"group|corporate|"
-    r"personal\s*accident|disability|"
+    r"group|corporate|micro|"
+    r"personal\s*accident|disability|workmen.?s?\s*compensation|"
+    r"employer.?s?\s*liability|fidelity(\s*guarantee)?|"
+    r"engineering|business\s*interruption|"
     r"retirement|pension|annuity|takaful|"
     r"crop|agricultur\w*)\b(\s+insurance)?",
     re.IGNORECASE,
@@ -5028,8 +5048,22 @@ class MultiSourceRAG:
                 # offers...". Insert the missing period before that happens.
                 # Skip when the line already ends in ".!?:" — a colon
                 # (introducing the list) or real terminal punctuation needs
-                # no extra period.
-                _list_src = _delist_re.sub(r'(?<=[^.!?:\s])\n\s*\n', '.\n\n', _list_src)
+                # no extra period. Only run this when the reply actually
+                # contains a numbered/bulleted marker — confirmed live this
+                # was firing unconditionally on ANY paragraph break in the
+                # text, not just ones adjacent to a list. "Sure thing,\n\nHome
+                # insurance is a type of..." (the model's own natural lead-in
+                # followed by a blank line before its main content, no list
+                # anywhere in the reply) got a period wrongly inserted right
+                # after the lead-in's comma, producing "Sure thing,. Home
+                # insurance..." once newlines collapsed. Gate on the same
+                # marker shape _MARKER_RE looks for below so this repair only
+                # touches replies that actually need delisting.
+                _has_list_marker = bool(
+                    _delist_re.search(r'(?:\A|\n)\s*(?:\d{1,2}\.\s+|[-*•]\s+)', _list_src)
+                )
+                if _has_list_marker:
+                    _list_src = _delist_re.sub(r'(?<=[^.!?:\s])\n\s*\n', '.\n\n', _list_src)
 
                 # Join each stripped marker with a space when the preceding
                 # text already ends in a sentence boundary (.!?) or a colon
