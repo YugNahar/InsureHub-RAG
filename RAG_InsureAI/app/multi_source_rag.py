@@ -5700,6 +5700,66 @@ class MultiSourceRAG:
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
+        # ── Third-party-victim contamination in first-party examples (brief) ──
+        # Confirmed live: "personal accident insurance" — a first-party-only
+        # type where the INSURED is always the one who suffers the loss,
+        # never the one who harms someone else — got a "give me an example"
+        # follow-up answered with a THIRD-PARTY-LIABILITY narrative instead:
+        # "imagine you're driving and accidentally hit a pedestrian... the
+        # pedestrian would be covered for medical expenses" — describing
+        # motor/liability insurance (the policy protects someone the INSURED
+        # harmed), the exact opposite of what personal accident insurance
+        # does. Reproduced on ~1 in 3 retries of the identical follow-up
+        # (nondeterministic, same as every other contamination case in this
+        # file). Doesn't name "third party liability" or "motor insurance"
+        # literally, so the existing _TYPE_GIVEAWAY_TERMS jargon-match filter
+        # above (detailed-mode only, matches type-NAME jargon) wouldn't catch
+        # it even if it ran in brief mode — the giveaway here is narrative
+        # structure, not vocabulary: the accident victim who gets
+        # compensated is someone OTHER than the insured/"you".
+        #
+        # Scoped to known first-party-only topics (the insured can only ever
+        # be the one who suffers the loss) so a genuine third-party-liability
+        # or motor-insurance answer, where this narrative is exactly correct,
+        # is never touched. A partial "example" that names the wrong
+        # beneficiary is actively misleading, not just incomplete, so this
+        # redirects straight to the standard refusal+escalation path rather
+        # than trying to salvage a fragment — mirrors the existing Rule4-
+        # discard/hollow-answer flags so it rides the same, already-proven
+        # escalation wiring in the final payload below.
+        _tpv_contamination_detected = False
+        _FIRST_PARTY_ONLY_RE = _re5.compile(
+            r'\bpersonal\s*accident\s*insurance\b|\bhealth\s*insurance\b|'
+            r'\blife\s*insurance\b|\bterm\s*insurance\b|\bwhole\s*life\b',
+            _re5.IGNORECASE,
+        )
+        if not _keyword_detailed and _FIRST_PARTY_ONLY_RE.search(retrieval_query or ''):
+            try:
+                _harm_re = _re5.compile(
+                    r'\b(?:hit|hits|hitting|injur\w+|struck?)\s+(?:a\s+)?'
+                    r'(pedestrian|another\s+(?:person|driver|vehicle)|third\s*part\w*|someone\s+else)\b',
+                    _re5.IGNORECASE,
+                )
+                _victim_benefit_re = _re5.compile(
+                    r'\b(pedestrian|they|the\s+other\s+(?:person|driver|party)|third\s*part\w*)\b'
+                    r'[^.!?]{0,80}\b(cover\w*|compensat\w*|reimburs\w*|paid|pay out|indemnif\w*)\b',
+                    _re5.IGNORECASE,
+                )
+                _tpv_src = (_corrected_text or _reply_stripped)
+                if _harm_re.search(_tpv_src) and _victim_benefit_re.search(_tpv_src):
+                    _refusal_text = (
+                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                    )
+                    _corrected_text = _refusal_text
+                    _kv_reply = _refusal_text
+                    _tpv_contamination_detected = True
+                    logger.info(
+                        "[ask_stream] third-party-victim contamination detected in first-party example — redirecting to refusal+escalation"
+                    )
+            except Exception as _tpv_exc:
+                logger.debug("[ask_stream] third-party-victim contamination check skipped: %s", _tpv_exc)
+
         # ── Hollow-answer detector (brief / conversational mode) ──────────────
         # Confirmed live: a genuinely substantive question ("my claim got
         # rejected and nobody's telling me why, what do I do") retrieved 8
@@ -5840,10 +5900,10 @@ class MultiSourceRAG:
         )
 
         _final_payload: dict = {
-            "sources": [] if (_rule4_discarded or _hollow_answer_detected) else unique_sources,
+            "sources": [] if (_rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected) else unique_sources,
             "done": True,
         }
-        if _rule4_discarded or _hollow_answer_detected:
+        if _rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
