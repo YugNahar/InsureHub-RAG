@@ -5080,6 +5080,54 @@ class MultiSourceRAG:
             except Exception as _delist_exc:
                 logger.debug("[ask_stream] numbered-list marker strip skipped: %s", _delist_exc)
 
+        # ── Warm lead-in fallback (brief / conversational mode) ───────────────
+        # FORMAT asks for a short warm lead-in ("So,", "Good question,"...)
+        # attached to the first sentence, but the model doesn't reliably add
+        # one — confirmed live: "What is public liability insurance?" came
+        # back as "Public Liability Insurance is a type of coverage..." with
+        # no lead-in, reading dry and textbook-like despite everything else
+        # (grounding, closing sign-off) being correct. Same lesson as every
+        # other formatting-compliance gap in this file: don't trust the
+        # prompt instruction alone. Skipped for the small set of known fixed
+        # refusal/decline/handoff messages, which already open naturally on
+        # their own and explicitly should NOT get an extra lead-in per
+        # FORMAT's own carve-out for them.
+        if not _keyword_detailed:
+            try:
+                import re as _lead_re
+                _lead_src = (_corrected_text or _reply_stripped).strip()
+                _KNOWN_NATURAL_STARTS = (
+                    "hmm,", "i'm only set up", "that's a bit outside",
+                    "i'm sorry", "no problem!", "sure thing! connecting",
+                )
+                _LEAD_IN_RE = _lead_re.compile(
+                    r'^(so,|good question,|sure thing,|right,|ah,)', _lead_re.IGNORECASE,
+                )
+                # Ordered by preference; skip a candidate if its own word
+                # already appears as a natural mid-sentence transition near
+                # the start of the model's own text (confirmed live: forcing
+                # "So," in front of a reply whose 2nd sentence already opens
+                # with "So, if someone gets injured..." produced an awkward
+                # back-to-back "So, ... So, ..." — pick a non-colliding
+                # lead-in instead of always defaulting to the first one).
+                _LEAD_IN_CANDIDATES = ("So,", "Good question,", "Right,", "Sure thing,")
+                if _lead_src:
+                    _lead_lower = _lead_src.lower()
+                    _has_natural_start = any(_lead_lower.startswith(p) for p in _KNOWN_NATURAL_STARTS)
+                    if not _has_natural_start and not _LEAD_IN_RE.match(_lead_src):
+                        _check_window = _lead_src[:200].lower()
+                        _chosen_lead = _LEAD_IN_CANDIDATES[0]
+                        for _cand in _LEAD_IN_CANDIDATES:
+                            _cand_word = _cand.rstrip(",").lower()
+                            if not _lead_re.search(r'\b' + _lead_re.escape(_cand_word) + r'\b,', _check_window):
+                                _chosen_lead = _cand
+                                break
+                        _with_lead = f"{_chosen_lead} {_lead_src}"
+                        _corrected_text = _with_lead
+                        _kv_reply = _with_lead
+            except Exception as _lead_exc:
+                logger.debug("[ask_stream] warm lead-in fallback skipped: %s", _lead_exc)
+
         # ── Hard sentence cap (brief / conversational mode) ──────────────────
         # Conversational prompts instruct the model to write 3 sentences max.
         # This enforcer guarantees it regardless of model compliance.
