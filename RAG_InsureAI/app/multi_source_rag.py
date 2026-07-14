@@ -2102,11 +2102,18 @@ def _strip_model_preamble(text: str) -> str:
 
 _RULE4_MARKER_RE = re.compile(r"i don.t have that specific", re.IGNORECASE)
 
-# Matches the filler-word usage of "honest," (comma right after, functioning
-# as a sentence-starting interjection) — not a legitimate adjective use like
-# "an honest answer". See the ask_stream call site for why this is fixed
-# deterministically instead of relying on the prompt instruction alone.
-_HONEST_FILLER_RE = re.compile(r"\b([Hh])onest,")
+# Matches the filler-word usage of "honest,"/"honestly," (comma right after,
+# functioning as a sentence-starting interjection) — not a legitimate
+# adjective use like "an honest answer". The prompt now bans this word
+# outright, but see the ask_stream call site for why that alone isn't
+# trusted: this filler was already a known compliance gap when the prompt
+# only asked for the full "honestly," spelling (the model unreliably
+# shortened it to "honest,"), so banning the word entirely needs the same
+# deterministic backstop, not just the new instruction. Only matches at a
+# sentence boundary (start of string, after ./!/?  + space, or after a
+# newline) so it strips the discourse-marker usage and capitalizes what
+# follows, without touching "an honest answer" mid-sentence.
+_HONESTLY_FILLER_RE = re.compile(r"(?:^|(?<=[.!?]\s)|(?<=\n))[Hh]onest(?:ly)?,\s*(\w)")
 
 # The frontend renders assistant messages as plain text (no markdown
 # parser) — confirmed live: the model sometimes writes "**Legal
@@ -2138,8 +2145,8 @@ _NON_LATIN_SCRIPT_RE = re.compile(
 
 
 def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str]:
-    """Handle the LLM appending the canned Rule 4 fallback ("Honestly/Honest,
-    I don't have that specific info...") after already writing something, or
+    """Handle the LLM appending the canned Rule 4 fallback ("Hmm, I don't
+    have that specific info...") after already writing something, or
     putting the refusal marker FIRST and real content AFTER it.
 
     Returns:
@@ -4398,16 +4405,16 @@ class MultiSourceRAG:
         _reply_stripped = (_kv_reply or "").rstrip()
         _corrected_text = None
 
-        # The prompt explicitly says the filler word "honestly" must NEVER be
-        # shortened to "honest," — the model doesn't reliably follow that
-        # (confirmed live, same call, non-deterministic: "Honestly, it's..."
-        # on one run, "Honest, it's..." on the next, identical question and
-        # context). Same lesson as the Rule4/truncation fixes right below:
-        # don't trust a prompt instruction the model won't consistently
-        # honor — enforce it deterministically instead. Only matches the
-        # filler-word usage (comma immediately after "honest"), not a
-        # legitimate adjective use ("an honest answer").
-        _honest_fixed = _HONEST_FILLER_RE.sub(lambda m: f"{m.group(1)}onestly,", _reply_stripped)
+        # The prompt bans the filler word "honestly"/"honest," outright, but
+        # the model doesn't reliably follow that (confirmed live, same call,
+        # non-deterministic: "Honestly, it's..." on one run, "Honest, it's..."
+        # on the next, identical question and context — this was already a
+        # known compliance gap before the word was banned entirely). Same
+        # lesson as the Rule4/truncation fixes right below: don't trust a
+        # prompt instruction the model won't consistently honor — enforce it
+        # deterministically instead. Strips the filler and capitalizes the
+        # word that follows so the sentence still reads naturally.
+        _honest_fixed = _HONESTLY_FILLER_RE.sub(lambda m: m.group(1).upper(), _reply_stripped)
         if _honest_fixed != _reply_stripped:
             _reply_stripped = _honest_fixed
             _kv_reply = _honest_fixed
