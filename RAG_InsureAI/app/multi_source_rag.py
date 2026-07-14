@@ -1744,14 +1744,35 @@ Search query:"""
             # append repair so that when history DOES name a real type, a
             # stripped wrong-type rewrite can still be re-anchored to it.
             _known_topics = f"{question}\n{recent}"
+            # Hyphen/space forms are treated as interchangeable when checking
+            # whether a type is "already known" — confirmed live: the raw
+            # follow-up said "third party insurance" (space), the LLM's own
+            # rewrite correctly wrote "third-party insurance" (hyphen), and
+            # a literal-text comparison between the two treated the hyphen
+            # form as a brand-new invented type never seen anywhere,
+            # stripping "third-party insurance" out of an otherwise-correct
+            # rewrite — "How is liability insurance different from
+            # third-party insurance?" became the badly broken "How is
+            # liability insurance different from?", which then answered a
+            # completely different (and unasked) comparison against property
+            # insurance instead. Splitting the matched phrase into words and
+            # rejoining with a hyphen-or-space-tolerant separator fixes the
+            # comparison without weakening the check itself — it's still an
+            # exact word-sequence match, just insensitive to which of the
+            # two equally-common spellings either side happened to use.
+            def _flexible_known(phrase: str) -> bool:
+                _words = [w for w in re.split(r"[\s-]+", phrase) if w]
+                if not _words:
+                    return False
+                _pattern = r"[\s-]+".join(re.escape(w) for w in _words)
+                return bool(re.search(rf"\b{_pattern}\b", _known_topics, re.IGNORECASE))
+
             for _ in range(3):  # rescan after each strip; bounded
                 _invented = next(
                     (
                         _m for _m in anchor_pattern.finditer(reformulated)
                         if _m.group(2)
-                        and not re.search(
-                            rf"\b{re.escape(_m.group(1))}\b", _known_topics, re.IGNORECASE
-                        )
+                        and not _flexible_known(_m.group(1))
                     ),
                     None,
                 )
