@@ -1248,13 +1248,26 @@ def _discover_kb_anchor_types(vector_store) -> set:
     multi-word phrase (e.g. bare "linked" once "unit linked" is present) —
     single words carry the most false-positive risk since they're most
     likely to also be ordinary English words.
+
+    Also unions in every value of the KB's own `policy_type` chunk-metadata
+    field (e.g. "cyber", "marine") with NO filtering — confirmed live this
+    was a real gap the prose-mining alone missed: "cyber insurance" only
+    appears in 2 chunks in this KB, below the 3-chunk frequency bar, so it
+    silently failed the same topic-switch bug the rest of this mechanism
+    exists to prevent ("switching to cyber insurance" after a marine-
+    insurance turn got "marine insurance" wrongly re-appended). `policy_type`
+    is structured, curated data assigned at ingestion time, not prose
+    mined from free text, so it carries none of the false-positive risk
+    (company names, sentence fragments) the text-mining pass has to guard
+    against — safe to trust unconditionally, and it catches genuinely
+    under-represented types the frequency bar would otherwise miss.
     """
     counts: dict = {}
     try:
         docs = vector_store.get_all_by_filter({})
     except Exception:
         logger.debug("[_discover_kb_anchor_types] KB scan failed, using hardcoded list only", exc_info=True)
-        return set()
+        docs = []
     for doc in docs:
         text = getattr(doc, "page_content", "") or ""
         for m in _KB_TYPE_PHRASE_RE.finditer(text):
@@ -1271,6 +1284,14 @@ def _discover_kb_anchor_types(vector_store) -> set:
         if " " not in p and any(p in mw.split() for mw in multiword):
             continue
         final.add(p)
+
+    try:
+        for policy_type in vector_store.list_values("policy_type"):
+            if policy_type:
+                final.add(policy_type.strip().lower())
+    except Exception:
+        logger.debug("[_discover_kb_anchor_types] policy_type lookup failed", exc_info=True)
+
     return final
 
 
