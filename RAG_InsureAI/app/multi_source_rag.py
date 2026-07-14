@@ -2166,6 +2166,19 @@ _HONESTLY_FILLER_RE = re.compile(r"(?:^|(?<=[.!?]\s)|(?<=\n))[Hh]onest(?:ly)?,\s
 # unpaired "**".
 _MARKDOWN_BOLD_RE = re.compile(r"\*\*([^\n*]+?)\*\*")
 
+# Every live prompt explicitly bans the em dash (—), but the model doesn't
+# reliably follow that — same lesson as every other formatting-compliance
+# gap in this file (numbered lists, the "honestly" filler, markdown bold):
+# don't trust a prompt-only instruction, enforce it deterministically too.
+# Confirmed live: "wat is a deductable in helth insurnace" (a fresh, never-
+# tested typo-laden query) came back with "It's like setting a threshold —
+# you handle the cost..." despite the ban. Replaced with a comma rather
+# than a period — safer as a universal default since guessing "does this
+# em dash join two independent clauses" wrong would produce a sentence
+# split with broken capitalization; a comma splice reads fine in the
+# casual, conversational tone this bot already uses everywhere.
+_EM_DASH_RE = re.compile(r"\s*—\s*")
+
 # The vLLM backend (Qwen2.5-7B) occasionally code-switches into Chinese
 # mid-response even though the question and the rest of the answer are
 # English — confirmed live: "...plus any bonuses累积的。具体金额取决于
@@ -4515,6 +4528,14 @@ class MultiSourceRAG:
             _kv_reply = _unbolded
             _corrected_text = _unbolded
 
+        _no_emdash = _EM_DASH_RE.sub(", ", _reply_stripped)
+        _no_emdash = re.sub(r",\s*([.!?])", r"\1", _no_emdash)
+        _no_emdash = re.sub(r",\s*,", ",", _no_emdash)
+        if _no_emdash != _reply_stripped:
+            _reply_stripped = _no_emdash
+            _kv_reply = _no_emdash
+            _corrected_text = _no_emdash
+
         # See _NON_LATIN_SCRIPT_RE above: rare vLLM language-leakage
         # artifact where the model tacks on a CJK-script tail (or, more
         # rarely, a mid-sentence run) after an otherwise-English answer.
@@ -4974,7 +4995,20 @@ class MultiSourceRAG:
                 # bare items into an unreadable run-on: "Mediclaim policy
                 # Overseas Mediclaim policy Raj Rajeshwari Mahila Kalyan
                 # Yojna..." — six policy names with nothing between them.
-                _MARKER_RE = _delist_re.compile(r'(?:\A|\n\s*|(?<=[.\s]))\d{1,2}\.\s+')
+                # Bullet markers ("- ", "* ", "• ") get the same treatment as
+                # numbered markers — confirmed live: "How much does life
+                # insurance pay out?" came back as "- **Term Insurance**
+                # pays out..." / "- **Whole Life Insurance** pays out..."
+                # despite the FORMAT rule banning bullets. Restricted to
+                # line starts only (\A or after a newline), unlike numbered
+                # markers which also match inline mid-sentence — a bullet
+                # dash never legitimately appears inline, but a bare hyphen
+                # does ("well-known", "up-to-date"), so matching it inline
+                # here would wrongly eat real words.
+                _MARKER_RE = _delist_re.compile(
+                    r'(?:\A|\n\s*)(?:\d{1,2}\.\s+|[-*•]\s+)'
+                    r'|(?<=[.\s])\d{1,2}\.\s+'
+                )
 
                 def _join_marker(m):
                     prefix = m.string[:m.start()].rstrip()
@@ -4983,6 +5017,12 @@ class MultiSourceRAG:
                     return ' ' if prefix[-1] in '.!?:' else ', '
 
                 _delisted = _MARKER_RE.sub(_join_marker, _list_src)
+                # Any bare newline left after marker-joining is a leftover
+                # line break with no list marker attached to it (e.g. the
+                # model's own paragraph formatting) — collapse it to a
+                # space so the whole reply reads as one flowing paragraph,
+                # per FORMAT's "plain conversational prose only".
+                _delisted = _delist_re.sub(r'[ \t]*\n[ \t]*', ' ', _delisted)
                 _delisted = _delist_re.sub(r'\s{2,}', ' ', _delisted).strip()
                 _delisted = _delist_re.sub(r'\s+,', ',', _delisted)
                 if _delisted and _delisted != _list_src.strip():
