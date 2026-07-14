@@ -396,8 +396,28 @@ def _context_covers_query(query: str, docs: list, llm_topics: set | None = None)
     Falls back to regex (OR logic) when llm_topics is absent.
     """
     if llm_topics:
+        # Excludes chunks matching _REGULATORY_BOILERPLATE_RE from this max —
+        # confirmed live via the hollow-answer investigation: "my claim got
+        # rejected, what do I do" retrieved a regulatory/supervisory chunk
+        # about IRDA's grievance-redressal and inter-party dispute-
+        # adjudication framework that scored highly enough on lexical
+        # similarity ("claim", "dispute") to trip the single_topic bypass
+        # below on its own, letting a chunk that doesn't actually answer a
+        # consumer's "why was MY claim rejected" question vouch for
+        # coverage. The model then had nothing real to draw from and
+        # produced a near-empty answer that technically passed every rule
+        # but helped no one (see the hollow-answer detector further down —
+        # that catches the SYMPTOM after generation; this is the same
+        # underlying cause, caught before generation runs at all). A
+        # boilerplate chunk can still be used as regular CONTEXT if it's
+        # not the only thing available — this only stops it from being the
+        # sole justification for skipping the stricter per-topic check.
         top_rerank = max(
-            (d.metadata.get("rerank_score", 0) for d in docs if hasattr(d, "metadata")),
+            (
+                d.metadata.get("rerank_score", 0) for d in docs
+                if hasattr(d, "metadata")
+                and not _REGULATORY_BOILERPLATE_RE.search((getattr(d, "page_content", "") or "").lower())
+            ),
             default=0,
         )
         stop = _QUERY_STOP_WORDS
@@ -1449,12 +1469,32 @@ def _last_anchor_type_match(text: str, pattern: re.Pattern = _ANCHOR_TYPE_RE) ->
 # content) because in this KB's consumer-facing prose the acting party is
 # always "the insurer"/"the insured"/"the policyholder"/"the agent" — "the
 # supervisor" only appears in the regulatory-oversight framework sections.
+# "grievance redressal|adjudicat\w*" extends this to the same category
+# confirmed live via the hollow-answer investigation: "my claim got
+# rejected, what do I do" retrieved a chunk about IRDA's statutory power to
+# adjudicate disputes between insurers and intermediaries — regulatory/
+# supervisory content about the regulator's OWN powers, not a consumer-
+# facing "how do I appeal my own claim" answer, but lexically close enough
+# ("claim", "dispute") to score highly on the cross-encoder anyway. Scoped
+# tightly to just these two terms after confirming live they're safe:
+# every occurrence of "adjudicat*" in this KB (8/8) and a sample of
+# "grievance redressal" occurrences are exclusively inside the IRDA
+# statutory-powers listing, never inside consumer-facing policy content.
+# Broader candidates considered and REJECTED after they caused a real
+# regression on a well-covered compound question (fire + burglary
+# insurance): bare "irda\b" and "insurance intermediar*" both appear
+# routinely in ordinary consumer-education content in this KB (a table of
+# contents entry, a "what is an intermediary" explainer chunk) — nowhere
+# near narrow enough to safely exclude without also demoting genuinely
+# relevant chunks that happen to mention the regulator or agents/brokers
+# in passing.
 _REGULATORY_BOILERPLATE_RE = re.compile(
     r"\b(the act|the bill|stamp duty|income tax act|central government|"
     r"section\s+\d+[a-z]?\b.{0,20}\bact\b|"
     r"guarantee[sd]?\s+by\s+the\s+(central\s+)?government|"
     r"amends?\b|gross\s+total\s+income|"
-    r"icp\s*\d+|the\s+supervisor)\b",
+    r"icp\s*\d+|the\s+supervisor|"
+    r"grievance\s+redressal|adjudicat\w*)\b",
     re.IGNORECASE,
 )
 
@@ -4581,6 +4621,14 @@ class MultiSourceRAG:
         unique_sources = list(dict.fromkeys(sources))
         streamed_ok = False
         _kv_reply = ""  # buffer for cache write
+        # Captured from the SSE stream's finish_reason field (see the
+        # streaming loop below) so the sentence cap further down can tell a
+        # naturally-completed answer ('stop') from one that was cut off or
+        # came from a path that doesn't report it (None) — see the "Hard
+        # sentence cap" section for why this matters. Stays None on the
+        # buffered/non-streaming fallback path, which the cap treats the
+        # same conservative way it always has.
+        _finish_reason = None
 
         # Streaming is always attempted below — always-stream, not gated on
         # _top_rerank. A prior version skipped live streaming when
@@ -4692,10 +4740,14 @@ class MultiSourceRAG:
                                     done = True
                                     break
                                 try:
-                                    token = _json.loads(data)["choices"][0]["delta"].get("content", "") or ""
+                                    _choice = _json.loads(data)["choices"][0]
+                                    token = _choice["delta"].get("content", "") or ""
                                     if token:
                                         _kv_reply += token
                                         yield token
+                                    _fr = _choice.get("finish_reason")
+                                    if _fr:
+                                        _finish_reason = _fr
                                 except Exception:
                                     pass
                             if done:
@@ -5357,26 +5409,35 @@ class MultiSourceRAG:
         # runaway length, so this cap only needs to catch actual rambling,
         # not cut a legitimate last step.
         #
-        # Cap raised 6 -> 9 -> 14: confirmed live a third time with a
-        # genuinely new question shape — a compound two-part question
+        # Cap raised 6 -> 9 -> 14, then made conditional on finish_reason:
+        # every one of the 3 raises above was needed because a fixed
+        # sentence count can't tell a naturally-completed answer (any
+        # length) from actual rambling — a compound two-part question
         # ("what's the difference between fire and burglary insurance, AND
-        # which should a small shop owner get"). First retry needed 8
-        # sentences (compare-fire + compare-burglary + recommendation +
-        # sign-off) and got chopped at 6; a second retry of the SAME
-        # question — same nondeterminism this codebase has hit repeatedly
-        # elsewhere (see vLLM nondeterministic quality glitches) — produced
-        # an even longer 11-sentence answer (it added a "which one should
-        # you get?" rhetorical beat) and still got chopped at 9, dropping
-        # the actual recommendation and sign-off a second time. Bumping by
-        # 1-3 each time a slightly-longer legitimate answer surfaces is a
-        # losing game against generation variance; raised further this time
-        # so the cap only catches genuine multi-paragraph rambling, not any
-        # answer that happens to cover 2 sub-questions plus a natural
-        # wrap-up. The 300-token budget upstream (not this cap) is the
-        # actual bound on runaway length — this only exists to catch
-        # rambling well past that.
+        # which should a small shop owner get") legitimately needed 8, then
+        # 11 sentences across two retries, chasing the cap up each time.
+        # That's a losing game against generation variance no matter how
+        # high the number goes.
+        #
+        # The real signal was sitting unused in the SSE stream the whole
+        # time: OpenAI-compatible completions report finish_reason='stop'
+        # on the chunk where the model concluded on its own (as opposed to
+        # 'length', hitting the max_tokens ceiling mid-thought). Now
+        # captured into _finish_reason as the stream is read (see above).
+        # A 'stop' means the model itself decided the answer was complete —
+        # trust that regardless of sentence count; this cap's job was
+        # always to catch rambling, and a model that stopped on its own
+        # isn't rambling. Only a NON-stop completion (hit the token
+        # ceiling, or finish_reason wasn't reported at all — the buffered
+        # fallback path, or a backend that omits it) still gets the cap,
+        # since those are exactly the cases where "many short sentences and
+        # no natural conclusion" is a real possibility. Kept at 10 for that
+        # narrower population — comfortably covers the documented 5-6-step
+        # how-to case without needing another cap-chasing bump later, while
+        # still catching truly excessive unstructured output when we have
+        # no better signal to go on.
         # Wrapped in try/except so any edge-case failure keeps the original reply.
-        if not _keyword_detailed and not _kv_has_example:
+        if not _keyword_detailed and not _kv_has_example and _finish_reason != 'stop':
             try:
                 import re as _re
                 _cap_src = (_corrected_text or _reply_stripped).strip()
@@ -5396,7 +5457,7 @@ class MultiSourceRAG:
                     # chopped it right after the stray "3." marker, discarding
                     # points 3 and 4 the model had already finished writing.
                     _sent_parts = _re.split(r'(?<=[.!?])(?<!\d\.)\s+', _cap_src)
-                    _MAX_SENTENCES = 14
+                    _MAX_SENTENCES = 10
                     if len(_sent_parts) > _MAX_SENTENCES:
                         _capped = " ".join(_sent_parts[:_MAX_SENTENCES]).strip()
                         # Ensure it ends cleanly
@@ -5404,6 +5465,10 @@ class MultiSourceRAG:
                             _capped += '.'
                         _corrected_text = _capped
                         _kv_reply = _capped
+                        logger.info(
+                            "[ask_stream] sentence cap trimmed reply (%d -> %d sentences, finish_reason=%r)",
+                            len(_sent_parts), _MAX_SENTENCES, _finish_reason,
+                        )
             except Exception as _cap_exc:
                 logger.debug("[ask_stream] sentence cap skipped: %s", _cap_exc)
 
