@@ -4946,10 +4946,45 @@ class MultiSourceRAG:
             try:
                 import re as _delist_re
                 _list_src = (_corrected_text or _reply_stripped)
-                _delisted = _delist_re.sub(r'^\d{1,2}\.\s+', '', _list_src)
-                _delisted = _delist_re.sub(r'\n\s*\d{1,2}\.\s+', ' ', _delisted)
-                _delisted = _delist_re.sub(r'(?<=[.\s])\d{1,2}\.\s+(?=[A-Z])', ' ', _delisted)
+                # A model paragraph break (blank line) right after a list
+                # item that has no terminal punctuation of its own signals a
+                # sentence boundary the newline-collapse below would
+                # otherwise erase — confirmed live: "...Jan Arogya Bima
+                # Policy\n\nLet me know if..." and "...Jan Arogya Bima
+                # Policy\n\nEach offers different levels..." (an arbitrary
+                # model-written wrap-up sentence, not just the fixed
+                # sign-off) both lost their separation once collapsed,
+                # producing "...Policy Let me know..." / "...Policy Each
+                # offers...". Insert the missing period before that happens.
+                # Skip when the line already ends in ".!?:" — a colon
+                # (introducing the list) or real terminal punctuation needs
+                # no extra period.
+                _list_src = _delist_re.sub(r'(?<=[^.!?:\s])\n\s*\n', '.\n\n', _list_src)
+
+                # Join each stripped marker with a space when the preceding
+                # text already ends in a sentence boundary (.!?) or a colon
+                # (which already introduces the list, so the first item
+                # needs no extra separator) — but with ", " otherwise.
+                # Confirmed live: "What types of health insurance policies
+                # are there?" produced bare noun-phrase items ("1. Mediclaim
+                # policy", "2. Overseas Mediclaim policy", ...) with no
+                # terminal punctuation of their own. Always joining with a
+                # single space (the original behavior) reads fine for full
+                # sentences ("...steps in. Pay that bit first...") but glues
+                # bare items into an unreadable run-on: "Mediclaim policy
+                # Overseas Mediclaim policy Raj Rajeshwari Mahila Kalyan
+                # Yojna..." — six policy names with nothing between them.
+                _MARKER_RE = _delist_re.compile(r'(?:\A|\n\s*|(?<=[.\s]))\d{1,2}\.\s+')
+
+                def _join_marker(m):
+                    prefix = m.string[:m.start()].rstrip()
+                    if not prefix:
+                        return ''
+                    return ' ' if prefix[-1] in '.!?:' else ', '
+
+                _delisted = _MARKER_RE.sub(_join_marker, _list_src)
                 _delisted = _delist_re.sub(r'\s{2,}', ' ', _delisted).strip()
+                _delisted = _delist_re.sub(r'\s+,', ',', _delisted)
                 if _delisted and _delisted != _list_src.strip():
                     _corrected_text = _delisted
                     _kv_reply = _delisted
