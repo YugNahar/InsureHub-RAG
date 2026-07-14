@@ -5299,8 +5299,16 @@ class MultiSourceRAG:
                     "hmm,", "i'm only set up", "that's a bit outside",
                     "i'm sorry", "no problem!", "sure thing! connecting",
                 )
+                # Punctuation after the lead-in word varies — "Sure thing!"
+                # and "Sure thing," both occur live, not just the comma form
+                # every example in this file happens to use. Confirmed live:
+                # matching only the comma form let "Sure thing! Fire
+                # insurance policies are..." slip past this check, and the
+                # fallback below wrongly prepended a second lead-in on top —
+                # "So, Sure thing! Fire insurance...". Accept comma,
+                # exclamation mark, or period as the separator.
                 _LEAD_IN_RE = _lead_re.compile(
-                    r'^(so,|good question,|sure thing,|right,|ah,)', _lead_re.IGNORECASE,
+                    r'^(so|good question|sure thing|right|ah)[,.!]', _lead_re.IGNORECASE,
                 )
                 # Ordered by preference; skip a candidate if its own word
                 # already appears as a natural mid-sentence transition near
@@ -5475,6 +5483,65 @@ class MultiSourceRAG:
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
+        # ── Hollow-answer detector (brief / conversational mode) ──────────────
+        # Confirmed live: a genuinely substantive question ("my claim got
+        # rejected and nobody's telling me why, what do I do") retrieved 8
+        # sources and passed the grounding check (loose keyword overlap —
+        # "claim"/"insurance" appear in plenty of unrelated regulatory
+        # boilerplate this KB has about insurer/regulator dispute processes,
+        # not a consumer-facing "how do I appeal my own claim" guide), so it
+        # never hit the refusal path. But with nothing actually grounded to
+        # say, the model correctly followed its "don't invent ungrounded
+        # content" rule and produced only empathy: "So, it's really
+        # frustrating when that happens. Let me know if you want more
+        # details! 😊" — a technically rule-compliant reply that helps the
+        # user precisely zero, and (unlike a proper refusal) never sets
+        # needs_human, so it doesn't escalate either. The user is left with
+        # nothing and no path to a human.
+        #
+        # Detect this by stripping the lead-in and the one fixed sign-off
+        # phrase, then checking what's left: BOTH short (<12 words — well
+        # under FORMAT's own 15-25-words-per-sentence target, so this can't
+        # false-positive on a legitimately terse-but-complete single
+        # sentence) AND missing every word in _INSURANCE_VOCAB (a real
+        # answer to an insurance question essentially always uses at least
+        # one). Requiring both together, rather than either alone, is what
+        # keeps this from misfiring on genuinely short factual answers
+        # ("No, travel insurance doesn't cover flight delays." is short but
+        # contains "insurance"/"cover"). If both hold, treat it exactly like
+        # the existing Rule4-discard refusal case: swap in the standard
+        # refusal message and mark needs_human so it escalates properly
+        # instead of silently doing nothing.
+        _hollow_answer_detected = False
+        if not _keyword_detailed:
+            try:
+                import re as _hollow_re
+                _hollow_src = (_corrected_text or _reply_stripped).strip()
+                _hollow_leadin_re = _hollow_re.compile(
+                    r'^(so|good question|sure thing|right|ah)[,.!]\s*', _hollow_re.IGNORECASE,
+                )
+                _content_only = _hollow_leadin_re.sub('', _hollow_src, count=1)
+                _content_only = _hollow_re.sub(
+                    r'\s*let me know if you want more details!?\s*\S*\s*$', '', _content_only,
+                    flags=_hollow_re.IGNORECASE,
+                ).strip()
+                _word_count = len(_hollow_re.findall(r'\w+', _content_only))
+                _has_domain_word = any(term in _content_only.lower() for term in _INSURANCE_VOCAB)
+                if _content_only and _word_count < 12 and not _has_domain_word:
+                    _refusal_text = (
+                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                    )
+                    _corrected_text = _refusal_text
+                    _kv_reply = _refusal_text
+                    _hollow_answer_detected = True
+                    logger.info(
+                        "[ask_stream] hollow answer detected (content=%r, words=%d) — redirecting to refusal+escalation",
+                        _content_only, _word_count,
+                    )
+            except Exception as _hollow_exc:
+                logger.debug("[ask_stream] hollow-answer check skipped: %s", _hollow_exc)
+
         # ── Buffered-path single yield (after all corrections) ────────────────
         # The non-streaming (buffered) path above stored the raw answer in
         # _kv_reply but did NOT yield it — we waited until after Rule4 strip,
@@ -5547,10 +5614,10 @@ class MultiSourceRAG:
         )
 
         _final_payload: dict = {
-            "sources": [] if _rule4_discarded else unique_sources,
+            "sources": [] if (_rule4_discarded or _hollow_answer_detected) else unique_sources,
             "done": True,
         }
-        if _rule4_discarded:
+        if _rule4_discarded or _hollow_answer_detected:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
