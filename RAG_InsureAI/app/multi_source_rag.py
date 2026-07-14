@@ -1126,6 +1126,45 @@ def _is_likely_followup(question: str) -> bool:
     return False
 
 
+_REACTION_LEADIN_RE = re.compile(
+    r"^(oh\s+)?(okay|ok|alright|got it|i see|gotcha|ah|"
+    r"that makes sense|makes sense|interesting|nice|cool|great|awesome|"
+    r"good to know|noted|thanks|thank you)\b",
+    re.IGNORECASE,
+)
+_REACTION_QUESTION_RE = re.compile(
+    r"\?|\b(what|how|why|when|where|which|who|can you|could you|do you|does it|"
+    r"is it|is there|are there|will it|would it|should i)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_conversational_reaction(question: str) -> bool:
+    """True for a longer acknowledgment/reaction with no retrieval-worthy
+    question content, e.g. "Oh okay that makes sense, I didn't know it
+    needed forced entry specifically." Confirmed live: at 13 words this is
+    past _is_likely_followup's 12-word "long questions are usually
+    self-contained" cutoff, so it fell through to standalone KB retrieval,
+    found nothing (it isn't a question, there's nothing to retrieve), and
+    triggered an unnecessary refusal + human-escalation email for a
+    message that was never actually asking anything.
+
+    Deliberately a separate check rather than folded into
+    _is_likely_followup — that function's word-count gate is tuned for
+    actual follow-up QUESTIONS, and loosening it risks the same
+    fragile-signal-list regressions documented elsewhere in this file
+    (_SIMPLE_SIGNALS/_DETAIL_SIGNALS). This only needs to catch pure
+    acknowledgments: it requires a reaction lead-in AND the absence of any
+    question-request pattern, so a message like "oh interesting, but does
+    it also cover theft without forced entry?" still gets treated as a
+    real question, not a reaction, and goes through normal retrieval.
+    """
+    q = question.strip()
+    if not q or not _REACTION_LEADIN_RE.match(q):
+        return False
+    return not _REACTION_QUESTION_RE.search(q)
+
+
 # Specific insurance-type nouns, used only to deterministically re-anchor a
 # reformulated follow-up whose LLM rewrite silently dropped the topic — see
 # the repair step inside _reformulate_query for why this exists.
@@ -3315,7 +3354,12 @@ class MultiSourceRAG:
         # ── Follow-up reformulation ───────────────────────────────────────────
         # For short/vague follow-ups ("what about premiums?", "give me in detail",
         # "is it legal?") rewrite into a full standalone query using history.
-        _detected_as_followup = bool(history and _is_likely_followup(question))
+        # Also catches longer pure acknowledgments ("oh okay that makes sense...")
+        # that _is_likely_followup's word-count gate would otherwise treat as a
+        # self-contained new question — see _is_conversational_reaction.
+        _detected_as_followup = bool(
+            history and (_is_likely_followup(question) or _is_conversational_reaction(question))
+        )
         _is_followup = False
         if _detected_as_followup:
             _reformulated = await _reformulate_query(question, history)
