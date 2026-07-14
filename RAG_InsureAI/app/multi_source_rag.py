@@ -3147,6 +3147,51 @@ class MultiSourceRAG:
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
             return
 
+        # ── Identity / capability questions — no retrieval needed ─────────────
+        # CONVERSATIONAL_RAG_PROMPT has an IDENTITY RULES section with the
+        # canned answers below, but that's useless if the request never
+        # reaches the LLM at all — confirmed live: "Who built you?" has zero
+        # insurance vocabulary, so retrieval found nothing, ctx_covered was
+        # False, and it fell straight through to the "I don't have that in my
+        # knowledge base" refusal + an unnecessary human-escalation email,
+        # never once consulting the prompt that already knew how to answer
+        # it. Same lesson as the off-topic fast-path and
+        # _is_conversational_reaction fixes: short-circuit deterministically
+        # before retrieval for questions that structurally can't be answered
+        # by KB lookup, rather than letting them reach the refusal path by
+        # default. Text matches the prompt's own IDENTITY RULES wording so
+        # the two stay in sync.
+        _IDENTITY_RE = re.compile(
+            r"\b(who (?:built|made|created|developed|designed) you|"
+            r"who(?:'s| is) behind you|"
+            r"who do you work for|"
+            r"what company (?:built|made|created|owns) you|"
+            r"what are you built (?:on|with)|"
+            r"are you (?:chatgpt|gpt|an? ai|a bot)|"
+            r"what model (?:are you|is this))\b",
+            re.IGNORECASE,
+        )
+        _KNOWLEDGE_SCOPE_RE = re.compile(
+            r"\b(what do you know|what can you (?:help|do)|"
+            r"what (?:kind|type) of (?:questions|things) can you|"
+            r"what topics (?:do you|can you)|"
+            r"what are you (?:trained|good) (?:on|at))\b",
+            re.IGNORECASE,
+        )
+        if _IDENTITY_RE.search(question):
+            import json as _json_s
+            yield (
+                "I was built by Nexsys IT Consulting, a tech firm that builds smart AI solutions. "
+                "Pretty cool, right? 😊 Anyway, I'm here for you. What insurance question can I help with?"
+            )
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+            return
+        if _KNOWLEDGE_SCOPE_RE.search(question):
+            import json as _json_s
+            yield "I've got a lot of insurance knowledge: health, life, motor, travel, home and more. What's on your mind?"
+            yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
+            return
+
         # ── Meta-conversation clarification after refusal/error (Part 3) ──────
         # If the previous assistant turn was a refusal/error/handoff message
         # and the user's very next message is a short clarifying question about
