@@ -2034,8 +2034,8 @@ def _extract_meaning_query_word(question: str) -> Optional[str]:
 
 
 _HANDOFF_MSG = (
-    "I don't have that in my knowledge base right now — "
-    "let me get a human agent to help you! 😊"
+    "I don't have that in my knowledge base right now. "
+    "Let me get a human agent to help you! 😊"
 )
 
 
@@ -2342,7 +2342,7 @@ _BOTH_REPLY_RE = re.compile(
 # history (used to recover the two sub-questions for a "both" reply) without
 # false-matching on an ordinary answer that happens to contain "both".
 _CLARIFY_TEMPLATE = (
-    'Happy to go deeper — did you want more on "{q1}" or "{q2}"? '
+    'Happy to go deeper. Did you want more on "{q1}" or "{q2}"? '
     'Click one below, or just say "both" for the full picture on each.'
 )
 _CLARIFY_PARSE_RE = re.compile(r'more on "(.+?)" or "(.+?)"\?', re.IGNORECASE)
@@ -2847,7 +2847,7 @@ class MultiSourceRAG:
             needs_human = False
             # Skip the LLM entirely — return a firm, friendly refusal
             return (
-                "I'm Layla, your insurance assistant! I can only help with insurance-related questions — things like policy coverage, premiums, claims, and benefits. Is there something about your insurance I can help you with today? 😊",
+                "I'm Layla, your insurance assistant! I can only help with insurance-related questions, things like policy coverage, premiums, claims, and benefits. Is there something about your insurance I can help you with today? 😊",
                 [],
                 False,
                 True,
@@ -2906,7 +2906,7 @@ class MultiSourceRAG:
                 answer = response.content if hasattr(response, "content") else str(response)
             except _LLM_BACKEND_ERRORS as _exc:
                 logger.warning("[MultiSourceRAG] LLM backend unavailable for calculation: %s", _exc)
-                answer = "I'm sorry, I can't process that calculation right now — the AI model server seems to be unreachable. Please try again in a moment!"
+                answer = "I'm sorry, I can't process that calculation right now. The AI model server seems to be unreachable. Please try again in a moment!"
             return _strip_markdown(_strip_model_preamble(answer)), list(dict.fromkeys(sources)), needs_human, is_off_topic
 
         if not full_context.strip():
@@ -2915,7 +2915,7 @@ class MultiSourceRAG:
             # instructions when context is empty).
             return (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
-                "Let me get one of our agents on it — they'll be able to help you better! 😊",
+                "Let me get one of our agents on it, they'll be able to help you better! 😊",
                 [],
                 True,
                 False,
@@ -2949,7 +2949,7 @@ class MultiSourceRAG:
         if not ctx_covered and not document_filter:
             return (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
-                "Let me get one of our agents on it — they'll be able to help you better! 😊",
+                "Let me get one of our agents on it, they'll be able to help you better! 😊",
                 [],
                 needs_human,
                 is_off_topic,
@@ -2984,7 +2984,7 @@ class MultiSourceRAG:
                 answer = (
                     "Hmm, that topic doesn't seem to be covered in my knowledge base right now. "
                     "On top of that, my AI model server is temporarily unreachable, so I can't "
-                    "pull from general knowledge either. Try again in a moment — or feel free to "
+                    "pull from general knowledge either. Try again in a moment, or feel free to "
                     "ask me something about your uploaded insurance documents!"
                 )
             else:
@@ -3085,7 +3085,7 @@ class MultiSourceRAG:
             )
             if _wants_handoff:
                 import json as _json_s
-                yield "Sure thing! Connecting you with a human agent now — one moment. 😊"
+                yield "Sure thing! Connecting you with a human agent now, one moment. 😊"
                 yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
                 return
             if _q_stripped in {"yes", "sure", "ok", "okay", "alright", "cool", "great", "perfect", "awesome"}:
@@ -3294,7 +3294,7 @@ class MultiSourceRAG:
                             "sources": [],
                             "done": True,
                             "needs_human": False,
-                            "clarify_options": [_q1, _q2, "Both — give me the full picture"],
+                            "clarify_options": [_q1, _q2, "Both, give me the full picture"],
                         })
                         return
 
@@ -3683,7 +3683,7 @@ class MultiSourceRAG:
             )
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
-                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                "Let me get one of our agents on it, they'll be able to help you better! 😊"
             )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
@@ -3903,7 +3903,7 @@ class MultiSourceRAG:
                     return
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
-                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                "Let me get one of our agents on it, they'll be able to help you better! 😊"
             )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
@@ -4062,7 +4062,7 @@ class MultiSourceRAG:
         if not full_context.strip():
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
-                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                "Let me get one of our agents on it, they'll be able to help you better! 😊"
             )
             yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": True})
             return
@@ -4118,7 +4118,7 @@ class MultiSourceRAG:
             # name itself).
             if _answered_via_standalone_retry:
                 prompt_question = (
-                    f"{prompt_question.rstrip(' .?')} — this may be a new question "
+                    f"{prompt_question.rstrip(' .?')}. This may be a new question "
                     f"unrelated to the earlier conversation; if so, open your answer "
                     f"with something like \"If you're asking about {{topic}} generally, \" "
                     f"before answering, naming the actual topic instead of the placeholder."
@@ -4138,7 +4138,7 @@ class MultiSourceRAG:
                 if _has_detail and _has_simple and _has_example:
                     _mod_instr = (
                         "Give a detailed explanation in simple, everyday language with one "
-                        "concrete real-life example. No jargon — explain like you would to a friend. "
+                        "concrete real-life example. No jargon. Explain like you would to a friend. "
                         "Use numbered points."
                     )
                     detailed = True  # SIMPLE normally overrides; force detailed prompt here
@@ -4154,7 +4154,7 @@ class MultiSourceRAG:
                     )
                 elif _has_simple and _has_example:
                     _mod_instr = (
-                        "Re-explain in very simple, everyday language — no jargon. "
+                        "Re-explain in very simple, everyday language. No jargon. "
                         "Then give one concrete real-life example to illustrate it clearly."
                     )
                 elif _has_example:
@@ -4177,7 +4177,7 @@ class MultiSourceRAG:
                         # either way.
                         _mod_instr = (
                             "Give ONLY an example or illustration of THIS EXACT POINT quoted "
-                            "above — not a general example of the broader topic. If this point "
+                            "above, not a general example of the broader topic. If this point "
                             "is a naming fact, a definition detail, or something else without a "
                             "natural real-world scenario, clarify or illustrate that specific "
                             "fact directly instead of inventing an unrelated scenario. "
@@ -4192,22 +4192,22 @@ class MultiSourceRAG:
                 elif _has_simple:
                     _mod_instr = (
                         "Re-explain this in very simple, everyday language. "
-                        "No jargon or technical terms — plain words only."
+                        "No jargon or technical terms. Plain words only."
                     )
                 elif _has_detail:
                     _mod_instr = (
                         "Give a full, detailed breakdown. "
-                        "The user wants more depth — use numbered points."
+                        "The user wants more depth. Use numbered points."
                     )
                 else:
                     _mod_instr = ""
                 if _mod_instr:
-                    prompt_question = f"{prompt_question.rstrip(' .?')} — {_mod_instr}"
+                    prompt_question = f"{prompt_question.rstrip(' .?')}. {_mod_instr}"
             elif not _detected_as_followup and _has_example:
                 # Fresh question asking for an explanation with an example
                 prompt_question = (
-                    f"{prompt_question.rstrip(' .?')} — "
-                    "please include a concrete real-life example to illustrate this concept clearly."
+                    f"{prompt_question.rstrip(' .?')}. "
+                    "Please include a concrete real-life example to illustrate this concept clearly."
                 )
 
             if document_filter:
@@ -4475,7 +4475,7 @@ class MultiSourceRAG:
             # standard refusal instead of an unconfirmed claim.
             _refusal_text = (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
-                "Let me get one of our agents on it — they'll be able to help you better! 😊"
+                "Let me get one of our agents on it, they'll be able to help you better! 😊"
             )
             _reply_stripped = _refusal_text
             _kv_reply = _refusal_text
