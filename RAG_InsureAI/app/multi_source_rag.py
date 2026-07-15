@@ -1912,7 +1912,24 @@ async def _extract_intent_topics(question: str) -> set[str]:
 # fast, cheap call (max_tokens=10 output either way) — not specified by the
 # original design, but consistent with the context[:1000] pattern elsewhere
 # in this file bounding auxiliary-call input size for latency.
-_GROUNDING_CONTEXT_CHARS = 3000
+#
+# Doubled 3000 -> 6000 alongside _build_grounding_context's window-joining
+# fix (see that function's docstring/comment) — that fix doubled how much
+# text each chunk contributes (both _rerank_windows candidates instead of
+# arbitrarily just one), which at the OLD 3000 cap roughly halved how many
+# of the already-best-first-sorted chunks actually fit before truncation,
+# silently losing lower-ranked-but-still-relevant chunks that used to be
+# visible. Confirmed live: "What is the maximum compensation for legal
+# expenses under travel insurance?" needs a phrase from the chunk ranked
+# #3 (the word "legal", establishing which of two adjacent, identically-
+# shaped clauses a figure in chunk #1 belongs to) — at the old cap that
+# phrase sat at char ~3849, past the truncation point, even though it was
+# genuinely present in the retrieved pool. Doubling the cap alongside the
+# per-chunk content restores roughly the same number of visible chunks as
+# before the window-joining fix, so this isn't a net increase in how much
+# "extra" content the model sees per chunk actually retrieved — only a
+# correction to keep the same chunk-count budget intact.
+_GROUNDING_CONTEXT_CHARS = 6000
 
 
 def _build_grounding_context(query: str, chunks: list) -> str:
@@ -1940,7 +1957,37 @@ def _build_grounding_context(query: str, chunks: list) -> str:
         if not text:
             continue
         windows = _rerank_windows(text, query)
-        parts.append(windows[1] if len(windows) > 1 else windows[0])
+        # Used to take ONLY windows[1] (the keyword-weighted window),
+        # discarding windows[0] (the plain start-of-chunk slice) whenever
+        # both existed. That's an arbitrary fixed-index choice, not "pick
+        # whichever window actually scored higher" — _rerank_windows'
+        # caller (the real reranking pass) takes the MAX score across
+        # windows, but that per-window score isn't threaded through to
+        # here, so this function had no way to know which one actually
+        # mattered. Confirmed live: "What is the maximum compensation for
+        # legal expenses under travel insurance?" against a chunk whose
+        # relevant sentence ("...the maximum amount of compensation is
+        # €8,500...") sits right at the start (windows[0]) — the
+        # keyword-weighted windows[1] drifted past it to an adjacent,
+        # differently-scoped clause ("...liability...€170,000...") that
+        # scores similarly on keyword density but doesn't answer the
+        # question at all. Dropping windows[0] unconditionally threw away
+        # the one window that actually had the answer, and the reranker's
+        # own 0.976 score (which DOES account for windows[0]) never gets a
+        # chance to inform this check. Joining both windows instead of
+        # picking one fixes this without needing to plumb the winning
+        # window's score through from reranking — bounded to ~1400 chars
+        # per chunk (2 windows of length _RERANK_TEXT_CHARS=700), and since
+        # chunks arrive sorted best-first (this function's caller already
+        # requires that), the top chunk's full ~1400 chars land within the
+        # first slice of _GROUNDING_CONTEXT_CHARS=3000 regardless of what
+        # lower-ranked chunks contribute afterward. This is a different
+        # tradeoff than the ORIGINAL single-full-chunk-per-entry approach
+        # this function replaced (see docstring above) — that discarded
+        # windowing entirely and diluted signal with multiple full,
+        # uncapped chunks; two short curated windows per chunk doesn't
+        # reintroduce that problem.
+        parts.append("\n".join(windows))
     return "\n\n".join(parts)
 
 
