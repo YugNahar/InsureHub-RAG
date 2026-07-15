@@ -18,6 +18,7 @@ except ImportError:
 
 from rapidfuzz import fuzz, process
 from turbovec_store import _rerank_windows
+from metadata_tagger import classify_query_policy_type
 
 logger = logging.getLogger(__name__)
 
@@ -3793,6 +3794,30 @@ class MultiSourceRAG:
 
         # Apply typo correction to the retrieval_query before KV cache and retrieval
         retrieval_query = _correct_typos(retrieval_query)
+
+        # ── Metadata-based retrieval filter (policy_type) ───────────────────
+        # Chunk policy_type metadata is now trustworthy (2026-07-15 retagging
+        # fix — see project_policy_type_metadata_mistagging memory) after
+        # fixing two ingestion bugs that had left 68.7% of the KB mistagged
+        # "life". classify_query_policy_type() uses a confidence bar suited
+        # to short queries rather than classify_chunk_policy_type()'s >=2-hit
+        # chunk-tuned bar (confirmed empirically: realistic queries only ever
+        # score a single hit — the chunk-tuned bar never fires on a query at
+        # all). Narrows the doc-store search to matching-type + always-
+        # included "general" chunks — "general" is always included so
+        # cross-topic reference-handbook content is never excluded, same
+        # design already used by build_metadata_filter() in metadata_tagger.py.
+        # This attacks cross-topic contamination one layer upstream of the
+        # growing _TYPE_GIVEAWAY_TERMS post-generation filter: a motor
+        # Vehicles-Act chunk now simply isn't a retrieval candidate for a
+        # transit-insurance query, instead of being retrieved and then
+        # having to be caught after the fact. Only applied to the doc store
+        # (video/webpage search() calls don't accept a filter parameter).
+        _query_policy_type = classify_query_policy_type(retrieval_query)
+        if _query_policy_type != "general":
+            _policy_filter = {"policy_type": {"$in": [_query_policy_type, "general"]}}
+            filter_meta = {"$and": [filter_meta, _policy_filter]} if filter_meta else _policy_filter
+            logger.debug("[ask_stream] policy_type filter: %s (query classified as %s)", filter_meta, _query_policy_type)
 
         # ── KV cache lookup ───────────────────────────────────────────────────
         # Key includes reformulated query + intent flags so "why is X compulsory"

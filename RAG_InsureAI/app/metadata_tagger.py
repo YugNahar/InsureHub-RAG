@@ -75,7 +75,7 @@ _POLICY_PATTERNS: dict[str, list[str]] = {
     "marine":            ["marine insurance", "marine cargo", "marine hull",
                           "cargo insurance", "shipping insurance",
                           "inland transit", "import cargo", "export cargo",
-                          "bill of lading", "marine policy"],
+                          "bill of lading", "marine policy", "transit insurance"],
     "liability":         ["liability insurance", "public liability", "product liability",
                           "professional indemnity", "errors and omissions",
                           "directors and officers", "d&o insurance",
@@ -307,6 +307,40 @@ def classify_query(question: str, llm: Any = None) -> dict:
     Queries are always treated as "policy_document" intent for matching purposes.
     """
     return tag_document(filename="", preview=question, doc_type="policy_document", llm=llm)
+
+
+def classify_query_policy_type(query: str) -> str:
+    """
+    Classify a short query's policy type using the same regex signals as
+    classify_chunk_policy_type(), but with a confidence bar suited to
+    short text instead of a full chunk.
+
+    classify_chunk_policy_type() requires >=2 distinct pattern hits (and
+    2x the runner-up) before trusting a regex result without an LLM --
+    right for a 200-500 word chunk, where a single incidental keyword is
+    weak evidence of the chunk's overall topic. A 5-10 word QUERY behaves
+    completely differently: confirmed empirically that realistic queries
+    ("Explain crop insurance in detail", "What is home insurance") score
+    exactly ONE hit for their correct type and nothing else -- there's
+    rarely room for a second distinct phrase in a single question.
+    Requiring the same >=2 bar here would mean this classifier never
+    fires for realistic queries at all.
+
+    A single hit is trusted here as long as it's the sole top-scoring
+    category (no tie) -- a comparison query mentioning two types by name
+    ("how is liability insurance different from motor insurance") will
+    score both at 1 and correctly fall back to "general" (unfiltered)
+    rather than guessing one side of the comparison.
+    """
+    scores = _regex_policy_score(query)
+    positive = {k: v for k, v in scores.items() if v > 0}
+    if not positive:
+        return "general"
+    best_score = max(positive.values())
+    tied = [k for k, v in positive.items() if v == best_score]
+    if len(tied) > 1:
+        return "general"
+    return tied[0]
 
 
 def build_metadata_filter(
@@ -772,7 +806,7 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
         "regex": [
             r"\bmarine insurance\b", r"\bmarine cargo\b", r"\bmarine hull\b",
             r"\bcargo insurance\b", r"\bshipping insurance\b", r"\binland transit\b",
-            r"\bgoods in transit\b", r"\bbill of lading\b",
+            r"\bgoods in transit\b", r"\bbill of lading\b", r"\btransit insurance\b",
         ],
     },
     "liability": {
