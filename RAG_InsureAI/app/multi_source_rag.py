@@ -4233,12 +4233,45 @@ class MultiSourceRAG:
         # "general insurance principles" section that ranks well for almost
         # any vague "explain simply with an example" phrasing. Same failure
         # mode as the pronoun case, just without a pronoun to catch it.
+        #
+        # A THIRD variant of the same underlying gap, found via live browser
+        # testing (2026-07-15): a bare generic-modifier follow-up with no
+        # pronoun AND no point reference — "can you give me an example" (no
+        # "it"/"that", no "point N") passed both guards above unchanged.
+        # Debug-traced live: _reformulate_query correctly anchored it to
+        # "Can you provide a real-life example of motor insurance?", but that
+        # correctly-anchored query's ctx_covered check failed (an "example"-
+        # style question's retrieved content doesn't always satisfy the
+        # lexical/semantic coverage bar as cleanly as a factual question
+        # does), so this retry fired anyway — retrying the BARE "can you give
+        # me an example" against the KB directly, which confidently matches
+        # almost ANY illustrative-example chunk (fire insurance, subrogation,
+        # whatever ranks highest) regardless of the actual prior topic, and
+        # that wrong-topic match passed its own grounding checks. Same root
+        # cause as the pronoun/point-ref cases: this retry is only safe when
+        # the raw question carries enough substantive content of its own to
+        # plausibly BE a genuine standalone question — a bare "explain more"/
+        # "give an example"/"in simple terms" modifier with no insurance
+        # vocabulary of its own carries none, exactly like a dangling pronoun
+        # or a "point N" reference. Reuses the identical modifier+no-
+        # vocabulary test _is_likely_followup() already uses for the same
+        # judgment, rather than inventing a new one.
         _question_tokens = {w.lower().strip('?.,!') for w in question.split()}
         _has_unresolved_pronoun = bool(_question_tokens & _FOLLOWUP_SIGNALS)
         _has_unresolved_point_ref = _extract_point_number(question) is not None
+        _q_lower_for_modifier_check = question.lower().strip()
+        _is_bare_modifier_only = (
+            any(sig in _q_lower_for_modifier_check for sig in (_DETAIL_SIGNALS | _SIMPLE_SIGNALS))
+            or _wants_example(_q_lower_for_modifier_check)
+        ) and not re.search(
+            r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
+            r"life|motor|travel|home|vehicle|accident|liability|rider|annuity|pension)\b",
+            _q_lower_for_modifier_check,
+        )
         if (
             not ctx_covered and not document_filter and not _pasted_grounds_answer
             and _detected_as_followup and not _has_unresolved_pronoun and not _has_unresolved_point_ref
+            and not _is_bare_modifier_only
         ):
             _standalone_chunks = await self._retrieve_doc_chunks(
                 question, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
