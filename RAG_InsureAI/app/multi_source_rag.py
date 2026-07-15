@@ -4186,7 +4186,37 @@ class MultiSourceRAG:
         )
         _t_grounding_ms = round((time.time() - _t_grounding_start) * 1000)
         _t_promptbuild_start = time.time()
-        ctx_covered = _lex_ok and _semantically_grounded
+        # High-confidence bypass: _verify_grounding_any_chunk is a small-
+        # model YES/NO judgment call, built specifically because this
+        # project's generation model unreliably hallucinates from training
+        # knowledge when just handed weak/irrelevant context (see the
+        # reranker-gate comment above) — but the SAME judgment call is
+        # itself occasionally wrong in the opposite direction. Confirmed
+        # live: "What is the maximum compensation for legal expenses under
+        # travel insurance?" retrieved the exact answer (rerank_score=0.976,
+        # lex_ok=True) yet _verify_grounding_any_chunk said NO on both its
+        # full-context and top-chunk-alone paths, and the SAME clean
+        # passage handed to the identical judgment call in isolation
+        # (no retrieval noise) got a correct YES 4/4 times — the retrieved
+        # content plainly was there, the gate was simply wrong that once.
+        # Only bypass at 0.9+ ("near-certain" per this file's own score
+        # calibration notes above), well clear of the 0.78 wrong-topic case
+        # already documented a few lines up ("...top-scored (0.78) a TRAVEL
+        # insurance exclusion list...correctly rejected") — that
+        # documented false-positive risk zone sits comfortably below this
+        # threshold, so this bypass doesn't reopen it. Still requires
+        # _lex_ok too — a very high rerank score alone isn't trusted on its
+        # own, matching the existing single_topic bypass inside
+        # _context_covers_query, which also never trusts the score in
+        # isolation.
+        _grounding_bypass = _lex_ok and _top_rerank >= 0.9
+        ctx_covered = _grounding_bypass or (_lex_ok and _semantically_grounded)
+        if _grounding_bypass and not _semantically_grounded:
+            logger.info(
+                "[ask_stream] grounding bypass: top_rerank=%.3f >= 0.9, lex_ok=True — "
+                "overriding a NO from _verify_grounding_any_chunk",
+                _top_rerank,
+            )
 
         _dropped_terms_note = None
         _answered_via_standalone_retry = False
