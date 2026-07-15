@@ -955,8 +955,18 @@ def classify_chunk_policy_type(
     #   (b) regex is ambiguous (multiple types close in score)
     #   (c) force_llm=True (always use LLM, e.g. for YouTube chunks)
     if llm is None:
-        # No LLM available — use best regex result or "general"
-        result = best_type if best_score >= 1 else "general"
+        # No LLM available — only trust the regex result when it actually
+        # cleared the same regex_confident bar used above (>=2 hits AND
+        # 2x the runner-up). A single incidental keyword match (best_score=1,
+        # e.g. one passing mention of "life insurer" in an agent-licensing
+        # paragraph) used to win outright here, which is what let a whole
+        # multi-topic reference handbook's chunks get stamped with whatever
+        # type its first incidental keyword happened to be — confirmed live
+        # against this KB: 276/402 chunks tagged "life", including a chunk
+        # that was actually about marine insurance law. Falling back to
+        # "general" for anything below the confidence bar is honest about
+        # what regex-only classification can actually tell without an LLM.
+        result = best_type if regex_confident else "general"
         logger.debug("[POLICY_TYPE] no LLM, regex fallback → %s", result)
         return result
 

@@ -800,10 +800,24 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     for chunk in chunks:
         chunk.metadata["source"] = unique_source
         chunk.metadata["filename"] = filename
+        # split_documents() already ran classify_chunk_policy_type() per
+        # chunk (see SectionChunker.split_documents) and set policy_type on
+        # this chunk specifically when it was confident. That per-chunk
+        # result is strictly more precise than the single document-level
+        # tag below for a multi-topic reference handbook — a chunk about
+        # marine insurance law inside a 400-page general handbook should
+        # keep "marine", not inherit whatever the handbook's opening pages
+        # scored. Save it before the blanket doc_tags update below (which
+        # would otherwise clobber it) and restore it after, matching the
+        # chunk-wins/doc-level-is-fallback order already used by the
+        # webpage and video ingestion paths.
+        _chunk_policy_type = chunk.metadata.get("policy_type")
         chunk.metadata.update(doc_tags)
         # Guarantee doc_type is not overwritten by doc_tags (it is set there
         # too, but be explicit for clarity and future-proofing).
         chunk.metadata["doc_type"] = doc_type
+        if _chunk_policy_type:
+            chunk.metadata["policy_type"] = _chunk_policy_type
 
     pipeline.vector_store.add_documents(chunks)
     doc_meta = {"filename": filename, "doc_type": doc_type, **doc_tags}
