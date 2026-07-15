@@ -690,7 +690,7 @@ function ChatWidget({
               className="max-h-32 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-50"
             />
             <Button
-              onClick={send}
+              onClick={() => send()}
               disabled={!input.trim() || sending || chatMode === "waiting"}
               size="icon"
               className="h-8 w-8 shrink-0 rounded-lg"
