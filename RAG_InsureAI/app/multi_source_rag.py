@@ -5214,10 +5214,11 @@ class MultiSourceRAG:
                 # marine case above.
                 _TYPE_GIVEAWAY_TERMS = {
                     "marine": ("marine insurance", "marine cargo", "icc (a)", "icc (b)", "institute cargo clause", "bill of lading", "voyage policy", "hull insurance"),
-                    "health": ("domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"),
-                    "crop": ("agriculturist", "crop failure", "sowing/planting", "loanee"),
+                    "health": ("health insurance", "domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"),
+                    "crop": ("crop insurance", "agriculturist", "crop failure", "sowing/planting", "loanee"),
                     "fidelity": ("fidelity insurance", "employee dishonesty", "embezzlement"),
-                    "transit": ("import covers by sea", "inland transit clause"),
+                    "transit": ("transit insurance", "import covers by sea", "inland transit clause"),
+                    "motor": ("motor insurance", "vehicles plying on public roads"),
                 }
                 _query_lower = retrieval_query.lower()
                 _contam_src = (_corrected_text or _reply_stripped).strip()
