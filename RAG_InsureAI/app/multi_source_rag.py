@@ -1037,11 +1037,51 @@ def _diff_dropped_terms(original: str, cleaned: str) -> Tuple[Optional[str], boo
     return (", ".join(dict.fromkeys(dropped)) if dropped else None, has_proper_noun)
 
 
+_SPECIFIC_TYPE_RE = re.compile(
+    r"\b(motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
+    r"life|term\s*life|whole\s*life|endowment|ulip|"
+    r"health|medical|hospital|"
+    r"travel|trip|flight|baggage|"
+    r"home|house|property|landlord|tenant|"
+    r"marine|cargo|fire|"
+    r"liability|third.party|"
+    r"critical\s*illness|cancer|"
+    r"group|corporate|reinsurance|takaful|"
+    r"crop|agricultur\w*|"
+    r"personal\s*accident|disability|"
+    r"retirement|pension|annuity)\b"
+)
+
+
 def _is_likely_followup(question: str) -> bool:
     """Heuristic: is this question likely a follow-up referencing a previous topic?"""
     words = question.strip().split()
+    q_lower_early = question.lower().strip()
     if len(words) > 12:
-        return False  # long questions are usually self-contained
+        # "Long questions are usually self-contained" only holds when the
+        # question actually names its own topic. Confirmed live this
+        # breaks down otherwise: a 20-word, mostly-filler follow-up ("but
+        # i have submitted the money on the monthly so what would happen
+        # to my money that i have submitted") named no insurance type at
+        # all -- "money" alone is undefined without knowing which policy
+        # -- but cleared this gate's old flat 12-word cutoff and got
+        # treated as self-contained. retrieval_query then stayed the bare
+        # 20-word sentence instead of being anchored to the term-life-
+        # policy-expiry context established two turns earlier, and the
+        # answer had to hedge across every possible policy type ("if
+        # you're referring to term life... if it's a savings/investment-
+        # linked policy...") instead of directly answering the one
+        # already in play. A genuinely long, standalone new question that
+        # names its own topic ("difference between comprehensive and
+        # third-party motor insurance for a 5-year-old car") still
+        # correctly clears this gate; one that doesn't name any type
+        # doesn't, regardless of length. Over-triggering this check for a
+        # genuinely fresh long question just costs one extra
+        # _reformulate_query call -- that prompt already reliably echoes
+        # a self-contained question back unchanged rather than corrupting
+        # it, so the failure mode here is asymmetric: worth the latency to
+        # avoid the alternative (silently un-anchored retrieval).
+        return not _SPECIFIC_TYPE_RE.search(q_lower_early)
     tokens = {w.lower().strip('?.,!') for w in words}
     q_lower = question.lower().strip()
 
@@ -1126,20 +1166,6 @@ def _is_likely_followup(question: str) -> bool:
             r"\b(claim|claims|premium|premiums|deductible|deductibles|"
             r"policy|policies|documents?|paperwork|process|renew|renewal|"
             r"cancel|cancellation|cost|price|apply|application)\b"
-        )
-        _SPECIFIC_TYPE_RE = re.compile(
-            r"\b(motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
-            r"life|term\s*life|whole\s*life|endowment|ulip|"
-            r"health|medical|hospital|"
-            r"travel|trip|flight|baggage|"
-            r"home|house|property|landlord|tenant|"
-            r"marine|cargo|fire|"
-            r"liability|third.party|"
-            r"critical\s*illness|cancer|"
-            r"group|corporate|reinsurance|takaful|"
-            r"crop|agricultur\w*|"
-            r"personal\s*accident|disability|"
-            r"retirement|pension|annuity)\b"
         )
         if _GENERIC_PROCESS_RE.search(q_lower) and not _SPECIFIC_TYPE_RE.search(q_lower):
             return True
