@@ -781,7 +781,7 @@ function AuthPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (getToken()) navigate("/admin", { replace: true });
+    navigate("/admin", { replace: true });
   }, [navigate]);
 
   async function onSubmit(e: React.FormEvent) {
@@ -883,19 +883,15 @@ type Item = {
 
 function AdminPage() {
   const navigate = useNavigate();
-  const [ready, setReady] = useState(false);
+  const [ready, setReady] = useState(true);
 
   useEffect(() => {
-    if (!getToken()) {
-      navigate("/auth", { replace: true });
-    } else {
-      setReady(true);
-    }
-  }, [navigate]);
+    setReady(true);
+  }, []);
 
   function signOut() {
     clearToken();
-    navigate("/auth", { replace: true });
+    navigate("/", { replace: true });
   }
 
   if (!ready) return null;
