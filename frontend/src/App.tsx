@@ -784,6 +784,8 @@ function AuthPage() {
     navigate("/admin", { replace: true });
   }, [navigate]);
 
+  return null;
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
