@@ -110,6 +110,7 @@
   }
 
   input:focus { border-color: var(--accent); }
+  #password { display: none; }
 
   button {
     width: 100%;
@@ -166,17 +167,12 @@
     </div>
   </div>
 
-  <h1>Sign in</h1>
-  <p class="subtitle">Admin access only.</p>
+  <h1>Opening admin dashboard</h1>
+  <p class="subtitle">Redirecting...</p>
 
-  <label for="username">Username</label>
-  <input type="text" id="username" placeholder="admin" autocomplete="username" />
 
-  <label for="password">Password</label>
   <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" />
 
-  <button id="loginBtn" onclick="handleLogin()">Sign in</button>
-  <div class="error-msg" id="errorMsg"></div>
 </div>
 
 <script>
@@ -187,6 +183,7 @@
       : window.location.origin.replace(/\/$/, '');
   })();
   const API = window.__BACKEND_URL;
+  window.location.replace('/admin');
 
   // If already logged in, verify and go straight to admin
   const _existingToken = localStorage.getItem('insure_token');
