@@ -458,7 +458,11 @@
 const API = window.__BACKEND_URL;
 
 // ── Auth guard ────────────────────────────────────────────────────────────────
-let token = localStorage.getItem('insure_token') || 'auth-disabled';
+let token = localStorage.getItem('insurehub_token')
+  || localStorage.getItem('insure_token')
+  || sessionStorage.getItem('insurehub_token')
+  || sessionStorage.getItem('insure_token')
+  || 'auth-disabled';
 Promise.resolve()
     .catch(() => { /* backend may be starting — health poller will recover */ });
 // Show backend host in topbar so admin always knows which server is connected
