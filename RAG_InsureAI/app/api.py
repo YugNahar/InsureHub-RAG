@@ -35,7 +35,7 @@ from urllib.parse import unquote
 from bs4 import BeautifulSoup
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from auth import create_login_endpoint, require_auth
+from auth import create_login_endpoint, require_auth, verify_access_token
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agent_hub import hub as _agent_hub
@@ -377,6 +377,13 @@ async def super_admin_login(request: Request):
     return {"token": token}
 
 
+@app.post("/super-admin/session-token")
+async def super_admin_session_token(_: str = Depends(require_auth)):
+    token = uuid.uuid4().hex
+    _agent_hub._super_admin_tokens.add(token)
+    return {"token": token}
+
+
 @app.get("/super-admin/data")
 async def super_admin_data(token: str = Depends(_check_super_admin)):
     return _agent_hub.get_super_admin_data()
@@ -464,6 +471,11 @@ async def ws_super_admin(websocket: WebSocket):
     await websocket.accept()
     try:
         auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=15)
+        if auth_msg.get("auth_token"):
+            username = verify_access_token(auth_msg.get("auth_token"))
+            if username:
+                auth_msg["token"] = uuid.uuid4().hex
+                _agent_hub._super_admin_tokens.add(auth_msg["token"])
         if auth_msg.get("token") not in _agent_hub._super_admin_tokens:
             await websocket.send_json({"type": "error", "message": "Unauthorized"})
             await websocket.close(code=1008)
@@ -564,7 +576,7 @@ async def ws_agent_endpoint(websocket: WebSocket):
             await websocket.close(code=1008)
             return
         name = (data.get("name") or "Agent").strip() or "Agent"
-        if data.get("password") != _AGENT_PASSWORD:
+        if data.get("password") != _AGENT_PASSWORD and not verify_access_token(data.get("auth_token")):
             await websocket.send_json({"type": "error", "message": "Invalid password."})
             await websocket.close(code=1008)
             return
