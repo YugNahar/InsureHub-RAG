@@ -459,23 +459,8 @@ const API = window.__BACKEND_URL;
 
 // ── Auth guard ────────────────────────────────────────────────────────────────
 let token = localStorage.getItem('insure_token') || 'auth-disabled';
-const _authReady = (async function authGuard() {
-  if (!token) {
-    try {
-      const r = await fetch(API + '/auth/status');
-      const j = await r.json();
-      if (!j.disabled) { window.location.href = API + '/auth'; return; }
-      token = 'auth-disabled';
-    } catch (e) {
-      window.location.href = API + '/auth';
-      return;
-    }
-  }
-  fetch(`${API}/auth/verify`, { headers: { Authorization: 'Bearer ' + token } })
-    .then(r => { if (r.status === 401) { localStorage.removeItem('insure_token'); token = 'auth-disabled'; } })
+Promise.resolve()
     .catch(() => { /* backend may be starting — health poller will recover */ });
-})();
-
 // Show backend host in topbar so admin always knows which server is connected
 (function() {
   try {
