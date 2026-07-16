@@ -54,6 +54,22 @@ def _create_access_token(data: dict, expires_delta: Optional[timedelta] = None) 
 
 
 # ── Dependency: require valid JWT ─────────────────────────────────────────────
+def verify_access_token(token: Optional[str]) -> Optional[str]:
+    """Return the authenticated username for a bearer token, or None."""
+    if DISABLE_AUTH:
+        return ADMIN_USERNAME
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise JWTError()
+        return username
+    except JWTError:
+        return None
+
+
 def require_auth(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     """FastAPI dependency — raise 401 if token is missing or invalid."""
     if DISABLE_AUTH:
