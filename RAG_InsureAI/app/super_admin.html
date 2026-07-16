@@ -14,7 +14,7 @@
   body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden}
 
   /* Login */
-  #login-screen{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:999}
+  #login-screen{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;z-index:999}
   .login-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px 36px;width:360px;display:flex;flex-direction:column;gap:18px}
   .login-card h1{font-size:1.4rem;font-weight:700;text-align:center}
   .login-card p{color:var(--muted);font-size:.85rem;text-align:center}
@@ -177,7 +177,7 @@
 </div>
 
 <!-- App -->
-<div id="app" style="display:none">
+<div id="app" style="display:flex">
   <div id="sidebar">
     <div id="sidebar-header">
       <div class="brand">InsureHub</div>
@@ -256,10 +256,42 @@ let _chatViewModes = {};     // card-idx → 'full' | 'agent'
 let pingTimer = null;
 
 // ── Login ──────────────────────────────────────────────────────────────────
-if (token) boot();
+startSuperAdmin();
 
 document.getElementById('login-btn').onclick = doLogin;
 document.getElementById('pw-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+function getPanelAuthToken() {
+  try {
+    return localStorage.getItem('insurehub_token')
+      || localStorage.getItem('insure_token')
+      || sessionStorage.getItem('insurehub_token')
+      || sessionStorage.getItem('insure_token')
+      || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function startSuperAdmin() {
+  if (token) {
+    boot();
+    return;
+  }
+  const authToken = getPanelAuthToken();
+  const headers = {};
+  if (authToken) headers.Authorization = 'Bearer ' + authToken;
+  try {
+    const r = await fetch('/super-admin/session-token', { method: 'POST', headers });
+    if (!r.ok) throw new Error('Not authorized');
+    token = (await r.json()).token;
+    sessionStorage.setItem('sa_token', token);
+    boot();
+  } catch (err) {
+    document.getElementById('conn-label').textContent = 'Not authorized';
+    setConn(false);
+  }
+}
 
 async function doLogin() {
   const pw = document.getElementById('pw-input').value;
@@ -325,7 +357,13 @@ function connectWS() {
   ws.onmessage = e => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'error') { sessionStorage.removeItem('sa_token'); location.reload(); return; }
+      if (msg.type === 'error') {
+        sessionStorage.removeItem('sa_token');
+        token = '';
+        setConn(false);
+        document.getElementById('conn-label').textContent = 'Not authorized';
+        return;
+      }
       if (msg.type === 'connected' || msg.type === 'update') {
         const firstLoad = !allData.agents.length;
         allData = { agents: msg.agents || [], live_sessions: msg.live_sessions || [] };
