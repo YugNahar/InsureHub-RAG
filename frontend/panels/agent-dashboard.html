@@ -9,7 +9,7 @@
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
 /* ── Login ── */
-#login-screen { display: flex; align-items: center; justify-content: center; height: 100vh; }
+#login-screen { display: none; align-items: center; justify-content: center; height: 100vh; }
 .login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 16px; padding: 32px; width: 360px; }
 .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; }
 .logo-icon { width: 36px; height: 36px; border-radius: 8px; background: #4f46e5; display: flex; align-items: center; justify-content: center; font-size: 18px; }
@@ -25,7 +25,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; b
 .login-error { color: #fc8181; font-size: 0.8rem; margin-top: 10px; display: none; }
 
 /* ── Dashboard layout ── */
-#dashboard { display: none; flex: 1; flex-direction: column; overflow: hidden; height: 100vh; }
+#dashboard { display: flex; flex: 1; flex-direction: column; overflow: hidden; height: 100vh; }
 header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: #111827; border-bottom: 1px solid #1f2937; flex-shrink: 0; z-index: 10; }
 .header-left { display: flex; align-items: center; gap: 12px; }
 .header-logo { width: 30px; height: 30px; border-radius: 6px; background: #4f46e5; display: flex; align-items: center; justify-content: center; font-size: 15px; }
@@ -676,6 +676,7 @@ let ws = null;
 let myAgentId = null;
 let myName = "";
 let savedPass = "";
+let authToken = "";
 let activeSessionId = null;
 let myActiveSession = null;
 let reconnectTimer = null;
@@ -747,6 +748,30 @@ function declineHandoffPopup() {
 document.getElementById("login-btn").addEventListener("click", doLogin);
 document.getElementById("inp-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
 
+function getPanelAuthToken() {
+  try {
+    return localStorage.getItem("insurehub_token")
+      || localStorage.getItem("insure_token")
+      || sessionStorage.getItem("insurehub_token")
+      || sessionStorage.getItem("insure_token")
+      || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function getPortalAgentName() {
+  try {
+    return localStorage.getItem("insure_user")
+      || localStorage.getItem("insurehub_user")
+      || sessionStorage.getItem("insure_user")
+      || sessionStorage.getItem("insurehub_user")
+      || "Agent";
+  } catch (_) {
+    return "Agent";
+  }
+}
+
 async function doLogin() {
   const btn = document.getElementById("login-btn");
   if (btn.disabled) return;
@@ -805,7 +830,7 @@ function openWebSocket() {
   ws.onopen = () => {
     reconnectAttempt = 0;
     document.getElementById("reconnect-banner").style.display = "none";
-    ws.send(JSON.stringify({ type: "login", name: myName, password: savedPass }));
+    ws.send(JSON.stringify({ type: "login", name: myName, password: savedPass, auth_token: authToken }));
   };
 
   ws.onmessage = ev => handle(JSON.parse(ev.data));
@@ -846,7 +871,8 @@ function handle(msg) {
 
     case "error":
       if (!myAgentId) {
-        showErr(msg.message || "Connection error.");
+        showToast(msg.message || "Connection error.", true);
+        setConnStatus(false);
         if (ws) ws.close();
       } else {
         showToast(msg.message || "An error occurred.", true);
@@ -1012,12 +1038,19 @@ function toggleOnlineAgents() {
 
 // ── Dashboard visibility ─────────────────────────────────────────────────────
 function showDashboard(show) {
-  document.getElementById("login-screen").style.display = show ? "none" : "flex";
-  document.getElementById("dashboard").style.display = show ? "flex" : "none";
-  if (show) {
-    document.getElementById("agent-name-label").textContent = myName;
-    document.getElementById("agent-avatar").textContent = myName[0]?.toUpperCase() || "A";
-  }
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("dashboard").style.display = "flex";
+  document.getElementById("agent-name-label").textContent = myName || "Agent";
+  document.getElementById("agent-avatar").textContent = (myName || "Agent")[0]?.toUpperCase() || "A";
+}
+
+function startAgentDashboard() {
+  myName = getPortalAgentName();
+  savedPass = "";
+  authToken = getPanelAuthToken();
+  intentionalDisconnect = false;
+  showDashboard(true);
+  openWebSocket();
 }
 
 document.getElementById("disconnect-btn").addEventListener("click", () => {
@@ -1037,7 +1070,10 @@ document.getElementById("disconnect-btn").addEventListener("click", () => {
   clearErr();
   resetConvPanel();
   setInputEnabled(false);
+  setConnStatus(false);
 });
+
+startAgentDashboard();
 
 function resetConvPanel() {
   document.getElementById("messages-area").innerHTML = `
