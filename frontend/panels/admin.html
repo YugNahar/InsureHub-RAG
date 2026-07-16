@@ -458,7 +458,7 @@
 const API = window.__BACKEND_URL;
 
 // ── Auth guard ────────────────────────────────────────────────────────────────
-let token = localStorage.getItem('insure_token');
+let token = localStorage.getItem('insure_token') || 'auth-disabled';
 const _authReady = (async function authGuard() {
   if (!token) {
     try {
@@ -472,7 +472,7 @@ const _authReady = (async function authGuard() {
     }
   }
   fetch(`${API}/auth/verify`, { headers: { Authorization: 'Bearer ' + token } })
-    .then(r => { if (r.status === 401 && token !== 'auth-disabled') { localStorage.clear(); window.location.href = '/auth'; } })
+    .then(r => { if (r.status === 401) { localStorage.removeItem('insure_token'); token = 'auth-disabled'; } })
     .catch(() => { /* backend may be starting — health poller will recover */ });
 })();
 
@@ -529,7 +529,7 @@ function authHeaders(extra = {}) {
 
 function logout() {
   localStorage.clear();
-  window.location.href = '/auth';
+  window.location.href = '/';
 }
 
 // ── Cache clear ───────────────────────────────────────────────────────────────
