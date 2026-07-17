@@ -6379,6 +6379,11 @@ class MultiSourceRAG:
             except Exception as _cap_exc:
                 logger.debug("[ask_stream] sentence cap skipped: %s", _cap_exc)
 
+        # Set unconditionally (not just inside the try block below) so the
+        # hollow-answer detector further down can safely check it even if
+        # the currency-filter's try block never runs or exits early.
+        _dropped_num = 0
+
         # ── Drop sentences/points with an ungrounded currency figure ──────────
         # Every prompt's grounding rules say "never state a number... unless
         # that exact figure appears literally in the CONTEXT — no estimates,
@@ -6607,6 +6612,11 @@ class MultiSourceRAG:
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
+        # Set unconditionally for the same reason as _dropped_num above — the
+        # hollow-answer detector needs to check this even if the try block
+        # below never runs.
+        _refund_units_dropped = False
+
         # ── Drop refund/money-back claims scoped to an unrelated event ────────
         # Confirmed live on both vLLM and Groq (see [[project_groq_4th_attempt
         # _confirms_avoid]]): "will I get my money back if my health policy
@@ -6714,6 +6724,7 @@ class MultiSourceRAG:
                             _rf_rebuilt += "."
                     _corrected_text = _rf_rebuilt
                     _kv_reply = _rf_rebuilt
+                    _refund_units_dropped = True
                     logger.info(
                         "[ask_stream] dropped refund claim scoped to an unrelated "
                         "triggering event (source conditions the rule on "
@@ -6820,9 +6831,17 @@ class MultiSourceRAG:
                     r'^(so|good question|sure thing|right|ah)[,.!]\s*', _hollow_re.IGNORECASE,
                 )
                 _content_only = _hollow_leadin_re.sub('', _hollow_src, count=1)
+                # Was "...want more details!?" only — a single fixed phrase.
+                # Confirmed live the model doesn't always use that exact
+                # wording ("Let me know if you need any other examples! 😊"
+                # survived untouched, inflating the word count enough to
+                # dodge this check entirely). The sign-off is a single
+                # prompt-mandated closer regardless of its exact phrasing, so
+                # strip everything from "let me know if you want/need"
+                # onward rather than one literal string.
                 _content_only = _hollow_re.sub(
-                    r'\s*let me know if you want more details!?\s*\S*\s*$', '', _content_only,
-                    flags=_hollow_re.IGNORECASE,
+                    r'\s*let me know if you (?:want|need)\b.*$', '', _content_only,
+                    flags=_hollow_re.IGNORECASE | _hollow_re.DOTALL,
                 ).strip()
                 _word_count = len(_hollow_re.findall(r'\w+', _content_only))
                 _has_domain_word = any(term in _content_only.lower() for term in _INSURANCE_VOCAB)
@@ -6835,7 +6854,21 @@ class MultiSourceRAG:
                 # and no domain word" is the MOST hollow case there is —
                 # but gating on `_content_only` being truthy first meant
                 # this exact case short-circuited past the check entirely.
-                if _hollow_src and _word_count < 12 and not _has_domain_word:
+                #
+                # _has_domain_word alone is too weak a bar once we already
+                # know a unit was dropped upstream: confirmed live,
+                # "explain excess with an example" had its invented "₹10,000"
+                # sentence correctly dropped by the currency-qualifier
+                # filter, leaving "So, imagine you have a comprehensive
+                # insurance policy for your car." — 10 words, answers
+                # nothing, but "insurance"/"comprehensive"/"policy" are all
+                # in _INSURANCE_VOCAB, so the AND-gated check let it through.
+                # When the currency or refund-scope filter already stripped
+                # a unit, don't require the domain-word absence too — a
+                # topic-naming stub with nothing else left is exactly the
+                # hollow shape those filters are known to produce.
+                _prior_unit_dropped = bool(_dropped_num) or _refund_units_dropped
+                if _hollow_src and _word_count < 12 and (not _has_domain_word or _prior_unit_dropped):
                     _refusal_text = (
                         "Hmm, I don't have that specific information in my knowledge base right now. "
                         "Let me get one of our agents on it, they'll be able to help you better! 😊"
