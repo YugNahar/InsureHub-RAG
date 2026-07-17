@@ -819,12 +819,78 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
         if _chunk_policy_type:
             chunk.metadata["policy_type"] = _chunk_policy_type
 
-    pipeline.vector_store.add_documents(chunks)
+    chunk_ids = pipeline.vector_store.add_documents(chunks)
     doc_meta = {"filename": filename, "doc_type": doc_type, **doc_tags}
+    import threading as _threading
+
+    # ── Step 6: background LLM re-classification of policy_type ──────────────
+    # Step 5's classification came from classify_chunk_policy_type() with
+    # llm=None (Step 2's comment explains why: an LLM call would risk job
+    # timeouts on the synchronous upload path) — regex-only. Re-running WITH
+    # an LLM in the background (same pattern as the summary thread below —
+    # the upload job already returned, so a slow LLM pass here costs
+    # nothing from the user's perspective) catches what regex missed, same
+    # fix already applied to the existing KB (see
+    # project_metadata_classifier_llm_bypass_bug: 162/402 existing chunks
+    # corrected this same way).
+    #
+    # Classifies ONCE PER section_id group (see SectionChunker.split_
+    # documents in rag.py for the reasoning), not once per chunk — a chunk
+    # substantively spanning several distinct insurance types can only
+    # carry one guessed label; classifying the full section text once, at
+    # a genuine heading boundary, is what actually fixes it (see
+    # project_live_upload_metadata_pipeline_test).
+    def _reclassify_chunks_with_llm() -> None:
+        try:
+            from router import get_insurance_llm
+            from metadata_tagger import verify_and_enrich_section_metadata
+            reclass_llm = get_insurance_llm(temperature=0)
+            tvec = pipeline.vector_store._store
+
+            sections: dict = {}
+            for cid, chunk in zip(chunk_ids, chunks):
+                sid = chunk.metadata.get("section_id") or cid
+                sections.setdefault(sid, []).append((cid, chunk))
+
+            updated = 0
+            for section_items in sections.values():
+                section_text = "\n\n".join(c.page_content for _, c in section_items)
+                # The synchronous step above already ran the free heading-
+                # first regex pass (SectionChunker.split_documents with
+                # llm=None, by design, to keep the upload response fast) —
+                # that result is already sitting in each chunk's
+                # policy_type metadata. Use it as the baseline the LLM
+                # verifies/corrects here, rather than reclassifying from
+                # scratch — cheaper, and lets a confident regex heading
+                # match (e.g. "MOTOR INSURANCE") skip straight to
+                # confirmation instead of re-deriving it.
+                assigned_type = section_items[0][1].metadata.get("policy_type", "general")
+                enriched = verify_and_enrich_section_metadata(section_text, assigned_type, llm=reclass_llm)
+                fresh = enriched["policy_type"]
+                for cid, _ in section_items:
+                    meta = tvec._metadatas.get(cid)
+                    if meta is None:
+                        continue
+                    if meta.get("policy_type") != fresh:
+                        meta["policy_type"] = fresh
+                        updated += 1
+                    for field in ("language", "jurisdiction", "document_version", "effective_date", "coverage_category"):
+                        if enriched.get(field, "unknown") != "unknown":
+                            meta[field] = enriched[field]
+            if updated:
+                tvec._save_state()
+            logger.info(
+                "[background reclassify] '%s': updated %d/%d chunk policy_type tags across %d section(s)",
+                filename, updated, len(chunk_ids), len(sections),
+            )
+        except Exception:
+            logger.exception("[background reclassify] failed for '%s'", filename)
+
+    _threading.Thread(target=_reclassify_chunks_with_llm, daemon=True).start()
+
     # Run summary generation in a daemon thread so it doesn't block the job
     # from completing. The summary is optional — retrieval degrades gracefully
     # without it, so a failure or slow LLM response is not critical.
-    import threading as _threading
     _threading.Thread(
         target=pipeline._upsert_summary,
         args=(chunks, unique_source, doc_meta, llm),
@@ -1018,7 +1084,7 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
         # This mirrors what _ingest_file() does for uploaded documents so that
         # webpage chunks participate in query-time metadata filtering just like
         # PDF/DOCX chunks do.
-        from metadata_tagger import tag_document, classify_chunk_policy_type, classify_chunk_intent
+        from metadata_tagger import tag_document
         from router import get_insurance_llm
 
         llm = None
@@ -1044,33 +1110,24 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
         )
 
         # ── Chunk ─────────────────────────────────────────────────────────────
+        # llm=llm passed through so SectionChunker's own per-section
+        # classification (heading-first regex pass + LLM verify/enrich —
+        # see SectionChunker.split_documents in rag.py) runs once per
+        # detected section, not once per chunk redundantly afterward below.
         chunker = SectionChunker(chunk_size=2000, chunk_overlap=600)
-        chunks  = chunker.split_documents(docs)
+        chunks  = chunker.split_documents(docs, llm=llm)
 
-        # ── Classify every chunk (section + policy_type) ─────────────────────
+        # ── Finish per-chunk metadata (section/policy_type already set) ──────
         for chunk in chunks:
             chunk.metadata["source_type"] = "webpage"
             chunk.metadata["source_url"]  = url
 
-            # Section / intent classification
-            chunk.metadata["section"] = classify_chunk_intent(
-                chunk.page_content,
-                doc_type="general",
-                llm=llm,
-                force_llm=False,
-            )
-
-            # Per-chunk policy_type — fall back to doc-level if still "general"
-            chunk_policy = classify_chunk_policy_type(
-                chunk.page_content,
-                llm=llm,
-                force_llm=False,
-            )
-            chunk.metadata["policy_type"] = (
-                chunk_policy
-                if chunk_policy != "general"
-                else doc_meta.get("policy_type", "general")
-            )
+            # split_documents() already set policy_type via the section-
+            # aware pass above — only fall back to the doc-level tag if it's
+            # still "general" (matches the same chunk-wins/doc-level-
+            # fallback order used everywhere else in this file).
+            if chunk.metadata.get("policy_type", "general") == "general":
+                chunk.metadata["policy_type"] = doc_meta.get("policy_type", "general")
 
             # Propagate doc-level fields to every chunk
             chunk.metadata["insurer"]  = doc_meta.get("insurer", "UNKNOWN")

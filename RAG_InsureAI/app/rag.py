@@ -26,7 +26,8 @@ from metadata_tagger import (
     build_metadata_filter,
     classify_document_type,
     classify_chunk_intent,
-    classify_chunk_policy_type,
+    regex_first_pass_policy_type,
+    verify_and_enrich_section_metadata,
 )
 from validator import detect_conflict, validate_grounding
 from router import get_insurance_llm, get_general_llm, VLLM_HOST
@@ -325,38 +326,92 @@ class SectionChunker:
         """
         Split documents and annotate each chunk with section/policy_type/keywords.
         Page merging and page-number recovery are handled by SemanticChunker.
+
+        policy_type (and section/intent) are decided ONCE PER SECTION, not
+        once per chunk — SemanticChunker.split_documents() now tags every
+        chunk with a section_id grouping it with its siblings from the same
+        detected heading-bounded section (see project_live_upload_metadata_
+        pipeline_test: classifying each ~500-word chunk independently means
+        a chunk substantively discussing 3-4 different insurance types can
+        only get ONE guessed label; classifying the full section text once
+        — which a genuine heading boundary means is far more likely to
+        actually BE about one topic — and inheriting that single decision
+        down to every chunk in the section is the structural fix, not a
+        better per-chunk guess). Falls back to one chunk == one section
+        (today's original per-chunk behavior) when no heading structure was
+        detected, via the section_id SemanticChunker already assigns in
+        that case.
         """
         chunks = self._splitter.split_documents(docs)
 
+        # ── Group chunks by section_id, decide metadata once per group ───────
+        sections: dict[str, list[Document]] = {}
         for chunk in chunks:
-            effective_doc_type = chunk.metadata.get("doc_type", doc_type)
+            sid = chunk.metadata.get("section_id") or id(chunk)
+            sections.setdefault(sid, []).append(chunk)
+
+        for section_chunks in sections.values():
+            first = section_chunks[0]
+            effective_doc_type = first.metadata.get("doc_type", doc_type)
             is_youtube = (
                 effective_doc_type == "youtube"
-                or "whisper" in str(chunk.metadata.get("source_type", "")).lower()
-                or "youtube" in str(chunk.metadata.get("source", "")).lower()
+                or "whisper" in str(first.metadata.get("source_type", "")).lower()
+                or "youtube" in str(first.metadata.get("source", "")).lower()
             )
+            # Full section text (all its chunks combined) gives the
+            # classifier real visibility into the section as a whole,
+            # rather than whatever one arbitrary sub-chunk happened to say —
+            # the prompt already truncates to a safe upper bound.
+            section_text = "\n\n".join(c.page_content for c in section_chunks)
 
             if llm is not None:
-                chunk.metadata["section"] = classify_chunk_intent(
-                    chunk.page_content,
-                    doc_type=effective_doc_type,
-                    llm=llm,
-                    force_llm=is_youtube,
+                section_intent = classify_chunk_intent(
+                    section_text, doc_type=effective_doc_type, llm=llm, force_llm=is_youtube,
                 )
             else:
-                chunk.metadata["section"] = _detect_section(
-                    chunk.page_content, doc_type=effective_doc_type
-                )
+                section_intent = _detect_section(section_text, doc_type=effective_doc_type)
 
-            chunk_policy = classify_chunk_policy_type(
-                chunk.page_content,
-                llm=llm if llm is not None else None,
-                force_llm=is_youtube if llm is not None else False,
-            )
-            if chunk_policy != "general":
-                chunk.metadata["policy_type"] = chunk_policy
+            # First pass: fast, free heading-then-body regex guess (see
+            # regex_first_pass_policy_type — checks the section HEADING
+            # first, a much cleaner signal than scanning the full body,
+            # falling back to the body only if the heading itself doesn't
+            # confidently resolve). Then the LLM verifies/corrects that
+            # guess (cheaper and more reliable than reclassifying from
+            # scratch — a targeted yes/no-with-confidence question, not an
+            # open "pick 1 of 12" one) and separately extracts metadata the
+            # structural pass has no way to determine (jurisdiction,
+            # document_version, language, effective_date,
+            # coverage_category — "unknown" is the correct, expected
+            # answer when a fixed-KB section doesn't state these).
+            section_heading = first.metadata.get("section_heading", "")
+            first_pass_type = regex_first_pass_policy_type(section_heading, section_text)
+            enriched = verify_and_enrich_section_metadata(section_text, first_pass_type, llm=llm)
+            section_policy = enriched["policy_type"]
 
-            chunk.metadata["keywords"] = _extract_keywords(chunk.page_content)
+            for chunk in section_chunks:
+                chunk.metadata["section"] = section_intent
+                # Always set the key, even when section_policy is "general" —
+                # confirmed live this must be an explicit, truthy string, not
+                # an absent key. api.py's ingest step saves each chunk's own
+                # policy_type before a blanket doc_tags.update() (crude
+                # whole-document-level tag) and restores it after, but only
+                # restores when the saved value is truthy — chunk.metadata.get
+                # returns None for an absent key, which is falsy, so a
+                # section correctly determined to be "general" silently lost
+                # that determination to the document-level tag. Confirmed
+                # live: a 6-topic test document where 3 sections' own content
+                # correctly resolved to "general" all got overwritten with
+                # "cyber" — the whole-document tag_document() call (a
+                # separate, older keyword list — see _POLICY_PATTERNS vs
+                # _POLICY_TYPE_HINTS) scored "cyber" highest across the
+                # WHOLE short document because one OTHER section
+                # (legitimately about cyber insurance) dominated the
+                # document-wide keyword count.
+                chunk.metadata["policy_type"] = section_policy
+                for field in ("language", "jurisdiction", "document_version", "effective_date", "coverage_category"):
+                    if enriched.get(field, "unknown") != "unknown":
+                        chunk.metadata[field] = enriched[field]
+                chunk.metadata["keywords"] = _extract_keywords(chunk.page_content)
 
         return chunks
 
@@ -685,6 +740,18 @@ class RAGPipeline:
             doc.metadata["doc_type"] = doc_type
             doc.metadata.setdefault("source_type", source_type)
 
+        # self._chunker is a SectionChunker — split_documents() already ran
+        # the section-aware policy_type classification per chunk (heading-
+        # first regex pass + LLM verify/enrich, grouped by section_id — see
+        # SectionChunker.split_documents above). That per-chunk value is
+        # strictly more precise than the single whole-document tag in
+        # doc_tags below (computed from just the first ~5000 chars of
+        # preview text) — a URL/YouTube source discussing several distinct
+        # topics should keep each chunk's own type, not have it flattened
+        # to whatever the preview happened to score. Save it before the
+        # blanket doc_tags update (which would otherwise clobber it) and
+        # restore it after, matching the same chunk-wins/doc-level-
+        # fallback order already used by the main /upload path in api.py.
         chunks = self._chunker.split_documents(docs, doc_type=doc_type, llm=llm)
 
         self._vector_store.delete_by_field("source_url", url)
@@ -694,17 +761,12 @@ class RAGPipeline:
             chunk.metadata["source"] = unique_source
             chunk.metadata["source_url"] = url
             chunk.metadata["filename"] = url
+            _chunk_policy_type = chunk.metadata.get("policy_type")
             chunk.metadata.update({k: v for k, v in doc_tags.items() if k not in _CHUNK_SKIP_FIELDS})
             chunk.metadata["doc_type"] = doc_type
             chunk.metadata.setdefault("source_type", "youtube" if is_youtube else "document")
-
-            chunk_policy = classify_chunk_policy_type(
-                chunk.page_content,
-                llm=llm,
-                force_llm=is_youtube,
-            )
-            if chunk_policy != "general":
-                chunk.metadata["policy_type"] = chunk_policy
+            if _chunk_policy_type:
+                chunk.metadata["policy_type"] = _chunk_policy_type
 
         self._vector_store.add_documents(chunks)
         doc_meta = {"filename": url, "source_url": url, "doc_type": doc_type, **doc_tags}

@@ -681,7 +681,19 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
         "regex": [
             r"\bcar insurance\b", r"\bmotor insurance\b", r"\bvehicle insurance\b",
             r"\bauto insurance\b", r"\bmotor vehicle\b", r"\bcomprehensive motor\b",
-            r"\bthird.?party\b", r"\bown damage\b", r"\bdriving\b",
+            # Narrowed from bare \bthird.?party\b (2026-07-16) — "third party"
+            # alone is a general legal/insurance concept spanning liability,
+            # professional indemnity, and general insurance principles, not
+            # exclusively motor. Confirmed live: the heading "THIRD PARTY
+            # ADMINISTRATORS-HEALTH" classified as motor purely because
+            # "third party" hit here with zero competing signal, even though
+            # "HEALTH" is literally in the same heading (health's list has
+            # no standalone fallback for it — see below). Requiring an
+            # immediate qualifier keeps the genuinely motor-specific
+            # phrasings ("third party liability", "third-party insurance")
+            # while dropping the bare, type-agnostic mention.
+            r"\bthird.?party\s+(?:liability|insurance|cover(?:age)?)\b",
+            r"\bown damage\b", r"\bdriving\b",
             r"\bbike insurance\b", r"\btwo.?wheeler\b", r"\bautomobile\b",
         ],
     },
@@ -702,6 +714,20 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             r"\bhospital\b", r"\bmedical expense\b", r"\bclinical\b",
             r"\bdoctor\b", r"\bsurgery\b", r"\billness\b", r"\btreatment\b",
             r"\bpre.?existing\b", r"\bmaternity\b",
+            # Bare \bhealth\b / \bmedical\b were tried and reverted the same
+            # day (2026-07-16): fixed a heading-only edge case ("THIRD PARTY
+            # ADMINISTRATORS-HEALTH") but caused a worse regression in body
+            # text — a personal-accident section explicitly contrasting
+            # itself against health cover ("Unlike a health plan, this kind
+            # of cover doesn't reimburse hospital bills directly") scored
+            # health=3 (health + hospital + medical, all present specifically
+            # BECAUSE the text was distinguishing itself from health
+            # insurance) and confidently misclassified. The original heading
+            # case doesn't actually need this — its real body text already
+            # contains "health insurance" as a full phrase (confirmed
+            # directly against the live KB chunk), which the existing
+            # \bhealth insurance\b entry above already catches once the
+            # heading check falls through to the body.
         ],
     },
     "life": {
@@ -711,13 +737,13 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "pension, retirement savings with life component."
         ),
         "keywords": [
-            "life insurance", "term life", "whole life", "death benefit",
+            "life insurance", "term insurance", "term life", "whole life", "death benefit",
             "sum assured", "life assurance", "accidental death", "critical illness",
             "terminal illness", "annuity", "pension", "retirement plan",
             "endowment", "unit-linked", "ULIP", "nominee", "beneficiary",
         ],
         "regex": [
-            r"\blife insurance\b", r"\bterm life\b", r"\bwhole life\b",
+            r"\blife insurance\b", r"\bterm insurance\b", r"\bterm life\b", r"\bwhole life\b",
             r"\bdeath benefit\b", r"\bsum assured\b", r"\blife assurance\b",
             r"\bcritical illness\b", r"\bannuity\b", r"\bpension\b",
             r"\bendowment\b", r"\bulip\b",
@@ -744,9 +770,18 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
     },
     "home": {
         "desc": (
-            "Home, property, building, contents, household insurance. Covers "
-            "fire, flood, theft, structural damage, personal belongings inside "
-            "the home."
+            "Home, property, building, contents, household insurance for a "
+            "RESIDENTIAL dwelling someone lives in — fire, flood, theft, "
+            "structural damage, personal belongings inside the home. NOT for "
+            "harm the policyholder CAUSES to someone else's property or a "
+            "third party (a neighbour's property damaged by a leak from the "
+            "insured's factory, a passerby injured outside the insured's "
+            "shop) — that is liability insurance, even though the word "
+            "'property' appears in both. NOT for a BUSINESS's own building, "
+            "warehouse, shop, or office, even though the underlying risk "
+            "(fire, flood, theft, a burst pipe) sounds identical — a "
+            "business's own premises is commercial insurance, not home, "
+            "regardless of how similar the covered perils are worded."
         ),
         "keywords": [
             "home insurance", "property insurance", "building insurance",
@@ -828,8 +863,15 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
     },
     "commercial": {
         "desc": (
-            "Commercial and business insurance. Covers business property, "
-            "business interruption, shop/office insurance, industrial all-risk."
+            "Commercial and business insurance. Covers business PROPERTY (the "
+            "building/premises itself), business interruption, shop/office "
+            "insurance, industrial all-risk. NOT a catch-all for anything a "
+            "business happens to buy — goods in transit is marine, a company "
+            "car is motor, a professional being sued for bad advice is "
+            "liability, even though all three are 'business' contexts. Only "
+            "use commercial when the cover is about the business's own "
+            "premises/property/operations continuity, with no more specific "
+            "type (marine, motor, liability, fire, etc.) actually fitting."
         ),
         "keywords": [
             "commercial insurance", "business insurance", "trade insurance",
@@ -909,6 +951,7 @@ def _build_policy_type_prompt(text: str, regex_scores: dict[str, int]) -> str:
         f"    Example keywords: {', '.join(info['keywords'][:6])}"
         for pt, info in _POLICY_TYPE_HINTS.items()
     )
+    all_labels = ", ".join(list(_POLICY_TYPE_HINTS.keys()) + ["general"])
 
     return f"""You are an insurance content classifier. Your job is to identify the POLICY TYPE of a text.
 
@@ -920,19 +963,27 @@ Regex keyword signals found in this text (these are HINTS only — the text may 
 or colloquial language that regex missed, so use your full understanding):
   {regex_hint}
 
-DECISION RULES (apply in order):
-1. If the text is about cars, vehicles, auto, driving, road accidents → motor
-2. If the text is about hospitals, doctors, medicine, illness, medical bills → health
-3. If the text is about death benefit, life cover, term plan, sum assured for life → life
-4. If the text is about travel, flights, baggage, trip cancellation, overseas → travel
-5. If the text is about home, property, building contents, fire at home, flood → home
-6. If the text covers multiple types with no dominant one, or is truly generic → general
+STEP 1 — read the ENTIRE text first, start to finish, before deciding anything. Note
+EVERY distinct insurance type it discusses, not just the first one you recognize —
+a paragraph a third of the way through can introduce a completely different type
+than the opening paragraph, and you must weigh it equally.
 
-Reply with ONLY the policy type label (one word from: motor, health, life, travel, home, general).
+STEP 2 — decide:
+- If the text discusses 2 OR MORE clearly different insurance types (e.g. one section
+  about hospital/medical cover, a later section about vehicle/driving cover) with no
+  single type covering the clear majority of the text → answer "general". Do NOT pick
+  whichever type happens to appear first or takes up the most space if a genuinely
+  different type is also substantively discussed — "general" is correct here even
+  though it means picking no single winner.
+- Only if the text is consistently about ONE type throughout (synonyms, examples, and
+  elaboration of that same type are fine — that's still one type) → answer that
+  specific type's label.
+
+Reply with ONLY the policy type label (one word from: {all_labels}).
 No explanation. No punctuation. Just the label.
 
-TEXT (first 500 chars):
-{text[:500]}
+FULL TEXT:
+{text[:4000]}
 
 POLICY TYPE:"""
 
@@ -978,16 +1029,33 @@ def classify_chunk_policy_type(
         best_score = 0
         regex_confident = False
 
-    # If regex is confident and we're not forcing LLM, trust it
-    if regex_confident and not force_llm:
-        logger.debug("[POLICY_TYPE] regex confident → %s (score=%d)", best_type, best_score)
-        return best_type
+    # Regex is a HINT for the LLM prompt below (see _build_policy_type_prompt,
+    # which explicitly tells the model these are "hints only ... use your
+    # full understanding"), not a decision authority in its own right — it
+    # should never get to NAME the chunk on its own when an LLM is available
+    # to actually judge the meaning. This used to short-circuit here
+    # whenever regex hit >=2 confident keywords, entirely skipping the LLM
+    # even when one was passed in. Real KB chunks can rack up 2+ incidental
+    # keyword hits for the WRONG type (e.g. a chunk about crop-insurance
+    # government schemes happens to pattern-match another type's regex)
+    # while genuinely on-topic content doesn't always contain the exact
+    # hardcoded keyword phrases regex looks for — regex is a narrow,
+    # brittle proxy for "what is this chunk about," the LLM's semantic
+    # reading is the actually reliable signal once it's available to ask.
+    # No longer returns early here at all — falls straight through to the
+    # LLM path below whenever an LLM is available, regardless of regex
+    # confidence; the `llm is None` branch there is the ONLY place that
+    # still trusts a confident regex result outright, since there's
+    # nothing else to consult in that case.
 
     # ── LLM path ──────────────────────────────────────────────────────────────
-    # Called when:
+    # Called whenever an LLM is available, regardless of regex confidence —
+    # regex_scores are still passed in as hint context (see prompt builder).
+    # Falls through to here when:
     #   (a) regex found nothing (best_score == 0) — LLM must decide from meaning
     #   (b) regex is ambiguous (multiple types close in score)
-    #   (c) force_llm=True (always use LLM, e.g. for YouTube chunks)
+    #   (c) regex WAS confident but an LLM is available to double-check it
+    #   (d) force_llm=True (always use LLM, e.g. for YouTube chunks)
     if llm is None:
         # No LLM available — only trust the regex result when it actually
         # cleared the same regex_confident bar used above (>=2 hits AND
@@ -1025,6 +1093,283 @@ def classify_chunk_policy_type(
         logger.warning("[POLICY_TYPE] LLM call failed: %s — using regex fallback", exc)
 
     return best_type if best_score >= 1 else "general"
+
+
+# ── Section-level: heading-first pass + LLM verify/enrich ───────────────────────
+# Two-role LLM usage, once per SECTION rather than once per chunk (see
+# SectionChunker.split_documents in rag.py, which now groups chunks by
+# section_id before calling this): a fast, free first-pass guess, then a
+# targeted LLM pass that VERIFIES that guess (cheaper and more reliable than
+# re-classifying from scratch — a yes/no-with-confidence question is a much
+# narrower ask than "pick 1 of 12 types") and separately EXTRACTS metadata
+# fields the structural/regex layer has no way to determine at all.
+def regex_first_pass_policy_type(section_heading: str, section_text: str) -> str:
+    """
+    Step 1 (fast, free, no LLM): guess policy_type from the section HEADING
+    first, falling back to the section BODY only if the heading itself
+    doesn't confidently resolve.
+
+    The heading is checked with classify_query_policy_type() rather than
+    the chunk-tuned confidence bar below — a heading is short, deliberately
+    topic-labeling text ("MOTOR INSURANCE", "FIRE INSURANCE"), the same
+    shape as a user query, not a 200-500 word chunk where a single
+    incidental keyword is weak evidence. When it works, it's a much
+    cleaner signal than scanning the full body for keyword hits. It won't
+    work for a paraphrased or abstract heading ("DIGITAL RISK COVER" for a
+    cyber-insurance section) — those fall through to the body-text check,
+    and if THAT also comes up empty, to "general", which
+    verify_and_enrich_section_metadata() below still gets a chance to
+    correct via its own semantic reading. Neither this function nor that
+    one is authoritative alone; this is just the free, fast opening guess.
+    """
+    if section_heading:
+        heading_type = classify_query_policy_type(section_heading)
+        if heading_type != "general":
+            return heading_type
+
+    regex_scores = _regex_policy_score(section_text)
+    positive_scores = {k: v for k, v in regex_scores.items() if v > 0}
+    if not positive_scores:
+        return "general"
+    best_type = max(positive_scores, key=positive_scores.__getitem__)
+    best_score = positive_scores[best_type]
+    sorted_vals = sorted(positive_scores.values(), reverse=True)
+    runner_up = sorted_vals[1] if len(sorted_vals) > 1 else 0
+    regex_confident = best_score >= 2 and best_score >= (runner_up * 2 + 1)
+    return best_type if regex_confident else "general"
+
+
+# Confidence (0-100) the LLM must report before its verification is trusted
+# to OVERRIDE the first-pass type. Below this, a "no, I think this is wrong"
+# verdict is logged but not acted on — a single low-confidence LLM wobble
+# shouldn't flip a tag the first pass may have already gotten right.
+_VERIFY_OVERRIDE_THRESHOLD = 70
+
+_ENRICHMENT_FIELDS = ("language", "jurisdiction", "document_version", "effective_date", "coverage_category")
+
+# Common everyday synonyms for our canonical type labels. Confirmed live:
+# asked the LLM to verify a wrongly-"health"-tagged section that was
+# unambiguously about car/collision/no-claim-bonus content — it correctly
+# recognized the mislabel (VERIFIED=no, confidence=85) but replied
+# CORRECTED_TYPE=auto instead of "motor", the exact label from the "Available
+# policy types" list handed to it in the same prompt. "auto" isn't in
+# _VALID_POLICY_TYPES, so the strict membership check silently discarded an
+# otherwise-correct correction and the wrong "health" tag stuck. Small models
+# don't perfectly follow "reply with exactly one of these words" instructions
+# even when the list is right there — normalizing a short list of the most
+# likely everyday synonyms before the membership check is a safety net for
+# that gap, not a replacement for the prompt's own instruction.
+_TYPE_SYNONYMS: dict[str, str] = {
+    "auto": "motor", "automobile": "motor", "car": "motor", "vehicle": "motor",
+    "car insurance": "motor", "vehicle insurance": "motor",
+    "property": "home", "household": "home", "house": "home", "homeowners": "home",
+    "medical": "health",
+    "accident": "personal_accident", "pa": "personal_accident",
+    "trip": "travel",
+    "agriculture": "crop", "agricultural": "crop", "farm": "crop",
+    "business": "commercial",
+    "shipping": "marine", "cargo": "marine",
+}
+
+
+def _normalize_policy_type(label: str) -> str:
+    return _TYPE_SYNONYMS.get(label, label)
+
+
+def _build_verify_and_enrich_prompt(text: str, assigned_type: str) -> str:
+    # Full descriptions, not just bare names — confirmed live this prompt
+    # used to hand the model only a comma-separated name list (unlike
+    # _build_policy_type_prompt's richer label_list), and a text unambiguously
+    # about marine cargo (ship, vessel, bill of lading, sea/air/inland
+    # transit) got confidently (95%) confirmed as "commercial" instead of
+    # corrected to "marine" — with no description in front of it, the model
+    # had nothing to weigh the surface-plausible-but-wrong label against.
+    # Matches the existing richer prompt's format for the same reason it
+    # exists there: names alone from a whole-industry vocabulary don't
+    # reliably disambiguate close pairs.
+    label_list = "\n".join(
+        f"  - {pt}: {info['desc']}"
+        for pt, info in _POLICY_TYPE_HINTS.items()
+    )
+    # "general" isn't a real topic to verify — it means the first pass found
+    # no confident single type, not "this text is about general insurance."
+    # Asking "does this discuss general insurance?" is a question the model
+    # will just agree with (confirmed live: VERIFIED=yes, confidence=80, on
+    # text that was unambiguously about cyber insurance) since nothing in
+    # the text actively contradicts "general." The real question when the
+    # first pass came up empty is the opposite framing: actively look for
+    # ONE specific type before accepting "general" as the answer.
+    #
+    # The IDENTIFY branch used to reuse the VERIFY branch's VERIFIED=<yes/no>
+    # + CORRECTED_TYPE=<type/"same"> fields, but that pairing has no real
+    # "no" case to verify against when the baseline is already "general" —
+    # confirmed live the model settled into a self-contradictory pattern,
+    # VERIFIED=no paired with CORRECTED_TYPE=same, on multiple different
+    # unambiguous texts (cyber: hacker/ransomware/data-breach content, home:
+    # house/building/contents/burglary content) across repeated identical
+    # calls. "no" was being used to hedge ("I'm not fully confirming general")
+    # without committing to naming an alternative, and since CORRECTED_TYPE
+    # was "same" the override correctly never fired — but that meant the
+    # IDENTIFY path silently never promoted anything out of "general" for
+    # these texts at all. A single unambiguous field removes the room for
+    # that contradiction: there's nothing to say "no" to.
+    if assigned_type == "general":
+        step1 = """STEP 1 — IDENTIFY: an initial keyword pass found no confident single type
+for this text. Read it and decide: does it discuss ONE particular insurance
+type clearly enough to name it specifically? Don't default to "general" just
+because the text doesn't use an exact textbook phrase — judge the actual
+subject matter (e.g. text about hackers, data breaches, and ransomware is
+about cyber insurance even if it never says the words "cyber insurance").
+- Judge by what TRIGGERS a claim and what the policy PAYS FOR — not by
+  incidental nouns mentioned only in a passing illustrative example. A
+  passage about a professional being sued for negligent advice is liability
+  insurance even if its example happens to be "a software consultant whose
+  faulty code crashes a client's system" — the trigger is a negligence
+  claim over professional judgment, not a hack or data breach, so it is
+  NOT cyber insurance just because the example mentions software.
+- If a single type clearly applies, put its label in IDENTIFIED_TYPE below.
+- If the text genuinely discusses multiple different types with no single
+  dominant one, or truly can't be pinned to any specific type, put "general"
+  in IDENTIFIED_TYPE — that is a correct, expected answer here, not a
+  failure to identify something."""
+        reply_fields = "IDENTIFIED_TYPE=<the single policy type that clearly applies, or \"general\" if none does>"
+        confidence_desc = "how confident you are in this identification"
+    else:
+        step1 = f"""STEP 1 — VERIFY: an initial keyword pass tagged this text as policy_type="{assigned_type}".
+Does this text genuinely, primarily discuss "{assigned_type}" insurance?
+- If yes, confirm it.
+- If no, state the ONE type it actually discusses instead — or "general" if it
+  genuinely discusses multiple different types with no single dominant one."""
+        reply_fields = ("VERIFIED=<yes/no>\n"
+                         "CORRECTED_TYPE=<the correct type if VERIFIED=no, otherwise write \"same\">")
+        confidence_desc = "how confident you are in this verification"
+
+    return f"""You are verifying and enriching metadata for a section of an insurance document.
+
+{step1}
+- WATCH FOR CONTRAST: text naming a DIFFERENT type specifically to distinguish
+  itself from it ("unlike a health plan...", "not like ongoing treatment
+  cover...", "irrelevant here in a way it would matter for a scheme built
+  around X...") is telling you it is NOT that other type — the other type's
+  vocabulary appearing in a sentence like that is evidence AGAINST that type,
+  not for it, even though the literal words are present.
+
+STEP 2 — EXTRACT (from the text only — never guess or invent a value): for each
+field below, give the value ONLY if it is explicitly stated in the text,
+otherwise write exactly "unknown".
+- language: the language the text is written in
+- jurisdiction: a specific country, state, or region the text is legally scoped to
+- document_version: an edition, version number, or year explicitly stated for this document
+- effective_date: an effective or commencement date explicitly stated
+- coverage_category: a specific named cover variant (e.g. "comprehensive", "third-party", "family floater") if the text is about ONE specific variant
+
+Available policy types:
+{label_list}
+  - general: text covers multiple types, is generic about insurance, or the type cannot be determined
+
+Use the EXACT label word shown above (e.g. "motor", not "auto" or "car"; "home",
+not "property" or "household") — these are fixed labels an automated system
+matches on, not free-text description.
+
+TEXT:
+{text[:4000]}
+
+Reply in EXACTLY this format, one line per field, no explanation, no extra text:
+{reply_fields}
+CONFIDENCE=<a number 0-100, {confidence_desc}>
+LANGUAGE=<value or unknown>
+JURISDICTION=<value or unknown>
+DOCUMENT_VERSION=<value or unknown>
+EFFECTIVE_DATE=<value or unknown>
+COVERAGE_CATEGORY=<value or unknown>"""
+
+
+def verify_and_enrich_section_metadata(
+    text: str,
+    assigned_type: str,
+    llm: Any = None,
+) -> dict:
+    """
+    Step 2: LLM verify + enrich, once per section.
+
+    Returns a dict with "policy_type" (the verified/corrected type) plus
+    the _ENRICHMENT_FIELDS, each either an extracted value or "unknown".
+    "unknown" is the CORRECT, expected answer when the text doesn't state
+    a field explicitly (most sections in a fixed textbook-style KB won't
+    name a jurisdiction or effective date) — it is not a failure.
+
+    Falls back to {"policy_type": assigned_type, ...all "unknown"} when no
+    LLM is available or the call fails; callers already have assigned_type
+    from regex_first_pass_policy_type() as that fallback baseline.
+    """
+    result: dict = {"policy_type": assigned_type}
+    result.update({field: "unknown" for field in _ENRICHMENT_FIELDS})
+
+    if llm is None:
+        return result
+
+    try:
+        prompt = _build_verify_and_enrich_prompt(text, assigned_type)
+        response = llm.invoke(prompt)
+        raw = response.content if hasattr(response, "content") else str(response)
+
+        def _field(name: str, default: str = "") -> str:
+            m = re.search(rf"{name}\s*=\s*(.+)", raw, re.IGNORECASE)
+            return m.group(1).strip().strip('"').strip() if m else default
+
+        try:
+            confidence = float(re.sub(r"[^\d.]", "", _field("CONFIDENCE", "0")) or 0)
+        except ValueError:
+            confidence = 0.0
+
+        # Two distinct reply shapes matching the two prompt branches above —
+        # see _build_verify_and_enrich_prompt for why IDENTIFY gets its own
+        # single field instead of reusing VERIFIED/CORRECTED_TYPE.
+        if assigned_type == "general":
+            identified = _normalize_policy_type(_field("IDENTIFIED_TYPE", "general").lower())
+            if identified != "general" and identified in _VALID_POLICY_TYPES:
+                if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
+                    logger.info(
+                        "[POLICY_TYPE] identified: general -> %r (confidence=%.0f)",
+                        identified, confidence,
+                    )
+                    result["policy_type"] = identified
+                else:
+                    logger.debug(
+                        "[POLICY_TYPE] identification suggested general -> %r but confidence %.0f "
+                        "< threshold %d — keeping general",
+                        identified, confidence, _VERIFY_OVERRIDE_THRESHOLD,
+                    )
+        else:
+            verified = _field("VERIFIED", "yes").lower().startswith("y")
+            corrected = _normalize_policy_type(_field("CORRECTED_TYPE", "same").lower())
+            if (
+                not verified
+                and corrected not in ("same", "", assigned_type.lower())
+                and corrected in _VALID_POLICY_TYPES
+            ):
+                if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
+                    logger.info(
+                        "[POLICY_TYPE] verification override: %r -> %r (confidence=%.0f)",
+                        assigned_type, corrected, confidence,
+                    )
+                    result["policy_type"] = corrected
+                else:
+                    logger.debug(
+                        "[POLICY_TYPE] verification suggested %r -> %r but confidence %.0f "
+                        "< threshold %d — keeping first-pass %r",
+                        assigned_type, corrected, confidence, _VERIFY_OVERRIDE_THRESHOLD, assigned_type,
+                    )
+
+        for field in _ENRICHMENT_FIELDS:
+            value = _field(field.upper(), "unknown").lower()
+            if value and value != "unknown":
+                result[field] = value
+
+    except Exception as exc:
+        logger.warning("[POLICY_TYPE] verify/enrich LLM call failed: %s — keeping first-pass assignment", exc)
+
+    return result
 
 
 def classify_chunk_policy_type_batch(
