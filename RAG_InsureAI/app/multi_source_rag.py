@@ -4198,7 +4198,21 @@ class MultiSourceRAG:
         # worse source material. Latency cost is real (this is what the
         # 2026-07-10 change traded away) but the user weighed answer
         # quality higher after seeing this evidence.
-        _doc_top_k   = 14 if _keyword_detailed else 8
+        # Widened 8/14 -> 12/18 (2026-07-17) — confirmed live this was still
+        # a real retrieval-stage bottleneck, not just a reranking-quality
+        # one: for "can I get medical insurance for my broken hand?" (brief
+        # mode, top_k=8), the one chunk answering the actual question (a
+        # pre-existing-injury exclusion clause) ranked #11 of 14 in the
+        # RRF/dense+BM25 pre-rerank pool even in detailed mode's wider
+        # setting — it never reached the reranker at all in brief mode,
+        # so no amount of reranker-side improvement (see
+        # _rerank_metadata_prefix in turbovec_store.py, the other half of
+        # this fix) could have surfaced it. This stage uses cruder
+        # embedding+keyword signals than the cross-encoder reranker that
+        # runs after it, so it needs a wider net specifically to avoid
+        # silently dropping a correct-but-differently-worded chunk before
+        # the reranker ever gets a chance to judge it.
+        _doc_top_k   = 18 if _keyword_detailed else 12
         # Trimmed 12/8 -> 8/5 (2026-07-13) — the final merged-and-reranked
         # pool actually sent to the LLM, kept deliberately separate from
         # _doc_top_k/_media_top_k above (which stay wide so the reranker
