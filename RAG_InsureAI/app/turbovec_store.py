@@ -165,6 +165,40 @@ _RERANK_WINDOW_STRIDE = _RERANK_TEXT_CHARS // 3
 _RERANK_MAX_WINDOWS = 2
 
 
+def _rerank_metadata_prefix(metadata: dict) -> str:
+    """
+    Cheap, high-leverage signal prepended to a chunk's text ONLY for the
+    (query, window) pair handed to the cross-encoder — never to the text
+    actually returned to the caller, stored, shown to the user, or sent to
+    the generation LLM. The reranker has no way to know a passage is an
+    EXCLUSIONS section versus ordinary coverage text without reading the
+    whole surrounding page, and a chunk's own wording often doesn't repeat
+    its policy type or section at all.
+
+    Confirmed live: a health-policy exclusion clause ("all diseases /
+    injuries which are pre-existing when the cover incepts") scored 0.0027
+    against "can I get medical insurance for my broken hand?" -- the query
+    never uses any wording close to the clause's, and the chunk's own
+    surrounding text is dominated by disease-specific exclusions unrelated
+    to an "injury" framing. Prepending "[Policy Type: Health Insurance]
+    [Section: Exclusions]" raised the SAME pairing's score to 0.059 --
+    above the chunk that had been winning outright (0.008) -- tested
+    against several label formats before picking this one; a bare
+    "Health Insurance." prefix alone helped less (0.050) and a full
+    natural-language sentence description helped less still (0.023).
+    """
+    parts = []
+    ptype = metadata.get("policy_type")
+    if ptype and ptype != "general":
+        parts.append(f"Policy Type: {str(ptype).replace('_', ' ').title()} Insurance")
+    section = metadata.get("section")
+    if section and section != "general":
+        parts.append(f"Section: {str(section).replace('_', ' ').title()}")
+    if not parts:
+        return ""
+    return "[" + "] [".join(parts) + "]\n"
+
+
 def _rerank_windows(text: str, query: str) -> List[str]:
     """Return up to _RERANK_MAX_WINDOWS candidate _RERANK_TEXT_CHARS windows
     of *text* for the cross-encoder to score independently — the caller
@@ -936,8 +970,9 @@ class TurboVecStore:
         pairs: List[tuple] = []
         owner: List[int] = []
         for i, c in enumerate(candidates):
+            prefix = _rerank_metadata_prefix(c[2])
             for window in _rerank_windows(c[1], query):
-                pairs.append((query, window))
+                pairs.append((query, prefix + window))
                 owner.append(i)
         raw_scores = self.reranker.predict(pairs)
         best_scores = [float("-inf")] * len(candidates)
@@ -968,8 +1003,9 @@ class TurboVecStore:
         pairs: List[tuple] = []
         owner: List[int] = []
         for i, doc in enumerate(docs):
+            prefix = _rerank_metadata_prefix(doc.metadata)
             for window in _rerank_windows(doc.page_content, query):
-                pairs.append((query, window))
+                pairs.append((query, prefix + window))
                 owner.append(i)
         raw_scores = self.reranker.predict(pairs)
         best_scores = [float("-inf")] * len(docs)

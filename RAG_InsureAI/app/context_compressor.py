@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from langchain_core.documents import Document
 
+from turbovec_store import _rerank_metadata_prefix
+
 logger = logging.getLogger(__name__)
 
 # Sentence must have at least this many chars to be embedded / kept.
@@ -294,8 +296,24 @@ class ContextCompressor:
                 self._sent_cache[_cache_key] = (sentences, None)
                 continue
 
+            # Embed an enriched version of each sentence (metadata prefix
+            # only, never returned) so the embedding model has a chance to
+            # know this sentence's policy_type/section — the same fix as
+            # _rerank_metadata_prefix's docstring describes for the
+            # cross-encoder reranker, applied here to the compressor's own
+            # separate embedding-similarity sentence selection. Confirmed
+            # live this same "broken hand" query dropped the one sentence
+            # that actually answered it (a pre-existing-injury exclusion
+            # clause) during compression even though the chunk containing
+            # it had already survived retrieval and reranking — the raw
+            # sentence's wording alone doesn't say "this is an exclusion,"
+            # so it lost out to other sentences in the same chunk that
+            # happened to share more surface vocabulary with the query.
+            # `sentences` (unenriched) is what actually gets returned in
+            # the final compressed text — only the embedding INPUT changes.
+            _prefix = _rerank_metadata_prefix(doc.metadata)
             start = len(_all_sentences)
-            _all_sentences.extend(sentences)
+            _all_sentences.extend(_prefix + s for s in sentences)
             end = len(_all_sentences)
             _offsets.append((i, start, end))
             _slots[i] = {
@@ -334,26 +352,38 @@ class ContextCompressor:
             scores = np.dot(sent_embs, query_emb)
             ranked = np.argsort(scores)[::-1]
 
-            kept_indices: set = set()
-            used = 0
-            for idx in ranked:
+            # Guarantee the single highest-scoring sentence a slot before
+            # the greedy walk below runs — a plain greedy walk in score
+            # order skips any sentence that doesn't fit the REMAINING
+            # budget and moves on, so an oversized #1 sentence can lose out
+            # to several shorter, lower-relevance ones that happen to fit,
+            # even though it individually outscores every one of them.
+            # Confirmed live: a 760-char sentence containing the only
+            # clause that actually answered "can I get insurance for my
+            # broken hand" (a pre-existing-injury exclusion) scored highest
+            # among its chunk's sentences but was silently dropped this
+            # way, while several shorter, less relevant sentences from the
+            # same chunk filled the budget instead — the generated answer
+            # was never grounded in the one fact that mattered. If the top
+            # sentence alone exceeds the whole allocation, it still wins:
+            # hard-truncated, it's used as this chunk's entire compressed
+            # result rather than being dropped for lesser complete ones.
+            top_idx = int(ranked[0])
+            top_sentence = sentences[top_idx]
+            if len(top_sentence) + 2 > alloc:
+                truncated = top_sentence[:alloc].rsplit(' ', 1)[0] + '…'
+                _slots[i] = {"kind": "hard_truncate", "doc": doc, "text": truncated}
+                continue
+
+            kept_indices: set = {top_idx}
+            used = len(top_sentence) + 2
+            for idx in ranked[1:]:
                 s = sentences[int(idx)]
                 if used + len(s) + 2 <= alloc:
                     kept_indices.add(int(idx))
                     used += len(s) + 2
                 if used >= alloc:
                     break
-
-            if not kept_indices:
-                # Even the single best sentence is too long — hard-truncate it.
-                best = sentences[int(ranked[0])]
-                truncated = best[:alloc] + '…'
-                _slots[i] = {
-                    "kind": "hard_truncate",
-                    "doc": doc,
-                    "text": truncated,
-                }
-                continue
 
             # Re-assemble in original document order (not relevance order)
             # so the LLM reads coherent prose, not a jumbled ranking.
