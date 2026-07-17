@@ -18,7 +18,9 @@ except ImportError:
 
 from rapidfuzz import fuzz, process
 from turbovec_store import _rerank_windows
-from metadata_tagger import classify_query_policy_type
+from metadata_tagger import (
+    classify_query_policy_type, _POLICY_TYPE_HINTS, _VALID_POLICY_TYPES, _normalize_policy_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -770,12 +772,29 @@ def _wants_example(text: str) -> bool:
     return bool(_EXAMPLE_PATTERN.search(text))
 
 
+# Same fragility as _EXAMPLE_SIGNALS had: _DETAIL_SIGNALS' 'in detail' entry
+# is an exact-phrase match, so ordinary grammar drift silently disables it.
+# Confirmed live: "can you explain it in more detail" — an extremely common,
+# natural follow-up phrasing — doesn't contain the literal substring "in
+# detail" (the word "more" sits between "in" and "detail"), so it silently
+# fell through to brief mode. The user got a marginally-longer paragraph
+# instead of the structured, wider-retrieval DETAILED_GROUNDED_PROMPT they
+# asked for — visible from the outside only as the answer keeping brief
+# mode's sign-off ("Let me know if you want more details!") instead of
+# detailed mode's ("Hope that clears it up!..."). Same fix shape as
+# _EXAMPLE_PATTERN: match the core signal via regex instead of an exact
+# phrase, permissive of 0-2 modifier words between "in" and "detail(s)" so
+# "in detail", "in more detail", "in greater detail", "in much more detail"
+# all match.
+_DETAIL_PATTERN = re.compile(r'\bin\s+(?:\w+\s+){0,2}details?\b', re.IGNORECASE)
+
+
 def _needs_detailed_answer(question: str) -> bool:
     """True when the question expects a comprehensive, multi-part, or procedural answer."""
     q = question.lower()
     if any(sig in q for sig in _SIMPLE_SIGNALS):
         return False  # user explicitly wants brief — short-circuit before detail check
-    if any(sig in q for sig in _DETAIL_SIGNALS):
+    if any(sig in q for sig in _DETAIL_SIGNALS) or _DETAIL_PATTERN.search(q):
         return True
     # Long questions (>25 words) almost always need more than 4 sentences
     if len(question.split()) > 25:
@@ -784,6 +803,177 @@ def _needs_detailed_answer(question: str) -> bool:
     if q.count(' and ') >= 3:
         return True
     return False
+
+
+# ── Hybrid fallback for detail/simple/example intent ───────────────────────
+# _SIMPLE_SIGNALS/_DETAIL_SIGNALS/_wants_example above are a fast, free,
+# zero-latency check that correctly classifies the vast majority of real
+# phrasings — but a fixed phrase/regex list can only ever cover phrasings
+# someone has already hit (see [[project_detail_pattern_generalization]],
+# [[project_fragile_signal_lists]]: EXAMPLE and DETAIL were each patched
+# after a live miss, and there will always be a next one no matter how many
+# patterns get added). The genuinely general fix is to ask the LLM itself
+# when the fast path is inconclusive — semantic understanding generalizes to
+# any phrasing, lexical matching never fully does.
+#
+# Kept as a FALLBACK, not the primary path, specifically for latency: this
+# project has repeatedly traded effort for latency elsewhere this session
+# (consolidated reranking, sentence caching, suggestion-chip removal), so
+# adding a blocking classification call to every single request would cut
+# directly against that. The fast path already resolves ~all real traffic;
+# the LLM call only fires for the (expected to be rare) case where NONE of
+# detail/simple/example matched anything lexically, so most requests pay
+# zero extra latency and only genuinely ambiguous/novel phrasing pays the
+# ~1-2s round trip.
+_MODIFIER_INTENT_PROMPT = """\
+Read the user's message to an insurance chatbot and decide what kind of \
+answer they want.
+
+DETAIL = the message EXPLICITLY asks for a full, comprehensive, step-by-\
+step, or thorough explanation — not just a plain question.
+SIMPLE = the message EXPLICITLY asks for a brief, short, plain-language, \
+or easy-to-understand answer — not just a plain question.
+EXAMPLE = the message EXPLICITLY asks for a concrete example, \
+illustration, or real-life scenario.
+
+A plain, ordinary question ("What is X?", "How does X work?", "Does X \
+cover Y?") with NO explicit request for a particular style or depth is \
+"no" on all three — default to "no" unless the wording clearly asks for \
+one of these. Do not infer DETAIL or SIMPLE from how long or short the \
+question itself is, or guess that a basic question implicitly wants a \
+short answer — many basic questions still want a normal, complete answer.
+
+Any, all, or none of these can be true for a given message. Output EXACTLY \
+one line, nothing else, in this exact format:
+detail=<yes/no> simple=<yes/no> example=<yes/no>
+
+Message: "What is health insurance?"
+detail=no simple=no example=no
+
+Message: "I want the full picture, not just a summary"
+detail=yes simple=no example=no
+
+Message: "keep it short please"
+detail=no simple=yes example=no
+
+Message: "can you show me a real scenario for this"
+detail=no simple=no example=yes
+
+Message: {question}
+"""
+
+
+# Loose, cheap pre-filter for whether the LLM fallback is even worth
+# trying. Confirmed live this matters: without it, "What is fire
+# insurance?" — a completely plain question with zero modifier-related
+# vocabulary — fell through to the LLM fallback exactly like a genuine
+# novel-phrasing case, because "the strict fast path matched nothing" is
+# also true for the overwhelming majority of ordinary questions that were
+# never asking for a modifier at all. Not matching the strict signal list
+# means "resolved: no modifier" for a plain question; it only means
+# "inconclusive, worth asking" when the wording ALSO contains some
+# modifier-adjacent vocabulary the strict list didn't happen to cover.
+# This word set is deliberately looser/broader than the strict signal
+# lists — it only has to be a cheap, in-process membership check, not an
+# accurate classifier; the LLM call that follows is the actual classifier.
+_MODIFIER_HINT_WORDS = {
+    'full', 'complete', 'thorough', 'thoroughly', 'comprehensive',
+    'everything', 'all', 'deep', 'deeper', 'depth', 'elaborate', 'expand',
+    'picture', 'scenario', 'illustrate', 'breakdown', 'overview',
+    'summary', 'summarize', 'concise', 'brief', 'briefly', 'quick',
+    'short', 'basics', 'layman', 'plain', 'simple', 'simplify',
+    'detail', 'details', 'detailed', 'skip',
+}
+# Multi-word hints can't be caught by single-word tokenization above —
+# checked separately as plain substrings.
+_MODIFIER_HINT_PHRASES = ('hold back', 'leave out', 'skip ahead')
+
+
+def _has_modifier_hint(question_lower: str) -> bool:
+    tokens = set(re.findall(r"[a-z]+(?:'[a-z]+)?", question_lower))
+    if tokens & _MODIFIER_HINT_WORDS:
+        return True
+    return any(phrase in question_lower for phrase in _MODIFIER_HINT_PHRASES)
+
+
+async def _classify_modifier_intent_llm(question: str) -> tuple[bool, bool, bool]:
+    """LLM fallback for detail/simple/example intent — only called when the
+    fast keyword/regex check found nothing in any of the three dimensions.
+    max_tokens=20 so the round trip stays short. Falls back to
+    (False, False, False) on any error/timeout, same as the fast path
+    finding nothing — the caller already treats that as "no modifier
+    requested", so a failed classification call degrades to the pre-hybrid
+    behavior rather than blocking or crashing the request.
+    """
+    try:
+        prompt = _MODIFIER_INTENT_PROMPT.format(question=question)
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=4)
+        if not raw:
+            return (False, False, False)
+        raw_l = raw.lower()
+        return (
+            bool(re.search(r"detail\s*=\s*yes", raw_l)),
+            bool(re.search(r"simple\s*=\s*yes", raw_l)),
+            bool(re.search(r"example\s*=\s*yes", raw_l)),
+        )
+    except Exception:
+        return (False, False, False)
+
+
+async def _resolve_modifier_intent(question: str) -> tuple[bool, bool, bool]:
+    """Resolve whether the user wants a detailed, simple, and/or
+    example-based answer. Three stages: (1) strict fast path (free) — a
+    real phrase/regex match resolves immediately; (2) if that finds
+    nothing, a loose hint-word pre-filter decides whether the question is
+    even worth asking the LLM about — a genuinely plain question with no
+    modifier-adjacent vocabulary at all resolves to "no modifier" here,
+    still free; (3) only if the loose filter also finds something does the
+    LLM classification call actually run. See the block comment above
+    _MODIFIER_INTENT_PROMPT for why this is hybrid rather than
+    always-fast or always-LLM, and _has_modifier_hint's comment for why
+    stage 2 exists (a plain "What is fire insurance?" was paying the LLM
+    round trip for nothing until stage 2 was added).
+
+    Returns (has_detail, has_simple, has_example). SIMPLE takes precedence
+    over DETAIL when both are somehow set, matching _needs_detailed_answer's
+    existing precedence — a user asking for both is treated as wanting
+    brief, not a contradiction to resolve either way.
+    """
+    q = question.lower()
+    _fast_example = _wants_example(q)
+    _fast_simple = any(sig in q for sig in _SIMPLE_SIGNALS)
+    _fast_detail = any(sig in q for sig in _DETAIL_SIGNALS) or bool(_DETAIL_PATTERN.search(q))
+    # Structural signals (long/compound questions) stay fast-path-only —
+    # these aren't a phrasing-recognition gap the LLM classifier would help
+    # with, they're "is this objectively a big question" regardless of
+    # wording, already phrasing-independent by construction.
+    _structural_detail = len(question.split()) > 25 or q.count(' and ') >= 3
+
+    if _fast_example or _fast_simple or _fast_detail or _structural_detail:
+        _has_detail = (_fast_detail or _structural_detail) and not _fast_simple
+        return (_has_detail, _fast_simple, _fast_example)
+
+    # Strict fast path matched nothing — for the overwhelming majority of
+    # ordinary questions ("What is fire insurance?") that's not ambiguity,
+    # it's the correct, confident answer: no modifier was requested. Only
+    # worth the LLM round trip when the wording ALSO contains some looser
+    # modifier-adjacent vocabulary the strict list didn't happen to cover —
+    # otherwise every plain question would pay the fallback's latency for
+    # no reason, defeating the entire point of the hybrid design.
+    if not _has_modifier_hint(q):
+        return (False, False, False)
+
+    # Genuinely ambiguous or novel phrasing (e.g. "I want the full
+    # picture, not just a summary", or "explain it in more detail" before
+    # that specific gap was patched into the strict list). Try the cheap
+    # LLM classifier before defaulting to "no modifier requested".
+    _llm_detail, _llm_simple, _llm_example = await _classify_modifier_intent_llm(question)
+    _has_detail = _llm_detail and not _llm_simple
+    logger.info(
+        "[ask_stream] modifier intent LLM fallback fired: detail=%s simple=%s example=%s query=%r",
+        _has_detail, _llm_simple, _llm_example, question[:80],
+    )
+    return (_has_detail, _llm_simple, _llm_example)
 
 
 _FOLLOWUP_SIGNALS = {
@@ -1052,6 +1242,89 @@ _SPECIFIC_TYPE_RE = re.compile(
     r"retirement|pension|annuity)\b"
 )
 
+# Narrower than _SPECIFIC_TYPE_RE above: requires the type word to sit right
+# next to "insurance/policy/assurance/cover" before counting as a genuine
+# type ATTRIBUTION. _SPECIFIC_TYPE_RE's bare-word matching is fine for its
+# original purpose (does a raw USER QUESTION name its own topic?), but reused
+# against GENERATED ANSWER prose it over-fires on ordinary English: a
+# correct, well-grounded takaful-insurance answer explaining "risks are
+# shared among a group, rather than being transferred to an insurance
+# company" got discarded and replaced with a refusal because "group" alone
+# matched — the answer never claimed anything about Group Insurance as a
+# product, it just used "group" to mean "a group of people." Words like
+# group/life/home/fire/crop are common English outside insurance too;
+# requiring adjacency to insurance/policy/assurance/cover keeps the
+# genuine-attribution cases ("endowment assurance policy", "group
+# insurance") while dropping incidental non-insurance uses of the same word.
+_TYPE_ATTRIBUTION_RE = re.compile(
+    r"\b(motor|car|vehicle|auto|bike|two.wheeler|four.wheeler|"
+    r"life|term\s*life|whole\s*life|endowment|ulip|"
+    r"health|medical|hospital|"
+    r"travel|trip|flight|baggage|"
+    r"home|house|property|landlord|tenant|"
+    r"marine|cargo|fire|"
+    r"liability|third.party|"
+    r"critical\s*illness|cancer|"
+    r"group|corporate|reinsurance|takaful|"
+    r"crop|agricultur\w*|"
+    r"personal\s*accident|disability|"
+    r"retirement|pension|annuity)\s+(insurance|policy|assurance|cover|coverage)\b",
+    re.IGNORECASE,
+)
+
+# Module-level (not request-scoped) so both the detailed-mode point filter
+# and the brief-mode whole-reply check below can share one definition rather
+# than drifting out of sync. Catches jargon/content from a RETRIEVED chunk
+# about the wrong topic — distinct from _TYPE_ATTRIBUTION_RE above, which
+# only catches an explicit "X insurance/policy" naming, not topic-specific
+# vocabulary that never says the type name at all (e.g. "driving history"
+# never says "motor insurance").
+_TYPE_GIVEAWAY_TERMS = {
+    "marine": ("marine insurance", "marine cargo", "icc (a)", "icc (b)", "institute cargo clause", "bill of lading", "voyage policy", "hull insurance"),
+    "health": ("health insurance", "domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"),
+    "crop": ("crop insurance", "agriculturist", "crop failure", "sowing/planting", "loanee"),
+    "fidelity": ("fidelity insurance", "employee dishonesty", "embezzlement"),
+    "transit": ("transit insurance", "import covers by sea", "inland transit clause"),
+    "motor": (
+        "motor insurance", "vehicles plying on public roads",
+        "vehicle", "owner-driver", "driving record", "driving history",
+        "reckless driving", "unnamed passengers",
+        "tp (third-party) premium", "own damage",
+    ),
+}
+# A query naming the type itself is exempt from that type's filter (a
+# genuine comparison/vehicle-linked question should keep vehicle content).
+# "motor" additionally exempts on "vehicle"/"car"/"driving" etc. since a
+# question can ask about vehicle-linked cover without ever saying "motor".
+_TYPE_QUERY_EXEMPT_WORDS = {
+    "motor": ("motor", "vehicle", "car", "bike", "scooter", "motorcycle", "driving", "driver"),
+}
+
+
+def _text_has_giveaway_contamination(text: str, query_lower: str, query_policy_type: str = "general") -> bool:
+    # query_policy_type is classify_query_policy_type(retrieval_query) —
+    # already computed once per request for the metadata retrieval filter,
+    # and far more reliable than re-deriving "does the query mention this
+    # type" via a bare-word substring check. Confirmed live: "What is
+    # medical insurance?" classifies correctly as "health" (its regex list
+    # includes "medical insurance"), but the OLD bare-word exemption only
+    # checked for the literal word "health" in the query — absent here — so
+    # a fully correct answer ("Medical insurance is a type of health
+    # insurance...") got flagged as contaminated for saying "health
+    # insurance", its own genuinely-correct category. Trusting the
+    # classifier directly closes this whole class of synonym/hypernym gap,
+    # not just this one instance.
+    text_lower = text.lower()
+    for _type_name, _terms in _TYPE_GIVEAWAY_TERMS.items():
+        if _type_name == query_policy_type:
+            continue
+        _exempt_words = _TYPE_QUERY_EXEMPT_WORDS.get(_type_name, (_type_name,))
+        if any(w in query_lower for w in _exempt_words):
+            continue
+        if any(term in text_lower for term in _terms):
+            return True
+    return False
+
 
 def _is_likely_followup(question: str) -> bool:
     """Heuristic: is this question likely a follow-up referencing a previous topic?"""
@@ -1095,7 +1368,11 @@ def _is_likely_followup(question: str) -> bool:
     # "in simple language with example", "in detail with simple language", etc.
     # The 6-word keyword check below misses these because of the word-count gate.
     _all_modifier_signals = _DETAIL_SIGNALS | _SIMPLE_SIGNALS
-    if any(sig in q_lower for sig in _all_modifier_signals) or _wants_example(q_lower):
+    if (
+        any(sig in q_lower for sig in _all_modifier_signals)
+        or _wants_example(q_lower)
+        or _DETAIL_PATTERN.search(q_lower)
+    ):
         from re import compile as _re_compile
         _II_QUICK = _re_compile(
             r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
@@ -1243,7 +1520,7 @@ _ANCHOR_TYPE_RE = re.compile(
     r"liability|third.party|public\s*liability|"
     r"critical\s*illness|"
     r"group|corporate|micro|"
-    r"personal\s*accident|disability|workmen.?s?\s*compensation|"
+    r"personal\s*accident|road\s*accident|accident|disability|workmen.?s?\s*compensation|"
     r"employer.?s?\s*liability|fidelity(?:\s*guarantee)?|"
     r"engineering|business\s*interruption|"
     r"retirement|pension|annuity|takaful|"
@@ -1932,6 +2209,59 @@ async def _extract_intent_topics(question: str) -> set[str]:
     except Exception as exc:
         logger.debug("[INTENT] extraction failed (%s) — using regex fallback", exc)
         return set()
+
+
+async def _classify_query_policy_type_llm(query: str) -> str:
+    """LLM fallback for query policy_type, used only when the free regex
+    pass (classify_query_policy_type) can't confidently name one.
+
+    Most real queries don't name their type in the exact textbook phrase
+    regex looks for — confirmed live: "what's not covered if my car is
+    stolen" scores zero regex hits for every type (motor's list needs the
+    full phrase "car insurance", not bare "car"; "stolen" isn't "theft")
+    and falls through to "general," meaning the query gets no type signal
+    at all despite obviously being about motor insurance to a human reader.
+
+    Kept deliberately fast and cheap (few output tokens, short timeout)
+    since — unlike the document/chunk-classification LLM calls elsewhere
+    in this codebase, which run in a background thread after the ingest
+    response has already returned — this sits on the LIVE query's
+    critical path: the result feeds directly into the retrieval filter
+    below, so it has to resolve before the vector search can even run.
+    Falls back to "general" (no filtering) on any failure, exactly like
+    the regex path already does.
+    """
+    try:
+        label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in _POLICY_TYPE_HINTS.items())
+        prompt = f"""Classify the ONE insurance policy type this short user question is about.
+
+{label_list}
+  - general: the question doesn't name or clearly imply one specific type, or spans several
+
+Don't default to "commercial" just because a question mentions a business,
+fleet, company, or workplace context — check whether a MORE SPECIFIC type
+fits first (a business's fleet of vans is still motor insurance, a business
+being sued by a client is still liability insurance, a business's stock
+lost to fire is still fire insurance). Only use "commercial" when the
+question is genuinely about the business's own premises or operational
+continuity, with no more specific type actually fitting.
+
+Use the EXACT label word above (e.g. "motor", not "car" or "auto"; "home", not "property").
+
+QUESTION: {query}
+
+Reply with ONLY the label word, nothing else."""
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=3)
+        if not raw:
+            return "general"
+        label = re.split(r"[\s\n,.:;()]", raw.strip().lower())[0]
+        label = _normalize_policy_type(label)
+        result = label if label in _VALID_POLICY_TYPES else "general"
+        logger.debug("[QUERY_POLICY_TYPE] LLM fallback: %r -> %s", query, result)
+        return result
+    except Exception as exc:
+        logger.debug("[QUERY_POLICY_TYPE] LLM fallback failed (%s) — treating as general", exc)
+        return "general"
 
 
 # Context passed to the grounding-check prompt is capped so this stays a
@@ -2959,9 +3289,19 @@ from rag import LLM_CONTEXT_WINDOW_CHARS
 # use and left too much room for history + context. Computed here from
 # the actual prompt strings (not hardcoded) so this can't silently go
 # stale again the next time any of the three templates changes size.
-_STRICT_PROMPT_TOKENS_EST = len(STRICT_GROUNDED_PROMPT) // 4
-_DETAILED_PROMPT_TOKENS_EST = len(DETAILED_GROUNDED_PROMPT) // 4
-_CONVERSATIONAL_PROMPT_TOKENS_EST = len(CONVERSATIONAL_RAG_PROMPT) // 4
+#
+# _CHARS_PER_TOKEN=4 was the original assumption here (a common rule of
+# thumb for English text), but confirmed live it undercounts real usage
+# by ~30-35% for this prompt's actual mix of insurance jargon, source
+# citations, and punctuation-heavy formatting: a request that this math
+# estimated as safely within budget was rejected by the real backend at
+# 3585 real input tokens + 512 requested output = 4097, just over the
+# model's 4096-token ceiling. Using 3 chars/token (instead of 4) builds
+# in that margin everywhere this ratio is used for a token estimate.
+_CHARS_PER_TOKEN = 3
+_STRICT_PROMPT_TOKENS_EST = len(STRICT_GROUNDED_PROMPT) // _CHARS_PER_TOKEN
+_DETAILED_PROMPT_TOKENS_EST = len(DETAILED_GROUNDED_PROMPT) // _CHARS_PER_TOKEN
+_CONVERSATIONAL_PROMPT_TOKENS_EST = len(CONVERSATIONAL_RAG_PROMPT) // _CHARS_PER_TOKEN
 
 class MultiSourceRAG:
     def __init__(self):
@@ -3510,13 +3850,22 @@ class MultiSourceRAG:
         # by KB lookup, rather than letting them reach the refusal path by
         # default. Text matches the prompt's own IDENTITY RULES wording so
         # the two stay in sync.
+        # "are you ... " permissive of 0-3 filler words before the actual
+        # identity term (real/human/bot/AI/person) — confirmed live the
+        # exact-adjacency version missed "are you a real person or a bot"
+        # entirely (neither alternative sits directly after "are you" once
+        # the other option is mentioned first), same fragility class as
+        # [[project_detail_pattern_generalization]]'s "in detail" gap.
         _IDENTITY_RE = re.compile(
             r"\b(who (?:built|made|created|developed|designed) you|"
             r"who(?:'s| is) behind you|"
             r"who do you work for|"
             r"what company (?:built|made|created|owns) you|"
             r"what are you built (?:on|with)|"
-            r"are you (?:chatgpt|gpt|an? ai|a bot)|"
+            r"are you (?:\w+\s+){0,3}?(?:chatgpt|gpt|an? ai|a bot|a real (?:person|human)|"
+            r"a human|human|real|a person)|"
+            r"is this (?:a bot|an? ai|chatgpt|gpt)|"
+            r"am i (?:talking|chatting|speaking) (?:to|with) (?:a bot|an? ai|a human|a real person)|"
             r"what model (?:are you|is this))\b",
             re.IGNORECASE,
         )
@@ -3815,7 +4164,18 @@ class MultiSourceRAG:
         # disambiguation above always wants the full picture on each part,
         # regardless of whether the combined question happens to match
         # _needs_detailed_answer()'s own signals.
-        _keyword_detailed = _needs_detailed_answer(question) or _force_both_detailed
+        #
+        # _resolve_modifier_intent also resolves has_simple/has_example here
+        # (not just has_detail) — this must run before retrieval sizing below
+        # anyway, so resolving all three together in one call (with one LLM
+        # fallback round trip if needed, not up to three) lets the KV-cache
+        # key and the instruction-injection block downstream reuse the same
+        # result instead of independently re-running the fast-path-only
+        # checks and missing whatever the LLM fallback just caught.
+        _resolved_has_detail, _resolved_has_simple, _resolved_has_example = (
+            await _resolve_modifier_intent(question)
+        )
+        _keyword_detailed = _resolved_has_detail or _force_both_detailed
         # Restored 8/6 -> 14/8 (2026-07-13, explicit user request after a
         # broad quality sweep). The 2026-07-10 reduction to 8/6 traded
         # quality for latency in a way that wasn't just "fewer results" —
@@ -3868,29 +4228,53 @@ class MultiSourceRAG:
         # Apply typo correction to the retrieval_query before KV cache and retrieval
         retrieval_query = _correct_typos(retrieval_query)
 
-        # ── Metadata-based retrieval filter (policy_type) ───────────────────
-        # Chunk policy_type metadata is now trustworthy (2026-07-15 retagging
-        # fix — see project_policy_type_metadata_mistagging memory) after
-        # fixing two ingestion bugs that had left 68.7% of the KB mistagged
-        # "life". classify_query_policy_type() uses a confidence bar suited
-        # to short queries rather than classify_chunk_policy_type()'s >=2-hit
+        # ── Metadata-based policy_type: hard pre-filter + soft re-rank ────────
+        # classify_query_policy_type() uses a confidence bar suited to short
+        # queries rather than classify_chunk_policy_type()'s >=2-hit
         # chunk-tuned bar (confirmed empirically: realistic queries only ever
         # score a single hit — the chunk-tuned bar never fires on a query at
-        # all). Narrows the doc-store search to matching-type + always-
-        # included "general" chunks — "general" is always included so
-        # cross-topic reference-handbook content is never excluded, same
-        # design already used by build_metadata_filter() in metadata_tagger.py.
-        # This attacks cross-topic contamination one layer upstream of the
-        # growing _TYPE_GIVEAWAY_TERMS post-generation filter: a motor
-        # Vehicles-Act chunk now simply isn't a retrieval candidate for a
-        # transit-insurance query, instead of being retrieved and then
-        # having to be caught after the fact. Only applied to the doc store
-        # (video/webpage search() calls don't accept a filter parameter).
+        # all). When regex can't confidently name a type (most real queries
+        # don't use the exact textbook phrase it looks for — "what's not
+        # covered if my car is stolen" scores zero hits for every type),
+        # _classify_query_policy_type_llm() gets one fast, cheap attempt
+        # before falling back to "general" (no filtering).
+        #
+        # This WAS a hard search-time filter, then got removed 2026-07-16
+        # after a live-confirmed false-negative: a genuinely relevant chunk
+        # about home-insurance payouts was mistagged "health" (a single-
+        # topic-per-chunk tag can't represent a chunk substantively
+        # discussing several types — see project_live_upload_metadata_
+        # pipeline_test), and the hard filter made it invisible to a "home
+        # insurance" query no matter how relevant its content actually was.
+        # Restored as a hard filter again (2026-07-17) now that: (a) the
+        # LLM query-classification fallback above reduces how often
+        # _query_policy_type itself is wrong to begin with, and (b) the
+        # filter always includes "general" via $in below, so a chunk the
+        # classifier genuinely couldn't confidently place — as opposed to
+        # one confidently mistagged to the WRONG specific type — still
+        # stays reachable. The residual risk this reopens (a confidently
+        # mistagged, non-general chunk becoming invisible to the one query
+        # that should have found it) is accepted as a known trade-off in
+        # exchange for keeping wrong-type chunks out of the candidate pool
+        # entirely, rather than just losing ties to on-topic chunks in it
+        # (see the down-weight below, which still runs on top of this for
+        # "general" vs. exact-type-matched chunks within the filtered pool).
+        # Saved before the policy_type filter is merged in below, for the
+        # standalone-retry path further down — that retry re-derives
+        # retrieval from the RAW follow-up question text, which can be
+        # about a genuinely DIFFERENT topic than whatever retrieval_query
+        # (the follow-up-reformulated, prior-topic-anchored text) was
+        # classified against. Applying a filter built from a stale,
+        # wrong-topic classification there would block the exact rescue
+        # that retry exists to attempt — it needs a clean, unfiltered
+        # shot at the raw question, not the primary attempt's filter.
+        _filter_meta_no_policy_type = filter_meta
         _query_policy_type = classify_query_policy_type(retrieval_query)
+        if _query_policy_type == "general":
+            _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
         if _query_policy_type != "general":
-            _policy_filter = {"policy_type": {"$in": [_query_policy_type, "general"]}}
-            filter_meta = {"$and": [filter_meta, _policy_filter]} if filter_meta else _policy_filter
-            logger.debug("[ask_stream] policy_type filter: %s (query classified as %s)", filter_meta, _query_policy_type)
+            _policy_type_filter = {"policy_type": {"$in": [_query_policy_type, "general"]}}
+            filter_meta = {"$and": [filter_meta, _policy_type_filter]} if filter_meta else _policy_type_filter
 
         # ── KV cache lookup ───────────────────────────────────────────────────
         # Key includes reformulated query + intent flags so "why is X compulsory"
@@ -3899,9 +4283,12 @@ class MultiSourceRAG:
         # not a retrieval term, so it doesn't survive reformulation).
         _kv = self.doc_pipeline._cache
         _kv_sources = self.doc_pipeline._vector_store.list_sources()
-        _q_lower_intent = question.lower()
-        _kv_has_example = _wants_example(_q_lower_intent)
-        _kv_has_simple  = any(sig in _q_lower_intent for sig in _SIMPLE_SIGNALS)
+        # Reuse the already-resolved intent (fast-path or LLM-fallback) from
+        # above instead of independently re-running the fast-path-only
+        # checks — otherwise a question the LLM fallback correctly caught as
+        # "wants an example" would get cached under has_example=False here.
+        _kv_has_example = _resolved_has_example
+        _kv_has_simple  = _resolved_has_simple
         _kv_key = _kv.make_key(
             query=retrieval_query,
             top_k=_doc_top_k,
@@ -3964,6 +4351,7 @@ class MultiSourceRAG:
                         "let me get one of our agents", "i can get one of our agents",
                         "i can get a human agent", "let me get a human agent",
                     )
+                    _cur_type_text = f"{question} {retrieval_query}".lower()
                     for _rel in _related:
                         _q_txt = (_rel.get("query_text") or "").strip()
                         _a_txt = (_rel.get("answer") or "").strip()
@@ -3973,6 +4361,21 @@ class MultiSourceRAG:
                         if _rel.get("has_example") != _kv_has_example:
                             continue
                         if _rel.get("has_simple") != _kv_has_simple:
+                            continue
+                        # Skip entries naming a DIFFERENT specific insurance type
+                        # than the current question. Structurally-similar
+                        # sentences about different policy types ("get my money
+                        # back if [X] insurance matures and nothing happened")
+                        # score well inside the [0.80, threshold) related window
+                        # on sentence shape alone — confirmed live: a motor
+                        # insurance maturity question got answered with life
+                        # insurance's "endowment assurance policy... on your
+                        # death" language, copied near-verbatim from a cached
+                        # life-insurance answer that scored 0.8-0.9 similar.
+                        # query_text here is the reformulated/anchored text, so
+                        # a follow-up correctly carries its established type.
+                        _rel_type = _SPECIFIC_TYPE_RE.search(_q_txt.lower())
+                        if _rel_type and _rel_type.group(1).lower() not in _cur_type_text:
                             continue
                         if _q_txt and _a_txt and not any(p in _a_txt.lower() for p in _no_ans_phrases):
                             _rel_parts.append(f"Q: {_q_txt}\nA: {_a_txt}")
@@ -4109,9 +4512,41 @@ class MultiSourceRAG:
         # Stage-1 boost chunks break ties upward: when two chunks share the
         # same rerank_score, the boost chunk (added because its document was
         # explicitly matched by the summary search) should win.
+        #
+        # Second layer on top of the hard pre-filter above: among the
+        # document chunks that SURVIVED filtering (exact-type match or
+        # "general" — a mismatched specific type never reaches this point
+        # anymore), a "general"-tagged chunk still gets a soft scoring
+        # penalty against an exact-type match. "general" is a deliberately
+        # permissive tag covering genuinely cross-cutting reference
+        # material, but that same permissiveness lets a chunk the
+        # classifier just couldn't confidently place — not one that's
+        # actually cross-cutting — win the reranker's top slot over
+        # genuinely on-topic content purely on incidental lexical overlap.
+        # Confirmed live: for "explain motor insurance in detail," a
+        # "general"-tagged chunk about a government CROP-insurance scheme
+        # for farmers scored 0.475 (rank #1 of 8) — higher than the actual
+        # motor-insurance chunks (0.329, 0.318) — and that off-topic
+        # content correlates with confirmed hallucinated detail in the
+        # generated answer (see [[project_always_false_claim_corrections]]).
+        # video/webpage chunks are exempt (source_type check below) since
+        # they aren't covered by the hard pre-filter either.
+        _TYPE_MISMATCH_DISCOUNT = 0.5
+
+        def _effective_sort_score(c):
+            _base = c.metadata.get("rerank_score", c.metadata.get("similarity", 0))
+            _chunk_type = str(c.metadata.get("policy_type", "general")).lower()
+            if (
+                _query_policy_type != "general"
+                and str(c.metadata.get("source_type", "document")).lower() == "document"
+                and _chunk_type != _query_policy_type
+            ):
+                return _base * _TYPE_MISMATCH_DISCOUNT
+            return _base
+
         all_chunks.sort(
             key=lambda x: (
-                x.metadata.get("rerank_score", x.metadata.get("similarity", 0)),
+                _effective_sort_score(x),
                 1 if x.metadata.get("stage1_boost") else 0,
             ),
             reverse=True,
@@ -4236,11 +4671,38 @@ class MultiSourceRAG:
         # _context_covers_query, which also never trusts the score in
         # isolation.
         _grounding_bypass = _lex_ok and _top_rerank >= 0.9
-        ctx_covered = _grounding_bypass or (_lex_ok and _semantically_grounded)
+        # Symmetric bypass for the OPPOSITE failure: _lex_ok itself is the
+        # weakest of the three signals here (whole-word matching against a
+        # hand-tuned 5-char-prefix heuristic — see _word_matches), and it can
+        # fail even when the other two, stronger signals agree. Confirmed
+        # live: "Does home protection cover jewellery and electronics inside
+        # the house?" retrieved the exact right chunk (top_rerank=0.9895) and
+        # _verify_grounding_any_chunk — the LLM having actually read the
+        # content — correctly said YES, yet _lex_ok was False because the
+        # extracted topic phrase "home protection" got split into the words
+        # "home" + "protection", and "home" (a short, <5-char topic word, so
+        # only an EXACT token match counts — see _word_matches) never occurs
+        # as a standalone token in that chunk, only inside "Homeowners". Two
+        # independent signals — an embedding-based reranker and an LLM that
+        # read the actual text — agreeing at a near-certain bar is strong
+        # enough evidence on its own; a tokenization artifact in the third,
+        # admittedly-weaker proxy signal shouldn't be able to override both.
+        _semantic_high_confidence_bypass = _semantically_grounded and _top_rerank >= 0.9
+        ctx_covered = (
+            _grounding_bypass
+            or _semantic_high_confidence_bypass
+            or (_lex_ok and _semantically_grounded)
+        )
         if _grounding_bypass and not _semantically_grounded:
             logger.info(
                 "[ask_stream] grounding bypass: top_rerank=%.3f >= 0.9, lex_ok=True — "
                 "overriding a NO from _verify_grounding_any_chunk",
+                _top_rerank,
+            )
+        if _semantic_high_confidence_bypass and not _lex_ok:
+            logger.info(
+                "[ask_stream] semantic bypass: top_rerank=%.3f >= 0.9, "
+                "semantically_grounded=True — overriding a False from _lex_ok",
                 _top_rerank,
             )
 
@@ -4366,6 +4828,7 @@ class MultiSourceRAG:
         _is_bare_modifier_only = (
             any(sig in _q_lower_for_modifier_check for sig in (_DETAIL_SIGNALS | _SIMPLE_SIGNALS))
             or _wants_example(_q_lower_for_modifier_check)
+            or _DETAIL_PATTERN.search(_q_lower_for_modifier_check)
         ) and not re.search(
             r"\b(insurance|policy|premium|deductible|coverage|claim|health|medical|"
             r"life|motor|travel|home|vehicle|accident|liability|rider|annuity|pension)\b",
@@ -4377,7 +4840,7 @@ class MultiSourceRAG:
             and not _is_bare_modifier_only
         ):
             _standalone_chunks = await self._retrieve_doc_chunks(
-                question, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
+                question, _filter_meta_no_policy_type, document_filter, doc_top_k=_doc_top_k, summary_top_k=2,
             )
             _standalone_top = max(
                 (c.metadata.get("rerank_score", float("-inf"))
@@ -4459,7 +4922,7 @@ class MultiSourceRAG:
         else:
             _PROMPT_TEMPLATE_TOKENS = _CONVERSATIONAL_PROMPT_TOKENS_EST
         _output_reserve = 1500 if detailed else 300
-        _history_tokens_est = len(history) // 4 if history else 0
+        _history_tokens_est = len(history) // _CHARS_PER_TOKEN if history else 0
 
         # If template + history + output_reserve alone already leave no
         # room even for the 300-token context floor below, the floor stops
@@ -4473,19 +4936,19 @@ class MultiSourceRAG:
         # there's guaranteed room, rather than trusting the floor alone.
         _min_reserve_without_history = _PROMPT_TEMPLATE_TOKENS + 300 + _output_reserve
         _max_history_tokens = max(0, _MAX_INPUT_TOKENS - _min_reserve_without_history)
-        _max_history_chars = _max_history_tokens * 4
+        _max_history_chars = _max_history_tokens * _CHARS_PER_TOKEN
         if history and len(history) > _max_history_chars:
             history = history[-_max_history_chars:]
             _first_newline = history.find("\n")
             if _first_newline != -1:
                 history = history[_first_newline + 1:]
-            _history_tokens_est = len(history) // 4
+            _history_tokens_est = len(history) // _CHARS_PER_TOKEN
 
         _context_token_budget = max(
             300,  # always keep at least a bit of context
             _MAX_INPUT_TOKENS - _PROMPT_TEMPLATE_TOKENS - _history_tokens_est - _output_reserve,
         )
-        _context_budget = min(6000, _context_token_budget * 4)  # tokens → chars
+        _context_budget = min(6000, _context_token_budget * _CHARS_PER_TOKEN)  # tokens → chars
 
         # Drop near-zero-relevance VIDEO/WEBPAGE chunks before fair-share
         # compression gives every SURVIVING chunk a guaranteed slice of the
@@ -4513,7 +4976,21 @@ class MultiSourceRAG:
         # transcripts run continuously across unrelated topics, so a
         # low score on them is a much more reliable "actually irrelevant"
         # signal than the same score on a document chunk.
-        _MIN_RERANK_SCORE = 0.05
+        #
+        # Raised 0.05 -> 0.15 (2026-07-16) — 0.05 was too permissive to
+        # actually screen out noise: confirmed live, a "How to file Car
+        # Insurance Claim UAE" video scored 0.069 against "what should i do
+        # to file a claim if my machinery breaks down during construction"
+        # (an ENGINEERING insurance question, no relation to motor claims)
+        # — "file a claim"/"breaks down" surface-level phrasing overlap was
+        # enough to clear 0.05 despite the video being about a completely
+        # different insurance type. The model faithfully wove the video's
+        # actual content (WhatsApp support, Emirates Police app, driving
+        # license) into the answer as if it applied to machinery breakdown.
+        # 0.15 clears that false match with real margin while staying well
+        # below genuinely relevant video scores (0.3+ in other confirmed
+        # cases), so on-topic video content still surfaces normally.
+        _MIN_RERANK_SCORE = 0.15
         _NON_DOCUMENT_SOURCE_TYPES = {"video", "youtube_transcript", "youtube", "webpage", "web"}
 
         def _keep_chunk(c) -> bool:
@@ -4692,11 +5169,12 @@ class MultiSourceRAG:
             # ── Modifier-signal instruction injection ─────────────────────────
             # Detect what kind of modifier the user asked for (example / simple /
             # detail) and inject a targeted instruction into prompt_question so
-            # the LLM knows exactly what format/style is expected.
-            _q_lower_mod = question.lower()
-            _has_example = _wants_example(_q_lower_mod)
-            _has_simple  = any(sig in _q_lower_mod for sig in _SIMPLE_SIGNALS)
-            _has_detail  = any(sig in _q_lower_mod for sig in _DETAIL_SIGNALS)
+            # the LLM knows exactly what format/style is expected. Reuses the
+            # already-resolved intent (fast-path or LLM-fallback) from above
+            # rather than independently re-running the fast-path-only checks.
+            _has_example = _resolved_has_example
+            _has_simple  = _resolved_has_simple
+            _has_detail  = _resolved_has_detail
 
             if _detected_as_followup and (_has_example or _has_simple or _has_detail):
                 # Build instruction based on the combination of signals.
@@ -5373,14 +5851,11 @@ class MultiSourceRAG:
                 # sentence from a fidelity-insurance chunk gets echoed,
                 # matching how "marine insurance" is already used for the
                 # marine case above.
-                _TYPE_GIVEAWAY_TERMS = {
-                    "marine": ("marine insurance", "marine cargo", "icc (a)", "icc (b)", "institute cargo clause", "bill of lading", "voyage policy", "hull insurance"),
-                    "health": ("health insurance", "domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"),
-                    "crop": ("crop insurance", "agriculturist", "crop failure", "sowing/planting", "loanee"),
-                    "fidelity": ("fidelity insurance", "employee dishonesty", "embezzlement"),
-                    "transit": ("transit insurance", "import covers by sea", "inland transit clause"),
-                    "motor": ("motor insurance", "vehicles plying on public roads"),
-                }
+                #
+                # _TYPE_GIVEAWAY_TERMS / _TYPE_QUERY_EXEMPT_WORDS are now
+                # module-level (see definition near _TYPE_ATTRIBUTION_RE) so
+                # the brief-mode whole-reply check below shares the exact
+                # same list instead of drifting out of sync.
                 _query_lower = retrieval_query.lower()
                 _contam_src = (_corrected_text or _reply_stripped).strip()
                 _contam_lines = _contam_src.split("\n")
@@ -5411,13 +5886,20 @@ class MultiSourceRAG:
                         _contam_closer.append(_line)
 
                 def _is_contaminated(point_text: str) -> bool:
-                    _point_lower = point_text.lower()
-                    return any(
-                        term in _point_lower
-                        for _type_name, _terms in _TYPE_GIVEAWAY_TERMS.items()
-                        if _type_name not in _query_lower
-                        for term in _terms
-                    )
+                    # Skip entirely for type-agnostic queries ("what's the
+                    # difference between NCB and TPA") — there's no "wrong
+                    # topic" to detect when the query never named a type in
+                    # the first place, and TPA/NCB-style cross-cutting jargon
+                    # legitimately requires naming a specific type (TPA is
+                    # genuinely explained via health insurance) to answer
+                    # correctly. Confirmed live: this exact query got
+                    # discarded because a fully correct answer said "health
+                    # insurance services" — reuses the same policy_type
+                    # classification already computed for the metadata
+                    # retrieval filter above, not a new heuristic.
+                    if _query_policy_type == "general":
+                        return False
+                    return _text_has_giveaway_contamination(point_text, _query_lower, _query_policy_type)
 
                 _clean_points = [p for p in _contam_points if not _is_contaminated(p)]
                 if _clean_points and len(_clean_points) < len(_contam_points):
@@ -5435,6 +5917,99 @@ class MultiSourceRAG:
             except Exception as _contam_exc:
                 logger.debug("[ask_stream] cross-topic contamination filter skipped: %s", _contam_exc)
 
+        # ── Cross-topic contamination via CONVERSATION HISTORY (brief mode) ───
+        # The block above only runs in detailed mode and only catches jargon
+        # from a RETRIEVED chunk about the wrong topic. A different failure
+        # shape hits brief mode: {history} is passed into STRICT_GROUNDED_PROMPT
+        # for conversational continuity (pronouns, "the 3rd one"), but the
+        # model can pattern-match a structurally similar EARLIER turn in that
+        # same history and reuse ITS specific facts instead of this turn's
+        # actual full_context. Confirmed live: "can i get the money back if
+        # motor insurance matures and my vehicle hasn't met any accident..."
+        # (full_context was motor-insurance KB text, no mention of endowment
+        # anywhere in it) got answered with "endowment assurance policy...
+        # lump sum either on your death" — copied near-verbatim from the
+        # PRECEDING turn's life-insurance answer, still visible in history.
+        # The KV-cache related-context type-guard elsewhere in this function
+        # only blocks contamination arriving via the semantic cache; this
+        # catches the same failure shape when the source is THIS session's
+        # own history instead. Detection: any specific-type ATTRIBUTION the
+        # answer makes (type word directly next to insurance/policy/
+        # assurance/cover — see _TYPE_ATTRIBUTION_RE, not the looser
+        # _SPECIFIC_TYPE_RE) must appear either in the question/
+        # retrieval_query (the user asked about it) or in full_context (the
+        # KB actually supports it) — an attribution present in NEITHER has
+        # no legitimate source this turn. Bare-word _SPECIFIC_TYPE_RE was
+        # tried first and over-fired on ordinary English: a correct takaful-
+        # insurance answer saying "risks are shared among a group" (meaning
+        # "a group of people," not Group Insurance) got wrongly discarded.
+        _history_type_contamination_detected = False
+        if not _keyword_detailed:
+            try:
+                _hist_ans_src = (_corrected_text or _reply_stripped)
+                _hist_legit_text = f"{question} {retrieval_query} {full_context}".lower()
+                for _hist_type_m in _TYPE_ATTRIBUTION_RE.finditer(_hist_ans_src.lower()):
+                    _hist_type_word = _hist_type_m.group(1).lower()
+                    if _hist_type_word not in _hist_legit_text:
+                        _hist_refusal_text = (
+                            "Hmm, I don't have that specific information in my knowledge base right now. "
+                            "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                        )
+                        _reply_stripped = _hist_refusal_text
+                        _kv_reply = _hist_refusal_text
+                        _corrected_text = _hist_refusal_text
+                        _history_type_contamination_detected = True
+                        logger.info(
+                            "[ask_stream] discarded brief answer: named %r, absent from "
+                            "question/retrieval_query/full_context — likely history bleed",
+                            _hist_type_word,
+                        )
+                        break
+            except Exception as _hist_contam_exc:
+                logger.debug("[ask_stream] history-contamination filter skipped: %s", _hist_contam_exc)
+
+        # ── Cross-topic contamination via RETRIEVAL (brief mode) ───────────────
+        # Distinct from the history-bleed check above, which only fires when
+        # the answer's claim is absent from THIS turn's full_context (i.e. it
+        # came from a stale prior turn). This catches the case where the
+        # wrong-topic content is genuinely IN full_context this turn — a
+        # broad "general"-tagged KB chunk spanning multiple insurance types
+        # (e.g. a single paragraph listing disclosure examples "(a) In Fire
+        # Insurance... (d) In Personal Accident Insurance...") gets retrieved
+        # because it matches on shared vocabulary, and the model picks out
+        # the wrong sub-item. Confirmed live: "What are the exclusions in
+        # term insurance?" answered "...pre-existing conditions, medical
+        # history, driving history, and claims history" — "driving history"
+        # is a personal-accident/motor underwriting factor from exactly this
+        # kind of multi-type chunk, tagged policy_type=general so the
+        # metadata retrieval filter doesn't exclude it either. Reuses the
+        # same _TYPE_GIVEAWAY_TERMS/_TYPE_QUERY_EXEMPT_WORDS the detailed-mode
+        # point filter above uses, applied to the whole reply since brief
+        # mode has no discrete points to drop — same discard-and-refuse
+        # fallback as the history-bleed check, since a wrong item embedded in
+        # a short brief-mode reply usually contaminates most of the value of
+        # the answer anyway.
+        _retrieval_contamination_detected = False
+        if not _keyword_detailed and not _history_type_contamination_detected and _query_policy_type != "general":
+            try:
+                _retr_ans_src = (_corrected_text or _reply_stripped)
+                _retr_query_lower = f"{question} {retrieval_query}".lower()
+                if _text_has_giveaway_contamination(_retr_ans_src, _retr_query_lower, _query_policy_type):
+                    _retr_refusal_text = (
+                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                    )
+                    _reply_stripped = _retr_refusal_text
+                    _kv_reply = _retr_refusal_text
+                    _corrected_text = _retr_refusal_text
+                    _retrieval_contamination_detected = True
+                    logger.info(
+                        "[ask_stream] discarded brief answer: cross-topic giveaway term found, "
+                        "query does not name that type — likely multi-type chunk contamination"
+                    )
+            except Exception as _retr_contam_exc:
+                logger.debug("[ask_stream] retrieval-contamination filter skipped: %s", _retr_contam_exc)
+
         # ── Strip stray numbered-list markers (brief / conversational mode) ───
         # CONVERSATIONAL_RAG_PROMPT explicitly forbids numbered lists ("No
         # bullet points... Plain conversational prose only"), but the model
@@ -5450,7 +6025,19 @@ class MultiSourceRAG:
         # the first place, strip the markers entirely so the text reads as
         # the flowing prose the prompt actually asked for, regardless of
         # which separator the model happened to use.
-        if not _keyword_detailed:
+        # A genuine 2+ point numbered list is now an allowed FORMAT option in
+        # brief mode (STRICT_GROUNDED_PROMPT's rule (b) — see prompt_template.py,
+        # added so answers with several distinct steps/options don't get
+        # crammed into one run-on sentence). This delisting step predates
+        # that change and would otherwise silently undo it on every brief
+        # answer. Only strip when there are 0-1 numbered markers — a lone
+        # stray "1." with no "2." following is never a real list (the
+        # original bug this step exists for); 2+ markers is a genuine list
+        # and must survive untouched.
+        _delist_point_count = len(re.findall(
+            r'(?:\A|\n)\s*\d{1,2}\.\s+', (_corrected_text or _reply_stripped)
+        ))
+        if not _keyword_detailed and _delist_point_count < 2:
             try:
                 import re as _delist_re
                 _list_src = (_corrected_text or _reply_stripped)
@@ -5582,11 +6169,106 @@ class MultiSourceRAG:
                             if not _lead_re.search(r'\b' + _lead_re.escape(_cand_word) + r'\b,', _check_window):
                                 _chosen_lead = _cand
                                 break
-                        _with_lead = f"{_chosen_lead} {_lead_src}"
+                        # The model's own text was written to stand as the
+                        # FIRST sentence, so it's capitalized accordingly
+                        # ("Totally get why that's confusing."). Prepending a
+                        # lead-in without adjusting that leaves an awkward
+                        # mid-sentence capital — confirmed live: "So, Totally
+                        # get why that's confusing." Lowercase the first
+                        # letter unless the first word is the pronoun "I"
+                        # (and its contractions) or a genuine multi-letter
+                        # acronym (NCB, ULIP, TPA) that should stay as-is.
+                        _first_word_m = _lead_re.match(r"^(\S+)", _lead_src)
+                        _first_word = _first_word_m.group(1) if _first_word_m else ""
+                        _skip_lower = (
+                            _first_word == "I" or _first_word.startswith("I'")
+                            or (len(_first_word) > 1 and _first_word.isupper())
+                        )
+                        _lead_src_cased = (
+                            _lead_src if _skip_lower or not _lead_src
+                            else _lead_src[0].lower() + _lead_src[1:]
+                        )
+                        _with_lead = f"{_chosen_lead} {_lead_src_cased}"
                         _corrected_text = _with_lead
                         _kv_reply = _with_lead
             except Exception as _lead_exc:
                 logger.debug("[ask_stream] warm lead-in fallback skipped: %s", _lead_exc)
+
+        # ── Prose→list conversion for genuinely multi-step answers ────────────
+        # STRICT_GROUNDED_PROMPT's FORMAT rule now allows (and prefers) a
+        # numbered list for 2+ parallel/sequential items, explicitly naming
+        # "First,... if... if... if..." as the exact prose shape to avoid —
+        # confirmed live the model still doesn't reliably switch to a literal
+        # "1. 2. 3." even with that direct callout ("What if the insurer
+        # denies to give me the money...?" kept coming back as "First, review
+        # your policy... If you still disagree... If that doesn't work..."
+        # across two prompt-wording attempts). Same lesson as every other
+        # format-compliance gap in this file: enforce in code, don't trust
+        # the instruction alone. Runs after the delisting guard above (so an
+        # already-genuine model-written list is left untouched, never
+        # double-converted) and after the lead-in fallback (so the first
+        # sentence is already a normalized lead-in before this splits on it).
+        # Detection: 3+ sentences, excluding the lead-in and sign-off, that
+        # each start with a sequential/parallel marker word — a reliable
+        # signal of genuinely enumerable content strung into prose rather
+        # than one continuous thought. A single incidental "If you have
+        # questions..." sentence mixed into otherwise non-enumerable prose
+        # won't hit this threshold, so ordinary conditional prose is left
+        # alone.
+        if not _keyword_detailed and _delist_point_count < 2:
+            try:
+                import re as _p2l_re
+                _p2l_src = (_corrected_text or _reply_stripped).strip()
+                _p2l_sentences = [s for s in _p2l_re.split(r'(?<=[.!?])\s+', _p2l_src) if s.strip()]
+                if len(_p2l_sentences) >= 4:
+                    _p2l_signoff_re = _p2l_re.compile(
+                        r"^(hope that|let me know|feel free|hang tight|glad to|dig into any part)",
+                        _p2l_re.IGNORECASE,
+                    )
+                    _p2l_lead_re = _p2l_re.compile(
+                        r'^(so|good question|sure thing|right|ah|hmm)[,.!]', _p2l_re.IGNORECASE,
+                    )
+                    _p2l_marker_re = _p2l_re.compile(
+                        r'^(first|second|third|next|then|also|additionally|finally|if)\b',
+                        _p2l_re.IGNORECASE,
+                    )
+                    _p2l_start = 1 if _p2l_lead_re.match(_p2l_sentences[0]) else 0
+                    _p2l_end = len(_p2l_sentences)
+                    if _p2l_signoff_re.match(_p2l_sentences[-1].strip()):
+                        _p2l_end -= 1
+                    _p2l_middle = _p2l_sentences[_p2l_start:_p2l_end]
+                    _p2l_marker_count = sum(
+                        1 for s in _p2l_middle if _p2l_marker_re.match(s.strip())
+                    )
+                    if _p2l_marker_count >= 3:
+                        _p2l_points: list = []
+                        _p2l_cur: list = []
+                        for _s in _p2l_middle:
+                            if _p2l_marker_re.match(_s.strip()) and _p2l_cur:
+                                _p2l_points.append(" ".join(_p2l_cur).strip())
+                                _p2l_cur = [_s]
+                            else:
+                                _p2l_cur.append(_s)
+                        if _p2l_cur:
+                            _p2l_points.append(" ".join(_p2l_cur).strip())
+                        if len(_p2l_points) >= 3:
+                            _p2l_lead = _p2l_sentences[0] if _p2l_start else ""
+                            _p2l_signoff = (
+                                _p2l_sentences[-1].strip() if _p2l_end < len(_p2l_sentences) else ""
+                            )
+                            _p2l_list = "\n".join(
+                                f"{i}. {p}" for i, p in enumerate(_p2l_points, 1)
+                            )
+                            _p2l_pieces = [p for p in (_p2l_lead, _p2l_list, _p2l_signoff) if p]
+                            _p2l_rebuilt = "\n\n".join(_p2l_pieces)
+                            _corrected_text = _p2l_rebuilt
+                            _kv_reply = _p2l_rebuilt
+                            logger.info(
+                                "[ask_stream] converted %d-marker prose answer into a %d-point numbered list",
+                                _p2l_marker_count, len(_p2l_points),
+                            )
+            except Exception as _p2l_exc:
+                logger.debug("[ask_stream] prose-to-list conversion skipped: %s", _p2l_exc)
 
         # ── Hard sentence cap (brief / conversational mode) ──────────────────
         # Conversational prompts instruct the model to write 3 sentences max.
@@ -6029,6 +6711,101 @@ class MultiSourceRAG:
             except Exception as _hollow_exc:
                 logger.debug("[ask_stream] hollow-answer check skipped: %s", _hollow_exc)
 
+        # ── Always-false factual corrections (brief + detailed mode) ──────────
+        # Distinct from _TYPE_GIVEAWAY_TERMS (cross-topic leaks): these are
+        # claims that are wrong in EVERY context regardless of topic — a
+        # coarse grounding YES/NO check doesn't reliably catch a single wrong
+        # clause in an otherwise on-topic, well-grounded answer. Kept
+        # deliberately small: only add an entry here once confirmed to recur
+        # across multiple INDEPENDENT fresh generations of the identical
+        # query — most small-model errors are one-off noise (see
+        # [[project_vllm_nondeterministic_quality_glitches]]) and don't
+        # belong here; this list is for the minority that keep coming back.
+        _false_claim_whole_reply_discarded = False
+        try:
+            _false_claim_src = (_corrected_text or _reply_stripped)
+            _false_claim_fixed = _false_claim_src
+
+            # TPA has exactly one correct meaning in this insurance domain —
+            # confirmed live: a detailed health-insurance answer said "TPA
+            # stands for Third Party Availability" instead of Administrator.
+            # Safe unconditional correction, not a prompt instruction (same
+            # reasoning as [[project_dont_trust_buried_disclosure_instructions]]:
+            # enforce a known fact deterministically in code).
+            _TPA_WRONG_EXPANSION_RE = re.compile(
+                r"Third[\s-]+Party\s+(?:Availability|Authorization|Agency|Assistance|Association|Assessor)\b",
+                re.IGNORECASE,
+            )
+            _false_claim_fixed = _TPA_WRONG_EXPANSION_RE.sub(
+                "Third Party Administrator", _false_claim_fixed
+            )
+
+            # Insurers cannot legally cover the insured's own fines, traffic
+            # violations, or penalties — a basic insurance-law principle,
+            # not a KB-specific fact. Confirmed reproduced in 2 of 3 fresh
+            # generations of "explain motor insurance in detail," claiming
+            # comprehensive cover "extends to risks such as fines and
+            # theft." Drop the whole sentence/point containing the claim
+            # (can't safely rewrite arbitrary surrounding phrasing) rather
+            # than surgically excise just the word, which would risk
+            # leaving grammatical debris ("...risks such as  and theft").
+            _FINES_CLAIM_RE = re.compile(r"\bfines?\b", re.IGNORECASE)
+            # A line correctly stating fines are NOT covered ("fines and
+            # penalties are excluded") is accurate and useful — only drop
+            # lines that appear to be CLAIMING coverage, not ones that
+            # already deny it. Imperfect for negation far from "fines" in a
+            # long sentence, but a meaningful safety margin over a bare
+            # word match.
+            _FINES_NEGATION_RE = re.compile(
+                r"\b(not|n't|except|exclud\w*|never|no\s+cover\w*)\b", re.IGNORECASE
+            )
+
+            def _fc_line_wrongly_claims_fines(_ln: str) -> bool:
+                return bool(_FINES_CLAIM_RE.search(_ln)) and not _FINES_NEGATION_RE.search(_ln)
+
+            if any(_fc_line_wrongly_claims_fines(_ln) for _ln in _false_claim_fixed.split("\n")):
+                _fc_lines = _false_claim_fixed.split("\n")
+                _fc_kept_lines = [
+                    _ln for _ln in _fc_lines if not _fc_line_wrongly_claims_fines(_ln)
+                ]
+                if len(_fc_kept_lines) < len(_fc_lines):
+                    # Renumber if a middle point of a numbered list was
+                    # dropped, so the list doesn't skip a number.
+                    _fc_point_re = re.compile(r"^(\s*)(\d{1,2})(\.\s+)(.*)$")
+                    _fc_renumbered, _fc_next_n = [], 1
+                    for _ln in _fc_kept_lines:
+                        _m = _fc_point_re.match(_ln)
+                        if _m:
+                            _fc_renumbered.append(f"{_m.group(1)}{_fc_next_n}{_m.group(3)}{_m.group(4)}")
+                            _fc_next_n += 1
+                        else:
+                            _fc_renumbered.append(_ln)
+                    _false_claim_fixed = "\n".join(_fc_renumbered)
+                    logger.info(
+                        "[ask_stream] dropped sentence/point claiming fines coverage — "
+                        "insurance never covers the insured's own fines/penalties"
+                    )
+                else:
+                    # A single-sentence brief-mode reply with no line breaks
+                    # to drop — the whole reply is built around this one
+                    # wrong claim, so discard it same as other contamination
+                    # checks rather than leave a mangled fragment.
+                    _false_claim_fixed = (
+                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                    )
+                    _false_claim_whole_reply_discarded = True
+                    logger.info(
+                        "[ask_stream] discarded whole reply claiming fines coverage — "
+                        "no line boundary to drop just that claim"
+                    )
+
+            if _false_claim_fixed != _false_claim_src:
+                _corrected_text = _false_claim_fixed
+                _kv_reply = _false_claim_fixed
+        except Exception as _false_claim_exc:
+            logger.debug("[ask_stream] false-claim correction skipped: %s", _false_claim_exc)
+
         # ── Buffered-path single yield (after all corrections) ────────────────
         # The non-streaming (buffered) path above stored the raw answer in
         # _kv_reply but did NOT yield it — we waited until after Rule4 strip,
@@ -6101,10 +6878,10 @@ class MultiSourceRAG:
         )
 
         _final_payload: dict = {
-            "sources": [] if (_rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected) else unique_sources,
+            "sources": [] if (_rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected or _history_type_contamination_detected or _retrieval_contamination_detected or _false_claim_whole_reply_discarded) else unique_sources,
             "done": True,
         }
-        if _rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected:
+        if _rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected or _history_type_contamination_detected or _retrieval_contamination_detected or _false_claim_whole_reply_discarded:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
