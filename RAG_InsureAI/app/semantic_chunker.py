@@ -29,6 +29,8 @@ from typing import Any, List
 import numpy as np
 from langchain_core.documents import Document
 
+from metadata_tagger import _regex_policy_score
+
 logger = logging.getLogger(__name__)
 
 # ── Tuning ──────────────────────────────────────────────────────────────────────
@@ -89,6 +91,97 @@ def _split_paragraphs(text: str) -> List[str]:
     return [text.strip()] if text.strip() else []
 
 
+# ── Section-boundary detection ───────────────────────────────────────────────────
+# Cosine-similarity grouping alone under-detects a genuine topic-type shift
+# within one broad domain (see _cross_type_merge_conflict above and
+# project_live_upload_metadata_pipeline_test) — different insurance-type
+# paragraphs still measure 0.58-0.68 similarity due to shared domain
+# vocabulary. Real structured documents (PDFs, handbooks) already mark
+# topic shifts explicitly via headings, which is a far more reliable
+# signal than embeddings when it's available. Chunking WITHIN detected
+# section boundaries (never across them) fixes multi-topic chunk blending
+# structurally, rather than trying to patch it after the fact with
+# reranking/classification workarounds.
+#
+# Heading candidates are short, ALL-CAPS, multi-word lines. The hard part
+# is separating genuine section titles from repeating page furniture
+# (running headers/footers, "Learning Objectives" boilerplate that
+# appears on every lesson page) — confirmed empirically against this
+# project's real KB: boilerplate lines like "LEARNING OBJECTIVES" repeat
+# 12+ times across one source document, while genuine headings like
+# "MOTOR INSURANCE" or "THIRD PARTY ADMINISTRATORS-HEALTH" appear exactly
+# once. A frequency filter (appears <=2 times in the document) reliably
+# separates the two without needing a fixed boilerplate word list that
+# would only work for this one KB's specific documents.
+_HEADING_BOILERPLATE = {
+    "learning objectives", "lesson outline", "lesson round-up", "lesson round up",
+    "self-test questions", "self test questions", "professional programme",
+    "study material", "list of recommended books", "arrangement of study lessons",
+    "practice test paper",
+}
+# Repeating running-footer page markers like "PP-IL&P 208" — short
+# alpha/punctuation code followed by a bare number.
+_HEADING_PAGE_MARKER_RE = re.compile(r"^[A-Z][A-Z0-9&.\-]{1,12}\s+\d+$")
+# Table-of-contents entries: "LESSON ROUND UP ... 220", "TOPIC … 51", or
+# any line ending in a bare page number after real words.
+_HEADING_TOC_RE = re.compile(r"(\.{2,}|…)|\s\d+$")
+
+
+def _is_heading_candidate(line: str) -> bool:
+    line = line.strip()
+    if not (3 <= len(line) < 70):
+        return False
+    if not line.isupper():
+        return False
+    if len(line.split()) < 2:
+        return False
+    if line.lower() in _HEADING_BOILERPLATE:
+        return False
+    if _HEADING_PAGE_MARKER_RE.match(line):
+        return False
+    if _HEADING_TOC_RE.search(line):
+        return False
+    return True
+
+
+def _extract_sections(text: str) -> List[tuple]:
+    """
+    Split *text* into (section_heading, section_text) tuples using detected
+    headings as boundaries.
+
+    Falls back to a single ("", text) section when fewer than 2 genuine
+    heading breaks are found — short documents or content with no
+    heading-like structure at all (plain prose, YouTube transcripts)
+    shouldn't be forced into artificial section boundaries; the existing
+    embedding-similarity grouping is the right tool for those.
+    """
+    lines = text.split("\n")
+    candidates = [l.strip() for l in lines if _is_heading_candidate(l)]
+    freq: dict[str, int] = {}
+    for c in candidates:
+        freq[c] = freq.get(c, 0) + 1
+    genuine_headings = {h for h, c in freq.items() if c <= 2}
+
+    sections: List[tuple] = []
+    current_heading = ""
+    current_lines: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped in genuine_headings and _is_heading_candidate(stripped):
+            if current_lines:
+                sections.append((current_heading, "\n".join(current_lines)))
+            current_heading = stripped
+            current_lines = []
+        else:
+            current_lines.append(line)
+    if current_lines:
+        sections.append((current_heading, "\n".join(current_lines)))
+
+    if len([s for s in sections if s[0]]) < 2:
+        return [("", text)]
+    return sections
+
+
 # ── Page-merge helper ────────────────────────────────────────────────────────────
 _PAGE_MARKER_RE = re.compile(r"<<<PAGE:([^>]+)>>>")
 
@@ -133,6 +226,51 @@ def _merge_pages(docs: List[Document]) -> List[Document]:
         logger.info("[SemanticChunker] Merged %d pages of '%s'", len(group_sorted), src)
 
     return merged
+
+
+# ── Cross-topic merge veto ───────────────────────────────────────────────────────
+# Cosine similarity alone under-detects a topic-TYPE shift within a single
+# broad domain: two paragraphs about completely different insurance types
+# (e.g. motor vs. crop) both use heavy shared "insurance domain" vocabulary
+# (policy, cover, claim, damage, premium), so their embeddings can still
+# clear SIM_THRESHOLD even though a human — or the existing policy_type
+# classifier — would never call them the same topic. Confirmed live via a
+# controlled 6-section test document (motor/travel/marine/crop/fire/
+# fidelity, each in plain natural language): 6 clearly distinct topics
+# collapsed into just 2 chunks, each spanning 3-4 unrelated insurance
+# types, and the resulting multi-topic chunks then got mistagged with
+# whichever type happened to have the most incidental keyword hits
+# (both chunks landed on "travel" — one of them containing ZERO travel
+# content at all).
+#
+# This adds a second, independent signal alongside cosine similarity: the
+# SAME regex confidence bar classify_chunk_policy_type() already uses
+# (>=2 keyword hits AND 2x the runner-up) applied separately to the
+# accumulated group so far and to the candidate paragraph. If BOTH sides
+# clear that bar and land on DIFFERENT types, the merge is vetoed — forcing
+# a new chunk boundary — even if cosine similarity says they're related
+# enough. A weak/ambiguous regex signal on either side (the common case)
+# never blocks a merge; this only fires when regex is confident on both
+# sides and they genuinely disagree, keeping the false-positive veto rate
+# low while catching the clear-cut cross-type merges that caused this bug.
+def _regex_confident_type(text: str) -> str | None:
+    scores = _regex_policy_score(text)
+    positive = {k: v for k, v in scores.items() if v > 0}
+    if not positive:
+        return None
+    best_type = max(positive, key=positive.__getitem__)
+    best = positive[best_type]
+    sorted_vals = sorted(positive.values(), reverse=True)
+    runner_up = sorted_vals[1] if len(sorted_vals) > 1 else 0
+    if best >= 2 and best >= (runner_up * 2 + 1):
+        return best_type
+    return None
+
+
+def _cross_type_merge_conflict(group_text: str, para_text: str) -> bool:
+    group_type = _regex_confident_type(group_text)
+    para_type = _regex_confident_type(para_text)
+    return group_type is not None and para_type is not None and group_type != para_type
 
 
 # ── Core chunker ─────────────────────────────────────────────────────────────────
@@ -181,13 +319,14 @@ class SemanticChunker:
     def _model_or_default(self) -> Any:
         return self._model if self._model is not None else _get_default_embed_model()
 
-    def split_text(
-        self,
-        text: str,
-        for_youtube: bool = False,  # accepted for backward compat, ignored
-    ) -> tuple:
+    def _group_paragraphs_into_chunks(self, text: str) -> tuple:
         """
-        Split *text* into final chunks.
+        The original greedy paragraph-grouping algorithm, scoped to a single
+        contiguous span of text (one detected section, or the whole document
+        when no section boundaries were found). Never sees text from a
+        different section — that boundary is now enforced structurally by
+        split_text() below, not just by the embedding-similarity/type-
+        conflict checks within this method.
 
         Step 1 — paragraph splitting (blank lines / newlines / word windows)
         Step 2 — embed every paragraph with BGE
@@ -236,16 +375,26 @@ class SemanticChunker:
 
             same_topic    = sim >= self._sim_threshold
             fits_in_limit = group_words + para_words <= self._max_words
+            # See _cross_type_merge_conflict above — cosine similarity alone
+            # under-detects a topic-TYPE shift within one broad domain
+            # (shared "insurance" vocabulary keeps unrelated types looking
+            # similar enough). Only checked when similarity/word-limit would
+            # otherwise allow the merge, since it's an extra veto, not an
+            # independent merge trigger.
+            type_conflict = (
+                same_topic and fits_in_limit
+                and _cross_type_merge_conflict("\n\n".join(group_paras), para)
+            )
 
             logger.debug(
                 "[SemanticChunker] para[%d] sim=%.3f threshold=%.2f "
-                "words=%d/%d same_topic=%s fits=%s",
+                "words=%d/%d same_topic=%s fits=%s type_conflict=%s",
                 i, sim, self._sim_threshold,
                 group_words + para_words, self._max_words,
-                same_topic, fits_in_limit,
+                same_topic, fits_in_limit, type_conflict,
             )
 
-            if same_topic and fits_in_limit:
+            if same_topic and fits_in_limit and not type_conflict:
                 # Similar topic + fits within 500 words → add to current group
                 group_paras.append(para)
                 group_emb_sum += para_emb
@@ -276,6 +425,44 @@ class SemanticChunker:
             chunks, overlap_sizes = self._apply_overlap(chunks, self._overlap_words)
 
         return chunks, overlap_sizes  # (List[str], List[int])
+
+    def split_text(
+        self,
+        text: str,
+        for_youtube: bool = False,  # accepted for backward compat, ignored
+    ) -> tuple:
+        """
+        Split *text* into final chunks, never letting a chunk cross a
+        detected section boundary (see _extract_sections above). Each
+        detected section is chunked independently via
+        _group_paragraphs_into_chunks — overlap is applied within a
+        section, never carried across into a different section's first
+        chunk, since that would reintroduce the exact topic-blending this
+        exists to prevent.
+
+        Returns (chunks, overlap_sizes, section_headings) — a 3-tuple, the
+        heading each chunk belongs to ("" when no section structure was
+        detected) so callers can classify once per section and apply that
+        result to every chunk sharing the same heading, instead of
+        classifying each chunk independently.
+        """
+        sections = _extract_sections(text)
+        all_chunks: List[str] = []
+        all_overlap_sizes: List[int] = []
+        all_headings: List[str] = []
+        for heading, section_text in sections:
+            section_chunks, section_overlaps = self._group_paragraphs_into_chunks(section_text)
+            all_chunks.extend(section_chunks)
+            all_overlap_sizes.extend(section_overlaps)
+            all_headings.extend([heading] * len(section_chunks))
+
+        if len(sections) > 1:
+            logger.info(
+                "[SemanticChunker] %d sections detected → %d total chunks",
+                len(sections), len(all_chunks),
+            )
+
+        return all_chunks, all_overlap_sizes, all_headings
 
     @staticmethod
     def _apply_overlap(
@@ -324,8 +511,9 @@ class SemanticChunker:
                 or doc.metadata.get("page_num")
                 or 0
             )
-            pieces_raw, overlap_sizes = self.split_text(doc.page_content)
-            for idx, (piece, ov_size) in enumerate(zip(pieces_raw, overlap_sizes)):
+            pieces_raw, overlap_sizes, headings = self.split_text(doc.page_content)
+            doc_source = doc.metadata.get("source") or doc.metadata.get("filename") or "doc"
+            for idx, (piece, ov_size, heading) in enumerate(zip(pieces_raw, overlap_sizes, headings)):
                 markers = _PAGE_MARKER_RE.findall(piece)
                 recovered_page = page_value
                 if markers:
@@ -337,7 +525,17 @@ class SemanticChunker:
                     piece = _PAGE_MARKER_RE.sub("", piece).strip()
 
                 # Count overlap words after marker stripping so the value is
-                # accurate for the stored (marker-free) text.
+                # accurate for the stored (marker-free) text. section_id
+                # groups every chunk produced from the same detected section
+                # (heading == "" when no section structure was found, in
+                # which case each chunk is its own section as before) — lets
+                # a caller classify policy_type once per section instead of
+                # once per chunk (see project_live_upload_metadata_
+                # pipeline_test: a single 500-word chunk substantively
+                # discussing 3-4 different insurance types can only carry
+                # one label, so tagging at the SECTION level, where a
+                # heading marks a genuine single-topic boundary, is the
+                # actual fix rather than a better guess at the chunk level).
                 result.append(Document(
                     page_content=piece,
                     metadata={
@@ -346,6 +544,8 @@ class SemanticChunker:
                         "chunk_index":         idx,
                         "chunking_method":     "semantic",
                         "overlap_prefix_words": ov_size,
+                        "section_heading":     heading,
+                        "section_id":          f"{doc_source}::{heading}" if heading else f"{doc_source}::chunk{idx}",
                     },
                 ))
         return result
