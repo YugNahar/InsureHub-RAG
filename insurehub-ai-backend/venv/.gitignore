@@ -1,0 +1,27 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+# --- Secrets — never commit these ---
+.env
+*.env
+!.env.example
+
+# --- Python (backend) ---
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# --- SQLite dev databases ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Node (frontend) ---
+node_modules/
+dist/
+build/
+
+# --- Editor/OS ---
+.vscode/
+.DS_Store
+Thumbs.db
