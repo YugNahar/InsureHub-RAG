@@ -472,6 +472,76 @@ def _load_youtube(url: str) -> list[Document]:
 # PDF LOADER
 # ══════════════════════════════════════════════════════════════════════════════
 
+# A line that's nothing but digits — almost always a bare page number sitting
+# on its own line, never a real sentence.
+_BARE_PAGE_NUMBER_RE = re.compile(r"^\d{1,5}$")
+
+
+def _strip_repeating_page_furniture(page_texts: dict[int, str]) -> dict[int, str]:
+    """
+    Remove running headers/footers that repeat verbatim across many pages of
+    the same PDF, plus bare page-number lines — both get extracted as
+    ordinary body text, with no punctuation separating them from whatever
+    sentence or paragraph they happen to land in the middle of.
+
+    Confirmed live: a running header ("DIPLOMA IN INSURANCE SERVICES MODULE
+    - 4 Notes Health Insurance Practice of General Insurance 78") landed
+    mid-paragraph in an extracted health-insurance exclusions section,
+    between one disease-list item and the next, with no period or clean line
+    break for a sentence-splitter to use — producing one ~900-character
+    merged "sentence" that diluted the actual answer (a pre-existing-
+    condition exclusion clause) enough that it lost every downstream
+    relevance ranking (embedding similarity, cross-encoder reranking) it was
+    scored against, even after retrieval itself was fixed to reach it.
+
+    Uses the same frequency principle already validated for this exact KB in
+    semantic_chunker.py's heading-vs-boilerplate split: a genuine, one-off
+    line of body text essentially never repeats character-for-character
+    across several DIFFERENT pages — even a paragraph that revisits the same
+    topic rephrases itself. A running header/footer does exactly that, by
+    definition, on every page it appears on.
+    """
+    if len(page_texts) < 4:
+        # Too few pages to trust a frequency signal — a short document's own
+        # section title legitimately repeating twice looks identical to a
+        # real running header with only this document to compare against.
+        return page_texts
+
+    line_counts: dict[str, int] = {}
+    for text in page_texts.values():
+        seen_this_page: set[str] = set()
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped in seen_this_page:
+                continue
+            seen_this_page.add(stripped)
+            line_counts[stripped] = line_counts.get(stripped, 0) + 1
+
+    # count > 2 mirrors semantic_chunker.py's _extract_sections: genuine
+    # one-off content stays below this bar, repeating page furniture clears
+    # it easily on any document long enough to have a stable running header.
+    repeating = {line for line, count in line_counts.items() if count > 2}
+
+    cleaned: dict[int, str] = {}
+    removed_total = 0
+    for page_num, text in page_texts.items():
+        kept_lines = []
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if stripped in repeating or _BARE_PAGE_NUMBER_RE.match(stripped):
+                removed_total += 1
+                continue
+            kept_lines.append(line)
+        cleaned[page_num] = "\n".join(kept_lines)
+
+    if removed_total:
+        logger.info(
+            "[PDF] stripped %d repeating header/footer/page-number lines across %d pages",
+            removed_total, len(page_texts),
+        )
+    return cleaned
+
+
 def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     """
     Load a PDF with per-page Documents.
@@ -520,7 +590,7 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
             except ImportError:
                 pass
 
-        all_texts = {**pypdf_texts, **plumber_texts}
+        all_texts = _strip_repeating_page_furniture({**pypdf_texts, **plumber_texts})
         docs: list[Document] = [
             Document(
                 page_content=all_texts[page_num],
@@ -546,21 +616,27 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     try:
         import pdfplumber  # type: ignore
 
-        docs = []
+        plumber_only_texts: dict[int, str] = {}
         with pdfplumber.open(file_path) as pdf:
             total = len(pdf.pages)
             for page_num, page in enumerate(pdf.pages):
                 text = (page.extract_text() or "").strip()
                 if text:
-                    docs.append(Document(
-                        page_content=text,
-                        metadata={
-                            "source":      _src,
-                            "filename":    _base,
-                            "page":        page_num + 1,
-                            "total_pages": total,
-                        },
-                    ))
+                    plumber_only_texts[page_num] = text
+
+        plumber_only_texts = _strip_repeating_page_furniture(plumber_only_texts)
+        docs = [
+            Document(
+                page_content=plumber_only_texts[page_num],
+                metadata={
+                    "source":      _src,
+                    "filename":    _base,
+                    "page":        page_num + 1,
+                    "total_pages": total,
+                },
+            )
+            for page_num in sorted(plumber_only_texts)
+        ]
         logger.info("[PDF/pdfplumber] Loaded %d pages from '%s'", len(docs), _base)
         return docs
 
