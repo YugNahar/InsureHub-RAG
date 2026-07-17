@@ -1650,12 +1650,38 @@ async def ask_stream(req: AskRequest):
 
     # Fast-path: greetings bypass the LLM entirely — instant reply
     # Fast-path: ILLEGAL content — firm refusal, no RAG, no handoff
-    _ILLEGAL_PATTERNS = re.compile(
+    #
+    # Split into two tiers. The first tier is never legitimate insurance
+    # vocabulary under any phrasing and blocks unconditionally. The second
+    # tier — confirmed live via a genuinely on-topic query — is exactly the
+    # vocabulary this KB's own cyber and theft/burglary insurance content is
+    # built on ("does cyber insurance cover a phishing scam the same as a
+    # network hack?" tripped the original unconditional block, since "hack"
+    # and "scam" were in the same list as "bomb" and "murder"). A cyber
+    # insurance product cannot be asked about without saying "hack",
+    # "malware", or "ransomware"; a theft/burglary section cannot be asked
+    # about without saying "steal" or "robbery"; a fraud-coverage rider
+    # cannot be asked about without saying "fraud". Tier 2 only blocks when
+    # the question does NOT also read like an insurance/coverage question —
+    # a genuine "how do I hack into my neighbour's wifi" still blocks, but
+    # "does my policy cover a hack" or "is fraud covered" does not.
+    _ILLEGAL_PATTERNS_ALWAYS = re.compile(
         r"\b(bomb|explosive|kill|murder|suicide|weapon|poison|terror|"
-        r"rape|porn|naked|drugs|cocaine|heroin|meth|steal|robbery|"
-        r"fraud|scam|forge|launder|hack|malware|ransomware)\b"
+        r"rape|porn|naked|drugs|cocaine|heroin|meth)\b"
     )
-    if _ILLEGAL_PATTERNS.search(req.question.lower()):
+    _ILLEGAL_PATTERNS_INSURANCE_ADJACENT = re.compile(
+        r"\b(steal|robbery|fraud|scam|forge|launder|hack|malware|ransomware)\b"
+    )
+    _INSURANCE_CONTEXT_RE = re.compile(
+        r"\b(insurance|policy|policies|cover|covers|covered|coverage|claim|"
+        r"premium|cyber|deductible|reimburs|payout|indemnity)\b"
+    )
+    _q_lower_for_illegal_check = req.question.lower()
+    _is_illegal = bool(_ILLEGAL_PATTERNS_ALWAYS.search(_q_lower_for_illegal_check)) or (
+        bool(_ILLEGAL_PATTERNS_INSURANCE_ADJACENT.search(_q_lower_for_illegal_check))
+        and not _INSURANCE_CONTEXT_RE.search(_q_lower_for_illegal_check)
+    )
+    if _is_illegal:
         async def _illegal_gen():
             yield "I'm only here to help with insurance questions. Let's keep our conversation focused on insurance. 😊"
             yield "\n\n" + _json.dumps({"sources": [], "done": True, "needs_human": False})

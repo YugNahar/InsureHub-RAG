@@ -117,12 +117,26 @@ class ConversationAgent:
             "what files", "what can you help with", "what can i ask",
         ]
         # ── ILLEGAL: harmful, violent, or profane content ──
-        _ILLEGAL_PATTERNS = re.compile(
-            r"\b(bomb|explosive|kill|murder|suicide|weapon|poison|hack|terror|"
-            r"rape|porn|naked|sex|drugs|cocaine|heroin|meth|weed|cannabis|"
-            r"steal|robbery|fraud|scam|cheat|fake|forge|launder)\b"
+        # Split into two tiers — see api.py's ask_stream() for the same fix
+        # and the full reasoning: tier 2 is exactly the vocabulary this KB's
+        # own cyber and fraud/theft insurance content is built on ("does
+        # cyber insurance cover a hack", "is fraud covered", "what if my
+        # policy is fake") and only blocks when the question doesn't also
+        # read like an insurance/coverage question.
+        _ILLEGAL_PATTERNS_ALWAYS = re.compile(
+            r"\b(bomb|explosive|kill|murder|suicide|weapon|poison|terror|"
+            r"rape|porn|naked|sex|drugs|cocaine|heroin|meth|weed|cannabis)\b"
         )
-        if _ILLEGAL_PATTERNS.search(q):
+        _ILLEGAL_PATTERNS_INSURANCE_ADJACENT = re.compile(
+            r"\b(hack|steal|robbery|fraud|scam|cheat|fake|forge|launder)\b"
+        )
+        _insurance_context_re = re.compile(
+            r"\b(insurance|policy|policies|cover|covers|covered|coverage|claim|"
+            r"premium|cyber|deductible|reimburs|payout|indemnity)\b"
+        )
+        if _ILLEGAL_PATTERNS_ALWAYS.search(q) or (
+            _ILLEGAL_PATTERNS_INSURANCE_ADJACENT.search(q) and not _insurance_context_re.search(q)
+        ):
             return "ILLEGAL"
 
         # ── OFF_TOPIC: general knowledge questions with no insurance relevance ──
