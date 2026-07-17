@@ -6607,6 +6607,121 @@ class MultiSourceRAG:
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
+        # ── Drop refund/money-back claims scoped to an unrelated event ────────
+        # Confirmed live on both vLLM and Groq (see [[project_groq_4th_attempt
+        # _confirms_avoid]]): "will I get my money back if my health policy
+        # expires and I never made a claim" got answered with "no refund of
+        # premium is allowed if you don't make a claim" — stated as a general
+        # rule. The KB source this is drawn from is actually the Group
+        # Mediclaim clause "No refund of premium is allowed for deletion of
+        # insured person if he or she has recovered a claim under the
+        # policy" — a narrow rule about removing a family member from a GROUP
+        # policy mid-term, unrelated to a policy simply expiring unused. Both
+        # backends generalized a specific, unrelated administrative clause
+        # into a blanket answer. Same bug class as the currency-qualifier-
+        # mismatch check above (a scoped source clause misapplied to an
+        # unstated scenario) but without a currency figure to anchor on, so
+        # it needs its own detection: only fires when the user's question is
+        # PURELY about natural expiry/non-use (no cancellation/deletion/
+        # surrender/free-look wording of its own) and there is no refund
+        # statement in the retrieved context that actually applies to that
+        # scenario — either because every refund-mentioning sentence found is
+        # scoped to one of those unrelated triggering events, OR because the
+        # word "refund" never appears in the retrieved context at all (a live
+        # retest confirmed this second shape too: with a differently-worded
+        # question and a different retrieval, the reply asserted "the insurer
+        # doesn't refund premiums if you don't use the coverage" while
+        # full_context contained no "refund" text whatsoever — not a
+        # misattributed clause, a claim invented from general insurance
+        # knowledge with zero textual support). A source sentence that states
+        # a refund rule with no scoping qualifier at all is left alone —
+        # that's a genuinely general, applicable answer, not a fabrication.
+        #
+        # Deliberately does not add its own "discard whole reply" branch —
+        # dropping units here can legitimately leave nothing but the sign-off
+        # ("Let me know if you want more details! 😊") in brief mode, and the
+        # hollow-answer detector below already exists specifically to catch
+        # that shape and redirect to refusal+escalation (its own comment
+        # documents this exact "every other unit dropped upstream by the
+        # currency-mismatch filter" interaction).
+        try:
+            import re as _re6
+            _REFUND_CLAIM_RE = _re6.compile(
+                r'\brefunds?\b|\bmoney\s*back\b|\bpremium\s+back\b', _re6.IGNORECASE
+            )
+            _REFUND_SCOPE_TRIGGERS = frozenset({
+                'cancellation', 'cancel', 'cancelled', 'canceling', 'cancelling',
+                'deletion', 'deleted', 'delete', 'removed', 'removal',
+                'free-look', 'freelook', 'free look', 'cooling-off', 'cooling off',
+                'surrender', 'surrendered', 'mid-term', 'midterm',
+                'dishonour', 'dishonor', 'bounced', 'return the policy',
+            })
+            _EXPIRY_TRIGGERS = frozenset({
+                'expire', 'expires', 'expired', 'expiry', 'lapse', 'lapsed',
+                'lapses', 'lapsing', "didn't use", 'did not use', 'not used',
+                'unused', 'never used', "didn't claim", 'did not claim',
+                "couldn't claim", 'could not claim', 'no claim', 'never claimed',
+                'matured', 'maturity',
+            })
+
+            def _refund_scope_words(text: str) -> set:
+                low = (text or '').lower()
+                return {t for t in _REFUND_SCOPE_TRIGGERS if t in low}
+
+            _q_low6 = (question or '').lower()
+            _question_is_expiry = any(t in _q_low6 for t in _EXPIRY_TRIGGERS)
+            _question_scope = _refund_scope_words(question)
+
+            _refund_scope_mismatch = False
+            if _question_is_expiry and not _question_scope:
+                _any_compatible_src = False
+                for _m in _re6.finditer(
+                    r'[^.\n]*\brefund[^.\n]*[.\n]', full_context or '', _re6.IGNORECASE
+                ):
+                    if not _refund_scope_words(_m.group(0)):
+                        _any_compatible_src = True
+                        break
+                # Fires whenever no compatible refund statement was found —
+                # whether because every occurrence found was scoped away
+                # from this scenario, or because "refund" never appears in
+                # the retrieved context at all (loop simply never runs).
+                _refund_scope_mismatch = not _any_compatible_src
+
+            if _refund_scope_mismatch:
+                _rf_src = (_corrected_text or _reply_stripped).strip()
+                _rf_has_points = bool(_re6.search(r'(?:^|\n)\s*\d+\.\s', _rf_src))
+                if _rf_has_points:
+                    _rf_units = _re6.split(r'\n(?=\s*\d+\.\s)', _rf_src)
+                else:
+                    _rf_units = _re6.split(r'(?<=[.!?])(?<!\d\.)\s+', _rf_src)
+
+                _rf_kept = [u for u in _rf_units if not _REFUND_CLAIM_RE.search(u)]
+                if len(_rf_kept) < len(_rf_units) and _rf_kept:
+                    if _rf_has_points:
+                        _rf_point_re = _re6.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re6.DOTALL)
+                        _rf_renumbered, _rf_next_n = [], 1
+                        for _u in _rf_kept:
+                            _m = _rf_point_re.match(_u)
+                            if _m:
+                                _rf_renumbered.append(f"{_m.group(1)}{_rf_next_n}{_m.group(3)}{_m.group(4)}")
+                                _rf_next_n += 1
+                            else:
+                                _rf_renumbered.append(_u)
+                        _rf_rebuilt = "\n".join(_rf_renumbered).strip()
+                    else:
+                        _rf_rebuilt = " ".join(_rf_kept).strip()
+                        if _rf_rebuilt and _rf_rebuilt[-1] not in ".!?":
+                            _rf_rebuilt += "."
+                    _corrected_text = _rf_rebuilt
+                    _kv_reply = _rf_rebuilt
+                    logger.info(
+                        "[ask_stream] dropped refund claim scoped to an unrelated "
+                        "triggering event (source conditions the rule on "
+                        "cancellation/deletion/surrender/free-look, not plain expiry)"
+                    )
+        except Exception as _refund_exc:
+            logger.debug("[ask_stream] refund-scope-mismatch filter skipped: %s", _refund_exc)
+
         # ── Third-party-victim contamination in first-party examples (brief) ──
         # Confirmed live: "personal accident insurance" — a first-party-only
         # type where the INSURED is always the one who suffers the loss,
