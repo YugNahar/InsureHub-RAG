@@ -290,6 +290,20 @@ async def _get_job(job_id: str) -> dict | None:
 app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc")
 create_login_endpoint(app)
 
+# ── Travel Bot module (app/travel_bot) ─────────────────────────────────────
+# Liza Mandal's UAE travel-insurance quoting/binding/issuing bot, integrated
+# 2026-07-17 as a logically separate module — its own DB (SQLite, separate
+# from this app's TurboVec/file-based storage), its own LLM provider
+# (OpenAI, via OPENAI_API_KEY in .env — required, unset by default; see
+# .env's comment), and its own request/response schema. Mounted at
+# /api/chat, distinct from every existing route here. See the router's own
+# module for the full quote/bind/issue conversation flow.
+from travel_bot.routers.chat import router as _travel_chat_router
+from travel_bot.core.database import Base as _travel_base, engine as _travel_engine
+import travel_bot.models.field_definition as _travel_field_definition  # noqa: F401 — registers the table below; only written by seed_field_definitions.py, never read by the live chat flow
+_travel_base.metadata.create_all(bind=_travel_engine)
+app.include_router(_travel_chat_router)
+
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
