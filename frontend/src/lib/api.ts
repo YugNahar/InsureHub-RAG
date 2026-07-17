@@ -100,34 +100,42 @@ export async function apiStream(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    // The backend appends a final JSON line: {"sources":[...],"done":true}
-    const jsonStart = buffer.lastIndexOf('\n\n{"sources"');
-    if (jsonStart !== -1) {
-      const textPart = buffer.slice(0, jsonStart);
-      const jsonPart = buffer.slice(jsonStart + 2);
-      if (textPart) onToken(textPart);
-      try {
-        const meta = JSON.parse(jsonPart);
-        onDone({
-          sources: meta.sources ?? [],
-          needs_human: meta.needs_human ?? false,
-          offline_escalated: meta.offline_escalated ?? false,
-          corrected_text: meta.corrected_text,
-          clarify_options: meta.clarify_options,
-        });
-      } catch {
-        onDone({ sources: [], needs_human: false, offline_escalated: false });
+      // The backend appends a final JSON line: {"sources":[...],"done":true}
+      const jsonStart = buffer.lastIndexOf('\n\n{"sources"');
+      if (jsonStart !== -1) {
+        const textPart = buffer.slice(0, jsonStart);
+        const jsonPart = buffer.slice(jsonStart + 2);
+        if (textPart) onToken(textPart);
+        try {
+          const meta = JSON.parse(jsonPart);
+          onDone({
+            sources: meta.sources ?? [],
+            needs_human: meta.needs_human ?? false,
+            offline_escalated: meta.offline_escalated ?? false,
+            corrected_text: meta.corrected_text,
+            clarify_options: meta.clarify_options,
+          });
+        } catch {
+          onDone({ sources: [], needs_human: false, offline_escalated: false });
+        }
+        return;
       }
-      return;
-    }
 
-    onToken(buffer);
-    buffer = "";
+      onToken(buffer);
+      buffer = "";
+    }
+  } catch {
+    // Stream dropped mid-read (network drop, tab backgrounded, navigation) —
+    // report it the same way the initial fetch() failure above does, instead
+    // of letting the rejection propagate to whatever called apiStream().
+    onError("Connection interrupted. Please try again.");
+    return;
   }
 
   if (buffer) onToken(buffer);
