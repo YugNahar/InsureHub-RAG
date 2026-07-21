@@ -276,17 +276,23 @@ def sync_extracted_values(db: DBSession, request_id: str, state: dict, fields: l
 
 def check_coverage_consistency(state: dict):
     """
-    Returns an error message if coverage_type/destination/departure conflict
-    with the rules in app/schemas/travel.py (e.g. coverage_type='GCC Countries'
-    but destination='France'). Returns None if there's nothing to check yet
-    (fields still missing) or everything's consistent.
+    Returns (bad_field, message) if coverage_type/destination/departure
+    conflict with the rules in app/schemas/travel.py (e.g. coverage_type=
+    'GCC Countries' but destination='France') — bad_field names exactly the
+    field the mismatch is actually about, so callers can clear just that one
+    rather than assuming it's always destination (confirmed live: a
+    hallucinated departure value, e.g. a date extracted into the departure
+    field when none was ever mentioned, was wiping out a correctly-extracted
+    destination as collateral damage). Returns (None, None) if there's
+    nothing to check yet (fields still missing) or everything's consistent.
     """
     coverage_type = state.get("coverage_type", "")
     destination = state.get("destination", "")
     departure = state.get("departure", "")
     if not coverage_type or not destination:
-        return None
-    return validate_coverage_destination(coverage_type, destination, departure) or None
+        return None, None
+    bad_field, message = validate_coverage_destination(coverage_type, destination, departure)
+    return (bad_field, message) if bad_field else (None, None)
 
 
 def total_travellers(state: dict) -> int:
@@ -742,12 +748,12 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
 
             print(f"\n--- CURRENT MEMORY STATE ---\n{state}\n----------------------------\n")
 
-            # 2. Catch coverage_type / destination mismatches (e.g. "GCC Countries"
-            #    coverage with "France" as the destination) before treating the
-            #    checklist as complete.
-            consistency_error = check_coverage_consistency(state)
+            # 2. Catch coverage_type / destination / departure mismatches (e.g.
+            #    "GCC Countries" coverage with "France" as the destination)
+            #    before treating the checklist as complete.
+            bad_field, consistency_error = check_coverage_consistency(state)
             if consistency_error:
-                state.pop("destination", None)
+                state.pop(bad_field, None)
                 final_reply = consistency_error
             elif not is_quote_checklist_complete(state):
                 final_reply = build_missing_fields_reply(state, newly_filled=newly_filled)
@@ -937,9 +943,9 @@ def upload_document_endpoint(
                 if inferred:
                     state["coverage_type"] = inferred
 
-            consistency_error = check_coverage_consistency(state)
+            bad_field, consistency_error = check_coverage_consistency(state)
             if consistency_error:
-                state.pop("destination", None)
+                state.pop(bad_field, None)
                 final_reply = consistency_error
             elif (
                 state.get("phase") == "QUOTING"

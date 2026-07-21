@@ -129,35 +129,37 @@ def get_coverage_type_code(coverage_type: str) -> str:
     return COVERAGE_TYPE_CODES.get(coverage_type, "")
 
 
-def validate_coverage_destination(coverage_type: str, destination: str, departure: str = "") -> str:
+def validate_coverage_destination(coverage_type: str, destination: str, departure: str = "") -> tuple:
     """
-    Returns an empty string if (coverage_type, destination, departure) are
-    consistent with the rules above. Otherwise returns a human-readable
-    explanation suitable for showing directly to the user, so they can
-    correct just the field that's wrong.
+    Returns (None, "") if (coverage_type, destination, departure) are
+    consistent with the rules above. Otherwise returns (bad_field, message) —
+    bad_field names exactly the field that's actually wrong ("coverage_type",
+    "destination", or "departure"), so the caller can clear just that field
+    instead of guessing. message is a human-readable explanation suitable for
+    showing directly to the user.
     """
     rule = COVERAGE_TYPE_RULES.get(coverage_type)
     if not rule:
-        return (
+        return "coverage_type", (
             f"'{coverage_type}' isn't a coverage type I recognize. "
             f"Please choose one of: {', '.join(COVERAGE_TYPE_OPTIONS)}."
         )
 
     dest_options = rule["destination_options"]
     if destination and dest_options and destination not in dest_options:
-        return (
+        return "destination", (
             f"For '{coverage_type}' coverage, the destination has to be one of: "
             f"{', '.join(dest_options)}. You gave '{destination}' — could you confirm the destination?"
         )
 
     dep_options = rule["departure_options"]
     if departure and dep_options and departure not in dep_options:
-        return (
+        return "departure", (
             f"For '{coverage_type}' coverage, the trip has to depart from: "
             f"{', '.join(dep_options)}. You gave '{departure}' — could you confirm where you're departing from?"
         )
 
-    return ""
+    return None, ""
 
 
 def infer_coverage_type_from_destination(destination: str) -> str:
