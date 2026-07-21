@@ -19,7 +19,7 @@ except ImportError:
 from rapidfuzz import fuzz, process
 from turbovec_store import _rerank_windows
 from metadata_tagger import (
-    classify_query_policy_type, _POLICY_TYPE_HINTS, _VALID_POLICY_TYPES, _normalize_policy_type,
+    classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -1301,7 +1301,10 @@ _TYPE_QUERY_EXEMPT_WORDS = {
 }
 
 
-def _text_has_giveaway_contamination(text: str, query_lower: str, query_policy_type: str = "general") -> bool:
+def _text_has_giveaway_contamination(
+    text: str, query_lower: str, query_policy_type: str = "general",
+    retrieved_types: frozenset = frozenset(),
+) -> bool:
     # query_policy_type is classify_query_policy_type(retrieval_query) —
     # already computed once per request for the metadata retrieval filter,
     # and far more reliable than re-deriving "does the query mention this
@@ -1314,9 +1317,28 @@ def _text_has_giveaway_contamination(text: str, query_lower: str, query_policy_t
     # insurance", its own genuinely-correct category. Trusting the
     # classifier directly closes this whole class of synonym/hypernym gap,
     # not just this one instance.
+    #
+    # retrieved_types requires the giveaway term's type to have actually
+    # been RETRIEVED this turn (a chunk genuinely tagged that specific
+    # type, not "general") before treating a keyword match as contamination
+    # at all. query_policy_type alone isn't a complete signal — its regex
+    # list can't cover every phrasing, and its LLM fallback isn't 100%
+    # reliable (confirmed live: "What is personal insurance?" scored zero
+    # regex hits and needed a dedicated pattern added — see
+    # [[project_query_type_classification_reliability_gap]]) — so a query
+    # the classifier mishandles could still trigger this check on a
+    # perfectly legitimate mention (e.g. a general classification-list
+    # chunk naming "motor insurance" as one of five general insurance
+    # categories while explaining an unrelated type). Grounding the check
+    # in what was actually retrieved means a giveaway term only counts when
+    # there's real evidence of that specific type's content being in
+    # context, independent of whether the query itself got classified
+    # correctly.
     text_lower = text.lower()
     for _type_name, _terms in _TYPE_GIVEAWAY_TERMS.items():
         if _type_name == query_policy_type:
+            continue
+        if _type_name not in retrieved_types:
             continue
         _exempt_words = _TYPE_QUERY_EXEMPT_WORDS.get(_type_name, (_type_name,))
         if any(w in query_lower for w in _exempt_words):
@@ -1520,7 +1542,7 @@ _ANCHOR_TYPE_RE = re.compile(
     r"liability|third.party|public\s*liability|"
     r"critical\s*illness|"
     r"group|corporate|micro|"
-    r"personal\s*accident|road\s*accident|accident|disability|workmen.?s?\s*compensation|"
+    r"personal\s*accident|personal\s*insurance|road\s*accident|accident|disability|workmen.?s?\s*compensation|"
     r"employer.?s?\s*liability|fidelity(?:\s*guarantee)?|"
     r"engineering|business\s*interruption|"
     r"retirement|pension|annuity|takaful|"
@@ -1674,7 +1696,7 @@ _HARDCODED_ANCHOR_TERMS = {
     "liability", "third party", "public liability",
     "critical illness",
     "group", "corporate", "micro",
-    "personal accident", "disability", "workmens compensation",
+    "personal accident", "personal insurance", "disability", "workmens compensation",
     "employers liability", "fidelity", "fidelity guarantee",
     "engineering", "business interruption",
     "retirement", "pension", "annuity", "takaful",
@@ -2232,7 +2254,7 @@ async def _classify_query_policy_type_llm(query: str) -> str:
     the regex path already does.
     """
     try:
-        label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in _POLICY_TYPE_HINTS.items())
+        label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in get_active_vocab().items())
         prompt = f"""Classify the ONE insurance policy type this short user question is about.
 
 {label_list}
@@ -2256,12 +2278,61 @@ Reply with ONLY the label word, nothing else."""
             return "general"
         label = re.split(r"[\s\n,.:;()]", raw.strip().lower())[0]
         label = _normalize_policy_type(label)
-        result = label if label in _VALID_POLICY_TYPES else "general"
+        result = label if label in _valid_policy_types() else "general"
         logger.debug("[QUERY_POLICY_TYPE] LLM fallback: %r -> %s", query, result)
         return result
     except Exception as exc:
         logger.debug("[QUERY_POLICY_TYPE] LLM fallback failed (%s) — treating as general", exc)
         return "general"
+
+
+async def _classify_query_candidate_type_llm(query: str) -> Optional[str]:
+    """
+    Open-vocabulary sibling of _classify_query_policy_type_llm() — no list
+    constraint, can name anything, even a label the candidate vocabulary has
+    never seen before. Never touches retrieval filtering; its only purpose
+    is comparison against a chunk's candidate_policy_type during reranking
+    (see _effective_sort_score in ask_stream). Callers only invoke this
+    when the retrieved pool actually contains a chunk with
+    candidate_policy_type set — the common case has nothing to compare
+    against, so this call would otherwise be pure wasted latency on every
+    single query.
+    """
+    from candidate_vocab import match_candidate_vocab, normalize_candidate_label, upsert_candidate
+
+    hit = match_candidate_vocab(query)
+    if hit:
+        upsert_candidate(hit, [], query, "query")
+        return hit
+
+    try:
+        prompt = f"""This is a short insurance-related question. If it names or clearly
+implies ONE specific insurance product or coverage type — even an unusual
+or unfamiliar-sounding one — extract that name in 1-3 words. If the
+question itself already uses a specific term for the coverage (even a term
+you don't recognize as a standard insurance category), use that exact term
+rather than judging whether it "sounds like" a real product.
+
+- If yes, reply with ONLY that name, lowercase, 1-3 words, nothing else.
+- If the question is generic, spans multiple types, or doesn't name or
+  imply one specific product at all, reply with exactly: general
+
+QUESTION: {query}
+
+ANSWER:"""
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=3)
+        if not raw:
+            return None
+    except Exception as exc:
+        logger.debug("[CANDIDATE_TYPE] query open-ended LLM call failed: %s", exc)
+        return None
+
+    label = normalize_candidate_label(raw)
+    if label is None:
+        return None
+    upsert_candidate(label, [], query, "query")
+    logger.debug("[CANDIDATE_TYPE] query open-ended guess: %r -> %r", query, label)
+    return label
 
 
 # Context passed to the grounding-check prompt is capped so this stays a
@@ -3314,8 +3385,24 @@ _DETAILED_PROMPT_TOKENS_EST = len(DETAILED_GROUNDED_PROMPT) // _CHARS_PER_TOKEN
 _CONVERSATIONAL_PROMPT_TOKENS_EST = len(CONVERSATIONAL_RAG_PROMPT) // _CHARS_PER_TOKEN
 
 class MultiSourceRAG:
-    def __init__(self):
-        self.doc_pipeline = RAGPipeline()
+    def __init__(self, doc_pipeline: Optional[RAGPipeline] = None):
+        # Accepts an existing RAGPipeline rather than always constructing a
+        # fresh one — critical when the caller already has a live singleton
+        # (see api.py's _get_multi_rag(), which passes _get_pipeline()'s
+        # result). Two independently-constructed RAGPipeline instances each
+        # load their own in-memory copy of the same on-disk vector store and
+        # KV cache; a document inserted via one is invisible to queries
+        # served through the other until a process restart reloads both
+        # from disk. Confirmed live: /upload (which used the module-level
+        # _get_pipeline() singleton) was invisible to /ask-stream (which
+        # used a separately-constructed MultiSourceRAG().doc_pipeline) for
+        # the lifetime of the process — a document could be uploaded
+        # successfully and still get "not in my knowledge base" on every
+        # query until the container restarted, regardless of any cache
+        # state. /upload-webpage and /upload-video were unaffected only
+        # because they already happened to insert through the
+        # MultiSourceRAG instance directly.
+        self.doc_pipeline = doc_pipeline if doc_pipeline is not None else RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
         self.max_context_chars = LLM_CONTEXT_WINDOW_CHARS  # kept in sync with compress_to_budget budget
@@ -3420,9 +3507,32 @@ class MultiSourceRAG:
                     if not src or src in seen_summary_srcs:
                         continue
                     seen_summary_srcs.add(src)
+                    # Respect the same policy_type constraint the main search
+                    # already applies — a document's SUMMARY can score well
+                    # against a query on totally different, coincidentally-
+                    # similar-sounding grounds (e.g. any "how do I file a
+                    # claim" summary tends to resemble any other), and unlike
+                    # the main search this boost has no type check of its
+                    # own. Confirmed live: a newly-uploaded pet insurance
+                    # guide's summary matched "how to claim health insurance
+                    # for a fractured hand" closely enough to enter the top
+                    # summary matches, and its claims-process chunk (source-
+                    # filtered only, no type filter) got boosted straight
+                    # into a human health-insurance answer verbatim ("Most
+                    # insurers accept claims through a mobile app... photo
+                    # submission"). filter_meta already carries "$in":
+                    # [_query_policy_type, "general"] when the query
+                    # classified to a specific type — folding it in here
+                    # closes that gap without touching the boost's own
+                    # purpose (rescuing an under-ranked chunk from a
+                    # genuinely relevant, type-compatible document).
+                    _boost_filter = (
+                        {"$and": [filter_meta, {"source": {"$eq": src}}]}
+                        if filter_meta else {"source": {"$eq": src}}
+                    )
                     boost = await asyncio.to_thread(
                         self.doc_pipeline._vector_store.search,
-                        retrieval_query, 2, {"source": {"$eq": src}}, True, False,
+                        retrieval_query, 2, _boost_filter, True, False,
                     )
                     if boost:
                         existing = {d.page_content[:80] for d in doc_raw}
@@ -3485,9 +3595,16 @@ class MultiSourceRAG:
                     # back down to what the comment always said, and
                     # summary_top_k trimmed to 2 alongside it — now at most
                     # 2 docs x 2 chunks = 4 extra candidates.)
+                    # Same policy_type guard as _retrieve_all_sources_combined's
+                    # copy of this loop — see the comment there for the
+                    # confirmed-live cross-topic leak this closes.
+                    _boost_filter = (
+                        {"$and": [filter_meta, {"source": {"$eq": src}}]}
+                        if filter_meta else {"source": {"$eq": src}}
+                    )
                     boost = await asyncio.to_thread(
                         self.doc_pipeline._vector_store.search,
-                        retrieval_query, 2, {"source": {"$eq": src}}, True, False,
+                        retrieval_query, 2, _boost_filter, True, False,
                     )
                     if boost:
                         existing = {d.page_content[:80] for d in doc_chunks}
@@ -4557,25 +4674,99 @@ class MultiSourceRAG:
         # they aren't covered by the hard pre-filter either.
         _TYPE_MISMATCH_DISCOUNT = 0.5
 
-        def _effective_sort_score(c):
-            _base = c.metadata.get("rerank_score", c.metadata.get("similarity", 0))
+        # Mutated by the Mode-B fallback further down, read by
+        # _effective_sort_score — a chunk that only made it into the pool
+        # because the constrained search was already struggling shouldn't
+        # then get penalized by the same mismatch logic that widening was
+        # meant to route around. Content-hash keyed (matching _merge_chunks'
+        # own dedup key) rather than id()-keyed, since rerank_documents()
+        # isn't guaranteed to hand back the identical Document objects it
+        # was given.
+        _fallback_hashes: set = set()
+
+        # Query-side open-vocabulary candidate, used only for the exact-match
+        # exemption below. Gated on the pool actually containing a chunk with
+        # a candidate label — the common case has nothing to compare against,
+        # so this avoids paying an LLM call on every single query for a
+        # comparison that usually can't matter.
+        _query_candidate_type: Optional[str] = None
+        if any(c.metadata.get("candidate_policy_type") for c in all_chunks):
+            try:
+                _query_candidate_type = await _classify_query_candidate_type_llm(retrieval_query)
+            except Exception as exc:
+                logger.debug("[CANDIDATE_TYPE] query-side gate failed: %s", exc)
+
+        def _type_mismatched(c):
             _chunk_type = str(c.metadata.get("policy_type", "general")).lower()
-            if (
+            return (
                 _query_policy_type != "general"
                 and str(c.metadata.get("source_type", "document")).lower() == "document"
                 and _chunk_type != _query_policy_type
-            ):
+            )
+
+        def _discount_exempt(c):
+            # Two cases beyond "chunk isn't general at all" (that case never
+            # reaches here — _type_mismatched is already False for it): (1)
+            # both sides independently guessed the same open-vocabulary
+            # topic, so the official "general" tag is known to be a
+            # taxonomy gap, not genuine irrelevance; (2) this chunk only
+            # exists in the pool because the fallback below had to widen
+            # the net past the filter entirely.
+            if hash(c.page_content[:200]) in _fallback_hashes:
+                return True
+            _chunk_candidate = c.metadata.get("candidate_policy_type")
+            return bool(
+                _chunk_candidate and _query_candidate_type and _chunk_candidate == _query_candidate_type
+            )
+
+        def _effective_sort_score(c):
+            _base = c.metadata.get("rerank_score", c.metadata.get("similarity", 0))
+            if _type_mismatched(c) and not _discount_exempt(c):
                 return _base * _TYPE_MISMATCH_DISCOUNT
             return _base
 
-        all_chunks.sort(
-            key=lambda x: (
-                _effective_sort_score(x),
-                1 if x.metadata.get("stage1_boost") else 0,
-            ),
-            reverse=True,
-        )
-        all_chunks = all_chunks[:_chunk_limit]
+        def _sort_and_truncate(chunks):
+            # A mismatched/"general" chunk that scores below EVERY
+            # genuinely type-specific match in the pool isn't losing a fair
+            # ranking fight — it's just backfilling a slot chunk_limit
+            # would otherwise leave unfilled. Confirmed live: a detailed-
+            # mode query with only 7 real health-insurance chunks in its
+            # retrieved pool still got an 8th, wrong-topic chunk (a newly-
+            # uploaded pet insurance guide, tagged "general") forced into
+            # the final context purely because chunk_limit=8 pads to a
+            # fixed count — its discounted score (0.054) correctly ranked
+            # below all 7 real matches (0.056-0.214), but "last place among
+            # 8" still meant "included," and its claims-process wording
+            # ended up echoed verbatim in a human health-insurance answer.
+            # Drop these outright rather than let a fixed slot count
+            # backfill with content that lost to every on-topic
+            # alternative — a shorter, cleaner context beats a padded,
+            # contaminated one.
+            _type_specific_scores = [
+                _effective_sort_score(c) for c in chunks
+                if not _type_mismatched(c) or _discount_exempt(c)
+            ]
+            if _type_specific_scores:
+                _min_type_specific = min(_type_specific_scores)
+                chunks = [
+                    c for c in chunks
+                    if not (
+                        _type_mismatched(c)
+                        and not _discount_exempt(c)
+                        and _effective_sort_score(c) < _min_type_specific
+                    )
+                ]
+            chunks = sorted(
+                chunks,
+                key=lambda x: (
+                    _effective_sort_score(x),
+                    1 if x.metadata.get("stage1_boost") else 0,
+                ),
+                reverse=True,
+            )
+            return chunks[:_chunk_limit]
+
+        all_chunks = _sort_and_truncate(all_chunks)
 
         # ── Hard reranker gate ────────────────────────────────────────────────
         # If the best reranker score across ALL retrieved chunks is below the
@@ -4605,6 +4796,67 @@ class MultiSourceRAG:
              for c in all_chunks if hasattr(c, "metadata") and "rerank_score" in c.metadata),
             default=float("-inf"),
         )
+
+        # ── Mode-B retrieval fallback ────────────────────────────────────────
+        # Closes the gap the discount above can't reach: when ingestion and
+        # query-time classification each confidently but wrongly force-fit
+        # the same novel topic into two DIFFERENT existing types, the hard
+        # policy_type filter (built above, "$in": [_query_policy_type,
+        # "general"]) excludes the correct chunks before they're ever
+        # scored — there's no "general" tag or candidate label to catch,
+        # because neither classifier ever produced an out-of-vocabulary
+        # answer for this specific case. The only observable signal is the
+        # symptom (a weak top score against the filtered pool), not the
+        # cause, so this doesn't try to detect a mismatch — it just widens
+        # the net when the constrained search already looks like it's
+        # struggling, and keeps the result only if it's actually better.
+        # Scoped the same way the two existing retry tiers below are
+        # (not document_filter): a query with an explicit document scope
+        # has already told retrieval exactly where to look.
+        _fallback_threshold = float(os.getenv("RETRIEVAL_FALLBACK_THRESHOLD", "0.01"))
+        if (
+            not document_filter
+            and _query_policy_type != "general"
+            and _top_rerank < _fallback_threshold
+        ):
+            try:
+                _unfiltered_raw = await asyncio.to_thread(
+                    self.doc_pipeline._vector_store.search,
+                    _search_query, top_k=_doc_top_k, use_hybrid=True, use_reranker=False,
+                    filter_metadata=_filter_meta_no_policy_type,
+                )
+                if _unfiltered_raw:
+                    _existing_hashes = {hash(c.page_content[:200]) for c in all_chunks}
+                    _merged_pool = self._merge_chunks(all_chunks + _unfiltered_raw)
+                    _new_hashes = {hash(c.page_content[:200]) for c in _merged_pool} - _existing_hashes
+                    # Rerank the merged pool ONCE rather than fetching and
+                    # reranking the unfiltered results separately — pool size
+                    # dominates rerank latency far more than whether a filter
+                    # was applied, so this is "rerank a bigger pool once,"
+                    # not "rerank twice."
+                    _merged_pool = await asyncio.to_thread(
+                        self.doc_pipeline._vector_store.rerank_documents,
+                        _search_query, _merged_pool, _chunk_limit,
+                    )
+                    _fallback_hashes.update(_new_hashes)
+                    _merged_pool = _sort_and_truncate(_merged_pool)
+                    _merged_top = max(
+                        (c.metadata.get("rerank_score", float("-inf"))
+                         for c in _merged_pool if hasattr(c, "metadata") and "rerank_score" in c.metadata),
+                        default=float("-inf"),
+                    )
+                    if _merged_top > _top_rerank:
+                        logger.info(
+                            "[ask_stream] Mode-B fallback: filtered top=%.4f -> merged top=%.4f, adopting wider pool",
+                            _top_rerank, _merged_top,
+                        )
+                        all_chunks = _merged_pool
+                        _top_rerank = _merged_top
+                    else:
+                        _fallback_hashes.difference_update(_new_hashes)
+            except Exception as exc:
+                logger.debug("[ask_stream] Mode-B fallback search failed: %s", exc)
+
         if not document_filter and _top_rerank < _rerank_gate and not _pasted_grounds_answer:
             logger.info(
                 "[ask_stream] Reranker gate: top=%.3f < gate=%.3f — not in KB",
@@ -4780,7 +5032,13 @@ class MultiSourceRAG:
                         _cleaned_query, _fallback_chunks, backend_override="vllm",
                     )
                     if _fallback_lex_ok and _fallback_sem_grounded:
-                        all_chunks = _fallback_chunks
+                        # Same gap as the standalone-retry tier below:
+                        # _retrieve_doc_chunks reranks but never applies
+                        # _effective_sort_score, so a "general"-tagged,
+                        # weaker-than-every-real-match chunk that squeaked
+                        # past filter_meta here would skip the discount/
+                        # exclusion pass entirely if assigned directly.
+                        all_chunks = _sort_and_truncate(_fallback_chunks)
                         retrieval_query = _cleaned_query
                         ctx_covered = True
                         _dropped_terms_note = _dropped
@@ -4881,7 +5139,27 @@ class MultiSourceRAG:
                 )
                 _standalone_sem_grounded = await _verify_grounding_any_chunk(question, _standalone_chunks)
                 if _standalone_lex_ok and _standalone_sem_grounded:
-                    all_chunks = _standalone_chunks
+                    # This retry deliberately searches unfiltered by
+                    # policy_type (see _filter_meta_no_policy_type above) —
+                    # the whole point is escaping a possibly-wrong prior-
+                    # topic-anchored classification, so a hard filter here
+                    # would defeat the retry itself. But that leaves the
+                    # same soft-discount/exclusion pass every other path
+                    # gets as the only thing standing between this pool and
+                    # the exact "general"-tagged, wrong-topic chunk problem
+                    # fixed above — _retrieve_doc_chunks does its own
+                    # reranking but never applies _effective_sort_score, so
+                    # a chunk this unfiltered search pulls in gets no
+                    # discount and no exclusion check at all otherwise.
+                    # Reclassify against `question` itself (not the stale
+                    # follow-up-reformulated retrieval_query) since that's
+                    # exactly what this retry just proved is the right
+                    # anchor going forward — matches the retrieval_query
+                    # reassignment right below.
+                    _query_policy_type = classify_query_policy_type(question)
+                    if _query_policy_type == "general":
+                        _query_policy_type = await _classify_query_policy_type_llm(question)
+                    all_chunks = _sort_and_truncate(_standalone_chunks)
                     retrieval_query = question
                     ctx_covered = True
                     _detected_as_followup = False  # answer as a fresh question, not a followup
@@ -5027,6 +5305,28 @@ class MultiSourceRAG:
         if _relevant_chunks:
             all_chunks = _relevant_chunks
 
+        # Full, uncompressed chunk text — kept alongside the (possibly
+        # compressed) prompt context below specifically for the post-
+        # generation grounding checks further down (_point_grounded,
+        # currency/qualifier-mismatch, refund-scope-mismatch, denial-claim
+        # checks). Those checks measure whether the model's paraphrase
+        # shares enough vocabulary with what was actually retrieved — but
+        # compress_to_budget can shrink a multi-hundred-word chunk down to
+        # a single ~100-char sentence when many chunks compete for a
+        # shared budget (confirmed live: 8 detailed-mode chunks compressed
+        # to 64-114 chars each, ~1300 chars total). The LLM was still shown
+        # only the compressed version and is expected to answer from it —
+        # but a genuinely correct paraphrase can reasonably restate detail
+        # from elsewhere in the SAME source chunk that didn't survive
+        # compression, and checking it against the compressed sliver alone
+        # produced false rejections (a textbook-correct "utmost good faith"
+        # point, verbatim-supported by the retrieved chunk, scored 3/10
+        # word matches against the compressed ~100-char version of that
+        # same chunk and got dropped). Grounding checks should ask "is this
+        # actually in what we retrieved," not "does it survive a budget
+        # cut made for an unrelated reason."
+        _full_context_uncompressed = "\n\n".join(c.page_content for c in all_chunks)
+
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
             all_chunks = self._compressor.compress_to_budget(
@@ -5036,6 +5336,28 @@ class MultiSourceRAG:
         # from the earlier call — the generation prompt should see
         # topic-specific content first too, not just the grounding check.
         all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
+
+        # Which specific (non-general) policy types are actually present
+        # among the chunks retrieved THIS turn — used below by the
+        # cross-topic-contamination checks instead of trusting
+        # classify_query_policy_type()'s guess alone. That classifier can't
+        # cover every possible phrasing (its regex list is necessarily
+        # finite, and its LLM fallback isn't 100% reliable either — see
+        # [[project_query_type_classification_reliability_gap]]), so a
+        # contamination check keyed purely off "does the query's guessed
+        # type match a giveaway term" can misfire on a query the classifier
+        # mishandles OR on a reply that legitimately mentions a sibling type
+        # by name (e.g. explaining "personal insurance" by listing it
+        # alongside motor/health as one of five general insurance
+        # categories — real KB content, not leakage). Grounding the check in
+        # what was ACTUALLY retrieved is a stronger signal either way: a
+        # giveaway term only means something if a chunk of that specific
+        # type was genuinely pulled into context, not just because the term
+        # happens to appear in a general/classification-style passage.
+        _retrieved_specific_types = {
+            c.metadata.get("policy_type") for c in all_chunks
+            if c.metadata.get("policy_type") and c.metadata.get("policy_type") != "general"
+        }
 
         _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
         _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
@@ -5722,7 +6044,7 @@ class MultiSourceRAG:
                         _point_texts[-1] = _point_texts[-1] + " " + _stripped_line
                     else:
                         _closer_lines.append(_line)
-                if len(_point_texts) >= 2 and full_context and full_context.strip():
+                if len(_point_texts) >= 2 and _full_context_uncompressed and _full_context_uncompressed.strip():
                     # Must strip punctuation the same way on both sides.
                     # full_context is raw KB prose, dense with commas
                     # ("lightning, explosion, aircraft damage, riot..."),
@@ -5756,7 +6078,7 @@ class MultiSourceRAG:
                     def _norm_words(text: str) -> list[str]:
                         return [_norm_word(w) for w in _re3.findall(r"\w+", text.lower())]
 
-                    _ctx_word_set = set(_norm_words(full_context))
+                    _ctx_word_set = set(_norm_words(_full_context_uncompressed))
                     # Switched from exact 4-word phrase matching to plain
                     # significant-word overlap after the phrase-based check
                     # proved fundamentally too brittle to fix by threshold
@@ -5923,7 +6245,9 @@ class MultiSourceRAG:
                     # retrieval filter above, not a new heuristic.
                     if _query_policy_type == "general":
                         return False
-                    return _text_has_giveaway_contamination(point_text, _query_lower, _query_policy_type)
+                    return _text_has_giveaway_contamination(
+                        point_text, _query_lower, _query_policy_type, _retrieved_specific_types
+                    )
 
                 _clean_points = [p for p in _contam_points if not _is_contaminated(p)]
                 if _clean_points and len(_clean_points) < len(_contam_points):
@@ -5971,7 +6295,7 @@ class MultiSourceRAG:
         if not _keyword_detailed:
             try:
                 _hist_ans_src = (_corrected_text or _reply_stripped)
-                _hist_legit_text = f"{question} {retrieval_query} {full_context}".lower()
+                _hist_legit_text = f"{question} {retrieval_query} {_full_context_uncompressed}".lower()
                 for _hist_type_m in _TYPE_ATTRIBUTION_RE.finditer(_hist_ans_src.lower()):
                     _hist_type_word = _hist_type_m.group(1).lower()
                     if _hist_type_word not in _hist_legit_text:
@@ -6018,7 +6342,9 @@ class MultiSourceRAG:
             try:
                 _retr_ans_src = (_corrected_text or _reply_stripped)
                 _retr_query_lower = f"{question} {retrieval_query}".lower()
-                if _text_has_giveaway_contamination(_retr_ans_src, _retr_query_lower, _query_policy_type):
+                if _text_has_giveaway_contamination(
+                    _retr_ans_src, _retr_query_lower, _query_policy_type, _retrieved_specific_types
+                ):
                     _retr_refusal_text = (
                         "Hmm, I don't have that specific information in my knowledge base right now. "
                         "Let me get one of our agents on it, they'll be able to help you better! 😊"
@@ -6416,7 +6742,7 @@ class MultiSourceRAG:
             import re as _re5
             _CURRENCY_RE = _re5.compile(r'(?:[₹$£€]|\bRs\.?\b|\bINR\b|\bEUR\b)\s?([\d,]+(?:\.\d+)?)', _re5.IGNORECASE)
             _num_src = (_corrected_text or _reply_stripped).strip()
-            _ctx_digits = _re5.sub(r'\D', '', full_context or '')
+            _ctx_digits = _re5.sub(r'\D', '', _full_context_uncompressed or '')
 
             def _currency_grounded(num_str: str) -> bool:
                 digits = num_str.replace(',', '').split('.')[0]
@@ -6521,9 +6847,9 @@ class MultiSourceRAG:
                     )
                     _any_occurrence = False
                     _any_compatible = False
-                    for _m in _fig_re.finditer(full_context or ''):
+                    for _m in _fig_re.finditer(_full_context_uncompressed or ''):
                         _any_occurrence = True
-                        _window_triggers = _extract_triggers(_source_window(full_context, _m.start(), _m.end()))
+                        _window_triggers = _extract_triggers(_source_window(_full_context_uncompressed, _m.start(), _m.end()))
                         if not _window_triggers or (_window_triggers & _question_triggers):
                             _any_compatible = True
                             break
@@ -6686,7 +7012,7 @@ class MultiSourceRAG:
             if _question_is_expiry and not _question_scope:
                 _any_compatible_src = False
                 for _m in _re6.finditer(
-                    r'[^.\n]*\brefund[^.\n]*[.\n]', full_context or '', _re6.IGNORECASE
+                    r'[^.\n]*\brefund[^.\n]*[.\n]', _full_context_uncompressed or '', _re6.IGNORECASE
                 ):
                     if not _refund_scope_words(_m.group(0)):
                         _any_compatible_src = True
@@ -6732,6 +7058,205 @@ class MultiSourceRAG:
                     )
         except Exception as _refund_exc:
             logger.debug("[ask_stream] refund-scope-mismatch filter skipped: %s", _refund_exc)
+
+        # Set unconditionally for the same reason as _dropped_num /
+        # _refund_units_dropped above.
+        _denial_units_dropped = False
+
+        # ── Drop coverage-denial claims not actually named in the source ──────
+        # Confirmed live: "if I intentionally damage my car under motor
+        # insurance, will I get any money?" got answered "you likely won't
+        # get any money... most policies have a clause that excludes
+        # intentional damage" — stated as if quoting a specific policy
+        # clause. The KB's actual motor-insurance "General Exclusions" list
+        # names exactly 5 items (outside the covered geographical area,
+        # contractual liability, use outside the policy's Use Clause, no
+        # valid driving licence, war/nuclear risks) — "intentional damage"
+        # is not one of them. The claim is directionally TRUE (a real,
+        # general insurance principle — deliberately causing your own loss
+        # voids a claim on moral-hazard/utmost-good-faith grounds) and is
+        # even loosely present in the KB as a general "moral hazard" concept
+        # passage (an unrelated warehouse-arson example, no cars, no named
+        # exclusions list) — but the reply presents it as if it were a
+        # specific, citable clause for THIS policy type, which it isn't.
+        #
+        # Same underlying bug class as the refund-scope-mismatch check
+        # above (a real principle applied as if it were specific retrieved
+        # text) but deliberately NOT scoped to refunds only — this is
+        # general enough to catch any coverage-denial claim ("won't cover
+        # X", "excludes X", "not covered") regardless of topic: flood
+        # damage, drunk driving, pre-existing conditions, whatever. Rather
+        # than enumerate scenario types (the exact whack-a-mole pattern
+        # already rejected for modifier-intent detection — see
+        # [[project_hybrid_modifier_intent_classifier]]), this drives
+        # entirely off the USER'S OWN QUESTION WORDING: strip generic
+        # insurance/English words, and check whether any of what's left
+        # (the words that actually describe the scenario — "intentionally",
+        # "damage") appear anywhere near an exclusion-indicating phrase in
+        # the retrieved context. A source window with no scenario word at
+        # all is either a general/unconditional exclusion (left alone,
+        # matching the currency-check's identical "no qualifier = general,
+        # don't touch it" logic) or — if no exclusion-context window
+        # anywhere in the document contains the scenario word — the reply's
+        # specific claim isn't actually grounded, regardless of how true it
+        # sounds.
+        try:
+            import re as _re7
+            # Confirmed live: the first version of this regex only matched
+            # "won't"/"will not" immediately followed by the verb — missed
+            # "wouldn't" (a different modal, not just a contraction of
+            # "won't") entirely, and broke on any filler adverb between the
+            # negation and the verb ("wouldn't TYPICALLY cover"). Same
+            # fragility class already fixed once this session for identity
+            # detection (see [[project_identity_regex_filler_words_gap]]) —
+            # permissive of a few filler words between the negation and verb
+            # rather than requiring exact adjacency.
+            _DENIAL_FILLER = r"(?:\s+(?:typically|usually|generally|normally|likely|probably|necessarily|always|certainly|automatically)){0,2}"
+            _DENIAL_RE = _re7.compile(
+                r"won'?t" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
+                r"will\s+not" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
+                r"would\s?n'?t" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
+                r"would\s+not" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
+                r"does\s?n'?t\s+cover|does\s+not\s+cover|"
+                r"\bexcludes?\b|\bexcluded\b|"
+                r"not\s+covered|no\s+coverage|not\s+payable",
+                _re7.IGNORECASE,
+            )
+            _EXCLUSION_INDICATOR_RE = _re7.compile(
+                r"exclu\w*|not\s+cover\w*|does\s?n'?t\s+cover|will\s+not\s+cover|"
+                r"not\s+payable|no\s+coverage",
+                _re7.IGNORECASE,
+            )
+            # Generic insurance vocabulary (already maintained for the
+            # hollow-answer detector) plus ordinary English function words —
+            # what's left after stripping both is the part of the question
+            # that actually names a scenario, not just "insurance" boilerplate.
+            _DENIAL_STOPWORDS = frozenset({
+                'the', 'a', 'an', 'and', 'or', 'but', 'if', 'will', 'would',
+                'can', 'could', 'should', 'is', 'are', 'was', 'were', 'be',
+                'been', 'being', 'do', 'does', 'did', 'my', 'your', 'i',
+                'you', 'it', 'me', 'to', 'of', 'in', 'on', 'for', 'under',
+                'with', 'get', 'any', 'money', 'back', 'that', 'this',
+                'what', 'when', 'how', 'why', 'who', 'which', 'have', 'has',
+                'not', 'no',
+                # Question-structure/meta words — describe what KIND of
+                # answer the user wants (an explanation, a list, more
+                # detail), not a specific scenario to verify grounding
+                # against. Confirmed live: "Explain the exclusions in fire
+                # insurance in detail" left {'explain', 'detail',
+                # 'exclusions'} as "scenario words" after the existing
+                # filters — none of which describe an actual scenario like
+                # "intentional damage" this check was built for, and none
+                # of which a real KB exclusion clause would ever literally
+                # contain. Every genuine exclusion the model correctly
+                # listed then failed the "does the source's exclusion
+                # window mention this scenario word" test and got dropped,
+                # since a general "list the exclusions" question doesn't
+                # name one scenario to check against in the first place.
+                'explain', 'explains', 'explaining', 'detail', 'details',
+                'detailed', 'describe', 'describes', 'list', 'lists',
+                'tell', 'give', 'know', 'understand', 'example', 'examples',
+                'point', 'points', 'exclusion', 'exclusions', 'exclude',
+                'excludes', 'excluded', 'excluding', 'denial', 'denied',
+                'deny', 'denies',
+            }) | frozenset(w.lower() for term in _INSURANCE_VOCAB for w in term.split())
+
+            def _denial_scenario_words(text: str) -> set:
+                words = _re7.findall(r"\b[a-zA-Z]{3,}\b", (text or ''))
+                return {w.lower() for w in words if w.lower() not in _DENIAL_STOPWORDS}
+
+            _question_scenario_words = _denial_scenario_words(question)
+            # The query's OWN insurance type (e.g. "fire" in "explain the
+            # exclusions in fire insurance") isn't a scenario either — it's
+            # just naming what the question is about, same non-signal as
+            # "explain"/"detail" above. Confirmed live: with those two
+            # filtered, "fire" alone survived as the only "scenario word"
+            # for a general "explain the exclusions in fire insurance"
+            # question, and since formal exclusion clauses don't
+            # necessarily repeat the type name in every sentence (a
+            # frequency-based pervasive-word filter above didn't
+            # reliably catch it either), 3 of 5 genuine exclusions still
+            # failed the "does the source window mention this word" check
+            # and got dropped.
+            if _query_policy_type != "general":
+                _question_scenario_words -= set(_query_policy_type.split("_"))
+            _dn_reply_src_check = (_corrected_text or _reply_stripped)
+            _reply_has_denial = bool(_DENIAL_RE.search(_dn_reply_src_check))
+
+            _denial_claim_mismatch = False
+            if _reply_has_denial and _question_scenario_words:
+                # A bare policy-type word ("car", "motor") isn't in
+                # _INSURANCE_VOCAB but still appears throughout almost every
+                # chunk of a topically-retrieved context — confirmed live:
+                # "car"/"motor" from the question matched near an UNRELATED
+                # exclusion mention purely because those words are pervasive
+                # in any motor-insurance passage, not because that specific
+                # window discussed the actual scenario asked about. Same
+                # "weak discriminator" bug already found once this session
+                # in the hollow-answer detector's domain-word check — fixed
+                # the same way there (see [[project_hollow_answer_detector]]
+                # sibling fix): don't just check presence, check whether the
+                # word is actually SCARCE across the full retrieved context.
+                # A word appearing 4+ times total is almost certainly a
+                # pervasive topic word, not a scenario-specific signal.
+                _full_ctx_lower = (_full_context_uncompressed or '').lower()
+                _ctx_word_freq = {
+                    w: len(_re7.findall(r'\b' + _re7.escape(w) + r'\b', _full_ctx_lower))
+                    for w in _question_scenario_words
+                }
+                _rare_scenario_words = {w for w, c in _ctx_word_freq.items() if 0 < c <= 3}
+
+                _any_compatible_denial_src = False
+                _any_exclusion_context = False
+                for _m in _EXCLUSION_INDICATOR_RE.finditer(_full_context_uncompressed or ''):
+                    _any_exclusion_context = True
+                    _window = _full_context_uncompressed[max(0, _m.start() - 300):_m.end() + 300]
+                    _window_words = _denial_scenario_words(_window)
+                    if not _window_words or (_window_words & _rare_scenario_words):
+                        _any_compatible_denial_src = True
+                        break
+                # Only a real mismatch if the reply is actually making a
+                # denial claim AND the document has exclusion-context at all
+                # but none of it names this scenario — a document with NO
+                # exclusion language anywhere is a different, already-handled
+                # case (general ungrounded-claim / hollow-answer territory).
+                _denial_claim_mismatch = _any_exclusion_context and not _any_compatible_denial_src
+
+            if _denial_claim_mismatch:
+                _dn_src = (_corrected_text or _reply_stripped).strip()
+                _dn_has_points = bool(_re7.search(r'(?:^|\n)\s*\d+\.\s', _dn_src))
+                if _dn_has_points:
+                    _dn_units = _re7.split(r'\n(?=\s*\d+\.\s)', _dn_src)
+                else:
+                    _dn_units = _re7.split(r'(?<=[.!?])(?<!\d\.)\s+', _dn_src)
+
+                _dn_kept = [u for u in _dn_units if not _DENIAL_RE.search(u)]
+                if len(_dn_kept) < len(_dn_units) and _dn_kept:
+                    if _dn_has_points:
+                        _dn_point_re = _re7.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re7.DOTALL)
+                        _dn_renumbered, _dn_next_n = [], 1
+                        for _u in _dn_kept:
+                            _m = _dn_point_re.match(_u)
+                            if _m:
+                                _dn_renumbered.append(f"{_m.group(1)}{_dn_next_n}{_m.group(3)}{_m.group(4)}")
+                                _dn_next_n += 1
+                            else:
+                                _dn_renumbered.append(_u)
+                        _dn_rebuilt = "\n".join(_dn_renumbered).strip()
+                    else:
+                        _dn_rebuilt = " ".join(_dn_kept).strip()
+                        if _dn_rebuilt and _dn_rebuilt[-1] not in ".!?":
+                            _dn_rebuilt += "."
+                    _corrected_text = _dn_rebuilt
+                    _kv_reply = _dn_rebuilt
+                    _denial_units_dropped = True
+                    logger.info(
+                        "[ask_stream] dropped coverage-denial claim not named in "
+                        "any exclusion-context window of the retrieved source "
+                        "(question scenario words=%r)", _question_scenario_words,
+                    )
+        except Exception as _denial_exc:
+            logger.debug("[ask_stream] unsupported-denial-claim filter skipped: %s", _denial_exc)
 
         # ── Third-party-victim contamination in first-party examples (brief) ──
         # Confirmed live: "personal accident insurance" — a first-party-only
@@ -6867,7 +7392,7 @@ class MultiSourceRAG:
                 # a unit, don't require the domain-word absence too — a
                 # topic-naming stub with nothing else left is exactly the
                 # hollow shape those filters are known to produce.
-                _prior_unit_dropped = bool(_dropped_num) or _refund_units_dropped
+                _prior_unit_dropped = bool(_dropped_num) or _refund_units_dropped or _denial_units_dropped
                 if _hollow_src and _word_count < 12 and (not _has_domain_word or _prior_unit_dropped):
                     _refusal_text = (
                         "Hmm, I don't have that specific information in my knowledge base right now. "
@@ -6977,6 +7502,61 @@ class MultiSourceRAG:
                 _kv_reply = _false_claim_fixed
         except Exception as _false_claim_exc:
             logger.debug("[ask_stream] false-claim correction skipped: %s", _false_claim_exc)
+
+        # ── Citation-leak strip: internal document/page labels ─────────────────
+        # DETAILED_GROUNDED_PROMPT/STRICT_GROUNDED_PROMPT already tell the
+        # model never to repeat the "[Document: filename (Page N)]" labels
+        # prepended to context chunks — but a small model doesn't reliably
+        # follow that 100% of the time (same class of gap as
+        # [[project_dont_trust_buried_disclosure_instructions]]: a prompt
+        # instruction alone isn't enough, deterministic code is). Confirmed
+        # live: a detailed follow-up answer said "follow the procedures
+        # discussed in Document [ea22bdd3a9bf_m4-5f.pdf (Page 17)] to get
+        # the claim processed" — a different surface form than the one the
+        # prompt rule's own example already covers, showing this leaks in
+        # more than one phrasing. Drop the whole unit (point/sentence)
+        # containing a leaked filename+page reference rather than trying
+        # to surgically edit the citation out and risk a grammatically
+        # broken remainder.
+        try:
+            import re as _re8
+            _CITATION_LEAK_RE = _re8.compile(
+                r'[\w][\w\-]*\.(?:pdf|docx?|txt|csv|xlsx?)\s*\(?\s*page\s*\d+\s*\)?',
+                _re8.IGNORECASE,
+            )
+            _cl_src = (_corrected_text or _reply_stripped).strip()
+            if _CITATION_LEAK_RE.search(_cl_src):
+                _cl_has_points = bool(_re8.search(r'(?:^|\n)\s*\d+\.\s', _cl_src))
+                if _cl_has_points:
+                    _cl_units = _re8.split(r'\n(?=\s*\d+\.\s)', _cl_src)
+                else:
+                    _cl_units = _re8.split(r'(?<=[.!?])(?<!\d\.)\s+', _cl_src)
+
+                _cl_kept = [u for u in _cl_units if not _CITATION_LEAK_RE.search(u)]
+                if len(_cl_kept) < len(_cl_units) and _cl_kept:
+                    if _cl_has_points:
+                        _cl_point_re = _re8.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re8.DOTALL)
+                        _cl_renumbered, _cl_next_n = [], 1
+                        for _u in _cl_kept:
+                            _m = _cl_point_re.match(_u)
+                            if _m:
+                                _cl_renumbered.append(f"{_m.group(1)}{_cl_next_n}{_m.group(3)}{_m.group(4)}")
+                                _cl_next_n += 1
+                            else:
+                                _cl_renumbered.append(_u)
+                        _cl_rebuilt = "\n".join(_cl_renumbered).strip()
+                    else:
+                        _cl_rebuilt = " ".join(_cl_kept).strip()
+                        if _cl_rebuilt and _cl_rebuilt[-1] not in ".!?":
+                            _cl_rebuilt += "."
+                    _corrected_text = _cl_rebuilt
+                    _kv_reply = _cl_rebuilt
+                    logger.info(
+                        "[ask_stream] dropped %d unit(s) leaking an internal document/page citation",
+                        len(_cl_units) - len(_cl_kept),
+                    )
+        except Exception as _cl_exc:
+            logger.debug("[ask_stream] citation-leak strip skipped: %s", _cl_exc)
 
         # ── Buffered-path single yield (after all corrections) ────────────────
         # The non-streaming (buffered) path above stored the raw answer in

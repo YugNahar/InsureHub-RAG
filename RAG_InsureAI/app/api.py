@@ -722,6 +722,11 @@ async def _start_job_pruner():
 async def _warmup_pipeline():
     """Pre-load embedding model and vector store at startup so first request is fast."""
     await asyncio.to_thread(_get_pipeline)
+    # Also warm _multi_rag here (not just on first /ask-stream call) — it
+    # now shares _get_pipeline()'s instance (see _get_multi_rag()), so this
+    # mainly pre-loads video_store/webpage_store/ContextCompressor rather
+    # than duplicating the doc pipeline load above.
+    await asyncio.to_thread(_get_multi_rag)
     logger.info("Pipeline warmed up — embedding model loaded and ready.")
 app.add_middleware(
     CORSMiddleware,
@@ -846,6 +851,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             chunk.metadata["policy_type"] = _chunk_policy_type
 
     chunk_ids = pipeline.vector_store.add_documents(chunks)
+    _invalidate_query_cache()
     doc_meta = {"filename": filename, "doc_type": doc_type, **doc_tags}
     import threading as _threading
 
@@ -869,7 +875,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     def _reclassify_chunks_with_llm() -> None:
         try:
             from router import get_insurance_llm
-            from metadata_tagger import verify_and_enrich_section_metadata
+            from metadata_tagger import verify_and_enrich_section_metadata, classify_candidate_type
             reclass_llm = get_insurance_llm(temperature=0)
             tvec = pipeline.vector_store._store
 
@@ -893,6 +899,18 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 assigned_type = section_items[0][1].metadata.get("policy_type", "general")
                 enriched = verify_and_enrich_section_metadata(section_text, assigned_type, llm=reclass_llm)
                 fresh = enriched["policy_type"]
+                # Mode-A fallback: the closed vocabulary still can't place
+                # this section even with a real LLM available — this is the
+                # pass that actually has one, unlike the synchronous
+                # ingest step above (llm=None there, by design). See
+                # classify_candidate_type() docstring — never overrides
+                # `fresh`, only attaches an open-ended guess for retrieval's
+                # candidate-match bypass and the promotion-review log.
+                section_candidate_type = None
+                if fresh == "general":
+                    section_candidate_type = classify_candidate_type(
+                        section_text, llm=reclass_llm, source=filename, source_type="chunk",
+                    )
                 for cid, _ in section_items:
                     meta = tvec._metadatas.get(cid)
                     if meta is None:
@@ -900,6 +918,8 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                     if meta.get("policy_type") != fresh:
                         meta["policy_type"] = fresh
                         updated += 1
+                    if section_candidate_type:
+                        meta["candidate_policy_type"] = section_candidate_type
                     for field in ("language", "jurisdiction", "document_version", "effective_date", "coverage_category"):
                         if enriched.get(field, "unknown") != "unknown":
                             meta[field] = enriched[field]
@@ -996,7 +1016,13 @@ _multi_rag: MultiSourceRAG | None = None
 def _get_multi_rag() -> MultiSourceRAG:
     global _multi_rag
     if _multi_rag is None:
-        _multi_rag = MultiSourceRAG()
+        # Share _get_pipeline()'s singleton rather than letting MultiSourceRAG
+        # construct its own separate RAGPipeline — see the docstring on
+        # MultiSourceRAG.__init__ for why: without this, /upload and
+        # /ingest-url (which both go through _get_pipeline()) were invisible
+        # to /ask-stream (which reads self.doc_pipeline here) until a
+        # container restart, independent of any cache state.
+        _multi_rag = MultiSourceRAG(doc_pipeline=_get_pipeline())
     return _multi_rag
 
 
@@ -1066,6 +1092,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
 
         chunks = _chunk_transcript(transcript_text, url, title, doc_meta=doc_meta)
         multi.add_video_chunks(url, chunks, title=title)
+        _invalidate_query_cache()
         return {
             "status":  "success",
             "url":     url,
@@ -1171,6 +1198,7 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
         )
 
         multi.add_webpage_chunks(url, chunks)
+        _invalidate_query_cache()
         return {
             "status":  "success",
             "url":     url,
@@ -1488,6 +1516,8 @@ async def ingest_url(req: URLRequest):
             async with _get_ingest_semaphore():
                 await _set_job(job_id, _job_state("processing", url))
                 chunks = await asyncio.to_thread(_get_pipeline().add_url, url)
+                if chunks:
+                    _invalidate_query_cache()
                 await _set_job(job_id, _job_state("done", url, chunks=chunks))
                 logger.info("Ingested URL %s — %d chunks", url, chunks)
         except Exception:
@@ -1906,19 +1936,46 @@ async def clear_docs(_: str = Depends(require_auth)):
     return {"status": "cleared"}
 
 
-@app.post("/admin/cache/clear", tags=["admin"])
-async def clear_kv_cache(_: str = Depends(require_auth)):
-    """Clear the KV answer cache. All future queries will regenerate fresh answers."""
+def _invalidate_query_cache() -> bool:
+    """
+    Clear the KV answer cache and reset the dynamic anchor-type cache.
+
+    Called both by the manual /admin/cache/clear endpoint below and
+    automatically right after every successful ingestion (_ingest_file,
+    /upload-video, /upload-webpage, /ingest-url). Without this, a query
+    answered — and cached — before a document was added can keep serving
+    that stale "not in my knowledge base" refusal indefinitely: the
+    semantic cache lookup matches on query-embedding similarity alone
+    (kv_cache.py's semantic_get), which has nothing to do with which
+    sources existed when the entry was written, so newly-relevant content
+    never invalidates it on its own. Confirmed live: a document uploaded
+    and queried immediately afterward kept refusing until the cache was
+    manually cleared, even though retrieval scored the new content at
+    0.999 once the cache was out of the way.
+
+    Returns False if the cache isn't available (nothing to invalidate)
+    rather than raising, since ingestion should never fail just because
+    this cleanup step couldn't run.
+    """
     multi = _get_multi_rag()
     cache = getattr(multi, "doc_pipeline", None)
     cache = getattr(cache, "_cache", None) if cache is not None else None
     if cache is None:
-        raise HTTPException(status_code=503, detail="Cache not available.")
-    await asyncio.to_thread(cache.clear)
+        return False
+    cache.clear()
     # Also re-scan the KB for insurance-type anchors (see
     # _get_dynamic_anchor_pattern) so newly-added/removed documents' topic
     # types are picked up without needing a full container restart.
     _reset_dynamic_anchor_cache()
+    return True
+
+
+@app.post("/admin/cache/clear", tags=["admin"])
+async def clear_kv_cache(_: str = Depends(require_auth)):
+    """Clear the KV answer cache. All future queries will regenerate fresh answers."""
+    ok = await asyncio.to_thread(_invalidate_query_cache)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Cache not available.")
     return {"status": "cleared"}
 
 

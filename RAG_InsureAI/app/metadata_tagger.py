@@ -799,18 +799,31 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
     "personal_accident": {
         "desc": (
             "Personal accident cover. Covers accidental injury, death, permanent or "
-            "temporary disability, dismemberment. Distinct from life insurance."
+            "temporary disability, dismemberment. Distinct from life insurance. "
+            "Users commonly say just \"personal insurance\" for this type."
         ),
         "keywords": [
             "personal accident", "pa insurance", "accidental injury",
             "accidental disability", "permanent disability", "temporary disability",
             "accidental dismemberment", "group personal accident",
-            "accidental death", "ptd", "ttd",
+            "accidental death", "ptd", "ttd", "personal insurance",
         ],
         "regex": [
             r"\bpersonal accident\b", r"\bpa insurance\b", r"\baccidental injur\b",
             r"\baccidental disabilit\b", r"\bpermanent disabilit\b",
             r"\btemporary disabilit\b", r"\bdismemberment\b",
+            # Confirmed live: "What is personal insurance?" scored zero
+            # regex hits for every type (the phrase is one word short of
+            # "personal accident"), fell through to the LLM fallback, which
+            # apparently didn't reliably map it here either — the correctly
+            # generated answer about personal accident insurance then got
+            # discarded as "cross-topic contamination" relative to whatever
+            # type the LLM guessed instead. "Personal insurance" is the
+            # natural everyday shorthand for this category (the KB's own
+            # "main products of general insurance" list names it "Personal
+            # accident insurance"), so it's added directly here rather than
+            # left to per-call LLM inference.
+            r"\bpersonal insurance\b",
         ],
     },
     "fire": {
@@ -921,6 +934,34 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
 _VALID_POLICY_TYPES = set(_POLICY_TYPE_HINTS.keys()) | {"general"}
 
 
+def get_active_vocab() -> dict[str, dict]:
+    """
+    _POLICY_TYPE_HINTS unioned with any promoted types from
+    candidate_vocab.get_active_vocab_extra() — this is what makes "add a
+    13th type" a data write instead of a code change. The original 12
+    (extensively tuned, with inline comments explaining specific regex
+    decisions) stay exactly as hardcoded above; only genuinely new,
+    promoted labels ever come from the JSON side.
+
+    Re-read on every call rather than cached — promotion is a rare, manual
+    admin action and the file is tiny, so correctness immediately after a
+    promotion (no stale in-memory copy, no cross-process cache invalidation
+    to coordinate between the api and eval containers) matters far more
+    than shaving a microsecond dict-merge off the classification path.
+    """
+    try:
+        from candidate_vocab import get_active_vocab_extra
+        extra = get_active_vocab_extra()
+    except Exception as exc:
+        logger.debug("[POLICY_TYPE] active-vocab-extra unavailable (%s)", exc)
+        extra = {}
+    return {**_POLICY_TYPE_HINTS, **extra} if extra else _POLICY_TYPE_HINTS
+
+
+def _valid_policy_types() -> set[str]:
+    return set(get_active_vocab().keys()) | {"general"}
+
+
 def _regex_policy_score(text: str) -> dict[str, int]:
     """
     Return hit-count per policy type using regex (fast path).
@@ -929,7 +970,7 @@ def _regex_policy_score(text: str) -> dict[str, int]:
     t = text.lower()
     return {
         ptype: sum(1 for p in info["regex"] if re.search(p, t))
-        for ptype, info in _POLICY_TYPE_HINTS.items()
+        for ptype, info in get_active_vocab().items()
     }
 
 
@@ -946,12 +987,13 @@ def _build_policy_type_prompt(text: str, regex_scores: dict[str, int]) -> str:
         f"{pt}({score})" for pt, score in top_regex if score > 0
     ) or "none (text may use synonyms or colloquial language)"
 
+    _vocab = get_active_vocab()
     label_list = "\n".join(
         f"  - {pt}: {info['desc']}\n"
         f"    Example keywords: {', '.join(info['keywords'][:6])}"
-        for pt, info in _POLICY_TYPE_HINTS.items()
+        for pt, info in _vocab.items()
     )
-    all_labels = ", ".join(list(_POLICY_TYPE_HINTS.keys()) + ["general"])
+    all_labels = ", ".join(list(_vocab.keys()) + ["general"])
 
     return f"""You are an insurance content classifier. Your job is to identify the POLICY TYPE of a text.
 
@@ -1078,7 +1120,7 @@ def classify_chunk_policy_type(
         raw = (response.content if hasattr(response, "content") else str(response)).strip().lower()
         # Take first token only — model sometimes adds punctuation or explanation
         label = re.split(r"[\s\n,.:;()]", raw)[0].strip()
-        if label in _VALID_POLICY_TYPES:
+        if label in _valid_policy_types():
             logger.info(
                 "[POLICY_TYPE] LLM → %s (regex was: %s/%d, force=%s)",
                 label, best_type, best_score, force_llm,
@@ -1189,7 +1231,7 @@ def _build_verify_and_enrich_prompt(text: str, assigned_type: str) -> str:
     # reliably disambiguate close pairs.
     label_list = "\n".join(
         f"  - {pt}: {info['desc']}"
-        for pt, info in _POLICY_TYPE_HINTS.items()
+        for pt, info in get_active_vocab().items()
     )
     # "general" isn't a real topic to verify — it means the first pass found
     # no confident single type, not "this text is about general insurance."
@@ -1327,7 +1369,7 @@ def verify_and_enrich_section_metadata(
         # single field instead of reusing VERIFIED/CORRECTED_TYPE.
         if assigned_type == "general":
             identified = _normalize_policy_type(_field("IDENTIFIED_TYPE", "general").lower())
-            if identified != "general" and identified in _VALID_POLICY_TYPES:
+            if identified != "general" and identified in _valid_policy_types():
                 if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
                     logger.info(
                         "[POLICY_TYPE] identified: general -> %r (confidence=%.0f)",
@@ -1346,7 +1388,7 @@ def verify_and_enrich_section_metadata(
             if (
                 not verified
                 and corrected not in ("same", "", assigned_type.lower())
-                and corrected in _VALID_POLICY_TYPES
+                and corrected in _valid_policy_types()
             ):
                 if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
                     logger.info(
@@ -1370,6 +1412,127 @@ def verify_and_enrich_section_metadata(
         logger.warning("[POLICY_TYPE] verify/enrich LLM call failed: %s — keeping first-pass assignment", exc)
 
     return result
+
+
+# Generic insurance vocabulary excluded from candidate-hint keywords — these
+# words appear in text about EVERY policy type, so keeping them would make
+# match_candidate_vocab() fire on almost anything instead of the words that
+# actually distinguish one novel topic from another.
+_CANDIDATE_STOPWORDS = frozenset({
+    "this", "that", "these", "those", "with", "from", "have", "will",
+    "shall", "would", "could", "should", "which", "their", "there",
+    "policy", "policies", "insurance", "insurer", "insured", "cover",
+    "covered", "coverage", "claim", "claims", "amount", "period", "under",
+    "such", "also", "only", "than", "when", "where", "into", "your", "each",
+    "hereby", "herein", "whereas", "provided",
+})
+
+# General-English function/filler words, on top of the domain list above.
+# A plain "not an insurance word" filter still lets ordinary connective and
+# document-boilerplate words through — confirmed live: a document's opening
+# ("Understanding Pet Insurance: A Complete Guide...") produced keywords
+# "understanding", "complete", "guide", "right", "choosing" purely because
+# they appeared early, and one of those (a later chunk's "plan", from
+# "wellness plan") went on to falsely match a completely unrelated document
+# ("...a specialized protection plan for...") that happened to share the
+# same ordinary scaffolding word. Frequency ranking below is the primary
+# defense; this list is the cheap first-pass filter in front of it.
+_GENERAL_STOPWORDS = frozenset({
+    "about", "after", "before", "between", "during", "over", "onto",
+    "upon", "while", "then", "than", "some", "many", "most", "more",
+    "much", "every", "both", "other", "another", "same", "different",
+    "various", "based", "typically", "generally", "usually", "often",
+    "always", "never", "sometimes", "specifically", "particularly",
+    "especially", "understanding", "complete", "guide", "right",
+    "choosing", "prepared", "apply", "history", "enrollment", "advisors",
+    "because", "however", "therefore", "although", "though", "since",
+    "being", "been", "were", "does", "doing", "done", "having", "here",
+    "what", "when", "why", "how", "who", "whom", "whose", "plan", "plans",
+})
+
+
+def _extract_candidate_keywords(text: str) -> list[str]:
+    """
+    Pick the words that actually distinguish THIS text, ranked by how often
+    they repeat within it — not just whichever non-stopword words happen to
+    appear first. A word mentioned several times is far more likely to be
+    the text's real subject than a one-off word from opening boilerplate,
+    which is exactly the failure mode the stopword list alone can't catch
+    (there's no fixed list of every possible boilerplate word). Ties
+    (equal frequency) break by first-occurrence order for determinism.
+    """
+    tokens = re.findall(r"\b[a-z]{4,}\b", text.lower())
+    counts: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    for i, t in enumerate(tokens):
+        if t in _CANDIDATE_STOPWORDS or t in _GENERAL_STOPWORDS:
+            continue
+        counts[t] = counts.get(t, 0) + 1
+        first_seen.setdefault(t, i)
+    ranked = sorted(counts, key=lambda t: (-counts[t], first_seen[t]))
+    return ranked[:8]
+
+
+def classify_candidate_type(
+    text: str, llm: Any = None, *, source: str = "", source_type: str = "chunk",
+) -> Optional[str]:
+    """
+    Mode-A handling (open-vocabulary fallback). Called only after the
+    closed-vocabulary classifiers (regex + constrained LLM) both land on
+    "general" for this text — never changes the OFFICIAL policy_type;
+    callers always keep that as "general" no matter what this returns. It
+    only ever produces a candidate label: free-text, logged, used purely
+    for the reranking candidate-match bypass and as raw material for a
+    future manual promotion review.
+
+    Step 3 (cheap): check the already-discovered candidate vocabulary's
+    keyword hints before paying for another LLM call — catches repeat
+    instances of a novel topic that's already been seen once.
+    Step 4 (LLM, no vocabulary constraint): only if step 3 also misses and
+    an LLM is available. Returns None (no candidate at all) if the model's
+    answer normalizes to a degenerate non-answer ("general", "unclear",
+    etc.) — a real absence of a guess, not an empty-string label, so two
+    unrelated "no idea" cases can never collide in the candidate-match
+    bypass downstream.
+    """
+    from candidate_vocab import match_candidate_vocab, normalize_candidate_label, upsert_candidate
+
+    hit = match_candidate_vocab(text)
+    if hit:
+        upsert_candidate(hit, _extract_candidate_keywords(text), source, source_type)
+        return hit
+
+    if llm is None:
+        return None
+
+    try:
+        prompt = f"""This text is an insurance-related passage. Read it and decide: does it
+describe a SPECIFIC, NAMEABLE insurance product or coverage type — one you
+can name in 1-3 words (e.g. "pet insurance", "aviation insurance",
+"directors and officers liability")?
+
+- If yes, reply with ONLY that name, lowercase, 1-3 words, nothing else.
+- If the text is genuinely generic, covers multiple unrelated types, or
+  isn't about one specific insurance product at all, reply with exactly:
+  general
+
+TEXT:
+{text[:2000]}
+
+ANSWER:"""
+        response = llm.invoke(prompt)
+        raw = (response.content if hasattr(response, "content") else str(response)).strip()
+    except Exception as exc:
+        logger.debug("[CANDIDATE_TYPE] open-ended LLM call failed: %s", exc)
+        return None
+
+    label = normalize_candidate_label(raw)
+    if label is None:
+        return None
+
+    upsert_candidate(label, _extract_candidate_keywords(text), source, source_type)
+    logger.info("[CANDIDATE_TYPE] open-ended guess: %r (from %r, source=%r)", label, raw[:60], source[:60])
+    return label
 
 
 def classify_chunk_policy_type_batch(

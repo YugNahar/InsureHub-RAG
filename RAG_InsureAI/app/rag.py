@@ -28,6 +28,7 @@ from metadata_tagger import (
     classify_chunk_intent,
     regex_first_pass_policy_type,
     verify_and_enrich_section_metadata,
+    classify_candidate_type,
 )
 from validator import detect_conflict, validate_grounding
 from router import get_insurance_llm, get_general_llm, VLLM_HOST
@@ -388,6 +389,20 @@ class SectionChunker:
             enriched = verify_and_enrich_section_metadata(section_text, first_pass_type, llm=llm)
             section_policy = enriched["policy_type"]
 
+            # Mode-A fallback: the closed 12-type vocabulary couldn't place
+            # this section. Get an open-ended candidate guess for it — never
+            # overrides section_policy (stays "general"), just attaches a
+            # free-text hint used later for retrieval's candidate-match
+            # bypass and logged as raw material for a future vocabulary
+            # promotion review. See classify_candidate_type() docstring.
+            section_candidate_type = None
+            if section_policy == "general":
+                section_candidate_type = classify_candidate_type(
+                    section_text, llm=llm,
+                    source=str(first.metadata.get("source", "")),
+                    source_type="chunk",
+                )
+
             for chunk in section_chunks:
                 chunk.metadata["section"] = section_intent
                 # Always set the key, even when section_policy is "general" —
@@ -408,6 +423,8 @@ class SectionChunker:
                 # (legitimately about cyber insurance) dominated the
                 # document-wide keyword count.
                 chunk.metadata["policy_type"] = section_policy
+                if section_candidate_type:
+                    chunk.metadata["candidate_policy_type"] = section_candidate_type
                 for field in ("language", "jurisdiction", "document_version", "effective_date", "coverage_category"):
                     if enriched.get(field, "unknown") != "unknown":
                         chunk.metadata[field] = enriched[field]

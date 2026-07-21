@@ -55,7 +55,7 @@ from app.document_loader import (
 from app.metadata_tagger import (
     tag_document, classify_query, build_metadata_filter, classify_document_type,
     classify_chunk_intent, classify_chunk_intent_batch,
-    classify_chunk_policy_type,
+    classify_chunk_policy_type, classify_candidate_type,
 )
 from app.vector_store import ChromaVectorStore
 from app.rag import (
@@ -401,10 +401,28 @@ def _classify_one(doc, doc_type: str, doc_meta: dict, llm: Any, force_llm: bool)
         llm=llm,
         force_llm=force_llm,
     )
-    doc.metadata["policy_type"] = (
+    final_policy = (
         chunk_policy if chunk_policy != "general"
         else doc_meta.get("policy_type", "general")
     )
+    doc.metadata["policy_type"] = final_policy
+
+    # Mode-A fallback: neither the chunk-level nor the document-level
+    # closed-vocabulary classification could place this chunk. Get an
+    # open-ended candidate guess — never overrides final_policy (stays
+    # "general"), only attaches a free-text hint for retrieval's
+    # candidate-match bypass and the promotion-review log. Gated on the
+    # FINAL value (not just chunk_policy) so candidate_policy_type is only
+    # ever present alongside policy_type == "general", matching the
+    # invariant the reranking bypass relies on.
+    if final_policy == "general":
+        candidate = classify_candidate_type(
+            text_for_classify, llm=llm,
+            source=str(doc.metadata.get("filename") or doc.metadata.get("source", "")),
+            source_type="chunk",
+        )
+        if candidate:
+            doc.metadata["candidate_policy_type"] = candidate
 
     logger.debug(
         "[CLASSIFY] doc_type=%s force=%s | section=%s | policy_type=%s | text=%r",

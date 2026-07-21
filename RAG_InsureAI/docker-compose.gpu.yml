@@ -1,0 +1,40 @@
+# GPU overlay for hosts with an NVIDIA GPU + nvidia-container-toolkit
+# (Docker Desktop on Windows: WSL2 backend, modern driver — no separate
+# toolkit install needed). Leaves docker-compose.yml itself untouched so
+# CPU-only hosts are unaffected.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+#
+# Rebuilds torch against a CUDA wheel (Dockerfile's TORCH_DEVICE arg) and
+# gives both services GPU access, so the embedding/reranker models —
+# currently CPU-bound, see multi_source_rag.py's compress_to_budget and
+# turbovec_store.py's CrossEncoder reranker — run on the GPU instead.
+#
+# Verify the GPU is reachable by Docker before running this:
+#   docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+
+services:
+  api:
+    build:
+      args:
+        TORCH_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  eval:
+    build:
+      args:
+        TORCH_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

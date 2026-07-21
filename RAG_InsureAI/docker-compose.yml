@@ -12,6 +12,11 @@ x-common: &common
   build:
     context: .
     dockerfile: Dockerfile
+    args:
+      # CPU by default. Overlay docker-compose.gpu.yml on a host with an
+      # NVIDIA GPU to build against CUDA torch and get GPU access instead
+      # (see that file for usage) — do not set this directly in .env.
+      TORCH_DEVICE: ${TORCH_DEVICE:-cpu}
   shm_size: '2gb'
   deploy:
     resources:
