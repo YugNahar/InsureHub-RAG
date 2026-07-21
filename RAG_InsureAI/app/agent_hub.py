@@ -1159,6 +1159,29 @@ class AgentHub:
         await self._broadcast_sessions_update()
         return True
 
+    async def request_agent_confirmation(self, session_id: str, agent_name: str) -> bool:
+        """Marks a session as awaiting the user's yes/no confirmation before
+        switching active_agent to agent_name. Does NOT change active_agent yet —
+        only set_active_agent() (called after the user says yes) does that."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        session.awaiting_agent_confirmation = agent_name
+        self._save_sessions()
+        await self._broadcast_sessions_update()
+        return True
+
+    async def clear_agent_confirmation(self, session_id: str) -> bool:
+        """Called when the user declines the handoff offer — clears the pending
+        confirmation without changing active_agent."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        session.awaiting_agent_confirmation = ""
+        self._save_sessions()
+        await self._broadcast_sessions_update()
+        return True
+
     @staticmethod
     def response_needs_human(response: str, sources: list, upstream_needs_human: bool | None = None) -> bool:
         """
