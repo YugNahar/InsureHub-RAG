@@ -1,52 +1,38 @@
-from openai import OpenAI
-import json
 import traceback
 from sqlalchemy.orm import Session
-from travel_bot.core.config import settings
 from travel_bot.models.session import ChatSession
 from travel_bot.schemas.travel import TravelInsuranceDetails, CompanionTraveller
 
-# CONFIRM THIS before running: OpenAI's model naming moves fast, and even cgyḥ...ūḥ
-# checking sources dated within the last week disagree on exactly what's GA
-# right now vs. still in limited preview. Check
-# https://platform.openai.com/docs/models for the current mini/cost-tier
-# model name and swap it in below — this is a placeholder, not a verified
-# current model id.
-MODEL_NAME = "gpt-4o"
-
 
 class LLMService:
-    def __init__(self):
-        # Deliberately lazy: this class is instantiated once at import time
-        # (module-level `llm_service = LLMService()` in routers/chat.py),
-        # which runs as part of importing api.py itself — every route in
-        # this whole app, not just the travel-bot ones. The OpenAI() client
-        # constructor raises immediately if no key is configured, which
-        # previously took the ENTIRE app down at startup whenever
-        # OPENAI_API_KEY was unset (confirmed live: 2026-07-17). Deferring
-        # client creation to first actual use means an unset key only
-        # breaks travel-bot requests, not every route in the app.
-        self._client = None
+    """
+    Uses the SAME LLM backend as the rest of the app (Layla's RAG side) —
+    routed through router.get_insurance_llm(), which respects whatever
+    backend Super Admin has selected (Auto/vLLM/Groq/Manual/OpenAI/
+    Anthropic). No separate API key or provider-specific client here
+    anymore — this used to call OpenAI directly with its own key, which
+    is no longer safe to do (that key was leaked to a public GitHub repo
+    and is considered compromised).
 
-    @property
-    def client(self) -> OpenAI:
-        if self._client is None:
-            if not settings.OPENAI_API_KEY:
-                raise RuntimeError(
-                    "OPENAI_API_KEY is not set — required for the travel-bot "
-                    "module (app/travel_bot). Add a real key to .env."
-                )
-            self._client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        return self._client
+    Structured extraction now goes through LangChain's provider-agnostic
+    with_structured_output() instead of OpenAI-SDK-specific
+    beta.chat.completions.parse(). Reliability of structured output
+    depends on whatever backend is currently active — if Super Admin has
+    selected vLLM, that server needs guided-decoding support configured
+    for consistent results; if extraction quality degrades, check the
+    active backend in Super Admin before assuming a code regression here.
+    """
+
+    def _get_llm(self, temperature: float = 0.0):
+        from router import get_insurance_llm
+        return get_insurance_llm(temperature=temperature)
 
     def extract_companion_traveller(self, user_message: str) -> dict:
         """
         Extracts ONE additional traveller's name + DOB from a message, for
         Group/Family policies that need more than one person on the policy.
-        Uses OpenAI's Structured Outputs (client.beta.chat.completions.parse
-        with response_format=<PydanticModel>) — the direct equivalent of the
-        Gemini response_schema= approach this replaced. Returns {} fields as
-        empty strings if this message doesn't mention a companion at all.
+        Returns {} fields as empty strings if this message doesn't mention
+        a companion at all.
         """
         prompt = (
             "The user is adding an ADDITIONAL traveller to a family/group travel "
@@ -60,14 +46,10 @@ class LLMService:
             f"USER MESSAGE:\n{user_message}"
         )
         try:
-            completion = self.client.beta.chat.completions.parse(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                response_format=CompanionTraveller,
-                temperature=0.0,
-            )
-            parsed = completion.choices[0].message.parsed
-            extracted = parsed.model_dump() if parsed else {}
+            llm = self._get_llm(temperature=0.0)
+            structured_llm = llm.with_structured_output(CompanionTraveller)
+            parsed = structured_llm.invoke(prompt)
+            extracted = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
             print(f"[extract_companion_traveller] extracted: {extracted}")
             return extracted
         except Exception:
@@ -78,15 +60,10 @@ class LLMService:
     def extract_fields_from_conversation(self, db: Session, session_id: str, user_message: str) -> dict:
         """
         Extracts travel-insurance fields from the user's LATEST message.
-
-        Same single-message pattern as the Gemini version this replaced —
-        one flat user message, no multi-turn history array, relying on
-        merge_extracted_fields in chat.py to progressively build up state
-        turn-by-turn. Only the SDK/response_format mechanism changed; the
-        prompt and merge strategy did not.
-
-        Returns the extracted fields dict (possibly empty — callers should
-        treat that as "no new info this turn", not a hard error).
+        Single-message pattern — merge_extracted_fields in chat.py progressively
+        builds up state turn-by-turn. Returns the extracted fields dict
+        (possibly empty — callers should treat that as "no new info this
+        turn", not a hard error).
         """
         db_session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
         state = db_session.extracted_data or {}
@@ -123,17 +100,12 @@ class LLMService:
         )
 
         try:
-            completion = self.client.beta.chat.completions.parse(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                response_format=TravelInsuranceDetails,
-                temperature=0.0,
-            )
-            parsed = completion.choices[0].message.parsed
-            extracted = parsed.model_dump() if parsed else {}
+            llm = self._get_llm(temperature=0.0)
+            structured_llm = llm.with_structured_output(TravelInsuranceDetails)
+            parsed = structured_llm.invoke(prompt)
+            extracted = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
             print(f"[extract_fields_from_conversation] extracted: {extracted}")
             return extracted
-
         except Exception:
             print("[extract_fields_from_conversation] LLM extraction failed:")
             print(traceback.format_exc())
@@ -150,8 +122,7 @@ class LLMService:
     def _deterministic_field_map(self, raw_extraction: dict) -> dict:
         """
         Maps Protego's known /extract-pdf response shape directly, with no LLM
-        call involved. Unchanged from the Gemini version — this logic never
-        touched the LLM SDK in the first place.
+        call involved.
         """
         if not isinstance(raw_extraction, dict):
             return {}
@@ -211,9 +182,9 @@ class LLMService:
         /extract-pdf) into our canonical TravelInsuranceDetails field names.
 
         Two passes:
-          1. Deterministic mapping — unchanged, no LLM involved.
-          2. An LLM fallback (now via OpenAI Structured Outputs) that only runs
-             for whatever fields pass 1 didn't find.
+          1. Deterministic mapping — no LLM involved.
+          2. An LLM fallback (via the active backend's structured output) that
+             only runs for whatever fields pass 1 didn't find.
         """
         if not raw_extraction:
             print("[parse_extracted_fields] raw_extraction was empty — extract-pdf returned nothing.")
@@ -224,6 +195,7 @@ class LLMService:
 
         still_missing = [f for f in self._EXTRACTABLE_FIELDS if not mapped.get(f)]
         if still_missing:
+            import json
             prompt = (
                 "Map the following raw document-extraction JSON onto the target schema. "
                 f"Focus especially on these fields, which a first pass could not confidently find: {still_missing}. "
@@ -232,14 +204,10 @@ class LLMService:
                 f"RAW EXTRACTION JSON:\n{json.dumps(raw_extraction)}"
             )
             try:
-                completion = self.client.beta.chat.completions.parse(
-                    model=MODEL_NAME,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format=TravelInsuranceDetails,
-                    temperature=0.0,
-                )
-                parsed = completion.choices[0].message.parsed
-                llm_fields = parsed.model_dump() if parsed else {}
+                llm = self._get_llm(temperature=0.0)
+                structured_llm = llm.with_structured_output(TravelInsuranceDetails)
+                parsed = structured_llm.invoke(prompt)
+                llm_fields = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
                 print(f"[parse_extracted_fields] LLM fallback found: {llm_fields}")
                 for key in still_missing:
                     val = llm_fields.get(key)
@@ -250,58 +218,3 @@ class LLMService:
 
         print(f"[parse_extracted_fields] final merged fields: {mapped}")
         return mapped
-
-    def extract_document_data(self, file_bytes: bytes, mime_type: str) -> dict:
-        """
-        Alternative path: extract fields directly from the raw document,
-        skipping the Protego extract-pdf call entirely.
-
-        NOT CURRENTLY CALLED by chat.py's upload endpoint (which uses
-        QuoteService.extract_pdf_bytes -> parse_extracted_fields instead) —
-        this was already true before the OpenAI switch, so it's unused
-        either way. Kept for parity.
-
-        IMPORTANT PROVIDER DIFFERENCE: Gemini could accept a raw PDF's bytes
-        directly as inline document data. OpenAI's chat completions API does
-        NOT accept raw PDF bytes the same way — it expects an image (base64
-        data URL). This implementation assumes `file_bytes` is an IMAGE
-        (jpg/png), not a PDF. If you need to feed actual multi-page PDFs
-        through OpenAI directly (rather than via Protego's own extract-pdf,
-        which is what's actually used today), that needs either: converting
-        PDF pages to images first, or using OpenAI's Files/Assistants API —
-        a separate, larger change from this file. Flagging rather than
-        silently guessing, since this is a real capability gap between the
-        two providers, not just a syntax difference.
-        """
-        import base64
-
-        prompt = (
-            "You are an AI data extractor for a travel insurance system. "
-            "Analyze the provided document image and extract any relevant information matching the "
-            "required checklist schema. "
-            "If a specific field is not found in the document, you MUST leave it as an empty string ''."
-        )
-
-        b64_data = base64.b64encode(file_bytes).decode("utf-8")
-        data_url = f"data:{mime_type};base64,{b64_data}"
-
-        try:
-            completion = self.client.beta.chat.completions.parse(
-                model=MODEL_NAME,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    }
-                ],
-                response_format=TravelInsuranceDetails,
-                temperature=0.0,
-            )
-            parsed = completion.choices[0].message.parsed
-            return parsed.model_dump() if parsed else {}
-        except Exception as e:
-            print(f"Document Extraction Error: {e}")
-            return {}
