@@ -326,6 +326,7 @@ class AgentHub:
                 "tone_from_red": s.tone_from_red,
                 "email_sent": getattr(s, "email_sent", False),
                 "active_agent": s.active_agent,
+                "awaiting_agent_confirmation": s.awaiting_agent_confirmation,
             })
         return out
 
@@ -1113,6 +1114,7 @@ class AgentHub:
                 "has_agent": has_agent,
                 "tone": s.tone,
                 "active_agent": s.active_agent,
+                "awaiting_agent_confirmation": s.awaiting_agent_confirmation,
             })
         return out
 
