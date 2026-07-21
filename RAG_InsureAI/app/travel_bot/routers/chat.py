@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from datetime import datetime, timedelta
+import random
 import re
 import json
 from sqlalchemy.orm import Session as DBSession
@@ -49,6 +50,18 @@ FIELD_LABELS = {
     "cover_type": "Cover type — who's insured (Individual / Group / Family)",
     "date_of_birth": "Date of birth",
 }
+
+def _short_field_label(field: str) -> str:
+    """FIELD_LABELS' parenthetical option lists ("(Hajj and Umrah / UAE
+    Inbound / ...)") and the cover_type em-dash clarifier exist to help
+    the user pick a value while a field is still being ASKED for — they
+    read as clutter (and previously got wrongly lowercased into "hajj and
+    umrah" / "uae inbound") when just naming a field that's already been
+    successfully captured. Strips everything from the first "(" or "—"
+    onward, leaving just the bare field name for that use.
+    """
+    return re.split(r"\s*[(—]", FIELD_LABELS[field], maxsplit=1)[0]
+
 
 # Conversational phrasing for asking each field, used instead of dumping the
 # raw FIELD_LABELS bullet list — see build_friendly_missing_prompt().
@@ -175,7 +188,36 @@ def build_obtained_summary(state: dict) -> str:
     return "I've pulled these details from your document: " + "; ".join(parts) + "."
 
 
-def build_friendly_missing_prompt(state: dict, newly_filled: list = None) -> str:
+_GREETING_RE = re.compile(
+    r"\b(hi|hello|hey|hiya|howdy|yo|good\s*(morning|afternoon|evening)|greetings)\b",
+    re.IGNORECASE,
+)
+
+# A few natural variants so a real back-and-forth doesn't sound like the same
+# canned line every time someone says hi — a human agent wouldn't repeat
+# themselves verbatim either.
+_GREETING_RESPONSES = [
+    "Hey there! ",
+    "Hi! Great to hear from you. ",
+    "Hello! Happy to help. ",
+]
+
+
+def is_greeting(message: str) -> bool:
+    return bool(_GREETING_RE.search(message or ""))
+
+
+def _capitalize_first(s: str) -> str:
+    """Uppercases just the first character, leaving the rest untouched.
+    str.capitalize() also lowercases every other character, which would
+    wrongly mangle proper nouns/acronyms already correctly cased inside
+    these question fragments (e.g. 'is this for Hajj and Umrah, UAE
+    Inbound, ...' -> 'Uae inbound' with .capitalize()).
+    """
+    return s[0].upper() + s[1:] if s else s
+
+
+def build_friendly_missing_prompt(state: dict, newly_filled: list = None, user_message: str = "") -> str:
     """Conversational, incremental replacement for the old full bullet-list
     prompt: acknowledges whatever was JUST captured this turn (if anything),
     then asks for at most 2 remaining fields at once instead of the whole
@@ -184,31 +226,49 @@ def build_friendly_missing_prompt(state: dict, newly_filled: list = None) -> str
     missing = [f for f in REQUIRED_FIELDS if not state.get(f)]
 
     ack = ""
+    if is_greeting(user_message):
+        # Confirmed live: a bare "Hi"/"Hello" got zero acknowledgment before —
+        # straight into "what's your first name?" with no greeting back,
+        # which is exactly what made this feel like a form, not an agent.
+        ack = random.choice(_GREETING_RESPONSES)
     if "cover_type" in newly_filled and state.get("cover_type") in MULTI_TRAVELLER_COVER_TYPES:
-        ack = f"That's exciting — travelling as a {state['cover_type'].lower()}! "
+        ack += f"That's exciting — travelling as a {state['cover_type'].lower()}! "
     elif newly_filled:
-        captured = _join_natural([FIELD_LABELS[f].lower() for f in newly_filled])
-        ack = f"Thanks for sharing your {captured}! "
+        captured = _join_natural([_short_field_label(f).lower() for f in newly_filled])
+        ack += f"Thanks for sharing your {captured}! "
 
     if not missing:
         return ack.strip() or "Got it, thank you!"
 
     to_ask = missing[:2]
-    questions = " ".join(FIELD_QUESTIONS.get(f, FIELD_LABELS[f] + "?") for f in to_ask)
+    frags = [FIELD_QUESTIONS.get(f, FIELD_LABELS[f] + "?") for f in to_ask]
 
     if len(missing) == 1:
-        return f"{ack}Just one more thing — {questions}"
+        # Single fragment, following "Just one more thing — " mid-sentence —
+        # lowercase is correct here, matches the em-dash continuation.
+        return f"{ack}Just one more thing — {frags[0]}"
+
+    # A second question fragment always starts a fresh sentence after the
+    # first one's "?", regardless of context — capitalize it unconditionally.
+    frags[1] = _capitalize_first(frags[1])
+
     if len(missing) == 2:
-        return f"{ack}Almost there, just two more things — {questions}"
-    return f"{ack}{questions}"
+        return f"{ack}Almost there, just two more things — " + " ".join(frags)
+
+    # No lead-in phrase here (unlike the two cases above) — the first
+    # fragment is either the very start of the reply or follows a
+    # full-stop-ending ack ("Hi! Great to hear from you. "), so it needs its
+    # own capital too, rather than the lowercase FIELD_QUESTIONS wording.
+    frags[0] = _capitalize_first(frags[0])
+    return f"{ack}" + " ".join(frags)
 
 
-def build_missing_fields_reply(state: dict, preamble: str = "", newly_filled: list = None) -> str:
+def build_missing_fields_reply(state: dict, preamble: str = "", newly_filled: list = None, user_message: str = "") -> str:
     """Kept as the single entry point call sites use, now delegating to the
     friendly incremental prompt instead of a bullet-list dump. `preamble`
     (e.g. after a document upload) is prepended as-is; pass a doc summary in
     via `preamble` when you want the full human recap shown."""
-    return preamble + build_friendly_missing_prompt(state, newly_filled)
+    return preamble + build_friendly_missing_prompt(state, newly_filled, user_message)
 
 
 def sync_field_tracking(db_session: ChatSession, state: dict) -> None:
@@ -756,7 +816,7 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
                 state.pop(bad_field, None)
                 final_reply = consistency_error
             elif not is_quote_checklist_complete(state):
-                final_reply = build_missing_fields_reply(state, newly_filled=newly_filled)
+                final_reply = build_missing_fields_reply(state, newly_filled=newly_filled, user_message=request.message)
             elif state.get("cover_type") in MULTI_TRAVELLER_COVER_TYPES:
                 # 3. Group/Family policies need a full traveller list (2-5 people).
                 #    Try to pull a companion out of THIS message (harmless if it's
@@ -790,11 +850,11 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
                     final_reply = build_traveller_prompt(state)
                 else:
                     quote_reply = try_fetch_quotes(state, request.message)
-                    final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state, newly_filled=newly_filled)
+                    final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state, newly_filled=newly_filled, user_message=request.message)
             else:
                 # 4. Individual policy with a complete checklist — fetch quotes now.
                 quote_reply = try_fetch_quotes(state, request.message)
-                final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state, newly_filled=newly_filled)
+                final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state, newly_filled=newly_filled, user_message=request.message)
 
         elif current_phase == "CHOOSING":
             msg_clean = request.message.strip()
