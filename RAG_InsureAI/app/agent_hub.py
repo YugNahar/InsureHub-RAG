@@ -119,6 +119,10 @@ class ChatSession:
     handoff_exhausted: bool = False  # True after handoff timed-out/all-declined; resets on next AI turn
     email_sent: bool = False    # True after escalation email sent; cleared when agent takes over
     pending_ws_message: Optional[dict] = None  # buffered for when WS reconnects after timeout
+    active_agent: str = "layla"          # "layla" | "ava" | future: "health", "life", etc.
+    awaiting_agent_confirmation: str = "" # set to a target agent name when Layla has asked
+                                          # "want to connect with X?" but the user hasn't
+                                          # confirmed yet; empty string = no pending offer
 
 
 @dataclass
@@ -164,6 +168,8 @@ class AgentHub:
                     tone=s.get("tone", "neutral"),
                     handoff_exhausted=s.get("handoff_exhausted", False),
                     email_sent=s.get("email_sent", False),
+                    active_agent=s.get("active_agent", "layla"),
+                    awaiting_agent_confirmation=s.get("awaiting_agent_confirmation", ""),
                 )
                 for m in s.get("history", []):
                     session.history.append(ChatMessage(
@@ -185,6 +191,8 @@ class AgentHub:
                     "tone": s.tone,
                     "handoff_exhausted": s.handoff_exhausted,
                     "email_sent": s.email_sent,
+                    "active_agent": s.active_agent,
+                    "awaiting_agent_confirmation": s.awaiting_agent_confirmation,
                     "history": [
                         {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta}
                         for m in s.history
@@ -317,6 +325,7 @@ class AgentHub:
                 "tone": s.tone,
                 "tone_from_red": s.tone_from_red,
                 "email_sent": getattr(s, "email_sent", False),
+                "active_agent": s.active_agent,
             })
         return out
 
@@ -1103,6 +1112,7 @@ class AgentHub:
                 "title": first_user or f"Session #{s.session_id}",
                 "has_agent": has_agent,
                 "tone": s.tone,
+                "active_agent": s.active_agent,
             })
         return out
 
@@ -1134,6 +1144,19 @@ class AgentHub:
         if not target:
             return False
         await self._assign_agent(session, target)
+        return True
+
+    async def set_active_agent(self, session_id: str, agent_name: str) -> bool:
+        """Switch which bot/agent answers this session (e.g. 'layla' -> 'ava').
+        Used both when a user confirms a handoff offer and when Super Admin or
+        Agent Dashboard manually reroutes a session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        session.active_agent = agent_name
+        session.awaiting_agent_confirmation = ""
+        self._save_sessions()
+        await self._broadcast_sessions_update()
         return True
 
     @staticmethod
