@@ -476,6 +476,16 @@ async def super_admin_unblock(name: str, token: str = Depends(_check_super_admin
     return {"ok": ok}
 
 
+class SetAgentRequest(BaseModel):
+    session_id: str
+    agent_name: str   # "layla" | "ava" | future bot names
+
+@app.post("/super-admin/set-agent")
+async def super_admin_set_agent(req: SetAgentRequest, token: str = Depends(_check_super_admin)):
+    ok = await _agent_hub.set_active_agent(req.session_id, req.agent_name)
+    return {"ok": ok}
+
+
 @app.post("/super-admin/assign")
 async def super_admin_assign(request: Request, token: str = Depends(_check_super_admin)):
     data = await request.json()
@@ -644,6 +654,9 @@ async def ws_agent_endpoint(websocket: WebSocket):
                 await _agent_hub.agent_monitor(agent_id, msg.get("session_id", ""))
             elif t == "takeover":
                 await _agent_hub.agent_takeover(agent_id, msg.get("session_id", ""))
+                await _agent_hub._broadcast_super_admin_update()
+            elif t == "set_agent":
+                await _agent_hub.set_active_agent(msg.get("session_id", ""), msg.get("agent_name", "layla"))
                 await _agent_hub._broadcast_super_admin_update()
             elif t == "message":
                 await _agent_hub.agent_send_message(agent_id, msg.get("session_id", ""), msg.get("content", ""))
