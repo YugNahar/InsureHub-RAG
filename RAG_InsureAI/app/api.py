@@ -348,33 +348,46 @@ from fastapi.staticfiles import StaticFiles
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _FRONTEND_DIST = "/app/frontend_dist"
 
-# Serve the React app's static assets (/assets/*, /favicon.ico, etc.)
-if os.path.isdir(_FRONTEND_DIST):
-    app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
+# Serve the frontend's static assets (/assets/*, /favicon.ico, etc.) —
+# only the legacy React build produces an assets/ subdirectory, so this
+# is conditional on its own rather than just on _FRONTEND_DIST existing.
+_FRONTEND_ASSETS_DIR = os.path.join(_FRONTEND_DIST, "assets")
+if os.path.isdir(_FRONTEND_ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_ASSETS_DIR), name="assets")
+
+_NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 
 @app.get("/")
 async def root():
     """Serve the React chat frontend if built, otherwise redirect to /auth."""
     _index = os.path.join(_FRONTEND_DIST, "index.html")
     if os.path.isfile(_index):
-        return FileResponse(_index)
+        return FileResponse(_index, headers=_NO_CACHE_HEADERS)
     return RedirectResponse(url="/auth", status_code=302)
+
+@app.get("/app.css")
+async def app_css():
+    return FileResponse(os.path.join(_FRONTEND_DIST, "app.css"), media_type="text/css", headers=_NO_CACHE_HEADERS)
+
+@app.get("/app.js")
+async def app_js():
+    return FileResponse(os.path.join(_FRONTEND_DIST, "app.js"), media_type="application/javascript", headers=_NO_CACHE_HEADERS)
 
 @app.get("/auth")
 async def auth_page():
-    return FileResponse(os.path.join(_FRONTEND_DIST, "auth.html"))
+    return FileResponse(os.path.join(_FRONTEND_DIST, "auth.html"), headers=_NO_CACHE_HEADERS)
 
 @app.get("/admin")
 async def admin_page():
-    return FileResponse(os.path.join(_FRONTEND_DIST, "admin.html"))
+    return FileResponse(os.path.join(_FRONTEND_DIST, "admin.html"), headers=_NO_CACHE_HEADERS)
 
 @app.get("/agent-dashboard")
 async def agent_dashboard_page():
-    return FileResponse(os.path.join(_FRONTEND_DIST, "agent-dashboard.html"))
+    return FileResponse(os.path.join(_FRONTEND_DIST, "agent-dashboard.html"), headers=_NO_CACHE_HEADERS)
 
 @app.get("/super-admin")
 async def super_admin_page():
-    return FileResponse(os.path.join(_APP_DIR, "super_admin.html"))
+    return FileResponse(os.path.join(_APP_DIR, "super_admin.html"), headers=_NO_CACHE_HEADERS)
 
 
 @app.get("/tunnel-url")

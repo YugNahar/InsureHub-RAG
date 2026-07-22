@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -15,9 +15,86 @@
     />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary" />
+    <link rel="stylesheet" href="/app.css" />
   </head>
-  <body class="bg-background text-foreground">
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+  <body>
+
+    <a class="skip-link" href="#composer-input">Skip to message input</a>
+
+    <div class="app" id="app">
+
+      <!-- ---------- HEADER ---------- -->
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2L3 6.5V11C3 16.2 6.8 20.9 12 22C17.2 20.9 21 16.2 21 11V6.5L12 2Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+              <path d="M8.5 12.2L10.8 14.5L15.5 9.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span class="brand__name">Layla</span>
+        </div>
+
+        <div class="app-header__actions">
+          <span class="status-pill" id="statusPill" role="status" aria-live="polite">
+            <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+            <span id="statusText">Checking…</span>
+          </span>
+          <button class="icon-btn" id="clearChatBtn" type="button" aria-label="Clear chat" title="Clear chat">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M4 7H20M9 7V4H15V7M6 7L7 20H17L18 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- ---------- MAIN COLUMN ---------- -->
+      <div class="main">
+
+        <!-- ---------- CHAT THREAD ---------- -->
+        <main class="thread-wrap">
+          <div
+            class="thread"
+            id="thread"
+            role="log"
+            aria-live="polite"
+            aria-atomic="false"
+          >
+            <!-- Empty state, message bubbles etc. populated by app.js -->
+          </div>
+
+          <button class="jump-latest-btn" id="jumpLatestBtn" type="button" hidden>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4V20M12 20L6 14M12 20L18 14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Jump to latest
+          </button>
+        </main>
+
+        <!-- ---------- COMPOSER ---------- -->
+        <footer class="composer">
+          <form class="composer__form" id="composerForm">
+            <div class="composer__box">
+              <textarea
+                id="composer-input"
+                class="composer__input"
+                placeholder="Ask about your policy, a claim, or coverage…"
+                rows="1"
+                aria-label="Message"
+              ></textarea>
+              <button class="send-btn" id="sendBtn" type="submit" aria-label="Send message">
+                <svg class="send-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12L20 4L14 20L11 13L4 12Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" fill="none"/></svg>
+                <span class="send-spinner" aria-hidden="true"></span>
+              </button>
+            </div>
+          </form>
+          <p class="composer__disclaimer">
+            Layla gives general information — not a substitute for advice from a licensed agent.
+          </p>
+        </footer>
+
+      </div>
+    </div>
+
+    <!-- Live region used purely for feedback confirmations (SR-only) -->
+    <div id="srAnnouncer" class="sr-only" role="status" aria-live="polite"></div>
+
+    <script src="/app.js"></script>
   </body>
 </html>
