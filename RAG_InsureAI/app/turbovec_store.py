@@ -19,6 +19,7 @@ import uuid
 from typing import List, Optional, Dict, Any
 
 import numpy as np
+import torch
 from langchain_core.documents import Document
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
@@ -28,6 +29,29 @@ logger = logging.getLogger(__name__)
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 TVEC_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "turbovec_data")
+
+# Latency plan (plan_latency.md) Phase 1a: the embedder (SentenceTransformer)
+# and reranker (CrossEncoder) are ordinary PyTorch models that load onto CPU
+# by default when no device= is given — measured live this session as the
+# dominant "dead air before the first token" cost (a flat 6-11s retrieval
+# tax + 5-15s cold compressor spikes, both driven by these two models'
+# forward passes on CPU). This is unrelated to TurboVec's own "no GPU
+# required" design goal (this module's docstring) — that claim is about the
+# quantized ANN INDEX specifically, not about these two neural models, which
+# genuinely benefit from a GPU when the deployment host has one. Auto-
+# detects CUDA and is a no-op (stays "cpu") on a host without one — e.g.
+# this dev machine — so this is safe to ship ahead of any GPU deployment.
+# MODEL_DEVICE overrides auto-detection explicitly (e.g. force "cpu" on a
+# GPU host for an A/B comparison, or force "cuda" if detection is ever
+# wrong for a specific setup).
+def _resolve_model_device() -> str:
+    override = os.getenv("MODEL_DEVICE", "").strip().lower()
+    if override in ("cuda", "cpu"):
+        return override
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+_MODEL_DEVICE = _resolve_model_device()
 
 _TVEC_IMPORT_ATTEMPTED = False
 _TVEC_AVAILABLE = False
@@ -94,10 +118,13 @@ def _get_shared_embed_model(embed_model_name: str) -> SentenceTransformer:
     with _SHARED_EMBED_LOCK:
         model = _SHARED_EMBED_MODELS.get(embed_model_name)
         if model is None:
-            model = SentenceTransformer(embed_model_name)
+            model = SentenceTransformer(embed_model_name, device=_MODEL_DEVICE)
             model.max_seq_length = 512
             _SHARED_EMBED_MODELS[embed_model_name] = model
-            logger.info("[SharedModels] embedding model loaded: %s", embed_model_name)
+            logger.info(
+                "[SharedModels] embedding model loaded: %s (device=%s)",
+                embed_model_name, _MODEL_DEVICE,
+            )
     return model
 
 
@@ -108,8 +135,11 @@ def _get_shared_reranker() -> CrossEncoder:
         return _shared_reranker
     with _SHARED_RERANKER_LOCK:
         if _shared_reranker is None:
-            _shared_reranker = CrossEncoder(RERANKER_MODEL_NAME)
-            logger.info("[SharedModels] reranker loaded: %s", RERANKER_MODEL_NAME)
+            _shared_reranker = CrossEncoder(RERANKER_MODEL_NAME, device=_MODEL_DEVICE)
+            logger.info(
+                "[SharedModels] reranker loaded: %s (device=%s)",
+                RERANKER_MODEL_NAME, _MODEL_DEVICE,
+            )
     return _shared_reranker
 
 
