@@ -5001,6 +5001,28 @@ class MultiSourceRAG:
                 "[ask_stream] Reranker gate: top=%.3f < gate=%.3f — not in KB",
                 _top_rerank, _rerank_gate,
             )
+            # This refusal still does real retrieval+reranking work before
+            # concluding nothing is relevant — unlike the trivial early
+            # returns (greeting, exact-cache-hit) the module comment above
+            # _t_request_start deliberately skips instrumenting, this one
+            # is genuinely worth measuring (it's what a latency baseline's
+            # "refusal" case actually exercises). Reuses the same TIMING
+            # line format so a log-scraping harness needs only one regex.
+            _t_ttft_ms = round((time.time() - _t_request_start) * 1000)
+            _t_total_ms = round((time.time() - _t_request_start) * 1000)
+            logger.info(
+                "[ask_stream] TIMING total=%dms ttft=%s retrieval=%s grounding=%s llm=%s other=%dms "
+                "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r question=%r",
+                _t_total_ms,
+                f"{_t_ttft_ms}ms",
+                f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
+                "n/a", "n/a", 0,
+                f"{_t_preprocess_ms}ms" if _t_preprocess_ms is not None else "n/a",
+                "n/a", "n/a",
+                _keyword_detailed,
+                retrieval_query[:80],
+                question[:80],
+            )
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it, they'll be able to help you better! 😊"
@@ -5338,6 +5360,33 @@ class MultiSourceRAG:
                     yield _meaning_answer.strip()
                     yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
                     return
+            # This is the grounding-check refusal — retrieval found something
+            # that cleared the reranker gate, but lexical/semantic coverage
+            # (and every retry tier above) still said no. Distinct exit point
+            # from the reranker-gate refusal above (that one never even
+            # reaches grounding); confirmed live this is the path the
+            # latency plan's own fixed refusal test case ("1998 Yugo GV in
+            # Alaska") actually hits, not the reranker-gate one — so it
+            # needs its own TIMING line for the same reason that one did.
+            # Reuses the identical format string; retrieval+grounding are
+            # both real here (unlike the reranker-gate case), llm/promptbuild
+            # never ran.
+            _t_ttft_ms = round((time.time() - _t_request_start) * 1000)
+            _t_total_ms = round((time.time() - _t_request_start) * 1000)
+            logger.info(
+                "[ask_stream] TIMING total=%dms ttft=%s retrieval=%s grounding=%s llm=%s other=%dms "
+                "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r question=%r",
+                _t_total_ms,
+                f"{_t_ttft_ms}ms",
+                f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
+                f"{_t_grounding_ms}ms" if _t_grounding_ms is not None else "n/a",
+                "n/a", 0,
+                f"{_t_preprocess_ms}ms" if _t_preprocess_ms is not None else "n/a",
+                "n/a", "n/a",
+                _keyword_detailed,
+                retrieval_query[:80],
+                question[:80],
+            )
             yield (
                 "Hmm, I don't have that specific information in my knowledge base right now. "
                 "Let me get one of our agents on it, they'll be able to help you better! 😊"
@@ -7860,7 +7909,7 @@ class MultiSourceRAG:
         )
         logger.info(
             "[ask_stream] TIMING total=%dms ttft=%s retrieval=%s grounding=%s llm=%s other=%dms "
-            "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r",
+            "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r question=%r",
             _t_total_ms,
             f"{_t_ttft_ms}ms" if _t_ttft_ms is not None else "n/a",
             f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
@@ -7872,6 +7921,16 @@ class MultiSourceRAG:
             f"{_t_postllm_ms}ms" if _t_postllm_ms is not None else "n/a",
             _keyword_detailed,
             retrieval_query[:80],
+            # The ORIGINAL raw question, not retrieval_query (which gets
+            # rewritten for follow-ups, typo correction, query cleaning,
+            # etc. — see the multiple "retrieval_query = " reassignments
+            # upstream). A latency/regression harness matching log lines
+            # back to the request it sent needs a stable, rarely-
+            # reassigned handle — question is reassigned only in the
+            # narrow compound-question "both" clarify-reply flow, so this
+            # is a far more reliable match target than query= above for
+            # that purpose specifically.
+            question[:80],
         )
 
         _final_payload: dict = {

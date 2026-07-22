@@ -1,0 +1,198 @@
+{
+  "timestamp": 1784728426.630553,
+  "cases": [
+    {
+      "label": "brief_1",
+      "mode": "brief",
+      "query": "What is personal accident insurance?",
+      "cold": {
+        "total_ms": 16087,
+        "ttft_ms": 6995,
+        "retrieval_ms": 5484,
+        "grounding_ms": 983,
+        "llm_ms": 9520,
+        "other_ms": 100,
+        "preprocess_ms": 3,
+        "promptbuild_ms": 93,
+        "postllm_ms": 4,
+        "detailed": "False",
+        "wall_ms": 16307
+      },
+      "warm": {
+        "total_ms": 15242,
+        "ttft_ms": 6277,
+        "retrieval_ms": 5037,
+        "grounding_ms": 887,
+        "llm_ms": 9221,
+        "other_ms": 97,
+        "preprocess_ms": 1,
+        "promptbuild_ms": 86,
+        "postllm_ms": 8,
+        "detailed": "False",
+        "wall_ms": 15425
+      },
+      "ok": true
+    },
+    {
+      "label": "brief_2",
+      "mode": "brief",
+      "query": "What does a comprehensive motor policy cover?",
+      "cold": {
+        "total_ms": 37772,
+        "ttft_ms": 10911,
+        "retrieval_ms": 9562,
+        "grounding_ms": 826,
+        "llm_ms": 26487,
+        "other_ms": 897,
+        "preprocess_ms": 1,
+        "promptbuild_ms": 246,
+        "postllm_ms": 647,
+        "detailed": "True",
+        "wall_ms": 41138
+      },
+      "warm": {
+        "total_ms": 36204,
+        "ttft_ms": 9221,
+        "retrieval_ms": 8162,
+        "grounding_ms": 673,
+        "llm_ms": 26628,
+        "other_ms": 741,
+        "preprocess_ms": 3,
+        "promptbuild_ms": 99,
+        "postllm_ms": 638,
+        "detailed": "True",
+        "wall_ms": 36360
+      },
+      "ok": true
+    },
+    {
+      "label": "detailed_1",
+      "mode": "detailed",
+      "query": "Explain fire insurance in detail",
+      "cold": {
+        "total_ms": 36356,
+        "ttft_ms": 8603,
+        "retrieval_ms": 7428,
+        "grounding_ms": 770,
+        "llm_ms": 27266,
+        "other_ms": 892,
+        "preprocess_ms": 2,
+        "promptbuild_ms": 135,
+        "postllm_ms": 754,
+        "detailed": "True",
+        "wall_ms": 36541
+      },
+      "warm": {
+        "total_ms": 36362,
+        "ttft_ms": 9161,
+        "retrieval_ms": 8032,
+        "grounding_ms": 656,
+        "llm_ms": 26669,
+        "other_ms": 1005,
+        "preprocess_ms": 2,
+        "promptbuild_ms": 190,
+        "postllm_ms": 811,
+        "detailed": "True",
+        "wall_ms": 36527
+      },
+      "ok": true
+    },
+    {
+      "label": "detailed_2",
+      "mode": "detailed",
+      "query": "Explain motor insurance in detail",
+      "cold": {
+        "total_ms": 55853,
+        "ttft_ms": 9321,
+        "retrieval_ms": 8204,
+        "grounding_ms": 747,
+        "llm_ms": 45725,
+        "other_ms": 1177,
+        "preprocess_ms": 2,
+        "promptbuild_ms": 118,
+        "postllm_ms": 1055,
+        "detailed": "True",
+        "wall_ms": 56031
+      },
+      "warm": {
+        "total_ms": 43374,
+        "ttft_ms": 9254,
+        "retrieval_ms": 7903,
+        "grounding_ms": 734,
+        "llm_ms": 33475,
+        "other_ms": 1262,
+        "preprocess_ms": 2,
+        "promptbuild_ms": 339,
+        "postllm_ms": 919,
+        "detailed": "True",
+        "wall_ms": 43555
+      },
+      "ok": true
+    },
+    {
+      "label": "followup",
+      "mode": "followup",
+      "query": "What's excluded under it?",
+      "cold": {
+        "total_ms": 16641,
+        "ttft_ms": 8747,
+        "retrieval_ms": 5589,
+        "grounding_ms": 682,
+        "llm_ms": 8591,
+        "other_ms": 1779,
+        "preprocess_ms": 1657,
+        "promptbuild_ms": 105,
+        "postllm_ms": 16,
+        "detailed": "False",
+        "wall_ms": 31535
+      },
+      "warm": {
+        "total_ms": 25810,
+        "ttft_ms": 7933,
+        "retrieval_ms": 5267,
+        "grounding_ms": 468,
+        "llm_ms": 18390,
+        "other_ms": 1685,
+        "preprocess_ms": 1589,
+        "promptbuild_ms": 88,
+        "postllm_ms": 7,
+        "detailed": "False",
+        "wall_ms": 39605
+      },
+      "ok": true
+    },
+    {
+      "label": "refusal",
+      "mode": "refusal",
+      "query": "What is the exact premium for a 1998 Yugo GV in Alaska?",
+      "cold": {
+        "total_ms": 13347,
+        "ttft_ms": 13347,
+        "retrieval_ms": 4908,
+        "grounding_ms": 983,
+        "llm_ms": null,
+        "other_ms": 0,
+        "preprocess_ms": 759,
+        "promptbuild_ms": null,
+        "postllm_ms": null,
+        "detailed": "False",
+        "wall_ms": 13615
+      },
+      "warm": {
+        "total_ms": 11920,
+        "ttft_ms": 11920,
+        "retrieval_ms": 4938,
+        "grounding_ms": 551,
+        "llm_ms": null,
+        "other_ms": 0,
+        "preprocess_ms": 637,
+        "promptbuild_ms": null,
+        "postllm_ms": null,
+        "detailed": "False",
+        "wall_ms": 12161
+      },
+      "ok": true
+    }
+  ],
+  "failed": []
+}
