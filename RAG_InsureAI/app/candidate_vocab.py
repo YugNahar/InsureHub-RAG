@@ -47,7 +47,7 @@ _DEGENERATE_LABELS = {
     "other", "others", "unclear", "unknown", "none", "na",
     "general", "various", "misc", "miscellaneous", "mixed", "unsure",
     "not_applicable", "not_sure", "no_specific_type", "no_specific",
-    "n_a",
+    "n_a", "insurance", "policy", "insurance_policy",
 }
 
 
@@ -132,20 +132,27 @@ def get_candidate_vocab() -> Dict[str, Dict]:
 
 def match_candidate_vocab(text: str) -> Optional[str]:
     """
-    Cheap keyword-substring check against already-discovered candidate
-    labels, tried before paying for another open-ended LLM call. First hit
-    wins — this is only ever a hint for a field that never touches the
-    retrieval filter, so it doesn't need the active vocabulary's stricter
-    confidence-contest scoring.
+    Cheap keyword-overlap check against already-discovered candidate
+    labels, tried before paying for another open-ended LLM call. Requires
+    at least 2 of a label's stored keywords present, not just 1 — confirmed
+    live in a 203-chunk backfill run that a single-keyword match against
+    generic insurance-domain vocabulary ("risk", "types", "loss",
+    "business", "companies") let one broadly-worded label cheap-match
+    ~200 genuinely unrelated chunks across 5 different source documents,
+    all without ever re-verifying via the LLM. First label clearing the
+    2-match bar wins — this is only ever a hint for a field that never
+    touches the retrieval filter, so it doesn't need the active
+    vocabulary's stricter confidence-contest scoring.
     """
     candidates = get_candidate_vocab()
     if not candidates:
         return None
     t = text.lower()
     for label, info in candidates.items():
-        for kw in info.get("keywords", []):
-            if kw and kw.lower() in t:
-                return label
+        keywords = info.get("keywords", [])
+        hits = sum(1 for kw in keywords if kw and kw.lower() in t)
+        if hits >= 2:
+            return label
     return None
 
 

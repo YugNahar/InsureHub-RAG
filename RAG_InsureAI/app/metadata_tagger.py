@@ -1475,6 +1475,7 @@ def _extract_candidate_keywords(text: str) -> list[str]:
 
 def classify_candidate_type(
     text: str, llm: Any = None, *, source: str = "", source_type: str = "chunk",
+    skip_cheap_match: bool = False,
 ) -> Optional[str]:
     """
     Mode-A handling (open-vocabulary fallback). Called only after the
@@ -1494,12 +1495,29 @@ def classify_candidate_type(
     etc.) — a real absence of a guess, not an empty-string label, so two
     unrelated "no idea" cases can never collide in the candidate-match
     bypass downstream.
+
+    skip_cheap_match: force step 4 unconditionally, bypassing step 3
+    entirely. For a one-time bulk re-classification pass (e.g. backfilling
+    candidate_policy_type across many pre-existing chunks in one run), the
+    normal per-request cost tradeoff that step 3 exists for doesn't apply —
+    confirmed live this backfill scenario is exactly where keyword-overlap
+    matching runs away: one early classification seeds generic domain
+    vocabulary ("risk", "insurable", "interest", "assessment" — all common
+    across broad insurance-law/textbook content, not distinctive to any one
+    topic), which then cheap-matches most of the REST of the same run
+    before the LLM ever gets a chance to independently disagree.
     """
     from candidate_vocab import match_candidate_vocab, normalize_candidate_label, upsert_candidate
 
-    hit = match_candidate_vocab(text)
+    hit = None if skip_cheap_match else match_candidate_vocab(text)
     if hit:
-        upsert_candidate(hit, _extract_candidate_keywords(text), source, source_type)
+        # Deliberately pass [] here, not _extract_candidate_keywords(text) —
+        # a cheap keyword match was never verified by the LLM, so growing
+        # the label's keyword set from it is how one over-broad match
+        # compounds into an even broader one next time. Only a fresh LLM
+        # classification (below) should ever widen the keyword list;
+        # guess_count/last_seen still update either way.
+        upsert_candidate(hit, [], source, source_type)
         return hit
 
     if llm is None:

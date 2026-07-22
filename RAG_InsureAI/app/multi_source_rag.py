@@ -17,10 +17,11 @@ except ImportError:
     _APIStatusError = Exception
 
 from rapidfuzz import fuzz, process
-from turbovec_store import _rerank_windows
+from turbovec_store import _rerank_windows, _get_shared_reranker
 from metadata_tagger import (
     classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
 )
+import contamination_trace
 
 logger = logging.getLogger(__name__)
 
@@ -1303,7 +1304,7 @@ _TYPE_QUERY_EXEMPT_WORDS = {
 
 def _text_has_giveaway_contamination(
     text: str, query_lower: str, query_policy_type: str = "general",
-    retrieved_types: frozenset = frozenset(),
+    retrieved_context_text: str = "",
 ) -> bool:
     # query_policy_type is classify_query_policy_type(retrieval_query) —
     # already computed once per request for the metadata retrieval filter,
@@ -1318,27 +1319,34 @@ def _text_has_giveaway_contamination(
     # classifier directly closes this whole class of synonym/hypernym gap,
     # not just this one instance.
     #
-    # retrieved_types requires the giveaway term's type to have actually
-    # been RETRIEVED this turn (a chunk genuinely tagged that specific
-    # type, not "general") before treating a keyword match as contamination
-    # at all. query_policy_type alone isn't a complete signal — its regex
-    # list can't cover every phrasing, and its LLM fallback isn't 100%
-    # reliable (confirmed live: "What is personal insurance?" scored zero
-    # regex hits and needed a dedicated pattern added — see
-    # [[project_query_type_classification_reliability_gap]]) — so a query
-    # the classifier mishandles could still trigger this check on a
-    # perfectly legitimate mention (e.g. a general classification-list
-    # chunk naming "motor insurance" as one of five general insurance
-    # categories while explaining an unrelated type). Grounding the check
-    # in what was actually retrieved means a giveaway term only counts when
-    # there's real evidence of that specific type's content being in
-    # context, independent of whether the query itself got classified
-    # correctly.
+    # retrieved_context_text requires the giveaway TERM to genuinely appear
+    # somewhere in what was retrieved this turn before treating a match in
+    # the generated text as contamination — same "real evidence" guarantee
+    # the original design wanted, but checked against the actual retrieved
+    # TEXT rather than a chunk's policy_type TAG. The tag-based version of
+    # this check (`_type_name not in retrieved_types`, retrieved_types
+    # built by excluding policy_type=="general") was structurally blind to
+    # any topic with no official policy_type of its own — confirmed live:
+    # "Explain engineering insurance in detail" retrieved ONLY
+    # general-tagged chunks (engineering isn't one of the 12 hardcoded
+    # types) and produced a point containing "hull insurance" — a term
+    # already tracked under the marine bucket — but the marine check never
+    # ran at all, since no chunk was TAGGED marine, even though the term
+    # was sitting right there in the retrieved text. Checking the text
+    # directly closes that gap without weakening the original guarantee:
+    # a term still only counts as evidence when it's actually present in
+    # what was retrieved, not just because the query's classifier guessed
+    # a sibling type (e.g. explaining "personal insurance" by listing it
+    # alongside motor/health as one of five general categories stays
+    # exempt, since neither "motor insurance" nor "health insurance" as a
+    # literal term needs to appear in the retrieved text for that to be a
+    # legitimate answer).
     text_lower = text.lower()
+    context_lower = retrieved_context_text.lower()
     for _type_name, _terms in _TYPE_GIVEAWAY_TERMS.items():
         if _type_name == query_policy_type:
             continue
-        if _type_name not in retrieved_types:
+        if not any(term in context_lower for term in _terms):
             continue
         _exempt_words = _TYPE_QUERY_EXEMPT_WORDS.get(_type_name, (_type_name,))
         if any(w in query_lower for w in _exempt_words):
@@ -1346,6 +1354,84 @@ def _text_has_giveaway_contamination(
         if any(term in text_lower for term in _terms):
             return True
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Shared numbered-point split/rebuild — contamination root-cause plan
+# (plan.md), Phase 0/2. Previously this exact opener/points/closer
+# split-and-fold logic was duplicated near-identically in the ungrounded-
+# point filter and the cross-topic contamination filter below (and would
+# have needed a THIRD copy for the point-relevance gate) — precisely the
+# kind of silent-drift risk the plan calls out. One shared implementation
+# now backs all three call sites plus the contamination trace.
+# ─────────────────────────────────────────────────────────────────────────
+_POINT_LINE_RE = re.compile(r"^\s*(\d+)\.\s+(.*)$")
+
+
+def _split_numbered_points(text: str) -> Tuple[List[str], List[str], List[str]]:
+    """Split numbered-list answer text into (opener_lines, point_texts,
+    closer_lines). Folds indented or "-"/"*"/"•" continuation lines into
+    their parent point so a later dropped point doesn't leave orphaned
+    sub-bullets behind — same behavior the two original inline copies
+    had, just no longer duplicated.
+    """
+    lines = text.split("\n")
+    opener_lines: List[str] = []
+    point_texts: List[str] = []
+    closer_lines: List[str] = []
+    seen_point = False
+    for line in lines:
+        m = _POINT_LINE_RE.match(line)
+        if m:
+            seen_point = True
+            point_texts.append(m.group(2).strip())
+            continue
+        if not seen_point:
+            opener_lines.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_continuation = line[:1].isspace() or stripped.startswith(("-", "*", "•"))
+        if is_continuation and point_texts:
+            point_texts[-1] = point_texts[-1] + " " + stripped
+        else:
+            closer_lines.append(line)
+    return opener_lines, point_texts, closer_lines
+
+
+def _rebuild_from_points(opener_lines: List[str], points: List[str], closer_lines: List[str]) -> str:
+    """Inverse of _split_numbered_points — rebuild numbered-list text from
+    a (possibly filtered) points list. Shared so the rebuild format never
+    drifts between the filters that use it.
+    """
+    opener_part = "\n".join(opener_lines).strip()
+    closer_part = "\n".join(closer_lines).strip()
+    rebuilt_points = "\n".join(f"{i}. {p}" for i, p in enumerate(points, 1))
+    pieces = [p for p in (opener_part, rebuilt_points, closer_part) if p]
+    return "\n\n".join(pieces)
+
+
+def _score_points_against_query(query: str, points: List[str]) -> List[float]:
+    """Score each point in *points* for query-relevance via the shared
+    cross-encoder reranker, in a single batched .predict() call — reused
+    by the contamination trace (log-only) and, once enabled, the Phase-2
+    topic-relevance gate. Returns [] on any failure (model not loaded,
+    empty points, etc.) rather than raising — a scoring failure must
+    never affect the answer itself, only the diagnostic/gate that
+    consumes the scores, and those callers already treat an empty list
+    as "no signal, don't act."
+    """
+    if not points or not query:
+        return []
+    try:
+        reranker = _get_shared_reranker()
+        pairs = [(query, p) for p in points]
+        scores = reranker.predict(pairs)
+        return [float(s) for s in scores]
+    except Exception as exc:
+        logger.debug("[contamination] point-relevance scoring failed: %s", exc)
+        return []
 
 
 def _is_likely_followup(question: str) -> bool:
@@ -4444,8 +4530,19 @@ class MultiSourceRAG:
         )
         _kv_q_emb = None
         _kv_related_ctx = ""   # supplementary context from related cache entries
-        _kv_hit = _kv.get(_kv_key)
-        if _kv_hit is None:
+        # Testing-only escape hatch (default off, matches CONTAMINATION_TRACE's
+        # env-gated pattern): QueryKVCache is a pure in-memory dict loaded once
+        # at process start (kv_cache.py's self._data) — deleting the on-disk
+        # JSON file between test requests does NOT clear it for the already-
+        # running process, so repeat samples of the identical query text
+        # (contamination_corpus_runner.py's --repeats) would otherwise all
+        # replay the first generation instead of producing independent
+        # samples of the model's real nondeterminism. Also skips the write
+        # below so corpus-testing traffic never pollutes the real cache real
+        # users hit.
+        _disable_query_cache = os.getenv("DISABLE_QUERY_CACHE", "").strip().lower() in ("1", "true", "yes")
+        _kv_hit = None if _disable_query_cache else _kv.get(_kv_key)
+        if _kv_hit is None and not _disable_query_cache:
             try:
                 _kv_q_emb = await asyncio.to_thread(
                     lambda: self.doc_pipeline._vector_store.embed_model.encode(
@@ -4704,6 +4801,31 @@ class MultiSourceRAG:
                 and _chunk_type != _query_policy_type
             )
 
+        def _candidate_mismatch(c):
+            # A chunk with its OWN confidently-labeled open-vocabulary
+            # candidate type (e.g. "pet_insurance" — not in the official
+            # 12-type taxonomy at all) that disagrees with the query's own
+            # candidate guess is much stronger negative evidence than the
+            # generic "policy_type says general" case _type_mismatched
+            # covers — we KNOW specifically what this chunk is about, and
+            # we KNOW the query isn't about that. The soft 0.5x discount
+            # below isn't enough to handle this: confirmed live, a pet-
+            # insurance chunk (candidate_policy_type="pet_insurance") still
+            # outranked the pool's only genuinely on-topic "home" chunk even
+            # after a 0.5x discount, because that one real match itself
+            # scored unusually low (0.0124) — general claims-process
+            # boilerplate about pets scored 0.0572 raw purely on incidental
+            # lexical overlap with "file a claim." Dropped outright instead
+            # of discounted, for "How do I file a claim after water damage?"
+            # leaking "just like visiting a vet for your pet" into a home-
+            # insurance answer. Query's own candidate is checked (not just
+            # "unset") so a real matching novel-type case is never dropped.
+            return bool(
+                str(c.metadata.get("source_type", "document")).lower() == "document"
+                and c.metadata.get("candidate_policy_type")
+                and c.metadata.get("candidate_policy_type") != _query_candidate_type
+            )
+
         def _discount_exempt(c):
             # Two cases beyond "chunk isn't general at all" (that case never
             # reaches here — _type_mismatched is already False for it): (1)
@@ -4765,6 +4887,15 @@ class MultiSourceRAG:
                 reverse=True,
             )
             return chunks[:_chunk_limit]
+
+        _candidate_dropped = [c for c in all_chunks if _candidate_mismatch(c)]
+        if _candidate_dropped:
+            logger.info(
+                "[ask_stream] candidate-type mismatch: dropping %s (query_candidate=%s)",
+                [(c.metadata.get("source", ""), c.metadata.get("candidate_policy_type")) for c in _candidate_dropped],
+                _query_candidate_type,
+            )
+            all_chunks = [c for c in all_chunks if c not in _candidate_dropped]
 
         all_chunks = _sort_and_truncate(all_chunks)
 
@@ -5336,28 +5467,6 @@ class MultiSourceRAG:
         # from the earlier call — the generation prompt should see
         # topic-specific content first too, not just the grounding check.
         all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
-
-        # Which specific (non-general) policy types are actually present
-        # among the chunks retrieved THIS turn — used below by the
-        # cross-topic-contamination checks instead of trusting
-        # classify_query_policy_type()'s guess alone. That classifier can't
-        # cover every possible phrasing (its regex list is necessarily
-        # finite, and its LLM fallback isn't 100% reliable either — see
-        # [[project_query_type_classification_reliability_gap]]), so a
-        # contamination check keyed purely off "does the query's guessed
-        # type match a giveaway term" can misfire on a query the classifier
-        # mishandles OR on a reply that legitimately mentions a sibling type
-        # by name (e.g. explaining "personal insurance" by listing it
-        # alongside motor/health as one of five general insurance
-        # categories — real KB content, not leakage). Grounding the check in
-        # what was ACTUALLY retrieved is a stronger signal either way: a
-        # giveaway term only means something if a chunk of that specific
-        # type was genuinely pulled into context, not just because the term
-        # happens to appear in a general/classification-style passage.
-        _retrieved_specific_types = {
-            c.metadata.get("policy_type") for c in all_chunks
-            if c.metadata.get("policy_type") and c.metadata.get("policy_type") != "general"
-        }
 
         _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
         _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
@@ -6008,42 +6117,24 @@ class MultiSourceRAG:
         # A shorter, fully-grounded list beats a longer one with invented
         # filler — matches the user's explicit "fewer points is fine, just
         # don't invent" instruction.
+        # Default so the contamination trace below can safely reference
+        # this even if _keyword_detailed is False or this block's try
+        # raises before reaching the assignment.
+        _trace_original_points: list = []
         if _keyword_detailed:
             try:
                 import re as _re3
                 _filter_src = (_corrected_text or _reply_stripped).strip()
-                _lines = _filter_src.split("\n")
-                _point_line_re = _re3.compile(r"^\s*(\d+)\.\s+(.*)$")
-                _opener_lines, _point_texts, _closer_lines = [], [], []
-                _seen_point = False
-                for _line in _lines:
-                    _m = _point_line_re.match(_line)
-                    if _m:
-                        _seen_point = True
-                        _point_texts.append(_m.group(2).strip())
-                        continue
-                    if not _seen_point:
-                        _opener_lines.append(_line)
-                        continue
-                    _stripped_line = _line.strip()
-                    if not _stripped_line:
-                        continue
-                    # A line after the first numbered point is either a
-                    # sub-item of that point (indented, or a "-"/"*"/"a."
-                    # bullet — models often break a point's detail into a
-                    # nested list) or genuine trailing closer prose. Folding
-                    # sub-items into the parent point's text keeps them
-                    # grounding-checked together and prevents them being
-                    # orphaned as unnumbered fragments glued onto the end of
-                    # the answer — confirmed live: a "Principles of
-                    # Insurance" point with indented "- Utmost Good Faith:
-                    # ..." sub-bullets otherwise split into a dropped header
-                    # plus 4 floating, contextless bullet lines.
-                    _is_continuation = _line[:1].isspace() or _stripped_line.startswith(("-", "*", "•"))
-                    if _is_continuation and _point_texts:
-                        _point_texts[-1] = _point_texts[-1] + " " + _stripped_line
-                    else:
-                        _closer_lines.append(_line)
+                # Shared with the cross-topic filter below, the Phase-2
+                # relevance gate, and the contamination trace — see
+                # _split_numbered_points's own docstring for why this used
+                # to be duplicated inline here.
+                _opener_lines, _point_texts, _closer_lines = _split_numbered_points(_filter_src)
+                # Original, pre-filter point set — captured here (not
+                # recomputed later) so the contamination trace below can
+                # show every point that was actually generated, including
+                # ones this filter or the cross-topic filter go on to drop.
+                _trace_original_points = list(_point_texts)
                 if len(_point_texts) >= 2 and _full_context_uncompressed and _full_context_uncompressed.strip():
                     # Must strip punctuation the same way on both sides.
                     # full_context is raw KB prose, dense with commas
@@ -6128,11 +6219,7 @@ class MultiSourceRAG:
 
                     _kept_points = [p for p in _point_texts if _point_grounded(p)]
                     if _kept_points and len(_kept_points) < len(_point_texts):
-                        _opener_part = "\n".join(_opener_lines).strip()
-                        _closer_part = "\n".join(_closer_lines).strip()
-                        _rebuilt_points = "\n".join(f"{i}. {p}" for i, p in enumerate(_kept_points, 1))
-                        _pieces = [p for p in (_opener_part, _rebuilt_points, _closer_part) if p]
-                        _rebuilt3 = "\n\n".join(_pieces)
+                        _rebuilt3 = _rebuild_from_points(_opener_lines, _kept_points, _closer_lines)
                         _corrected_text = _rebuilt3
                         _kv_reply = _rebuilt3
                         logger.info(
@@ -6204,32 +6291,15 @@ class MultiSourceRAG:
                 # same list instead of drifting out of sync.
                 _query_lower = retrieval_query.lower()
                 _contam_src = (_corrected_text or _reply_stripped).strip()
-                _contam_lines = _contam_src.split("\n")
-                _contam_point_re = _re4.compile(r"^\s*(\d+)\.\s+(.*)$")
-                # Same opener/points/closer split as the padding-point filter
-                # above, including folding indented or "-"/"*"/"•" continuation
-                # lines into their parent point — otherwise a dropped
-                # contaminated point could leave its own sub-bullets behind as
-                # orphaned, contextless fragments.
-                _contam_opener, _contam_points, _contam_closer = [], [], []
-                _contam_seen_point = False
-                for _line in _contam_lines:
-                    _m = _contam_point_re.match(_line)
-                    if _m:
-                        _contam_seen_point = True
-                        _contam_points.append(_m.group(2).strip())
-                        continue
-                    if not _contam_seen_point:
-                        _contam_opener.append(_line)
-                        continue
-                    _stripped = _line.strip()
-                    if not _stripped:
-                        continue
-                    _is_continuation = _line[:1].isspace() or _stripped.startswith(("-", "*", "•"))
-                    if _is_continuation and _contam_points:
-                        _contam_points[-1] = _contam_points[-1] + " " + _stripped
-                    else:
-                        _contam_closer.append(_line)
+                # Shared with the ungrounded-point filter above — see
+                # _split_numbered_points's docstring.
+                _contam_opener, _contam_points, _contam_closer = _split_numbered_points(_contam_src)
+                # This filter can run even when the ungrounded-point filter
+                # above didn't fire (e.g. only 1 point total, or that block's
+                # try/except skipped) — cover that case so the trace still
+                # has an original point set to show.
+                if not _trace_original_points:
+                    _trace_original_points = list(_contam_points)
 
                 def _is_contaminated(point_text: str) -> bool:
                     # Skip entirely for type-agnostic queries ("what's the
@@ -6246,16 +6316,12 @@ class MultiSourceRAG:
                     if _query_policy_type == "general":
                         return False
                     return _text_has_giveaway_contamination(
-                        point_text, _query_lower, _query_policy_type, _retrieved_specific_types
+                        point_text, _query_lower, _query_policy_type, _full_context_uncompressed
                     )
 
                 _clean_points = [p for p in _contam_points if not _is_contaminated(p)]
                 if _clean_points and len(_clean_points) < len(_contam_points):
-                    _opener_part = "\n".join(_contam_opener).strip()
-                    _closer_part = "\n".join(_contam_closer).strip()
-                    _rebuilt_points = "\n".join(f"{i}. {p}" for i, p in enumerate(_clean_points, 1))
-                    _pieces = [p for p in (_opener_part, _rebuilt_points, _closer_part) if p]
-                    _rebuilt4 = "\n\n".join(_pieces)
+                    _rebuilt4 = _rebuild_from_points(_contam_opener, _clean_points, _contam_closer)
                     _corrected_text = _rebuilt4
                     _kv_reply = _rebuilt4
                     logger.info(
@@ -6264,6 +6330,58 @@ class MultiSourceRAG:
                     )
             except Exception as _contam_exc:
                 logger.debug("[ask_stream] cross-topic contamination filter skipped: %s", _contam_exc)
+
+        # ── Contamination trace (Phase 0, plan.md) ─────────────────────────────
+        # Opt-in via CONTAMINATION_TRACE=1. Logs the FINAL surviving points
+        # (after both filters above have already run) with a per-point
+        # query-relevance score from the shared cross-encoder and a
+        # best-guess source-chunk attribution — pure diagnostics, nothing
+        # here changes the answer. This is what makes contamination
+        # visible in bulk instead of one live repro at a time; see
+        # contamination_trace.py's module docstring. _trace_original_points
+        # is not yet used here (surviving == what the trace shows) but is
+        # threaded through so a later stage can report per-point drop
+        # attribution without re-deriving it.
+        if _keyword_detailed and contamination_trace.TRACE_ENABLED:
+            try:
+                _trace_src = (_corrected_text or _reply_stripped).strip()
+                _, _trace_final_points, _ = _split_numbered_points(_trace_src)
+                if _trace_final_points:
+                    _trace_scores = _score_points_against_query(retrieval_query, _trace_final_points)
+                    _trace_chunk_texts = [getattr(c, "page_content", "") for c in all_chunks]
+                    _trace_point_records = []
+                    for _ti, _tpoint in enumerate(_trace_final_points):
+                        _tscore = _trace_scores[_ti] if _ti < len(_trace_scores) else None
+                        _tbest_idx = contamination_trace.best_matching_chunk_index(_tpoint, _trace_chunk_texts)
+                        _tbest_chunk = all_chunks[_tbest_idx] if _tbest_idx is not None else None
+                        _trace_point_records.append({
+                            "text": _tpoint[:200],
+                            "relevance_score": _tscore,
+                            "best_chunk_source": (
+                                _tbest_chunk.metadata.get("source") or _tbest_chunk.metadata.get("source_url")
+                            ) if _tbest_chunk else None,
+                            "best_chunk_policy_type": _tbest_chunk.metadata.get("policy_type") if _tbest_chunk else None,
+                        })
+                    contamination_trace.write_trace({
+                        "query": question,
+                        "retrieval_query": retrieval_query,
+                        "query_policy_type": _query_policy_type,
+                        "query_candidate_type": _query_candidate_type,
+                        "original_point_count": len(_trace_original_points),
+                        "final_point_count": len(_trace_final_points),
+                        "retrieved_chunks": [
+                            {
+                                "source": c.metadata.get("source") or c.metadata.get("source_url"),
+                                "policy_type": c.metadata.get("policy_type"),
+                                "candidate_policy_type": c.metadata.get("candidate_policy_type"),
+                                "rerank_score": c.metadata.get("rerank_score", c.metadata.get("similarity")),
+                            }
+                            for c in all_chunks
+                        ],
+                        "points": _trace_point_records,
+                    })
+            except Exception as _trace_exc:
+                logger.debug("[ask_stream] contamination trace skipped: %s", _trace_exc)
 
         # ── Cross-topic contamination via CONVERSATION HISTORY (brief mode) ───
         # The block above only runs in detailed mode and only catches jargon
@@ -6343,7 +6461,7 @@ class MultiSourceRAG:
                 _retr_ans_src = (_corrected_text or _reply_stripped)
                 _retr_query_lower = f"{question} {retrieval_query}".lower()
                 if _text_has_giveaway_contamination(
-                    _retr_ans_src, _retr_query_lower, _query_policy_type, _retrieved_specific_types
+                    _retr_ans_src, _retr_query_lower, _query_policy_type, _full_context_uncompressed
                 ):
                     _retr_refusal_text = (
                         "Hmm, I don't have that specific information in my knowledge base right now. "
@@ -7582,7 +7700,7 @@ class MultiSourceRAG:
             "don't have that right now",
             "i don't have that right now",
         )
-        if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases):
+        if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases) and not _disable_query_cache:
             try:
                 _kv.put(
                     _kv_key,

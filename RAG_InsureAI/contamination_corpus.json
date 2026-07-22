@@ -1,0 +1,572 @@
+{
+  "version": 1,
+  "description": "Labeled corpus for the cross-topic-contamination root-cause plan (plan.md, Phase 0b). Every 'known_contamination_repro' case is a real, previously-observed live failure mined from git-tracked code comments and this project's memory files, with the exact query text and the exact contaminating phrases/topics that were actually seen. 'clean_control'/'exemption_control'/'narrative_structure_repro' cases exist so a fix's success is never measured only by whether it stops known-bad cases — it must also NOT wrongly touch legitimate content. Run via contamination_corpus_runner.py. Add new confirmed live contamination reports here FIRST, then fix — see plan.md Phase 4.",
+  "cases": [
+    {
+      "id": "motor-marine-icc-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["marine cargo", "icc (a)", "icc (b)", "institute cargo clause", "bill of lading", "voyage policy", "hull insurance", "marine insurance"],
+      "forbidden_topics": ["marine"],
+      "source": "project_cross_topic_contamination.md; multi_source_rag.py _TYPE_GIVEAWAY_TERMS comments",
+      "notes": "Confirmed live: a generic policy-schedule-documentation chunk used a marine cargo/ICC(A)/(B) example as its own illustration; the model reproduced it as fact about motor insurance."
+    },
+    {
+      "id": "motor-health-domiciliary-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["domiciliary hospitalization", "domiciliary hospitalisation", "cashless hospitalization", "cashless hospitalisation", "pre-existing disease"],
+      "forbidden_topics": ["health"],
+      "source": "project_cross_topic_contamination.md",
+      "notes": "Confirmed live, same session as the marine case: a health-insurance exclusions chunk retrieved alongside motor chunks got misapplied as if describing motor insurance's own coverage."
+    },
+    {
+      "id": "motor-crop-general-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["crop insurance", "agriculturist", "crop failure", "sowing", "loanee", "farmers"],
+      "forbidden_topics": ["crop"],
+      "source": "project_general_chunk_reranking_downweight.md",
+      "notes": "A policy_type='general' government crop-insurance-scheme chunk outscored (0.475) the real motor chunks (0.329/0.318) in reranking for this exact query."
+    },
+    {
+      "id": "engineering-marine-hull-01",
+      "category": "known_contamination_repro",
+      "query": "Explain engineering insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "commercial",
+      "forbidden_phrases": ["hull insurance", "cargo insurance", "marine insurance", "aspect of marine", "component of marine", "within marine insurance"],
+      "forbidden_topics": ["marine"],
+      "source": "project_cross_topic_contamination.md",
+      "notes": "Confirmed live across 2 separately-worded generations ('Hull insurance is a component of marine insurance...' then 'Cargo insurance within marine insurance covers...'). Engineering has no official policy_type in metadata_tagger.py's _POLICY_TYPE_HINTS — all engineering chunks are tagged 'general', so the hard retrieval filter admits everything for this query."
+    },
+    {
+      "id": "burglary-fidelity-01",
+      "category": "known_contamination_repro",
+      "query": "Explain burglary insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "home",
+      "forbidden_phrases": ["fidelity insurance", "employee dishonesty", "embezzlement"],
+      "forbidden_topics": ["fidelity"],
+      "source": "project_cross_topic_contamination.md",
+      "notes": "A 'Lesson Round Up' chapter-summary chunk's fidelity-insurance bullet was reproduced verbatim as a numbered point about burglary insurance."
+    },
+    {
+      "id": "transit-motor-vehicles-act-01",
+      "category": "known_contamination_repro",
+      "query": "Explain transit insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": ["motor vehicles act", "vehicles plying on public roads", "registration certificate"],
+      "forbidden_topics": ["motor"],
+      "allowed_despite_topic_match": ["marine insurance", "cover note"],
+      "source": "project_cross_topic_contamination.md",
+      "notes": "IMPORTANT nuance case: transit is a genuine KB sub-category of marine insurance (see metadata_tagger.py _POLICY_TYPE_HINTS['marine']['regex'] which includes inland-transit/goods-in-transit signals), so a legitimate 'marine insurance'/'cover note' mention here is CORRECT, not contamination — only the Motor Vehicles Act / registration-certificate content is the actual leak. A fix that flags every 'marine insurance' mention here is over-broad."
+    },
+    {
+      "id": "personal-accident-motor-rider-01",
+      "category": "known_contamination_repro",
+      "query": "Explain personal accident insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": ["owner-driver", "tp (third-party) premium", "third-party premium", "unnamed passengers", "driving record", "own damage", "vehicle repairs", "repairs to the vehicle", "reckless driving"],
+      "forbidden_topics": ["motor"],
+      "source": "project_motor_bareword_giveaway_generalization.md",
+      "notes": "Confirmed across 4+ separately-worded live generations. The compulsory-PA-rider-within-a-motor-policy content is real KB text, genuinely retrieved for sharing 'personal accident' vocabulary with the query, but describes a different product (PA as a motor add-on, not standalone PA insurance)."
+    },
+    {
+      "id": "personal-accident-full-picture-01",
+      "category": "known_contamination_repro",
+      "query": "give me the full picture on personal accident cover, don't leave anything out",
+      "mode": "detailed",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": ["voluntary excess", "own damage section", "owners of vehicles", "transferring ownership of a vehicle"],
+      "forbidden_topics": ["motor"],
+      "source": "project_motor_bareword_giveaway_generalization.md",
+      "notes": "5th repro of the same underlying leak, found via a deliberately different phrasing during a stress-test round — confirms a fix tuned to one phrasing doesn't automatically generalize to a differently-worded request for the same content."
+    },
+    {
+      "id": "personal-accident-vehicle-exempt-01",
+      "category": "exemption_control",
+      "query": "Explain in detail how personal accident cover works for my vehicle",
+      "mode": "detailed",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "must_allow_phrases": ["vehicle", "owner-driver"],
+      "source": "project_motor_bareword_giveaway_generalization.md",
+      "notes": "NEGATIVE case: the query itself legitimately asks about vehicle-linked PA cover, so vehicle/motor-adjacent content here is CORRECT and must survive any topic-relevance gate. A fix that drops vehicle content unconditionally is over-broad."
+    },
+    {
+      "id": "term-insurance-exclusions-driving-01",
+      "category": "known_contamination_repro",
+      "query": "What are the exclusions in term insurance?",
+      "mode": "brief",
+      "expected_topic": "life",
+      "forbidden_phrases": ["driving history"],
+      "forbidden_topics": ["motor", "personal_accident"],
+      "source": "project_term_insurance_multitype_chunk_leak.md",
+      "notes": "A single KB paragraph enumerates disclosure-duty examples across several DIFFERENT insurance types (a/b/c/d list); 'driving history' is the personal-accident/motor sub-item, correctly tagged policy_type='general' at ingestion (genuinely multi-type), so the hard retrieval filter can't exclude it. Reproduced on 1 of 3 fresh generations — expect nondeterminism when re-running this case."
+    },
+    {
+      "id": "ncb-tpa-type-agnostic-01",
+      "category": "exemption_control",
+      "query": "what's the difference between NCB and TPA",
+      "mode": "brief",
+      "expected_topic": "general",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "must_allow_phrases": ["health insurance", "third party administrator"],
+      "source": "project_type_agnostic_jargon_false_positive.md",
+      "notes": "NEGATIVE case: TPA is genuinely explained via health insurance, and the query never names ANY specific type — classify_query_policy_type() returns 'general' here. A correct answer legitimately says 'health insurance' and must not be flagged as contamination just because the query didn't name that type itself."
+    },
+    {
+      "id": "personal-accident-example-third-party-01",
+      "category": "narrative_structure_repro",
+      "query": "What is personal accident insurance? -> can you give me an example",
+      "mode": "brief",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": ["pedestrian", "hit a pedestrian", "accidentally hit"],
+      "forbidden_topics": [],
+      "narrative_pattern": "insured harms a third party, third party receives the payout",
+      "source": "project_third_party_victim_contamination.md",
+      "notes": "Distinct sub-class: contamination is in NARRATIVE STRUCTURE (who hits whom, who gets paid), not vocabulary — personal accident insurance only ever pays the insured, never a third party the insured harmed. Jargon-term matching structurally cannot catch this; flagged in plan.md Phase 3 as a case to verify the semantic point-relevance gate does (or doesn't) also catch. Reproduced ~1-in-3-to-5 retries — expect nondeterminism."
+    },
+    {
+      "id": "clean-motor-01",
+      "category": "clean_control",
+      "query": "What does a comprehensive motor policy cover?",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "No known historical issue — used to confirm a fix drops zero legitimate points on ordinary motor content."
+    },
+    {
+      "id": "clean-health-01",
+      "category": "clean_control",
+      "query": "Explain health insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "health",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "Broad, high-traffic topic — clean baseline."
+    },
+    {
+      "id": "clean-life-01",
+      "category": "clean_control",
+      "query": "Explain life insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "life",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-travel-01",
+      "category": "clean_control",
+      "query": "Explain travel insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "travel",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-home-01",
+      "category": "clean_control",
+      "query": "Explain home insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "home",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-fire-01",
+      "category": "clean_control",
+      "query": "Explain fire insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "fire",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-marine-01",
+      "category": "clean_control",
+      "query": "Explain marine insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "marine",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-liability-01",
+      "category": "clean_control",
+      "query": "Explain liability insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "liability",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "Historically the retrieval-narrowing recall regression case (multi_source_rag.py comments ~:4312-4341) — kept here as a recall spot-check for Phase 1's windowing change, not just a contamination check."
+    },
+    {
+      "id": "clean-cyber-01",
+      "category": "clean_control",
+      "query": "Explain cyber insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "cyber",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-crop-01",
+      "category": "clean_control",
+      "query": "Explain crop insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "crop",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-commercial-01",
+      "category": "clean_control",
+      "query": "Explain commercial insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "commercial",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-personal-accident-standalone-01",
+      "category": "clean_control",
+      "query": "What is standalone personal accident insurance and what does it cover?",
+      "mode": "detailed",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": ["owner-driver", "own damage section", "vehicle repairs"],
+      "forbidden_topics": ["motor"],
+      "notes": "Explicitly worded 'standalone' to make the motor-rider distinction unambiguous — a stronger version of personal-accident-motor-rider-01."
+    },
+    {
+      "id": "clean-engineering-02",
+      "category": "clean_control",
+      "query": "What does machinery breakdown insurance cover?",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": ["marine insurance", "hull insurance"],
+      "forbidden_topics": ["marine"],
+      "notes": "Engineering sub-type with no official policy_type tag (maps to 'general') — a second, differently-worded engineering probe beyond engineering-marine-hull-01."
+    },
+    {
+      "id": "clean-fidelity-01",
+      "category": "clean_control",
+      "query": "What is fidelity guarantee insurance?",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": ["marine cargo", "domiciliary hospitalization"],
+      "forbidden_topics": ["marine", "health"],
+      "notes": "Another type absent from the official 12 — maps to 'general', so the hard retrieval filter provides zero protection here; relies entirely on downstream defenses."
+    },
+    {
+      "id": "clean-aviation-01",
+      "category": "clean_control",
+      "query": "Explain aviation insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "Not in the official 12 types (maps to 'general') and not previously tested for contamination at all — genuinely novel probe, exactly the kind of type _TYPE_GIVEAWAY_TERMS structurally cannot cover but a type-agnostic semantic gate should."
+    },
+    {
+      "id": "clean-burglary-followup-01",
+      "category": "clean_control",
+      "query": "Explain burglary insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "home",
+      "forbidden_phrases": ["fidelity insurance", "employee dishonesty"],
+      "forbidden_topics": ["fidelity"],
+      "notes": "Repeat of burglary-fidelity-01's query as its own case — LLM nondeterminism means running the identical query multiple times is a legitimate, distinct data point, not a duplicate."
+    },
+    {
+      "id": "clean-motor-repeat-01",
+      "category": "clean_control",
+      "query": "Explain motor insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["marine cargo", "icc (a)", "icc (b)", "domiciliary hospitalization", "crop insurance", "agriculturist"],
+      "forbidden_topics": ["marine", "health", "crop"],
+      "notes": "Repeat of the historically worst-offending query, run independently for its own contamination-rate contribution rather than only counting motor-marine-icc-01/motor-health-domiciliary-01/motor-crop-general-01 once."
+    },
+    {
+      "id": "clean-motor-repeat-02",
+      "category": "clean_control",
+      "query": "Explain motor insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["marine cargo", "icc (a)", "icc (b)", "domiciliary hospitalization", "crop insurance", "agriculturist"],
+      "forbidden_topics": ["marine", "health", "crop"],
+      "notes": "Third independent run of the same query — this KB's worst-documented offender warrants multiple samples given confirmed nondeterministic reproduction rates (1-in-3 to 1-in-5 in prior findings)."
+    },
+    {
+      "id": "clean-engineering-repeat-01",
+      "category": "clean_control",
+      "query": "Explain engineering insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "commercial",
+      "forbidden_phrases": ["hull insurance", "cargo insurance", "marine insurance"],
+      "forbidden_topics": ["marine"],
+      "notes": "Second independent run of engineering-marine-hull-01's query."
+    },
+    {
+      "id": "clean-personal-accident-repeat-01",
+      "category": "clean_control",
+      "query": "Explain personal accident insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": ["owner-driver", "own damage section", "vehicle repairs", "driving record"],
+      "forbidden_topics": ["motor"],
+      "notes": "Second independent run of personal-accident-motor-rider-01's query."
+    },
+    {
+      "id": "clean-term-life-01",
+      "category": "clean_control",
+      "query": "What are the exclusions in term insurance?",
+      "mode": "brief",
+      "expected_topic": "life",
+      "forbidden_phrases": ["driving history"],
+      "forbidden_topics": ["motor", "personal_accident"],
+      "notes": "Second independent run of term-insurance-exclusions-driving-01's query."
+    },
+    {
+      "id": "phrasing-motor-claim-01",
+      "category": "clean_control",
+      "query": "How do I file a claim under my motor insurance policy?",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["marine cargo", "domiciliary hospitalization"],
+      "forbidden_topics": ["marine", "health"],
+      "notes": "Different phrasing pattern ('how do I') on the historically worst-offending topic — a fix tuned to 'Explain X in detail' phrasing must generalize to procedural phrasing too."
+    },
+    {
+      "id": "phrasing-health-coverage-01",
+      "category": "clean_control",
+      "query": "What is covered and excluded under health insurance?",
+      "mode": "detailed",
+      "expected_topic": "health",
+      "forbidden_phrases": ["marine cargo", "crop failure"],
+      "forbidden_topics": ["marine", "crop"]
+    },
+    {
+      "id": "phrasing-travel-walkthrough-01",
+      "category": "clean_control",
+      "query": "Walk me through how travel insurance claims work",
+      "mode": "detailed",
+      "expected_topic": "travel",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "phrasing-life-what-are-all-01",
+      "category": "clean_control",
+      "query": "What are all the types of life insurance available?",
+      "mode": "detailed",
+      "expected_topic": "life",
+      "forbidden_phrases": ["driving history", "vehicles plying on public roads"],
+      "forbidden_topics": ["motor"],
+      "notes": "'what are all' is a known enumeration-trigger phrase (multi_source_rag.py _enumeration_query_covered) — different retrieval/prompt path than 'explain in detail'."
+    },
+    {
+      "id": "adjacent-home-fire-01",
+      "category": "clean_control",
+      "query": "How does home insurance protect against fire damage?",
+      "mode": "detailed",
+      "expected_topic": "home",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "must_allow_phrases": ["fire"],
+      "notes": "Deliberately adjacent-topic query (home insurance covering fire risk is genuinely correct content) — a good stress test that a topic-relevance gate doesn't over-trigger on a query that legitimately spans two related KB tags."
+    },
+    {
+      "id": "clean-liability-professional-01",
+      "category": "clean_control",
+      "query": "Explain professional liability insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "liability",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "clean-motor-third-party-01",
+      "category": "clean_control",
+      "query": "What does third party motor insurance cover?",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["marine cargo", "domiciliary hospitalization"],
+      "forbidden_topics": ["marine", "health"]
+    },
+    {
+      "id": "clean-crop-claim-01",
+      "category": "clean_control",
+      "query": "How do I claim under my crop insurance policy?",
+      "mode": "detailed",
+      "expected_topic": "crop",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "marine-icc-legitimate-01",
+      "category": "exemption_control",
+      "query": "Explain marine cargo insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "marine",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "must_allow_phrases": ["icc (a)", "icc (b)", "institute cargo clause"],
+      "notes": "NEGATIVE case, important: the same ICC-clause jargon that is contamination in motor-marine-icc-01 is completely correct here since the query IS about marine cargo. Confirms any fix keys off query-topic mismatch, not the mere presence of the jargon term."
+    },
+    {
+      "id": "clean-health-group-01",
+      "category": "clean_control",
+      "query": "Explain group health insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "health",
+      "forbidden_phrases": ["marine cargo", "crop failure"],
+      "forbidden_topics": ["marine", "crop"]
+    },
+    {
+      "id": "water-damage-pet-leak-01",
+      "category": "known_contamination_repro",
+      "query": "How do I file a claim after water damage?",
+      "mode": "brief",
+      "expected_topic": "home",
+      "forbidden_phrases": ["vet", "pet is affected", "pet insurance"],
+      "forbidden_topics": ["pet"],
+      "source": "witnessed live in THIS session (browser test right after building the new frontend, before DISABLE_QUERY_CACHE existed)",
+      "notes": "Observed answer opened: 'you'll start by visiting a vet if your pet is affected, but since you're asking about water damage to property, let's focus on that.' Pet_Insurance_Guide.pdf is a real KB document. Re-tested fresh (cache disabled) 5x brief + 3x forced-detailed: the retrieval hole reproduces 8/8 (Pet_Insurance_Guide.pdf is in every single retrieved-sources list) but the VISIBLE leak did not reproduce in any of those 8 fresh samples — strongly suggesting the original observation was a stale cached reply from before this session's cache-purge practice was actually effective (see DISABLE_QUERY_CACHE fix). Kept as a repro case for the RETRIEVAL-side hole specifically (forbidden_topics check on retrieved_chunks would need the runner extended to check retrieval, not just answer text -- not yet done). If forbidden_phrases ever matches again live, that's the generation-side leak actually manifesting."
+    },
+    {
+      "id": "water-damage-detailed-pet-01",
+      "category": "known_contamination_repro",
+      "query": "Explain in detail how to file a claim after water damage to my property",
+      "mode": "detailed",
+      "expected_topic": "home",
+      "forbidden_phrases": ["vet", "pet is affected", "pet insurance"],
+      "forbidden_topics": ["pet"],
+      "notes": "Detailed-mode variant of water-damage-pet-leak-01, forcing point-based format specifically (the plan's own thesis is that leaks surface almost exclusively in numbered-point mode). 3/3 fresh samples clean so far."
+    },
+    {
+      "id": "compare-motor-health-01",
+      "category": "clean_control",
+      "query": "Compare motor insurance and health insurance",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": ["marine cargo", "crop failure", "fidelity insurance", "domiciliary hospitalization is excluded from motor"],
+      "forbidden_topics": ["marine", "crop", "fidelity"],
+      "must_allow_phrases": ["motor insurance", "health insurance"],
+      "notes": "Untested surface: comparison queries legitimately retrieve TWO real types at once. Stress test is whether a THIRD, unrelated type leaks in alongside the two the query actually asked about."
+    },
+    {
+      "id": "compare-fire-marine-01",
+      "category": "clean_control",
+      "query": "What's the difference between fire insurance and marine insurance?",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": ["crop failure", "domiciliary hospitalization", "fidelity insurance", "motor insurance"],
+      "forbidden_topics": ["crop", "health", "fidelity", "motor"],
+      "must_allow_phrases": ["fire insurance", "marine insurance"]
+    },
+    {
+      "id": "pet-insurance-direct-01",
+      "category": "clean_control",
+      "query": "Explain pet insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": ["marine cargo", "motor vehicles act", "crop failure"],
+      "forbidden_topics": ["marine", "motor", "crop"],
+      "must_allow_phrases": ["vet", "pet"],
+      "notes": "Direct query about the topic itself, whose KB doc caused the observed leak elsewhere -- confirms genuinely on-topic pet content is allowed and the doc is answerable on its own, isolating whether the problem is retrieval-into-wrong-context specifically."
+    },
+    {
+      "id": "workmens-compensation-01",
+      "category": "clean_control",
+      "query": "Explain workmen's compensation insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "Niche textbook sub-topic not in the official 12 types, untested until now."
+    },
+    {
+      "id": "householders-insurance-01",
+      "category": "clean_control",
+      "query": "What does householder's insurance cover?",
+      "mode": "detailed",
+      "expected_topic": "home",
+      "forbidden_phrases": ["marine cargo", "domiciliary hospitalization"],
+      "forbidden_topics": ["marine", "health"]
+    },
+    {
+      "id": "jewellery-insurance-01",
+      "category": "clean_control",
+      "query": "Explain jewellery insurance in detail",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "Niche sub-topic, untested."
+    },
+    {
+      "id": "keyman-insurance-01",
+      "category": "clean_control",
+      "query": "What is keyman insurance and why do businesses buy it?",
+      "mode": "detailed",
+      "expected_topic": "general",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "Niche commercial/life-adjacent sub-topic, untested."
+    },
+    {
+      "id": "followup-motor-then-detail-01",
+      "category": "clean_control",
+      "query": "What is motor insurance? -> Explain it in more detail",
+      "mode": "detailed",
+      "expected_topic": "motor",
+      "forbidden_phrases": ["marine cargo", "domiciliary hospitalization", "crop failure"],
+      "forbidden_topics": ["marine", "health", "crop"],
+      "notes": "Multi-turn follow-up chain -- a distinct code path (history-aware reformulation) from a single-shot detailed query, untested by any case so far."
+    },
+    {
+      "id": "followup-personal-accident-elaborate-01",
+      "category": "known_contamination_repro",
+      "query": "What is personal accident insurance? -> Can you elaborate on all the details?",
+      "mode": "detailed",
+      "expected_topic": "personal_accident",
+      "forbidden_phrases": ["owner-driver", "own damage section", "driving record", "vehicle repairs"],
+      "forbidden_topics": ["motor"],
+      "notes": "Follow-up-chain variant of personal-accident-motor-rider-01/clean-personal-accident-repeat-01 -- same historically-worst-offending topic, via the history-aware reformulation path instead of a single-shot query."
+    },
+    {
+      "id": "enumerate-liability-types-01",
+      "category": "clean_control",
+      "query": "What are all the types of liability insurance?",
+      "mode": "detailed",
+      "expected_topic": "liability",
+      "forbidden_phrases": [],
+      "forbidden_topics": []
+    },
+    {
+      "id": "adjacent-travel-medical-01",
+      "category": "clean_control",
+      "query": "Does travel insurance cover medical emergencies abroad?",
+      "mode": "detailed",
+      "expected_topic": "travel",
+      "forbidden_phrases": ["domiciliary hospitalization", "pre-existing disease"],
+      "forbidden_topics": ["health"],
+      "must_allow_phrases": ["medical"],
+      "notes": "Deliberately adjacent to health insurance (travel medical cover) -- stress test for over-triggering on a legitimately health-adjacent travel query."
+    }
+  ]
+}
