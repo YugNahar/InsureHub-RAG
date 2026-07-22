@@ -332,16 +332,6 @@ header {
   border-bottom: 1px solid #FDE68A; font-size: 0.78rem; text-align: center; padding: 7px; z-index: 999; font-weight: 500;
 }
 
-/* ── Tunnel URL bar ── */
-#tunnel-bar {
-  position: fixed; bottom: 0; left: 0; right: 0; z-index: 990; background: var(--surface); border-top: 1px solid var(--border);
-  font-size: 0.71rem; color: var(--text-muted); padding: 6px 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-}
-#tunnel-bar a { color: var(--primary); text-decoration: none; }
-#tunnel-bar a:hover { text-decoration: underline; }
-#tunnel-copy-btn { cursor: pointer; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 5px; padding: 2px 8px; font-size: 0.69rem; }
-#tunnel-copy-btn:hover { background: var(--border); color: var(--text); }
-
 /* ── Handoff popup ── */
 .handoff-overlay {
   display: none; position: fixed; inset: 0; z-index: 1000; background: rgba(15, 23, 42, 0.5); backdrop-filter: blur(2px);
@@ -455,7 +445,6 @@ header {
   .conv-header { padding: 10px 14px; }
   .messages-area { padding: 14px; }
   .conv-actions .action-btn span.btn-label { display: none; }
-  #tunnel-bar { font-size: 0.66rem; padding: 5px 10px; }
 }
 @media (max-width: 520px) {
   .handoff-card { padding: 20px 18px 18px; }
@@ -471,14 +460,6 @@ header {
 
 <div id="reconnect-banner">⚠ Connection lost — reconnecting automatically…</div>
 <div id="agent-toast"></div>
-
-<!-- Tunnel URL bar (bottom) -->
-<div id="tunnel-bar">
-  <span>Tunnel:</span>
-  <a id="tunnel-link" href="#" target="_blank">detecting…</a>
-  <button id="tunnel-copy-btn" onclick="copyTunnelUrl()">copy</button>
-  <span style="margin-left:auto;color:var(--text-faint)">Chat: <a id="chat-link" href="/">Open Chat</a></span>
-</div>
 
 <!-- Handoff Request Popup -->
 <div class="handoff-overlay" id="handoff-overlay">
@@ -1497,30 +1478,6 @@ function fmtTime(ts) {
   return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 }
 
-// ── Tunnel URL bar ────────────────────────────────────────────────────────────
-let _lastTunnelUrl = null;
-function refreshTunnelUrl() {
-  fetch(`${getBackendUrl()}/tunnel-url`).then(r => r.json()).then(d => {
-    const url = d.url;
-    const link = document.getElementById('tunnel-link');
-    if (!url) { link.textContent = 'tunnel not running'; link.href = '#'; return; }
-    if (url !== _lastTunnelUrl) {
-      _lastTunnelUrl = url;
-      link.textContent = url.replace('https://', '');
-      link.href = url;
-    }
-  }).catch(() => {});
-}
-function copyTunnelUrl() {
-  if (!_lastTunnelUrl) return;
-  navigator.clipboard.writeText(_lastTunnelUrl + '/agent-dashboard').then(() => {
-    const btn = document.getElementById('tunnel-copy-btn');
-    btn.textContent = 'copied!';
-    setTimeout(() => btn.textContent = 'copy', 1500);
-  });
-}
-refreshTunnelUrl();
-setInterval(refreshTunnelUrl, 15000);
 </script>
 </body>
 </html>
