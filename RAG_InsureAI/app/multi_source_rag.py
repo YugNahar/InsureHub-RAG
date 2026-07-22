@@ -3981,6 +3981,14 @@ class MultiSourceRAG:
         _t_preprocess_ms = None
         _t_promptbuild_ms = None
         _t_postllm_ms = None
+        # Time-to-first-token — set once, on the first real generated token
+        # actually yielded to the client. Distinct from _t_llm_ms (which
+        # times the WHOLE generation call): this is what the user actually
+        # perceives as "how long until something starts appearing," i.e.
+        # preprocess+retrieval+grounding+promptbuild+(prefill) — the exact
+        # "dead air" the latency plan (plan_latency.md) Phase 2 targets,
+        # separate from total generation time (Phase 1's GPU-vLLM lever).
+        _t_ttft_ms = None
 
         retrieval_query = question
         filter_meta = None
@@ -5872,6 +5880,8 @@ class MultiSourceRAG:
                                     _choice = _json.loads(data)["choices"][0]
                                     token = _choice["delta"].get("content", "") or ""
                                     if token:
+                                        if _t_ttft_ms is None:
+                                            _t_ttft_ms = round((time.time() - _t_request_start) * 1000)
                                         _kv_reply += token
                                         yield token
                                     _fr = _choice.get("finish_reason")
@@ -6346,53 +6356,48 @@ class MultiSourceRAG:
                 logger.debug("[ask_stream] cross-topic contamination filter skipped: %s", _contam_exc)
 
         # ── Semantic per-point topic-relevance gate (Phase 2, plan.md) ─────────
-        # LOG-ONLY by default (POINT_RELEVANCE_GATE_ACTIVE unset) — see the
-        # false-positive finding below before ever flipping this on.
+        # LOG-ONLY by default (POINT_RELEVANCE_GATE_ACTIVE unset) — this is
+        # the SECOND design, after the first (ratio-to-max) was confirmed
+        # live to gut legitimate answers. See git history / memory
+        # project_point_relevance_ratio_to_max_unsafe.md for that failure;
+        # this design specifically fixes the root cause it exposed.
         #
         # The two filters above only catch what they were built to catch: a
         # point ungrounded in the retrieved text, or one naming a small,
         # hardcoded list of type-giveaway jargon. Neither asks the one
         # question that actually generalizes: "is this point about what the
-        # user asked?" This gate was meant to, via the same shared cross-
-        # encoder reranker already resident in-process
-        # (_score_points_against_query, already built for the Phase-0 trace
-        # below — this is what "once enabled" in that function's docstring
-        # refers to).
+        # user asked?" This gate does, via the shared cross-encoder
+        # reranker already resident in-process (_score_points_against_query).
         #
-        # CONFIRMED LIVE FALSE POSITIVE on the very first real request
-        # (2026-07-22, "Explain personal accident insurance in detail"):
-        # after the cross-topic filter correctly removed the ONE genuinely
-        # contaminated point ("driving record"), this gate's first
-        # calibration (ratio-to-MAX = 0.15, absolute floor 0.05) went on to
-        # drop 5 of the remaining 7 points — every one of them a legitimate,
-        # correctly-grounded disclosure factor (age/height/weight/
-        # occupation, substance abuse, prior losses, ...) — leaving a
-        # gutted 2-point answer. Root cause: one point (0.9739) happened to
-        # closely restate the query's own framing and scored far above
-        # everything else; anchoring the relative bar to that single MAX
-        # made every other point look like a "relative outlier" by
-        # comparison, even though a cross-encoder naturally scores a
-        # narrow, specific, 100%-correct disclosure item LOW against a
-        # broad "explain X in detail" query — that low score reflects
-        # topical narrowness, not contamination. Ratio-to-max is fragile to
-        # exactly this shape (one confident point + many legitimately-
-        # narrower ones), which is common, not an edge case. Median-
-        # anchoring was considered and rejected too: it makes the bar so
-        # low that it stops separating anything (the one CONFIRMED real
-        # contaminated case's own scores, 0.047 and 0.006, sit in the same
-        # range as several of ITS legitimate siblings).
+        # ISOLATION/GAP design, not ratio-to-max. Anchoring to the single
+        # highest-scoring point (the first attempt) is fragile whenever one
+        # point closely echoes the query and scores far above the rest —
+        # every other point then looks like an outlier by comparison, even
+        # fully legitimate ones (a cross-encoder naturally scores a narrow,
+        # correct, specific point LOW against a broad "explain X in detail"
+        # query — that reflects topical narrowness, not contamination).
         #
-        # Given the plan's own hard requirement — "on the clean-control
-        # set, ZERO legitimate points dropped" — and this immediate,
-        # unambiguous counter-example, this gate is not safe to auto-drop
-        # with on the data available. It now only SCORES and LOGS what it
-        # WOULD drop (candidate data for a future, better-calibrated
-        # statistic — e.g. a genuine isolation/gap test rather than a
-        # single-anchor ratio), gated fully inert unless
-        # POINT_RELEVANCE_GATE_ACTIVE=1 is explicitly set, so it can never
-        # rewrite an answer until a real calibration pass justifies it.
-        _POINT_RELATIVE_RATIO = 0.15
-        _POINT_ABSOLUTE_FLOOR = 0.05
+        # Instead: sort this answer's own point scores, find the single
+        # largest consecutive-ratio jump, and treat everything below that
+        # jump as a candidate drop ONLY IF that low group is a genuine
+        # MINORITY of the points (a real contaminated point is rare among
+        # an otherwise-good answer, not most of it) AND the jump itself is
+        # a real cliff, not gradual variation. Validated against the two
+        # concrete cases already on hand: the confirmed real contamination
+        # (7 points, scores 0.0001-0.538) has its largest gap (57.8x)
+        # isolate just 1 of 7 points (14%) — a minority, correctly
+        # droppable. The confirmed false positive (8 points, scores
+        # 0.0018-0.9634) has its largest gap (19.27x) isolate 6 of 8 points
+        # (75%) — a MAJORITY — correctly rejected by the minority
+        # constraint alone, even though the raw gap ratio is comparably
+        # large in both cases. The minority constraint, not the gap size,
+        # is what separates the two — gap size alone is not sufficient.
+        #
+        # Still log-only pending broader validation across the full corpus
+        # before ever setting POINT_RELEVANCE_GATE_ACTIVE=1.
+        _POINT_MIN_GAP_RATIO = 5.0
+        _POINT_MAX_MINORITY_FRACTION = 0.4
+        _POINT_ISOLATED_ABS_CEILING = 0.15
         _POINT_GATE_ACTIVE = os.getenv("POINT_RELEVANCE_GATE_ACTIVE", "").strip().lower() in ("1", "true", "yes")
         if _keyword_detailed:
             try:
@@ -6400,32 +6405,49 @@ class MultiSourceRAG:
                 _rel_opener, _rel_points, _rel_closer = _split_numbered_points(_relevance_src)
                 if not _trace_original_points:
                     _trace_original_points = list(_rel_points)
-                # Need at least 3 points for "relative to the cohort" to mean
-                # anything — with 2, dropping one just leaves a single
-                # point, which the "never drop the last surviving point"
-                # rule already treats as a no-op scenario, and with 1 there
-                # is no cohort to compare against at all.
+                # Need at least 3 points: with a minority fraction of 0.4,
+                # anything smaller can never isolate a non-empty minority
+                # group in the first place.
                 if len(_rel_points) >= 3:
                     _rel_scores = _score_points_against_query(retrieval_query, _rel_points)
                     if _rel_scores and len(_rel_scores) == len(_rel_points):
-                        _top_score = max(_rel_scores)
-                        _relative_bar = _top_score * _POINT_RELATIVE_RATIO
-                        _kept_rel_points = [
-                            p for p, s in zip(_rel_points, _rel_scores)
-                            if not (s < _relative_bar and s < _POINT_ABSOLUTE_FLOOR)
-                        ]
-                        _would_drop = len(_rel_points) - len(_kept_rel_points)
-                        if _would_drop:
+                        _n_points = len(_rel_points)
+                        # Sort INDICES by score (not the point strings
+                        # themselves) — unambiguous even if two points
+                        # happen to share identical text.
+                        _rank_order = sorted(range(_n_points), key=lambda i: _rel_scores[i])
+                        _max_minority_size = int(_n_points * _POINT_MAX_MINORITY_FRACTION)
+                        # Find the largest consecutive-ratio gap, but only
+                        # among split points that would leave the LOW side a
+                        # minority — a huge gap that splits off a majority
+                        # (the false-positive shape) is never even a
+                        # candidate, not just rejected after the fact.
+                        _best_ratio, _split_at = 0.0, -1
+                        for i in range(min(_max_minority_size, _n_points - 1)):
+                            _cur = max(_rel_scores[_rank_order[i]], 1e-6)
+                            _nxt = _rel_scores[_rank_order[i + 1]]
+                            _ratio = _nxt / _cur
+                            if _ratio > _best_ratio:
+                                _best_ratio, _split_at = _ratio, i
+                        _isolated_idx = _rank_order[:_split_at + 1] if _split_at >= 0 else []
+                        _drop_idx = [i for i in _isolated_idx if _rel_scores[i] <= _POINT_ISOLATED_ABS_CEILING]
+                        if (
+                            _drop_idx
+                            and len(_drop_idx) == len(_isolated_idx)
+                            and _best_ratio >= _POINT_MIN_GAP_RATIO
+                        ):
+                            _drop_set = set(_drop_idx)
+                            _kept_rel_points = [p for i, p in enumerate(_rel_points) if i not in _drop_set]
                             logger.info(
-                                "[ask_stream] point-relevance gate CANDIDATE drop=%d active=%s "
-                                "(scores=%s, top=%.4f, bar=%.4f)",
-                                _would_drop, _POINT_GATE_ACTIVE,
-                                [round(s, 4) for s in _rel_scores], _top_score, _relative_bar,
+                                "[ask_stream] point-relevance gate CANDIDATE drop=%d/%d active=%s "
+                                "(gap=%.2fx, sorted_scores=%s)",
+                                len(_drop_idx), _n_points, _POINT_GATE_ACTIVE,
+                                _best_ratio, [round(_rel_scores[i], 4) for i in _rank_order],
                             )
-                        if _POINT_GATE_ACTIVE and _kept_rel_points and _would_drop:
-                            _rebuilt5 = _rebuild_from_points(_rel_opener, _kept_rel_points, _rel_closer)
-                            _corrected_text = _rebuilt5
-                            _kv_reply = _rebuilt5
+                            if _POINT_GATE_ACTIVE and _kept_rel_points:
+                                _rebuilt5 = _rebuild_from_points(_rel_opener, _kept_rel_points, _rel_closer)
+                                _corrected_text = _rebuilt5
+                                _kv_reply = _rebuilt5
             except Exception as _rel_exc:
                 logger.debug("[ask_stream] point-relevance gate skipped: %s", _rel_exc)
 
@@ -7782,6 +7804,12 @@ class MultiSourceRAG:
         # buffered path; the live-streaming path already yielded tokens as
         # they arrived and must NOT hit this yield.
         if not streamed_ok:
+            # Buffered path never streams tokens as they're generated, so
+            # TTFT here just is total time to this point — still worth
+            # recording (None would misleadingly suggest it was never
+            # measured) rather than leaving it unset for these requests.
+            if _t_ttft_ms is None:
+                _t_ttft_ms = round((time.time() - _t_request_start) * 1000)
             yield (_corrected_text or _reply_stripped)
 
         # ── KV cache write ────────────────────────────────────────────────────
@@ -7831,9 +7859,10 @@ class MultiSourceRAG:
             v for v in (_t_retrieval_ms, _t_grounding_ms, _t_llm_ms) if v is not None
         )
         logger.info(
-            "[ask_stream] TIMING total=%dms retrieval=%s grounding=%s llm=%s other=%dms "
+            "[ask_stream] TIMING total=%dms ttft=%s retrieval=%s grounding=%s llm=%s other=%dms "
             "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r",
             _t_total_ms,
+            f"{_t_ttft_ms}ms" if _t_ttft_ms is not None else "n/a",
             f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
             f"{_t_grounding_ms}ms" if _t_grounding_ms is not None else "n/a",
             f"{_t_llm_ms}ms" if _t_llm_ms is not None else "n/a",
