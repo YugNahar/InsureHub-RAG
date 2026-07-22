@@ -56,11 +56,44 @@ else
   echo "==> .env already exists on server, leaving it untouched."
 fi
 
-echo "==> Building and starting the backend..."
+# ── GPU detection ──────────────────────────────────────────────────────
+# docker-compose.gpu.yml rebuilds torch against a CUDA wheel and reserves
+# an NVIDIA device, but nothing in the deploy path referenced it — so a
+# GPU host silently deployed the CPU image. That failure is invisible at
+# runtime: torch.cuda.is_available() just returns False and every model
+# quietly stays on CPU, so the deploy "succeeds" and buys nothing. This
+# block exists to make that outcome impossible to get by accident.
+#
+# Override with FORCE_GPU=1 (skip probing, assume GPU) or FORCE_CPU=1.
+COMPOSE_FILES=(-f docker-compose.yml)
+GPU_MODE="cpu"
+
+if [ "${FORCE_CPU:-}" = "1" ]; then
+  echo "==> FORCE_CPU=1 — building CPU image."
+elif [ "${FORCE_GPU:-}" = "1" ]; then
+  COMPOSE_FILES+=(-f docker-compose.gpu.yml); GPU_MODE="cuda"
+  echo "==> FORCE_GPU=1 — building CUDA image without probing."
+elif command -v nvidia-smi &>/dev/null; then
+  echo "==> NVIDIA GPU found on host — checking Docker can actually reach it..."
+  # Host nvidia-smi working does NOT imply containers can use the GPU;
+  # that needs nvidia-container-toolkit. Probe the real thing.
+  if docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi &>/dev/null; then
+    COMPOSE_FILES+=(-f docker-compose.gpu.yml); GPU_MODE="cuda"
+    echo "    ✓ Docker has GPU access — building CUDA image."
+  else
+    echo "    ✗ nvidia-smi works on the host but Docker cannot reach the GPU."
+    echo "      Install nvidia-container-toolkit and re-run to get GPU acceleration."
+    echo "      Falling back to the CPU image."
+  fi
+else
+  echo "==> No NVIDIA GPU detected — building CPU image."
+fi
+
+echo "==> Building and starting the backend (${GPU_MODE})..."
 cd "$COMPOSE_DIR"
 docker compose pull --ignore-pull-failures 2>/dev/null || true
-docker compose build api
-docker compose up -d api
+docker compose "${COMPOSE_FILES[@]}" build api
+docker compose "${COMPOSE_FILES[@]}" up -d api
 
 echo "==> Waiting for the API to become healthy..."
 for i in $(seq 1 20); do
@@ -73,6 +106,27 @@ done
 echo ""
 echo "==> Checking the API..."
 curl -sf http://localhost:8501/health && echo " ✓ API is up!" || echo " ✗ API health check failed — check: docker logs insurehub_api"
+
+# ── Phase 1a exit criterion (plan_latency.md): device=cuda observed ─────
+# The models log their resolved device on load. Assert it matches what we
+# built for, so a GPU deploy that silently fell back to CPU is reported
+# loudly here instead of being discovered later as "the GPU changed nothing".
+echo ""
+echo "==> Verifying model device..."
+DEVICE_LINE=$(docker logs insurehub_api 2>&1 | grep -m1 "SharedModels.*device=" || true)
+if [ -z "$DEVICE_LINE" ]; then
+  echo "    ? No model-load line yet (models load lazily on first query)."
+  echo "      Check later with: docker logs insurehub_api 2>&1 | grep 'SharedModels'"
+elif echo "$DEVICE_LINE" | grep -q "device=cuda"; then
+  echo "    ✓ Models are on the GPU: $DEVICE_LINE"
+elif [ "$GPU_MODE" = "cuda" ]; then
+  echo "    ✗ BUILT FOR GPU BUT RUNNING ON CPU — this deploy bought nothing."
+  echo "      $DEVICE_LINE"
+  echo "      torch.cuda.is_available() is False inside the container. Check that"
+  echo "      nvidia-container-toolkit is installed and the daemon was restarted."
+else
+  echo "    ✓ CPU build, models on CPU (expected): $DEVICE_LINE"
+fi
 
 echo ""
 echo "================================================================"
@@ -89,17 +143,21 @@ echo "================================================================"
 
 echo ""
 echo "==> Setting up auto-restart on server reboot..."
-# Create a systemd service so the container restarts if the server reboots
+# Create a systemd service so the container restarts if the server reboots.
+# It must carry the SAME compose file list chosen above — otherwise a GPU
+# host comes back on the CPU config after any reboot, silently undoing the
+# deploy with no error anywhere.
+COMPOSE_ARGS="${COMPOSE_FILES[*]}"
 sudo tee /etc/systemd/system/insurehub.service > /dev/null <<UNIT
 [Unit]
-Description=InsureHub RAG Backend
+Description=InsureHub RAG Backend ($GPU_MODE)
 After=docker.service
 Requires=docker.service
 
 [Service]
 WorkingDirectory=$COMPOSE_DIR
-ExecStart=/usr/bin/docker compose up api
-ExecStop=/usr/bin/docker compose stop api
+ExecStart=/usr/bin/docker compose $COMPOSE_ARGS up api
+ExecStop=/usr/bin/docker compose $COMPOSE_ARGS stop api
 Restart=always
 RestartSec=10
 

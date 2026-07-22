@@ -47,13 +47,19 @@ _default_model: Any = None
 def _get_default_embed_model() -> Any:
     global _default_model
     if _default_model is None:
-        from sentence_transformers import SentenceTransformer
         logger.warning(
-            "[SemanticChunker] No embed_model passed — lazy-loading '%s'. "
-            "Pass the shared TurboVec embed_model to avoid a duplicate copy in memory.",
+            "[SemanticChunker] No embed_model passed — falling back to the shared "
+            "TurboVec model for '%s'. Pass embed_model explicitly to avoid this path.",
             EMBED_MODEL_NAME,
         )
-        _default_model = SentenceTransformer(EMBED_MODEL_NAME)
+        # Go through TurboVec's shared getter rather than constructing our
+        # own SentenceTransformer. Building one directly bypassed both the
+        # process-wide cache (a second full copy of the model in memory,
+        # which the warning above already complained about) AND the device
+        # resolution — no device= argument means it always lands on CPU,
+        # even on a GPU host where every other model load is on cuda.
+        from turbovec_store import _get_shared_embed_model
+        _default_model = _get_shared_embed_model(EMBED_MODEL_NAME)
     return _default_model
 
 
