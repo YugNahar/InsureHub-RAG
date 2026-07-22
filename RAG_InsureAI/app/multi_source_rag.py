@@ -5488,7 +5488,21 @@ class MultiSourceRAG:
                 page = chunk.metadata.get("page", "?")
                 label = f"Document: {src} (Page {page})"
                 sources.append(f"{src} (page {page})")
-            context_parts.append(f"[{label}]\n{chunk.page_content}")
+            # Phase 1 (contamination plan): generation used to see the
+            # chunk's ENTIRE page_content, so a mixed "general"-tagged
+            # chunk's off-topic sentence (e.g. a marine example embedded in
+            # a motor-underwriting chunk) sat right there in the prompt and
+            # the model dutifully turned it into its own point. Windowing
+            # to the query-relevant excerpt(s) — the exact mechanism
+            # _build_grounding_context already uses for the grounding check
+            # — removes that sentence from what generation ever sees,
+            # without excluding the chunk itself (its on-topic window still
+            # contributes). _rerank_windows already returns the full text
+            # unchanged for a chunk short enough that windowing wouldn't
+            # help (<=700 chars, see its own docstring) — no separate
+            # degenerate-chunk special-case needed here.
+            _gen_windows = _rerank_windows(chunk.page_content, retrieval_query)
+            context_parts.append(f"[{label}]\n" + "\n".join(_gen_windows))
 
         full_context = "\n\n".join(context_parts)
 
