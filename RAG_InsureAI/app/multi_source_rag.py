@@ -6345,6 +6345,90 @@ class MultiSourceRAG:
             except Exception as _contam_exc:
                 logger.debug("[ask_stream] cross-topic contamination filter skipped: %s", _contam_exc)
 
+        # ── Semantic per-point topic-relevance gate (Phase 2, plan.md) ─────────
+        # LOG-ONLY by default (POINT_RELEVANCE_GATE_ACTIVE unset) — see the
+        # false-positive finding below before ever flipping this on.
+        #
+        # The two filters above only catch what they were built to catch: a
+        # point ungrounded in the retrieved text, or one naming a small,
+        # hardcoded list of type-giveaway jargon. Neither asks the one
+        # question that actually generalizes: "is this point about what the
+        # user asked?" This gate was meant to, via the same shared cross-
+        # encoder reranker already resident in-process
+        # (_score_points_against_query, already built for the Phase-0 trace
+        # below — this is what "once enabled" in that function's docstring
+        # refers to).
+        #
+        # CONFIRMED LIVE FALSE POSITIVE on the very first real request
+        # (2026-07-22, "Explain personal accident insurance in detail"):
+        # after the cross-topic filter correctly removed the ONE genuinely
+        # contaminated point ("driving record"), this gate's first
+        # calibration (ratio-to-MAX = 0.15, absolute floor 0.05) went on to
+        # drop 5 of the remaining 7 points — every one of them a legitimate,
+        # correctly-grounded disclosure factor (age/height/weight/
+        # occupation, substance abuse, prior losses, ...) — leaving a
+        # gutted 2-point answer. Root cause: one point (0.9739) happened to
+        # closely restate the query's own framing and scored far above
+        # everything else; anchoring the relative bar to that single MAX
+        # made every other point look like a "relative outlier" by
+        # comparison, even though a cross-encoder naturally scores a
+        # narrow, specific, 100%-correct disclosure item LOW against a
+        # broad "explain X in detail" query — that low score reflects
+        # topical narrowness, not contamination. Ratio-to-max is fragile to
+        # exactly this shape (one confident point + many legitimately-
+        # narrower ones), which is common, not an edge case. Median-
+        # anchoring was considered and rejected too: it makes the bar so
+        # low that it stops separating anything (the one CONFIRMED real
+        # contaminated case's own scores, 0.047 and 0.006, sit in the same
+        # range as several of ITS legitimate siblings).
+        #
+        # Given the plan's own hard requirement — "on the clean-control
+        # set, ZERO legitimate points dropped" — and this immediate,
+        # unambiguous counter-example, this gate is not safe to auto-drop
+        # with on the data available. It now only SCORES and LOGS what it
+        # WOULD drop (candidate data for a future, better-calibrated
+        # statistic — e.g. a genuine isolation/gap test rather than a
+        # single-anchor ratio), gated fully inert unless
+        # POINT_RELEVANCE_GATE_ACTIVE=1 is explicitly set, so it can never
+        # rewrite an answer until a real calibration pass justifies it.
+        _POINT_RELATIVE_RATIO = 0.15
+        _POINT_ABSOLUTE_FLOOR = 0.05
+        _POINT_GATE_ACTIVE = os.getenv("POINT_RELEVANCE_GATE_ACTIVE", "").strip().lower() in ("1", "true", "yes")
+        if _keyword_detailed:
+            try:
+                _relevance_src = (_corrected_text or _reply_stripped).strip()
+                _rel_opener, _rel_points, _rel_closer = _split_numbered_points(_relevance_src)
+                if not _trace_original_points:
+                    _trace_original_points = list(_rel_points)
+                # Need at least 3 points for "relative to the cohort" to mean
+                # anything — with 2, dropping one just leaves a single
+                # point, which the "never drop the last surviving point"
+                # rule already treats as a no-op scenario, and with 1 there
+                # is no cohort to compare against at all.
+                if len(_rel_points) >= 3:
+                    _rel_scores = _score_points_against_query(retrieval_query, _rel_points)
+                    if _rel_scores and len(_rel_scores) == len(_rel_points):
+                        _top_score = max(_rel_scores)
+                        _relative_bar = _top_score * _POINT_RELATIVE_RATIO
+                        _kept_rel_points = [
+                            p for p, s in zip(_rel_points, _rel_scores)
+                            if not (s < _relative_bar and s < _POINT_ABSOLUTE_FLOOR)
+                        ]
+                        _would_drop = len(_rel_points) - len(_kept_rel_points)
+                        if _would_drop:
+                            logger.info(
+                                "[ask_stream] point-relevance gate CANDIDATE drop=%d active=%s "
+                                "(scores=%s, top=%.4f, bar=%.4f)",
+                                _would_drop, _POINT_GATE_ACTIVE,
+                                [round(s, 4) for s in _rel_scores], _top_score, _relative_bar,
+                            )
+                        if _POINT_GATE_ACTIVE and _kept_rel_points and _would_drop:
+                            _rebuilt5 = _rebuild_from_points(_rel_opener, _kept_rel_points, _rel_closer)
+                            _corrected_text = _rebuilt5
+                            _kv_reply = _rebuilt5
+            except Exception as _rel_exc:
+                logger.debug("[ask_stream] point-relevance gate skipped: %s", _rel_exc)
+
         # ── Contamination trace (Phase 0, plan.md) ─────────────────────────────
         # Opt-in via CONTAMINATION_TRACE=1. Logs the FINAL surviving points
         # (after both filters above have already run) with a per-point
