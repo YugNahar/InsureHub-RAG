@@ -83,6 +83,42 @@ const API = {
     }
   },
 
+  // ws:// or wss:// mirroring the page's own protocol — same-origin as
+  // /ask-stream, just a different scheme for the persistent connection.
+  wsUrl() {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const base = this.baseUrl || `${window.location.protocol}//${window.location.host}`;
+    return base.replace(/^http/, proto.replace(':', ''));
+  },
+
+  // Polling fallback for human-agent messages — used alongside the
+  // WebSocket (which only carries out-of-band signals; this call owns
+  // actual message delivery, see the polling loop below for why).
+  async pollSession(sessionId, after) {
+    if (MOCK_MODE) return null;
+    try {
+      const res = await fetch(`${this.baseUrl}/session/${sessionId}/poll?after=${after}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  },
+
+  async requestHandoff(sessionId) {
+    if (MOCK_MODE) return;
+    try {
+      await fetch(`${this.baseUrl}/session/${sessionId}/request-handoff`, { method: 'POST' });
+    } catch { /* best-effort HTTP fallback when WS is down */ }
+  },
+
+  async cancelHandoff(sessionId) {
+    if (MOCK_MODE) return;
+    try {
+      await fetch(`${this.baseUrl}/session/${sessionId}/cancel-handoff`, { method: 'POST' });
+    } catch { /* best-effort HTTP fallback when WS is down */ }
+  },
+
   // Async generator yielding { type: 'chunk', text } | { type: 'done', ... }.
   async *streamAsk(query, sessionId, signal) {
     if (MOCK_MODE) {
@@ -264,6 +300,15 @@ const el = {
 let userScrolledAway = false;
 let activeAbortController = null;
 
+// Human-agent handoff state — not persisted to localStorage; re-derived
+// from the server on every poll tick / page load, since the backend is
+// the source of truth for whether an agent is actually connected.
+let chatMode = 'ai'; // 'ai' | 'waiting' | 'human'
+let agentName = null;
+let pollSeen = 0;
+let ws = null;
+let pollIntervalId = null;
+
 /* =========================================================================
    7. RENDERING — thread
    ========================================================================= */
@@ -324,23 +369,35 @@ function buildMessageEl(m) {
   const avatar = document.createElement('div');
   avatar.className = 'msg__avatar';
   avatar.setAttribute('aria-hidden', 'true');
-  avatar.textContent = m.role === 'user' ? 'You' : 'L';
+  avatar.textContent = m.role === 'user' ? 'You' : m.role === 'agent' ? (m.agentName || 'A')[0].toUpperCase() : 'L';
 
   const col = document.createElement('div');
   col.className = 'msg__col';
 
-  const meta = document.createElement('div');
-  meta.className = 'msg__meta';
-  meta.textContent = formatTime(m.timestamp);
-
   const bubble = document.createElement('div');
   bubble.className = 'msg__bubble';
-  bubble.innerHTML = m.role === 'assistant'
+  bubble.innerHTML = (m.role === 'assistant' || m.role === 'agent')
     ? renderMarkdown(m.content)
     : escapeHtml(m.content);
 
-  col.appendChild(meta);
-  col.appendChild(bubble);
+  if (m.role === 'system') {
+    // Centered notice pill (handoff transitions) — no timestamp, no avatar.
+    col.appendChild(bubble);
+  } else {
+    const meta = document.createElement('div');
+    meta.className = 'msg__meta';
+    meta.textContent = m.role === 'agent' && m.agentName
+      ? `${m.agentName} · ${formatTime(m.timestamp)}`
+      : formatTime(m.timestamp);
+    if (m.role === 'agent' && m.answersQuestion) {
+      const answersLine = document.createElement('span');
+      answersLine.className = 'msg__meta--answers';
+      answersLine.textContent = `Replying to: "${m.answersQuestion}"`;
+      meta.appendChild(answersLine);
+    }
+    col.appendChild(meta);
+    col.appendChild(bubble);
+  }
 
   if (m.role === 'assistant' && m.content) {
     col.appendChild(buildMessageControls(m));
@@ -447,6 +504,15 @@ async function sendMessage(text) {
   el.composerInput.value = '';
   autoResizeTextarea();
   renderThread();
+  saveState();
+
+  // In human mode, a live agent is handling this conversation — send
+  // straight over the WebSocket instead of /ask-stream. The agent's reply
+  // comes back through the polling loop (see section 8b), not here.
+  if (chatMode === 'human' && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'message', content: value }));
+    return;
+  }
 
   const assistantMsg = msg('assistant', '', Date.now());
   state.messages.push(assistantMsg);
@@ -482,6 +548,7 @@ async function streamInto(assistantMsg, queryText) {
         if (!userScrolledAway) scrollToBottom();
       } else if (evt.type === 'done') {
         if (evt.correctedText) raw = evt.correctedText;
+        if (evt.needsHuman) requestHandoff();
         if (evt.offlineEscalated) {
           state.messages.push(msg(
             'assistant',
@@ -541,6 +608,154 @@ function renderErrorInto(assistantMsg, queryText, err) {
 function setComposerLoading(loading) {
   el.sendBtn.classList.toggle('is-loading', loading);
   el.sendBtn.disabled = loading;
+}
+
+/* =========================================================================
+   8b. HUMAN AGENT HANDOFF
+   Mirrors the proven React client's architecture (frontend/src/App.tsx):
+   a WebSocket carries out-of-band signals only (agent_joined,
+   handoff_timeout, etc.) while a 1s polling loop owns actual message
+   delivery. Confirmed live this frontend previously had NEITHER — an
+   agent's reply was visible in the agent dashboard (backend-side) but had
+   no delivery path to the user's browser at all.
+   ========================================================================= */
+
+function connectAgentChannel() {
+  if (state.sessionId == null || MOCK_MODE) return;
+
+  // Sync pollSeen to the backend's current total BEFORE opening the
+  // interval, so a returning visitor doesn't replay messages already
+  // shown from localStorage.
+  API.pollSession(state.sessionId, 0).then((data) => {
+    if (data && typeof data.total === 'number') pollSeen = data.total;
+  }).finally(() => {
+    openAgentSocket();
+    startPolling();
+  });
+}
+
+function openAgentSocket() {
+  try {
+    const socket = new WebSocket(`${API.wsUrl()}/ws/user/${state.sessionId}`);
+    ws = socket;
+    socket.onmessage = handleWsMessage;
+    socket.onclose = () => {
+      if (ws === socket) ws = null;
+      // Reconnect once after 3s so the backend can deliver anything it
+      // buffered while we were disconnected (session.pending_ws_message).
+      setTimeout(() => {
+        if (!ws && state.sessionId) openAgentSocket();
+      }, 3000);
+    };
+  } catch {
+    // WebSocket unavailable entirely (e.g. blocked by a host page's CSP) —
+    // polling alone still delivers messages and status transitions.
+  }
+}
+
+function startPolling() {
+  if (pollIntervalId) return;
+  pollIntervalId = setInterval(async () => {
+    const data = await API.pollSession(state.sessionId, pollSeen);
+    if (data) applyPollResult(data);
+  }, 1000);
+}
+
+function applyPollResult(data) {
+  // Sync chatMode with server status — the source of truth.
+  if (data.status === 'human' && chatMode !== 'human') {
+    chatMode = 'human';
+    agentName = data.agent_name || 'Agent';
+    pushSystemMessage(`You're now connected with ${agentName}. They can see your conversation and will help you directly.`);
+  }
+  if (data.status === 'waiting' && chatMode === 'ai') {
+    chatMode = 'waiting';
+  }
+  if (data.status === 'ai' && chatMode !== 'ai') {
+    const wasWaiting = chatMode === 'waiting';
+    chatMode = 'ai';
+    agentName = null;
+    if (wasWaiting) {
+      pushSystemMessage('No agents are available right now. Your question has been emailed to our support team — someone will reach out to you soon.');
+    }
+  }
+
+  let delivered = false;
+  for (const m of data.messages || []) {
+    if (m.role === 'agent') {
+      state.messages.push({
+        ...msg('agent', m.content, Date.parse(m.timestamp) || Date.now()),
+        agentName: data.agent_name || 'Agent',
+        answersQuestion: m.answers_question || null,
+      });
+      delivered = true;
+    }
+  }
+  if (delivered) {
+    renderThread();
+    if (!userScrolledAway) scrollToBottom();
+    saveState();
+  }
+  if (typeof data.total === 'number') pollSeen = data.total;
+}
+
+function pushSystemMessage(text) {
+  state.messages.push(msg('system', text, Date.now()));
+  renderThread();
+  if (!userScrolledAway) scrollToBottom();
+  saveState();
+}
+
+function handleWsMessage(ev) {
+  let payload;
+  try { payload = JSON.parse(ev.data); } catch { return; }
+  // agent_message is intentionally NOT handled here — polling owns
+  // message delivery (see this section's header comment) so the same
+  // reply can never be shown twice.
+  if (payload.type === 'agent_joined') {
+    if (chatMode !== 'human') {
+      chatMode = 'human';
+      agentName = payload.agent_name;
+      pushSystemMessage(`You're now connected with ${agentName}. They can see your conversation and will help you directly.`);
+    }
+  } else if (payload.type === 'agent_left') {
+    chatMode = 'ai';
+    agentName = null;
+    pushSystemMessage(payload.message || "You're back with Layla.");
+  } else if (payload.type === 'waiting') {
+    pushSystemMessage(payload.message);
+  } else if (payload.type === 'handoff_timeout') {
+    chatMode = 'ai';
+    agentName = null;
+    pushSystemMessage(payload.message || 'No agents available. Our team has been notified by email.');
+  }
+}
+
+function requestHandoff() {
+  // Guard: only trigger once per AI session — don't re-trigger if already
+  // waiting for an agent or already in a live human session.
+  if (chatMode !== 'ai') return;
+  chatMode = 'waiting';
+  pushSystemMessage("I'm finding a human agent who can help you better. One moment…");
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'request_handoff' }));
+  } else {
+    API.requestHandoff(state.sessionId);
+  }
+}
+
+function cancelHandoff() {
+  if (chatMode !== 'waiting') return;
+  chatMode = 'ai';
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    // WS reply (type: "handoff_timeout") delivers the confirmation message.
+    ws.send(JSON.stringify({ type: 'cancel_handoff' }));
+  } else {
+    // No WS to deliver the server's reply — push the confirmation locally
+    // so Cancel doesn't look unresponsive while the next poll tick catches up.
+    API.cancelHandoff(state.sessionId);
+    pushSystemMessage("No problem! I've sent your question to our support team — someone will follow up with you soon. You can keep chatting with me in the meantime! 😊");
+  }
 }
 
 /* =========================================================================
@@ -646,6 +861,7 @@ function init() {
   autoResizeTextarea();
   wireEvents();
   refreshStatus();
+  connectAgentChannel();
 
   setInterval(refreshStatus, 30000);
 }
