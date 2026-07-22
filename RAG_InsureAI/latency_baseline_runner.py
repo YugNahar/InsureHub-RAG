@@ -12,16 +12,37 @@ Phase 4 asks for, so it can be re-run on the GPU server once deployed
 there without rewriting anything.
 
 Design notes:
-  * Each query is sent TWICE and only the SECOND run is reported as the
-    baseline data point ("warm") — the first run is discarded but still
-    printed for reference. This warms the context-compressor's per-chunk
-    sentence-embedding cache (context_compressor.py's _sent_cache, keyed
-    by chunk TEXT not by query) without needing DISABLE_QUERY_CACHE=1 to
-    ALSO warm the model-weight/OS caches. Requires DISABLE_QUERY_CACHE=1
-    in the container's env, or the second run just hits the exact-match
-    KV cache and returns near-instantly — that's a different, degenerate
-    code path, not what "warm" means here. This script checks for that
-    env var and warns loudly if it isn't set.
+  * Each query gets ONE discarded warm-up request followed by REPEATS
+    measured ones, and the reported number is the MEDIAN of the measured
+    set (min-max spread is printed alongside and stored in the JSON).
+    The warm-up is what the plan's "run twice, take the 2nd" asks for:
+    it fills the context-compressor's per-chunk sentence-embedding cache
+    (context_compressor.py's _sent_cache, keyed by chunk TEXT not by
+    query) for this query's chunks. Requires DISABLE_QUERY_CACHE=1 in
+    the container's env, or every repeat after the first just hits the
+    exact-match KV cache and returns near-instantly — a different,
+    degenerate code path. This script checks and warns loudly if unset.
+  * Repeats exist because a single sample is not a measurement here.
+    The generation backend is a REMOTE, shared vLLM host (VLLM_HOST),
+    so "idle backend" cannot be enforced from this side. Two runs of
+    this script with zero code change between them produced a 3.6x
+    swing on one case (brief_1 total 55.3s then 15.2s). Phase 4 wants
+    to attribute a before/after delta to a code change; with n=1 an
+    outlier is indistinguishable from a real regression.
+  * There is deliberately NO cold/warm split. It was tried and measured
+    nothing: _purge_kv_cache() clears query_kv_cache.json only, while
+    the compressor's in-process _sent_cache — the thing "warm" was
+    supposed to warm — is never reset between passes, cases, or runs
+    (logs show it accumulating monotonically and surviving across
+    runs), so the "cold" pass was already warm. Retrieval time moved
+    -8/-15/+8/-4/-6/+1 percent cold->warm across the six cases: noise.
+    The doubled runtime now buys repeats instead.
+  * Answer length is recorded per run. Phase 3 of the plan is output-
+    length/prompt shaping, whose exit criterion is "tighter/complete,
+    total unchanged-or-better" — unmeasurable without it. It also
+    de-confounds llm=: at the remote host's ~7-8 tok/s a 512-token cap
+    is ~64s, so "the system got slower" and "the model wrote more" look
+    identical in the timing alone.
   * TIMING lines (including ttft=) are read back from `docker logs`
     right after each request completes. Matched on the log line's
     question=%r field, NOT query=%r (which is retrieval_query — rewritten
@@ -29,10 +50,10 @@ Design notes:
     silently produced zero matches for the follow-up case). question= is
     the raw, rarely-reassigned input text and was added to the TIMING
     line specifically so this harness has a stable match target.
-  * A FRESH session_id is used for every (case, pass) — cold and warm
-    are two independent conversations, not two turns of the same one, so
-    a multi-turn case's warm pass starts from a clean slate exactly like
-    its cold pass did, not with the cold pass's history still attached.
+  * A FRESH session_id is used for every single pass (warm-up and each
+    repeat) — every pass is an independent conversation, so a multi-turn
+    case's later repeats start from a clean slate exactly like its first
+    did rather than accumulating the previous passes' history.
   * Follow-up queries need real prior turns to be meaningful — the
     follow-up case sends a context-setting first message before the
     actual follow-up (the measured one, per-pass, in the same session).
@@ -150,7 +171,13 @@ def _read_timing_for_question(question: str, tail_lines: int = 300) -> dict:
         if "TIMING" not in line or needle not in line:
             continue
         m = _TIMING_RE.search(line)
-        if m:
+        # Confirm the text matched in the CAPTURED question= field, not
+        # just somewhere in the line — query= carries text too, so a raw
+        # substring test can match a different request whose retrieval_
+        # query happens to contain this question. The set already holds
+        # duplicate text (brief_1 is byte-identical to followup's first
+        # turn), so this is one reordering away from mattering.
+        if m and needle in m.group(11):
             matches.append(m)
     if not matches:
         raise TimingNotFound(
@@ -175,63 +202,98 @@ def _read_timing_for_question(question: str, tail_lines: int = 300) -> dict:
     }
 
 
-def run_case(label: str, mode: str, turns: list) -> dict:
+_PHASE_KEYS = (
+    "total_ms", "ttft_ms", "retrieval_ms", "grounding_ms", "llm_ms",
+    "other_ms", "preprocess_ms", "promptbuild_ms", "postllm_ms",
+    "answer_chars",
+)
+
+
+def _median_of(runs: list, key: str):
+    """Median of a phase across the measured repeats, ignoring runs where
+    the phase legitimately didn't execute (llm/promptbuild on a refusal)."""
+    vals = sorted(r[key] for r in runs if r.get(key) is not None)
+    if not vals:
+        return None
+    return vals[len(vals) // 2] if len(vals) % 2 else round((vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2)
+
+
+def _one_pass(label: str, turns: list, tag: str) -> dict:
+    """One full request sequence + its TIMING readback. Fresh session so
+    no pass inherits a previous pass's conversation history."""
+    session_id = f"latency-baseline-{label}-{tag}-{uuid.uuid4().hex[:8]}"
+    _purge_kv_cache()
+    t0 = time.time()
+    answer = ""
+    for turn in turns:
+        answer = _ask(turn, session_id)
+    wall_ms = round((time.time() - t0) * 1000)
+    timing = _read_timing_for_question(turns[-1])
+    timing["wall_ms"] = wall_ms
+    # Output length, so Phase 3 (output-length shaping) is measurable and
+    # llm= isn't confounded by how much the model happened to write.
+    # Strips the trailing JSON sources/done payload the stream appends.
+    timing["answer_chars"] = len(answer.split('\n\n{"sources"')[0].strip())
+    return timing
+
+
+def run_case(label: str, mode: str, turns: list, repeats: int) -> dict:
     print(f"[{label}] ({mode}) — {turns[-1]!r}")
 
-    runs = []
     ok = True
-    for pass_name in ("cold", "warm"):
-        # Fresh session per PASS, not shared across cold/warm — a multi-
-        # turn case's warm pass must start from a clean slate exactly like
-        # its cold pass did (Opus review D3: sharing one session_id meant
-        # the warm pass ran as turns 3-4 with the cold pass's history
-        # still attached, measuring a different conversational state).
-        session_id = f"latency-baseline-{label}-{pass_name}-{uuid.uuid4().hex[:8]}"
-        _purge_kv_cache()
-        t0 = time.time()
-        try:
-            for turn in turns:
-                _ask(turn, session_id)
-        except Exception as exc:
-            print(f"    [{pass_name}] request failed: {exc}", file=sys.stderr)
-            ok = False
-            continue
-        wall_ms = round((time.time() - t0) * 1000)
-        try:
-            timing = _read_timing_for_question(turns[-1])
-        except TimingNotFound as exc:
-            print(f"    [{pass_name}] FAILED: {exc}", file=sys.stderr)
-            ok = False
-            timing = {}
-        timing["wall_ms"] = wall_ms
-        runs.append((pass_name, timing))
-        if timing:
+    runs = []
+    try:
+        # Discarded warm-up: fills the compressor's per-chunk sentence
+        # cache for THIS query's chunks so the measured repeats aren't
+        # measuring first-touch embedding cost.
+        _one_pass(label, turns, "warmup")
+        for i in range(repeats):
+            t = _one_pass(label, turns, f"rep{i + 1}")
+            runs.append(t)
             print(
-                f"    [{pass_name}] total={timing.get('total_ms')}ms "
-                f"ttft={timing.get('ttft_ms')}ms llm={timing.get('llm_ms')}ms "
-                f"retrieval={timing.get('retrieval_ms')}ms"
+                f"    [rep{i + 1}] total={t.get('total_ms')}ms ttft={t.get('ttft_ms')}ms "
+                f"llm={t.get('llm_ms')}ms retrieval={t.get('retrieval_ms')}ms "
+                f"chars={t.get('answer_chars')}"
             )
+    except TimingNotFound as exc:
+        print(f"    FAILED: {exc}", file=sys.stderr)
+        ok = False
+    except Exception as exc:
+        print(f"    request failed: {exc}", file=sys.stderr)
+        ok = False
 
-    warm = next((t for name, t in runs if name == "warm"), {})
-    cold = next((t for name, t in runs if name == "cold"), {})
-    return {"label": label, "mode": mode, "query": turns[-1], "cold": cold, "warm": warm, "ok": ok}
+    median = {k: _median_of(runs, k) for k in _PHASE_KEYS} if runs else {}
+    totals = [r["total_ms"] for r in runs if r.get("total_ms") is not None]
+    if totals:
+        median["total_min_ms"], median["total_max_ms"] = min(totals), max(totals)
+        # Spread is reported next to every median so a number that happens
+        # to sit on a noisy case can't be mistaken for a precise one.
+        median["spread_x"] = round(max(totals) / max(min(totals), 1), 2)
+    return {
+        "label": label, "mode": mode, "query": turns[-1],
+        "repeats": len(runs), "median": median, "runs": runs, "ok": ok,
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=None, help="write full results JSON here")
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="measured repeats per query after one discarded warm-up (default 3)")
     args = ap.parse_args()
 
     _check_disable_query_cache()
 
-    results = [run_case(label, mode, turns) for label, mode, turns in QUERY_SET]
+    results = [run_case(label, mode, turns, args.repeats)
+               for label, mode, turns in QUERY_SET]
 
     failed = [r["label"] for r in results if not r["ok"]]
 
-    print("\n" + "=" * 78)
-    print("LATENCY BASELINE (warm run — this is the number that matters)")
-    print("=" * 78)
-    header = f"{'label':<12} {'mode':<10} {'total':>7} {'ttft':>7} {'retr':>7} {'ground':>7} {'llm':>7} {'promptbuild':>12}"
+    print("\n" + "=" * 96)
+    print(f"LATENCY BASELINE — median of {args.repeats} measured repeats (ms)")
+    print("=" * 96)
+    header = (f"{'label':<12} {'mode':<10} {'total':>7} {'ttft':>7} {'retr':>7} "
+              f"{'ground':>7} {'llm':>7} {'other':>7} {'chars':>6} {'spread':>7}")
     print(header)
 
     def _cell(v):
@@ -242,11 +304,7 @@ def main():
         return "n/a" if v is None else str(v)
 
     for r in results:
-        w = r["warm"]
-        # Check the explicit ok flag, not `if not w:` — timing["wall_ms"]
-        # is set unconditionally after every pass (see run_case), so a
-        # failed pass's dict is never actually empty and that check never
-        # caught the failure, crashing the format string below on None.
+        w = r["median"]
         if not r["ok"] or w.get("total_ms") is None:
             print(f"{r['label']:<12} {r['mode']:<10} {'FAILED — see stderr above':>60}")
             continue
@@ -254,9 +312,15 @@ def main():
             f"{r['label']:<12} {r['mode']:<10} "
             f"{_cell(w.get('total_ms')):>7} {_cell(w.get('ttft_ms')):>7} "
             f"{_cell(w.get('retrieval_ms')):>7} {_cell(w.get('grounding_ms')):>7} "
-            f"{_cell(w.get('llm_ms')):>7} {_cell(w.get('promptbuild_ms')):>12}"
+            f"{_cell(w.get('llm_ms')):>7} {_cell(w.get('other_ms')):>7} "
+            f"{_cell(w.get('answer_chars')):>6} {str(w.get('spread_x', '?')) + 'x':>7}"
         )
-    print("=" * 78)
+    print("=" * 96)
+    print("ttft is a PREFIX of total on generation rows, but EQUALS total on the")
+    print("refusal row (nothing streams there) — do not average the column.")
+    noisy = [r["label"] for r in results if (r["median"].get("spread_x") or 0) >= 1.5]
+    if noisy:
+        print(f"\nWARNING: {noisy} varied >=1.5x across repeats — treat those medians as soft.")
 
     if failed:
         print(
