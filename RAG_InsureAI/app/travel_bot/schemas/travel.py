@@ -184,21 +184,30 @@ def infer_coverage_type_from_destination(destination: str) -> str:
 
 
 class TravelInsuranceDetails(BaseModel):
-    # NOTE: deliberately no `default=...` on these fields. Pydantic includes
-    # `default` in the JSON schema it generates for any field that has one,
-    # and google-generativeai's proto Schema converter (protos.Schema(**dict))
-    # does not support a "default" key on this SDK version — it throws
-    # "ValueError: Unknown field for Schema: default" the moment it's present,
-    # which was silently breaking every single Gemini call that used this
-    # model as response_schema. This model is only ever used as a schema hint
-    # for Gemini calls (never instantiated directly), so omitting defaults is
-    # safe.
-    first_name: str = Field(description="The user's first name")
-    last_name: str = Field(description="The user's last name")
-    email: str = Field(description="The user's email address")
-    mobile_number: str = Field(description="The user's mobile number")
+    # default="" on every field: this schema means "fill a field if you can
+    # confidently extract it, else leave it empty" (see the prompts in
+    # llm_service.py) — none of these are truly required in the business
+    # sense, so a partial tool-call response should still validate.
+    # Confirmed live 2026-07-22: without a default, the model omitting even
+    # one field (in practice, almost always 'departure' — the one field
+    # chat.py's REQUIRED_FIELDS never actually asks the user for, so the
+    # model usually has nothing to put there and sometimes skips the key
+    # entirely instead of emitting "") makes Pydantic raise a hard
+    # ValidationError ("Field required"), which discards every OTHER
+    # correctly-extracted field for that turn too — a user who just typed
+    # their name and email got neither captured, purely because of this
+    # one unrelated field. (A prior version of this comment claimed no
+    # `default=` was needed because this schema was "only ever used as a
+    # schema hint for Gemini calls" — there is no live Gemini backend
+    # anywhere in this codebase, router.py has no Gemini branch at all, so
+    # that reasoning no longer applies.)
+    first_name: str = Field(default="", description="The user's first name")
+    last_name: str = Field(default="", description="The user's last name")
+    email: str = Field(default="", description="The user's email address")
+    mobile_number: str = Field(default="", description="The user's mobile number")
 
     coverage_type: str = Field(
+        default="",
         description=(
             "The INSURANCE PRODUCT the user needs - must be exactly one of: "
             "'Hajj and Umrah', 'UAE Inbound', 'Worldwide', 'Schengen', 'GCC Countries'. "
@@ -207,35 +216,38 @@ class TravelInsuranceDetails(BaseModel):
         )
     )
     destination: str = Field(
+        default="",
         description="The specific destination country (e.g. 'Qatar', 'Portugal'). Must be valid for the chosen coverage_type."
     )
     departure: str = Field(
+        default="",
         description="The departure/origin country. Must be valid for the chosen coverage_type (most types allow any country)."
     )
 
-    start_date: str = Field(description="Travel start date (YYYY-MM-DD)")
-    end_date: str = Field(description="Travel end date (YYYY-MM-DD)")
-    plan_type: str = Field(description="Must be 'Single Trip' or 'Annual Multi-Trip'")
+    start_date: str = Field(default="", description="Travel start date (YYYY-MM-DD)")
+    end_date: str = Field(default="", description="Travel end date (YYYY-MM-DD)")
+    plan_type: str = Field(default="", description="Must be 'Single Trip' or 'Annual Multi-Trip'")
 
     cover_type: str = Field(
+        default="",
         description=(
             "WHO is insured - must be exactly one of: 'Individual', 'Group', or 'Family'. "
             "This is NOT the same as coverage_type (the insurance product/destination rules)."
         )
     )
-    date_of_birth: str = Field(description="The user's date of birth (YYYY-MM-DD)")
+    date_of_birth: str = Field(default="", description="The user's date of birth (YYYY-MM-DD)")
 
 
 class CompanionTraveller(BaseModel):
     """
     One additional traveller on a Group/Family policy (i.e. NOT the primary
     account holder, who's already captured by TravelInsuranceDetails'
-    first_name/last_name/date_of_birth). No `default=...` here either — same
-    proto-Schema constraint as TravelInsuranceDetails above.
+    first_name/last_name/date_of_birth). default="" on every field — see
+    TravelInsuranceDetails above for why.
     """
-    first_name: str = Field(description="This companion traveller's first name")
-    last_name: str = Field(description="This companion traveller's last name")
-    date_of_birth: str = Field(description="This companion traveller's date of birth, normalized to YYYY-MM-DD")
+    first_name: str = Field(default="", description="This companion traveller's first name")
+    last_name: str = Field(default="", description="This companion traveller's last name")
+    date_of_birth: str = Field(default="", description="This companion traveller's date of birth, normalized to YYYY-MM-DD")
 
 
 # Group/Family policies need a full traveller list (primary + companions).

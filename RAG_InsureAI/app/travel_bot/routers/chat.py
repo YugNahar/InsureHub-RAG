@@ -64,19 +64,28 @@ def _short_field_label(field: str) -> str:
 
 
 # Conversational phrasing for asking each field, used instead of dumping the
-# raw FIELD_LABELS bullet list — see build_friendly_missing_prompt().
+# raw FIELD_LABELS bullet list — see build_friendly_missing_prompt(). Each
+# entry is a complete, politely-phrased, capitalized question (not a
+# lowercase mid-sentence fragment) — confirmed live that a human agent
+# leads with "Can you please..."/"Could you..." rather than a bare
+# "what's your X?", and reads more natural capitalized even after an
+# em-dash lead-in like "Just one more thing — ".
 FIELD_QUESTIONS = {
-    "first_name": "what's your first name?",
-    "last_name": "and your last name?",
-    "email": "what's the best email to reach you on?",
-    "mobile_number": "could you share your mobile number?",
-    "coverage_type": "is this for Hajj & Umrah, UAE Inbound, GCC Countries, Schengen, or Worldwide cover?",
-    "destination": "which country are you travelling to?",
-    "start_date": "when does the trip start?",
-    "end_date": "and when does it end?",
-    "plan_type": "would you like a Single Trip plan, or Annual Multi-Trip cover?",
-    "cover_type": "are you travelling solo, or with a group/family?",
-    "date_of_birth": "what's your date of birth?",
+    "first_name": "Could you please share your first name?",
+    # Only ever rendered standalone now — build_friendly_missing_prompt
+    # collapses first_name+last_name into one "full name" ask when both are
+    # missing together, so this no longer needs the "and" that assumed it
+    # would always follow the first_name question.
+    "last_name": "Could you also share your last name?",
+    "email": "Could you please share the best email address to reach you on?",
+    "mobile_number": "Could you please share your mobile number?",
+    "coverage_type": "Could you let me know if this is for Hajj & Umrah, UAE Inbound, GCC Countries, Schengen, or Worldwide cover?",
+    "destination": "Which country will you be travelling to?",
+    "start_date": "When would you like the trip to start?",
+    "end_date": "And when does it end?",
+    "plan_type": "Would you like a Single Trip plan, or Annual Multi-Trip cover?",
+    "cover_type": "Are you travelling solo, or with a group or family?",
+    "date_of_birth": "Could you please share your date of birth?",
 }
 
 # Discrete-choice fields — used to attach tappable quick-reply buttons
@@ -124,8 +133,18 @@ def is_quote_checklist_complete(data: dict) -> bool:
 
 
 def merge_extracted_fields(state: dict, extracted: dict) -> dict:
-    """Only write fields that actually have a value — never blank out existing data."""
+    """Only write fields that actually have a value — never blank out existing
+    data. Also never OVERWRITE an already-filled field: the extraction
+    schema requires all fields on every call (structured-output contract),
+    even though the prompt only asks the model to focus on whichever fields
+    are still missing — so for a field already captured, a non-empty value
+    coming back here is the model guessing to satisfy the schema, not real
+    signal from this message. Confirmed live: "Schengen" correctly captured,
+    then a later message about dates alone came back with coverage_type
+    hallucinated as "Worldwide" and silently clobbered the real answer."""
     for key, val in (extracted or {}).items():
+        if state.get(key):
+            continue
         if val and str(val).strip() != "":
             val = str(val).strip()
             if key in ("destination", "departure"):
@@ -193,6 +212,20 @@ _GREETING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Stricter than _GREETING_RE (substring match, used only for ack tone) —
+# this only matches when the ENTIRE message is a greeting and nothing else,
+# e.g. "Hi" or "Hey there!". "Hi, I'm John" or "Hello, going to France"
+# correctly falls through to the real extraction call below since there's
+# actual data alongside the greeting.
+_GREETING_ONLY_RE = re.compile(
+    r"^\s*(hi|hello|hey|hiya|howdy|yo|good\s*(morning|afternoon|evening)|greetings)[\s!.,]*$",
+    re.IGNORECASE,
+)
+
+
+def is_greeting_only(message: str) -> bool:
+    return bool(_GREETING_ONLY_RE.match(message or ""))
+
 # A few natural variants so a real back-and-forth doesn't sound like the same
 # canned line every time someone says hi — a human agent wouldn't repeat
 # themselves verbatim either.
@@ -234,18 +267,49 @@ def build_friendly_missing_prompt(state: dict, newly_filled: list = None, user_m
     if "cover_type" in newly_filled and state.get("cover_type") in MULTI_TRAVELLER_COVER_TYPES:
         ack += f"That's exciting — travelling as a {state['cover_type'].lower()}! "
     elif newly_filled:
-        captured = _join_natural([_short_field_label(f).lower() for f in newly_filled])
+        # Same "atomic" collapse as the question side below (full name /
+        # contact details): confirmed live that "Thanks for sharing your
+        # first name and last name!" read just as robotic as the stitched
+        # question did, so any paired fields get named as one thing here
+        # too rather than spelled out separately.
+        _collapse_pairs = [
+            (("first_name", "last_name"), "full name"),
+            (("email", "mobile_number"), "contact details"),
+        ]
+        labels = []
+        remaining = list(newly_filled)
+        for pair, combined_label in _collapse_pairs:
+            if all(f in remaining for f in pair):
+                labels.append(combined_label)
+                remaining = [f for f in remaining if f not in pair]
+        labels.extend(_short_field_label(f).lower() for f in remaining)
+        captured = _join_natural(labels)
         ack += f"Thanks for sharing your {captured}! "
 
     if not missing:
         return ack.strip() or "Got it, thank you!"
 
     to_ask = missing[:2]
-    frags = [FIELD_QUESTIONS.get(f, FIELD_LABELS[f] + "?") for f in to_ask]
+    # first_name + last_name is really one "what's your name" question, not
+    # two separate ones — unlike start_date/end_date (genuinely two distinct
+    # pieces of info even in casual speech), a name is atomic. Confirmed
+    # live: "What's your first name? And your last name?" read as two
+    # separate questions stitched together, not how a human agent asks.
+    # REQUIRED_FIELDS always lists first_name before last_name, so this
+    # exact-order check is reliable whenever both are still missing.
+    if to_ask == ["first_name", "last_name"]:
+        frags = ["Can you please provide your full name?"]
+    # Same reasoning applies to email + mobile_number: stacking "What's the
+    # best email to reach you on? Could you share your mobile number?" back
+    # to back read like a form, not a person. Collapse into one warm
+    # "contact details" ask instead. REQUIRED_FIELDS lists email before
+    # mobile_number, so this exact-order check is reliable too.
+    elif to_ask == ["email", "mobile_number"]:
+        frags = ["Could you please share your contact details — your email address and mobile number?"]
+    else:
+        frags = [FIELD_QUESTIONS.get(f, FIELD_LABELS[f] + "?") for f in to_ask]
 
-    if len(missing) == 1:
-        # Single fragment, following "Just one more thing — " mid-sentence —
-        # lowercase is correct here, matches the em-dash continuation.
+    if len(missing) == 1 or len(frags) == 1:
         return f"{ack}Just one more thing — {frags[0]}"
 
     # A second question fragment always starts a fresh sentence after the
@@ -257,8 +321,9 @@ def build_friendly_missing_prompt(state: dict, newly_filled: list = None, user_m
 
     # No lead-in phrase here (unlike the two cases above) — the first
     # fragment is either the very start of the reply or follows a
-    # full-stop-ending ack ("Hi! Great to hear from you. "), so it needs its
-    # own capital too, rather than the lowercase FIELD_QUESTIONS wording.
+    # full-stop-ending ack ("Hi! Great to hear from you. "). FIELD_QUESTIONS
+    # entries are already capitalized, but this stays as a defensive
+    # guarantee for the FIELD_LABELS fallback branch too.
     frags[0] = _capitalize_first(frags[0])
     return f"{ack}" + " ".join(frags)
 
@@ -415,7 +480,7 @@ def build_traveller_prompt(state: dict, just_selected: bool = False) -> str:
         )
     return (
         f"Thanks — that's {n} traveller{'s' if n != 1 else ''} so far! "
-        f"Anyone else joining (up to {slots_left} more), or just reply **'done'** and I'll pull your quotes."
+        f"Anyone else joining (up to {slots_left} more), or just reply 'done' and I'll pull your quotes."
     )
 
 
@@ -480,19 +545,19 @@ def format_quotes_list(state: dict, sort_by: str = "price_asc") -> str:
     scores = [(s, i) for s, i in scores if s is not None]
     best_value_idx = max(scores, key=lambda pair: pair[0])[1] if len(scores) >= 2 else None
 
-    lines = [f"Sorted by **{_SORT_LABELS.get(sort_by, _SORT_LABELS['price_asc'])}** — {len(quotes)} quote(s) found:\n"]
+    lines = [f"Sorted by {_SORT_LABELS.get(sort_by, _SORT_LABELS['price_asc'])} — {len(quotes)} quote(s) found:\n"]
     for i, q in enumerate(top5):
         insurer = q.get("insurer", {}).get("name", "Insurer")
         plan = q.get("plan", {}).get("name", "Standard")
         price = _quote_price(q)
         currency = q.get("plan", {}).get("price", {}).get("currency", "AED")
         price_str = f"{price} {currency}" if price else "pricing unavailable"
-        badge = " ⭐ *Best value (medical coverage per AED spent)*" if i == best_value_idx else ""
-        lines.append(f"**Option {i + 1}**: {insurer} ({plan}) — **{price_str}**{badge}")
+        badge = " ⭐ Best value (medical coverage per AED spent)" if i == best_value_idx else ""
+        lines.append(f"Option {i + 1}: {insurer} ({plan}) — {price_str}{badge}")
 
     lines.append(
-        "\nReply with a number to select a plan, or ask me to **sort by price/insurer**, "
-        "**show add-ons for option N**, or **compare 1 and 2** (etc.)."
+        "\nReply with a number to select a plan, or ask me to sort by price/insurer, "
+        "show add-ons for option N, or compare 1 and 2 (etc.)."
     )
     return "\n".join(lines)
 
@@ -526,7 +591,7 @@ def format_addons_for_quote(quote: dict) -> str:
                 break
             insurer = quote.get("insurer", {}).get("name", "this plan")
             plan_name = quote.get("plan", {}).get("name", "")
-            lines = [f"**Add-ons for {insurer} ({plan_name})**:"]
+            lines = [f"Add-ons for {insurer} ({plan_name}):"]
             for item in items:
                 label = item.get("label", "Add-on")
                 amount = item.get("amount")
@@ -558,47 +623,51 @@ def _find_section_item(quote: dict, label: str):
 
 
 def format_compare_quotes(quotes: list, indices: list) -> str:
-    """Markdown table comparing 2+ selected quotes across a curated set of
-    coverage line items, plus price."""
+    """Plain-text comparison of 2+ selected quotes across a curated set of
+    coverage line items, plus price — grouped by line item with each
+    quote's value indented beneath, since the actual Ava chat bubble has
+    no table renderer at all (confirmed live: it renders message text
+    as-is, so a markdown pipe table used to show up as literal '|' and
+    '---' characters rather than an actual table)."""
     selected = [quotes[i] for i in indices if 0 <= i < len(quotes)]
     if len(selected) < 2:
-        return "I need at least 2 valid option numbers to compare — try **'compare 1 and 2'**."
+        return "I need at least 2 valid option numbers to compare — try 'compare 1 and 2'."
 
     def col_name(q):
         return f"{q.get('insurer', {}).get('name', 'Insurer')} ({q.get('plan', {}).get('name', '')})"
 
-    rows = [
-        "| Coverage | " + " | ".join(col_name(q) for q in selected) + " |",
-        "|---" * (len(selected) + 1) + "|",
-    ]
+    names = [col_name(q) for q in selected]
+    blocks = [f"Comparing {_join_natural(names)}:"]
 
-    price_cells = []
-    for q in selected:
+    price_lines = ["Price"]
+    for q, name in zip(selected, names):
         price = _quote_price(q)
         currency = q.get("plan", {}).get("price", {}).get("currency", "")
-        price_cells.append(f"**{price} {currency}**" if price else "**N/A**")
-    rows.append("| **Price** | " + " | ".join(price_cells) + " |")
+        price_str = f"{price} {currency}" if price else "N/A"
+        price_lines.append(f"  {name}: {price_str}")
+    blocks.append("\n".join(price_lines))
 
     for label in _COMPARE_LABELS:
-        cells, any_found = [], False
-        for q in selected:
+        item_lines, any_found = [f"{label}"], False
+        for q, name in zip(selected, names):
             item = _find_section_item(q, label)
             if item is None:
-                cells.append("—")
+                item_lines.append(f"  {name}: not listed")
                 continue
             any_found = True
             val = item.get("value")
             currency = item.get("currency", "")
             if val is False or val is None:
-                cells.append("✗")
+                val_str = "not covered"
             elif isinstance(val, (int, float)):
-                cells.append(f"{currency} {val:,.0f}".strip())
+                val_str = f"{currency} {val:,.0f}".strip()
             else:
-                cells.append(str(val))
+                val_str = str(val)
+            item_lines.append(f"  {name}: {val_str}")
         if any_found:
-            rows.append(f"| {label} | " + " | ".join(cells) + " |")
+            blocks.append("\n".join(item_lines))
 
-    return "\n".join(rows)
+    return "\n\n".join(blocks)
 
 
 # Rough hemisphere list used only to decide which months count as "winter"
@@ -669,7 +738,7 @@ def build_seasonal_addon_note(state: dict) -> str:
 
     if not hits:
         return ""
-    return "\n\n❄️ Since your trip falls in winter, you might want a **Winter Sports** add-on:\n" + "\n".join(hits)
+    return "\n\n❄️ Since your trip falls in winter, you might want a Winter Sports add-on:\n" + "\n".join(hits)
 
 
 def _value_score(q: dict):
@@ -736,12 +805,12 @@ def try_fetch_quotes(state: dict, user_message: str = ""):
         traveller_count = total_travellers(state)
         traveller_note = f" ({traveller_count} travellers)" if state.get("cover_type") in MULTI_TRAVELLER_COVER_TYPES else ""
         trip_summary = (
-            f"**Trip:** {state.get('destination', '')} · "
-            f"{state.get('start_date', '')} → {state.get('end_date', '')} · "
+            f"Trip: {state.get('destination', '')} · "
+            f"{_format_date_human(state.get('start_date', ''))} → {_format_date_human(state.get('end_date', ''))} · "
             f"{state.get('plan_type', '')} · {state.get('cover_type', '')} cover{traveller_note}\n\n"
         )
 
-        reply = trip_summary + "🎉 **Great news!** I have all your details and managed to fetch your live options:\n\n"
+        reply = trip_summary + "🎉 Great news! I have all your details and managed to fetch your live options:\n\n"
         reply += format_quotes_list(state, sort_by="price_asc")
         reply += build_seasonal_addon_note(state)
         return reply
@@ -792,7 +861,13 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
             #    see extract_fields_from_conversation for why nested/history-based schemas were removed)
             previously_missing = {f for f in REQUIRED_FIELDS if not state.get(f)}
 
-            updated_state = llm_service.extract_fields_from_conversation(db, request.session_id, request.message)
+            # A bare "Hi"/"Hey there!" can't contain any extractable field —
+            # skip the LLM round-trip entirely rather than paying for one
+            # just to get an empty result back every time.
+            if is_greeting_only(request.message):
+                updated_state = {}
+            else:
+                updated_state = llm_service.extract_fields_from_conversation(db, request.session_id, request.message)
             state = merge_extracted_fields(state, updated_state)
 
             newly_filled = [f for f in REQUIRED_FIELDS if f in previously_missing and state.get(f)]
@@ -881,19 +956,19 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
                 if choice_idx < len(quotes):
                     state["selected_quote_index"] = choice_idx
                     state["phase"] = "BINDING"
-                    final_reply = "Perfect! To bind this quote to your official profile, please type your **Passport Number**."
+                    final_reply = "Perfect! To bind this quote to your official profile, please type your Passport Number."
                 else:
                     final_reply = f"I only have {len(quotes)} option(s) listed above — please pick one of those numbers."
             else:
                 final_reply = (
-                    "Please reply with a number to select a plan, or ask me to **sort by price/insurer**, "
-                    "**show add-ons for option N**, or **compare 1 and 2** (etc.)."
+                    "Please reply with a number to select a plan, or ask me to sort by price/insurer, "
+                    "show add-ons for option N, or compare 1 and 2 (etc.)."
                 )
 
         elif current_phase == "BINDING":
             if "passport_number" not in state:
                 state["passport_number"] = request.message.strip().upper()
-                final_reply = "Got it. Now please provide your **Emirates ID** (or local identification number)."
+                final_reply = "Got it. Now please provide your Emirates ID (or local identification number)."
             elif "emirates_id" not in state:
                 state["emirates_id"] = request.message.strip()
 
@@ -907,9 +982,9 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
                     state["booking_reference_id"] = booking_ref
                     state["phase"] = "ISSUING"
                     final_reply = (
-                        f"🔒 **Quote Bound Successfully!**\n"
-                        f"Your temporary Booking Reference is: `{booking_ref}`.\n\n"
-                        f"Type **'issue'** whenever you are ready to authorize checkout and deploy coverage."
+                        f"🔒 Quote Bound Successfully!\n"
+                        f"Your temporary Booking Reference is: {booking_ref}.\n\n"
+                        f"Type 'issue' whenever you are ready to authorize checkout and deploy coverage."
                     )
                 else:
                     final_reply = "Validation failed on binding parameters. Let's try confirming your passport number again."
@@ -924,11 +999,11 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
                 state["policy_number"] = policy_number
 
                 final_reply = (
-                    f"✈️ **Transaction Complete! Your Trip is Insured!**\n\n"
-                    f"Your active policy number is **{policy_number}**. The certificate has been directly transmitted to your verified email."
+                    f"✈️ Transaction Complete! Your Trip is Insured!\n\n"
+                    f"Your active policy number is {policy_number}. The certificate has been directly transmitted to your verified email."
                 )
             else:
-                final_reply = "Your order is pending confirmation. Type **'issue'** to finalize deployment."
+                final_reply = "Your order is pending confirmation. Type 'issue' to finalize deployment."
 
         else:
             final_reply = "Your policy assignment workflow has been fully executed! Let me know if you need to plan another trip."

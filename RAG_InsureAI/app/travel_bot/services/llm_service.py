@@ -1,4 +1,5 @@
 import traceback
+from datetime import datetime
 from sqlalchemy.orm import Session
 from travel_bot.models.session import ChatSession
 from travel_bot.schemas.travel import TravelInsuranceDetails, CompanionTraveller
@@ -6,26 +7,83 @@ from travel_bot.schemas.travel import TravelInsuranceDetails, CompanionTraveller
 
 class LLMService:
     """
-    Uses the SAME LLM backend as the rest of the app (Layla's RAG side) —
-    routed through router.get_insurance_llm(), which respects whatever
-    backend Super Admin has selected (Auto/vLLM/Groq/Manual/OpenAI/
-    Anthropic). No separate API key or provider-specific client here
-    anymore — this used to call OpenAI directly with its own key, which
-    is no longer safe to do (that key was leaked to a public GitHub repo
-    and is considered compromised).
+    Prefers Groq directly over router.get_insurance_llm() (Layla's shared
+    RAG backend) when GROQ_API_KEY is set — confirmed live 2026-07-22 that
+    the shared vLLM host (VLLM_HOST) decodes at only ~7-8 tokens/sec, and
+    TravelInsuranceDetails' 12-field schema forces ~90 output tokens on
+    every call even when almost every field comes back empty, so a single
+    extraction call was taking 10-12s end to end (measured directly against
+    vLLM, independent of any LangChain/network overhead). The identical
+    call against Groq (llama-3.3-70b-versatile) measured 0.37s — its output
+    is the same JSON, just far faster to decode.
 
-    Structured extraction now goes through LangChain's provider-agnostic
+    This is safe here even though FORCE_BACKEND=groq stays commented out in
+    .env for Layla's RAG side (see the .env comments above GROQ_API_KEY):
+    that regression was specifically Groq's generation being unreliable
+    against _verify_grounding's YES/NO check on retrieved documents. Travel
+    bot has no retrieval/grounding step at all — this is pure structured
+    extraction of fields out of the user's own message — so that failure
+    mode doesn't apply. Falls back to router.get_insurance_llm() (whatever
+    Super Admin has configured) when no Groq key is present, so this still
+    works in an environment without one.
+
+    Structured extraction goes through LangChain's provider-agnostic
     with_structured_output() instead of OpenAI-SDK-specific
-    beta.chat.completions.parse(). Reliability of structured output
-    depends on whatever backend is currently active — if Super Admin has
-    selected vLLM, that server needs guided-decoding support configured
-    for consistent results; if extraction quality degrades, check the
-    active backend in Super Admin before assuming a code regression here.
+    beta.chat.completions.parse(). This used to call OpenAI directly with
+    its own key, which is no longer safe to do (that key was leaked to a
+    public GitHub repo and is considered compromised) — hence going through
+    a LangChain chat model instead of a raw provider SDK client here.
     """
 
-    def _get_llm(self, temperature: float = 0.0):
+    def _get_llm(self, temperature: float = 0.0, max_tokens: int = 0):
+        import os
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if groq_key:
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+                base_url="https://api.groq.com/openai/v1",
+                api_key=groq_key,
+                temperature=temperature,
+                max_tokens=max_tokens if max_tokens > 0 else 500,
+                timeout=60,
+                max_retries=1,
+            )
         from router import get_insurance_llm
-        return get_insurance_llm(temperature=temperature)
+        return get_insurance_llm(temperature=temperature, max_tokens=max_tokens)
+
+    def _structured_method(self) -> str:
+        """
+        with_structured_output()'s method has to match what the active
+        backend actually supports — confirmed live these two don't overlap:
+        Groq's llama-3.3-70b-versatile rejects response_format=json_schema
+        outright (400: "This model does not support response format
+        json_schema"), while this deployment's vLLM host rejects tool/
+        function-calling (400: "requires --tool-call-parser to be set" —
+        it isn't configured). "function_calling" is what's confirmed
+        working against Groq; "json_schema" is what was already working
+        against vLLM before Groq was ever wired in here.
+        """
+        import os
+        return "function_calling" if os.getenv("GROQ_API_KEY", "").strip() else "json_schema"
+
+    def _structured_kwargs(self) -> dict:
+        """Extra with_structured_output() kwargs alongside method(). Groq's
+        "function_calling" path defaults to strict=True (LangChain's own
+        default), which asks Groq to enforce every schema property present
+        with zero tolerance — confirmed live this fails outright and drops
+        ALL extracted fields for the turn whenever the model's tool-call
+        JSON skips even one property (in practice, always 'departure' —
+        TravelInsuranceDetails' one field chat.py never actually asks the
+        user for, so the model has nothing to put there and sometimes omits
+        the key entirely rather than emitting ""). strict=False lets Groq
+        accept a partial-but-valid tool call instead of hard-rejecting it.
+        vLLM's "json_schema" path is unaffected either way — its guided
+        decoding already structurally forces every key present regardless
+        of this flag, which is why the failure never showed up before
+        Groq was wired in here.
+        """
+        return {"strict": False} if self._structured_method() == "function_calling" else {}
 
     def extract_companion_traveller(self, user_message: str) -> dict:
         """
@@ -46,8 +104,12 @@ class LLMService:
             f"USER MESSAGE:\n{user_message}"
         )
         try:
-            llm = self._get_llm(temperature=0.0)
-            structured_llm = llm.with_structured_output(CompanionTraveller)
+            # TravelInsuranceDetails/CompanionTraveller are small schemas (a
+            # handful of short string fields) — capping output well below
+            # vLLM's 1024-token default cuts real generation time for a
+            # structured-extraction call that never needs anywhere near that.
+            llm = self._get_llm(temperature=0.0, max_tokens=400)
+            structured_llm = llm.with_structured_output(CompanionTraveller, method=self._structured_method(), **self._structured_kwargs())
             parsed = structured_llm.invoke(prompt)
             extracted = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
             print(f"[extract_companion_traveller] extracted: {extracted}")
@@ -78,8 +140,15 @@ class LLMService:
         if not missing_fields:
             return {}
 
+        # The model has no other way to know what "today" is — without this,
+        # a bare "starting Aug 8, ending Aug 18" (no year given) gets a
+        # guessed year from the model's own training-data sense of
+        # "current," not the real current year. Confirmed live: this
+        # produced a 2024 trip date while running in 2026.
+        today = datetime.now().strftime("%Y-%m-%d")
+
         prompt = (
-            "Extract travel-insurance details from the user's message below. "
+            f"Today's date is {today}. Extract travel-insurance details from the user's message below. "
             f"Focus especially on these fields, which are still missing: {missing_fields}. "
             "Only fill a field if you can confidently determine it from this message. "
             "Leave anything uncertain or not mentioned as an empty string — never guess.\n\n"
@@ -95,21 +164,73 @@ class LLMService:
             "  - plan_type: exactly 'Single Trip' or 'Annual Multi-Trip' (map 'single' -> 'Single Trip', "
             "'annual'/'multi-trip' -> 'Annual Multi-Trip').\n"
             "  - first_name / last_name: split full names intelligently.\n"
-            "  - date_of_birth: normalize to YYYY-MM-DD (e.g. '21/09/2001' -> '2001-09-21').\n\n"
+            "  - start_date / end_date: normalize to YYYY-MM-DD. If the user gives a year, use it exactly. "
+            f"If the user does NOT mention a year (e.g. 'August 8th to the 18th'), use today's year ({today[:4]}) "
+            "unless that date has already passed this year, in which case use next year instead — a trip is "
+            "always in the future, never in the past.\n"
+            "  - date_of_birth: normalize to YYYY-MM-DD (e.g. '21/09/2001' -> '2001-09-21'). Unlike trip dates, "
+            "NEVER guess a birth year the user didn't give — leave it empty instead.\n\n"
             f"USER MESSAGE:\n{user_message}"
         )
 
         try:
-            llm = self._get_llm(temperature=0.0)
-            structured_llm = llm.with_structured_output(TravelInsuranceDetails)
+            # Small schema (a handful of short string fields) — cap output
+            # well below vLLM's 1024-token default as a safety ceiling.
+            # Confirmed via direct measurement this does NOT fix the real
+            # latency here: the model already stops well short of 1024 on
+            # its own, so the actual bottleneck is generation speed on the
+            # remote vLLM host itself, not an unbounded token ceiling.
+            llm = self._get_llm(temperature=0.0, max_tokens=400)
+            structured_llm = llm.with_structured_output(TravelInsuranceDetails, method=self._structured_method(), **self._structured_kwargs())
             parsed = structured_llm.invoke(prompt)
             extracted = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
+            self._roll_trip_dates_to_future(extracted)
             print(f"[extract_fields_from_conversation] extracted: {extracted}")
             return extracted
         except Exception:
             print("[extract_fields_from_conversation] LLM extraction failed:")
             print(traceback.format_exc())
             return {}
+
+    @staticmethod
+    def _roll_trip_dates_to_future(extracted: dict) -> None:
+        """Mutates start_date/end_date in place: if start_date has already
+        passed, bumps BOTH by the same number of years until start_date is
+        in the future. A trip being quoted for insurance is always ahead of
+        today, so this is safe to enforce unconditionally on the final
+        value regardless of whether the model defaulted the year itself or
+        the user actually stated a past one — either way a past start_date
+        can only mean "next occurrence of this date," not a real past trip.
+        Applied here instead of trusting the prompt's year-inference
+        instruction alone: confirmed live the model doesn't reliably reason
+        about "has this date passed" through instructions ('January 5' with
+        today in July stayed on the current year instead of rolling to next
+        year), so the actual date comparison is done in code, not asked of
+        the model."""
+        start = extracted.get("start_date")
+        if not start:
+            return
+        try:
+            start_dt = datetime.strptime(start, "%Y-%m-%d")
+            years_ahead = 0
+            while start_dt.date() < datetime.now().date():
+                years_ahead += 1
+                start_dt = start_dt.replace(year=start_dt.year + 1)
+        except (ValueError, TypeError):
+            # Feb 29 rolling into a non-leap year, or an unparseable value —
+            # leave the date exactly as extracted rather than risk losing
+            # every other field to the caller's broader except block.
+            return
+        if years_ahead == 0:
+            return
+        extracted["start_date"] = start_dt.strftime("%Y-%m-%d")
+        end = extracted.get("end_date")
+        if end:
+            try:
+                end_dt = datetime.strptime(end, "%Y-%m-%d")
+                extracted["end_date"] = end_dt.replace(year=end_dt.year + years_ahead).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
 
     # Fields we can plausibly get out of a travel document. plan_type / cover_type
     # are deliberately excluded — a flight ticket or passport has no concept of
@@ -204,8 +325,10 @@ class LLMService:
                 f"RAW EXTRACTION JSON:\n{json.dumps(raw_extraction)}"
             )
             try:
-                llm = self._get_llm(temperature=0.0)
-                structured_llm = llm.with_structured_output(TravelInsuranceDetails)
+                # Small schema — cap output well below vLLM's 1024-token
+                # default (see extract_fields_from_conversation above).
+                llm = self._get_llm(temperature=0.0, max_tokens=400)
+                structured_llm = llm.with_structured_output(TravelInsuranceDetails, method=self._structured_method(), **self._structured_kwargs())
                 parsed = structured_llm.invoke(prompt)
                 llm_fields = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
                 print(f"[parse_extracted_fields] LLM fallback found: {llm_fields}")
