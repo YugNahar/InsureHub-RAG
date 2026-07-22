@@ -33,9 +33,6 @@ logger = logging.getLogger(__name__)
 # Sentence must have at least this many chars to be embedded / kept.
 _MIN_SENT_CHARS = 25
 
-# If compressed result is shorter than this we fall back to the original.
-_MIN_COMPRESSED_CHARS = 60
-
 
 def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
     """
@@ -132,46 +129,6 @@ class ContextCompressor:
     # Public API
     # ------------------------------------------------------------------
 
-    def compress(self, query: str, chunks: List[Document]) -> List[Document]:
-        """
-        Return a new list of Documents where each chunk's text is compressed
-        to the sentences most relevant to *query*.
-
-        Chunks shorter than `max_chars_per_chunk` are returned as-is.
-        Chunks where compression removes too much text are returned as-is.
-        """
-        if not chunks or not query.strip():
-            return chunks
-
-        query_emb: np.ndarray = self._model.encode(
-            [query], normalize_embeddings=True, show_progress_bar=False
-        )[0]
-
-        results: List[Document] = []
-        total_saved = 0
-
-        for chunk in chunks:
-            text = chunk.page_content
-            original_len = len(text)
-
-            # Skip small chunks — no benefit from compressing them.
-            if original_len <= self._skip_below:
-                results.append(chunk)
-                continue
-
-            compressed_doc = self._compress_one(chunk, query_emb)
-            saved = original_len - len(compressed_doc.page_content)
-            total_saved += max(saved, 0)
-            results.append(compressed_doc)
-
-        if total_saved > 0:
-            logger.info(
-                "[Compressor] compressed %d chunks — saved ~%d chars total",
-                len(chunks), total_saved,
-            )
-
-        return results
-
     def compress_to_budget(
         self,
         query: str,
@@ -249,6 +206,13 @@ class ContextCompressor:
         _slots: List[Optional[Dict[str, Any]]] = [None] * n
         _all_sentences: List[str] = []
         _offsets: List[tuple] = []  # (slot_index, start, end) into _all_sentences
+        # Real production hit rate was unmeasured — the three plausible causes
+        # of "still slow despite caching" (cold-start on a wide/low-overlap
+        # retrieval pattern, cache size churning against a bigger corpus, or
+        # a genuine per-token model-speed floor) each point to a different
+        # fix, and this is the one number that tells them apart.
+        _cache_hits = 0
+        _cache_misses = 0
 
         for i, (doc, alloc) in enumerate(zip(chunks, allocations)):
             if alloc <= 0:
@@ -271,6 +235,7 @@ class ContextCompressor:
             _cache_key = (text, is_yt)
             _cached = self._sent_cache.get(_cache_key)
             if _cached is not None:
+                _cache_hits += 1
                 sentences, sent_embs = _cached
                 if len(sentences) <= 1:
                     truncated = text[:alloc].rsplit('. ', 1)[0] + '…'
@@ -282,6 +247,7 @@ class ContextCompressor:
                 }
                 continue
 
+            _cache_misses += 1
             sentences = _split_sentences(text, for_youtube=is_yt)
 
             if len(sentences) <= 1:
@@ -411,57 +377,13 @@ class ContextCompressor:
                     metadata={**slot["doc"].metadata, "budget_trimmed": True},
                 ))
 
+        _ranked_total = _cache_hits + _cache_misses
+        if _ranked_total > 0:
+            logger.info(
+                "[Compressor] sentence-cache: %d hit / %d miss (%.0f%% hit rate this call), "
+                "cache size=%d/%d",
+                _cache_hits, _cache_misses, 100 * _cache_hits / _ranked_total,
+                len(self._sent_cache), self._sent_cache_max,
+            )
+
         return final
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _compress_one(self, chunk: Document, query_emb: np.ndarray) -> Document:
-        text = chunk.page_content
-        is_yt = (
-            chunk.metadata.get("doc_type") == "youtube"
-            or "youtube" in str(chunk.metadata.get("source_type", "")).lower()
-            or "whisper" in str(chunk.metadata.get("source_type", "")).lower()
-        )
-        sentences = _split_sentences(text, for_youtube=is_yt)
-
-        if len(sentences) < 2:
-            return chunk
-
-        sent_embs = self._model.encode(
-            sentences,
-            normalize_embeddings=True,
-            batch_size=32,
-            show_progress_bar=False,
-        )
-        scores: np.ndarray = np.dot(sent_embs, query_emb)
-
-        # Always keep the top min_sentences regardless of threshold
-        ranked = list(np.argsort(scores)[::-1])
-        keep: set[int] = set(int(i) for i in ranked[: self._min_sents])
-
-        # Add any sentence that clears the threshold (up to max_sentences)
-        for i, sc in enumerate(scores):
-            if len(keep) >= self._max_sents:
-                break
-            if float(sc) >= self._threshold:
-                keep.add(i)
-
-        # Preserve original sentence order
-        kept_text = ' '.join(sentences[i] for i in sorted(keep))
-
-        if len(kept_text) < _MIN_COMPRESSED_CHARS:
-            return chunk  # too aggressively compressed — use original
-
-        compression_ratio = round(len(kept_text) / len(text), 2)
-        return Document(
-            page_content=kept_text,
-            metadata={
-                **chunk.metadata,
-                "compressed": True,
-                "compression_ratio": compression_ratio,
-                "original_chars": len(text),
-                "compressed_chars": len(kept_text),
-            },
-        )
