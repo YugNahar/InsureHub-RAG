@@ -855,6 +855,20 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             r"\bmarine insurance\b", r"\bmarine cargo\b", r"\bmarine hull\b",
             r"\bcargo insurance\b", r"\bshipping insurance\b", r"\binland transit\b",
             r"\bgoods in transit\b", r"\bbill of lading\b", r"\btransit insurance\b",
+            # Bare words added 2026-07-23 — every entry above is a full
+            # phrase, so a short natural query like "do you cover overseas
+            # shipping of goods?" scored ZERO for marine and lost outright
+            # to travel's bare \boverseas\b (confirmed live). None of
+            # these three collide with any other type's keyword/regex list
+            # (checked) — they're distinctively marine/shipping vocabulary,
+            # unlike home's \btheft\b/\bflood\b or health's \btreatment\b,
+            # which stay untouched here since narrowing THOSE has already
+            # caused a worse regression once (see bare \bhealth\b revert
+            # note above). This only ADDS a competing signal so marine can
+            # win or at least tie (-> safe "general") instead of losing by
+            # default to an unrelated type that happened to have a bare
+            # word and marine didn't.
+            r"\bcargo\b", r"\bvessel\b", r"\bshipping\b",
         ],
     },
     "liability": {
@@ -910,6 +924,14 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
         "regex": [
             r"\bcrop insurance\b", r"\bagriculture insurance\b", r"\bpmfby\b",
             r"\bfasal bima\b", r"\bkharif\b", r"\brabi crop\b",
+            # Bare \bcrops?\b added 2026-07-23 — every entry above requires
+            # a full phrase, so "is flood damage to my crops covered?"
+            # scored zero for crop and lost outright to home's bare
+            # \bflood\b (confirmed live). Doesn't collide with any other
+            # type's list. Only adds a competing signal — worst case is a
+            # tie against home that safely falls back to "general" instead
+            # of confidently answering "home" for a crop question.
+            r"\bcrops?\b",
         ],
     },
     "cyber": {
