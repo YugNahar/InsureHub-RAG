@@ -1,0 +1,2459 @@
+{
+  "timestamp": 1784749119.888319,
+  "api_url": "http://localhost:8501/ask-stream",
+  "case_count": 56,
+  "repeats": 2,
+  "overall_rate_pct": 0.89,
+  "repro_rate_pct": 4.17,
+  "control_rate_pct": 0.0,
+  "control_point_drops": [
+    {
+      "id": "clean-motor-01",
+      "run": 0,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "clean-motor-01",
+      "run": 1,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "clean-health-01",
+      "run": 0,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "clean-health-01",
+      "run": 1,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "clean-life-01",
+      "run": 0,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "clean-home-01",
+      "run": 0,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "clean-home-01",
+      "run": 1,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    }
+  ],
+  "repro_point_drops": [
+    {
+      "id": "motor-crop-general-01",
+      "run": 0,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "motor-crop-general-01",
+      "run": 1,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "engineering-marine-hull-01",
+      "run": 1,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "burglary-fidelity-01",
+      "run": 0,
+      "dropped": 3,
+      "original": 8,
+      "final": 5
+    },
+    {
+      "id": "burglary-fidelity-01",
+      "run": 1,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "transit-motor-vehicles-act-01",
+      "run": 0,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "transit-motor-vehicles-act-01",
+      "run": 1,
+      "dropped": 3,
+      "original": 8,
+      "final": 5
+    },
+    {
+      "id": "personal-accident-motor-rider-01",
+      "run": 0,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    },
+    {
+      "id": "personal-accident-motor-rider-01",
+      "run": 1,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "personal-accident-full-picture-01",
+      "run": 0,
+      "dropped": 1,
+      "original": 8,
+      "final": 7
+    },
+    {
+      "id": "personal-accident-full-picture-01",
+      "run": 1,
+      "dropped": 2,
+      "original": 8,
+      "final": 6
+    }
+  ],
+  "contaminated_point_scores": {
+    "n": 6,
+    "min": 0.003,
+    "p10": 0.003,
+    "median": 0.0291,
+    "p90": 0.9169,
+    "max": 0.9169
+  },
+  "clean_point_scores": {
+    "n": 156,
+    "min": 0.0003,
+    "p10": 0.0017,
+    "median": 0.0859,
+    "p90": 0.819,
+    "max": 1.0
+  },
+  "cases": [
+    {
+      "id": "motor-marine-icc-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "original_point_count": 8,
+          "final_point_count": 8,
+          "points_dropped": 0,
+          "point_scores": [
+            0.7614686489105225,
+            0.01516119297593832,
+            0.3720591962337494,
+            0.10550695657730103,
+            0.5382505059242249,
+            0.005179715342819691,
+            0.02160840667784214,
+            0.06929802149534225
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance refers to the coverage provided for private cars and motorcycles, among other motor vehicles.\n2. It is a contract between the insured and the insurer where the insurer promises to indemnify the financial liabili"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "original_point_count": 8,
+          "final_point_count": 8,
+          "points_dropped": 0,
+          "point_scores": [
+            0.8067674040794373,
+            0.01593093015253544,
+            0.3202924430370331,
+            0.5007579922676086,
+            0.02808288298547268,
+            0.0071245948784053326,
+            0.0022497279569506645,
+            0.22565589845180511
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance refers to a type of insurance that covers private cars and motorcycles, among other motor vehicles.\n2. It is a contract between the insured and the insurer where the insurer promises to indemnify the financial l"
+        }
+      ]
+    },
+    {
+      "id": "motor-health-domiciliary-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "original_point_count": 8,
+          "final_point_count": 8,
+          "points_dropped": 0,
+          "point_scores": [
+            0.8860894441604614,
+            0.5888528823852539,
+            0.4915098249912262,
+            0.41894349455833435,
+            0.05551214888691902,
+            0.02969205193221569,
+            0.07536092400550842,
+            0.008444840088486671
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a type of insurance that covers various aspects related to motor vehicles, including private cars and motorcycles.\n2. At the time of entering into a motor insurance contract, the insured must disclose all mat"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "original_point_count": 8,
+          "final_point_count": 8,
+          "points_dropped": 0,
+          "point_scores": [
+            0.6891067624092102,
+            0.017118388786911964,
+            0.324771523475647,
+            0.009660781361162663,
+            0.00369516434147954,
+            0.5874324440956116,
+            0.017412347719073296,
+            0.0035092062316834927
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance covers various types of motor vehicles, broadly classified into private cars, motorcycles, and others.\n2. It is a contract between the insured and the insurer, where the insurer promises to indemnify the financi"
+        }
+      ]
+    },
+    {
+      "id": "motor-crop-general-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.7411912083625793,
+            0.14968803524971008,
+            0.7515901327133179,
+            0.02068067342042923,
+            0.17931531369686127,
+            0.05929440259933472
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance covers private cars, motorcycles, and other similar vehicles. It\u2019s a contract between the insured and the insurer where the insurer promises to indemnify the financial liability in case of loss to the insured.\n\n"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.6308589577674866,
+            0.01516119297593832,
+            0.3202924430370331,
+            0.11017236858606339,
+            0.03108527697622776,
+            0.19234025478363037
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance covers private cars and motorcycles, among other motor vehicles.\n2. It is a contract between the insured and the insurer where the insurer promises to indemnify the financial liability in case of loss to th"
+        }
+      ]
+    },
+    {
+      "id": "engineering-marine-hull-01",
+      "category": "known_contamination_repro",
+      "query": "Explain engineering insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "original_point_count": 8,
+          "final_point_count": 8,
+          "points_dropped": 0,
+          "point_scores": [
+            0.49889126420021057,
+            0.07315825670957565,
+            0.12880347669124603,
+            0.002411699155345559,
+            0.057859573513269424,
+            0.0013747886987403035,
+            0.007546266075223684,
+            0.00028694982756860554
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into engineering insurance in detail:\n\n1. Engineering insurance covers risks associated with construction projects, including machinery breakdown, boiler and pressure plant insurance, and electronic equipment insurance.\n2. It also includes civil engineering compl"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.7411547303199768,
+            0.0733308270573616,
+            0.0009047703933902085,
+            0.0017365935491397977,
+            0.0017221187008544803,
+            0.0006009259959682822
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into engineering insurance in detail:\n\n1. Engineering insurance typically covers risks related to construction projects, including machinery breakdown, boiler and pressure plant insurance, and electronic equipment insurance.\n2. It also includes civil engineering "
+        }
+      ]
+    },
+    {
+      "id": "burglary-fidelity-01",
+      "category": "known_contamination_repro",
+      "query": "Explain burglary insurance in detail",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 5,
+          "original_point_count": 8,
+          "final_point_count": 5,
+          "points_dropped": 3,
+          "point_scores": [
+            0.8303343653678894,
+            0.2532557547092438,
+            0.022242402657866478,
+            0.03394175320863724,
+            0.2076023817062378
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a significant part of the miscellaneous insurance department and contributes substantially to the department\u2019s premium income.\n2. It includes theft of property from the premises following upon felonious"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.9336138367652893,
+            0.022974977269768715,
+            0.02243685908615589,
+            0.02475624904036522,
+            0.05628294497728348,
+            0.12590989470481873
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a significant part of miscellaneous insurance policies, contributing substantially to the insurer's premium income.\n2. It primarily covers theft of property from premises following felonious entry via v"
+        }
+      ]
+    },
+    {
+      "id": "transit-motor-vehicles-act-01",
+      "category": "known_contamination_repro",
+      "query": "Explain transit insurance in detail",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.9150621294975281,
+            0.18314962089061737,
+            0.08589480072259903,
+            0.06858986616134644,
+            0.0994843989610672,
+            0.41641765832901
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into the details of transit insurance:\n\n1. Transit insurance typically covers the movement of goods from one place to another, often involving multiple modes of transportation.\n2. This type of insurance can be sought before a voyage or transit actually commences."
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 5,
+          "original_point_count": 8,
+          "final_point_count": 5,
+          "points_dropped": 3,
+          "point_scores": [
+            0.8870419263839722,
+            0.29443126916885376,
+            0.07762397080659866,
+            0.17660515010356903,
+            0.17786850035190582
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into the details of transit insurance:\n\n1. Transit insurance covers the movement of goods from one place to another, often involving multiple modes of transport like sea, road, or rail.\n2. This type of insurance is particularly useful for importers and exporters "
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-motor-rider-01",
+      "category": "known_contamination_repro",
+      "query": "Explain personal accident insurance in detail",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 1,
+      "any_contaminated": true,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": true,
+          "forbidden_hits": [
+            "driving record"
+          ],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.916917622089386,
+            0.003045126795768738,
+            0.02905004471540451,
+            0.05295350030064583,
+            0.004318520426750183,
+            0.011607046239078045
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Personal Accident Insurance requires disclosure of age, height, weight, and occupation, especially if it increases the chance of an accident.\n2. Previous medical history must also be disclosed, as it can affect the likelihood of an accident"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.8189986348152161,
+            0.25099626183509827,
+            0.002901877276599407,
+            0.2765573561191559,
+            0.0827658623456955,
+            0.0017978735268115997,
+            0.029747802764177322
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Personal Accident Insurance covers injuries resulting from accidents, regardless of their cause.\n2. When applying for this type of insurance, the proposer must disclose age, height, weight, and occupation. These factors are crucial as they "
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-full-picture-01",
+      "category": "known_contamination_repro",
+      "query": "give me the full picture on personal accident cover, don't leave anything out",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.08079099655151367,
+            0.04820472002029419,
+            0.005688061472028494,
+            0.001000263262540102,
+            0.0014632395468652248,
+            0.0011000449303537607,
+            0.11170267313718796
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, here\u2019s the full picture on personal accident cover:\n\n1. Personal accident insurance provides coverage for injuries or death resulting from accidents. This type of insurance can offer financial protection to the policyholder or their beneficiaries.\n\n2. When applying for pers"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.5900187492370605,
+            0.025057995691895485,
+            0.002428297419101,
+            0.009416230954229832,
+            0.0009582535130903125,
+            0.0014948174357414246
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, let's go through the full picture on personal accident cover:\n\n1. Personal accident insurance is designed to provide financial protection in case of accidental death or disability.\n2. When applying for personal accident insurance, the insurer requires detailed information a"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-vehicle-exempt-01",
+      "category": "exemption_control",
+      "query": "Explain in detail how personal accident cover works for my vehicle",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "term-insurance-exclusions-driving-01",
+      "category": "known_contamination_repro",
+      "query": "What are the exclusions in term insurance?",
+      "expected_topic": "life",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are specific risks or events that the insurer will not cover. Things like suicide within the first two years, intentional harm, or certain medical conditions might not be covered. Let me know if you want more details! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are the events the insurer won't cover. Things like intentional self-harm, war, and certain medical conditions are typically excluded. Let me know if you want more details! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "ncb-tpa-type-agnostic-01",
+      "category": "exemption_control",
+      "query": "what's the difference between NCB and TPA",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-example-third-party-01",
+      "category": "narrative_structure_repro",
+      "query": "What is personal accident insurance? -> can you give me an example",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Sure thing! Imagine Sarah, who works as a construction site manager. She buys personal accident insurance to protect her family in case she gets injured on the job. If Sarah suffers a serious accident and needs hospitalization, her policy would cover her medical expenses and poss"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Sure thing! Imagine someone going on a hiking trip. They purchase personal accident insurance to cover any accidental injuries that might occur during the hike. If they fall and get hurt, the insurance would help cover medical expenses and possibly provide compensation if they be"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-01",
+      "category": "clean_control",
+      "query": "What does a comprehensive motor policy cover?",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.9985170960426331,
+            0.973476231098175,
+            0.9544041156768799,
+            0.9331011176109314,
+            0.3525477349758148,
+            0.7507078051567078,
+            0.9963122010231018
+          ],
+          "retrieved_types": [
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. A comprehensive motor policy covers the loss or damage to the vehicle itself, including accessories.\n2. It includes loss or damage to the property or life of the insured.\n3. Third-party coverage is included, meaning it covers liability for "
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "original_point_count": 8,
+          "final_point_count": 6,
+          "points_dropped": 2,
+          "point_scores": [
+            0.7674091458320618,
+            0.9999650716781616,
+            0.21586653590202332,
+            0.9854205250740051,
+            0.6403809785842896,
+            0.9910640716552734
+          ],
+          "retrieved_types": [
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. A comprehensive motor policy covers private cars against the risk of fine and/or theft.\n2. It includes third party/thief risks.\n3. The policy provides combined coverage of the vehicles including accessories, loss or damage to property or li"
+        }
+      ]
+    },
+    {
+      "id": "clean-health-01",
+      "category": "clean_control",
+      "query": "Explain health insurance in detail",
+      "expected_topic": "health",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.2781655192375183,
+            0.1314864605665207,
+            0.08927567303180695,
+            0.033136509358882904,
+            0.21693699061870575,
+            0.03119673766195774,
+            0.6440503597259521
+          ],
+          "retrieved_types": [
+            "health",
+            "health",
+            "health",
+            "general",
+            "health"
+          ],
+          "answer_preview": "Sure, let's dive into the details of health insurance:\n\n1. Health insurance is a type of insurance agreement where the insurer agrees to provide specified health insurance at an agreed-upon price (premium). It usually provides either direct payment or reimbursement for expenses a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.3192356824874878,
+            0.25827154517173767,
+            0.0197009090334177,
+            0.228786900639534,
+            0.029145635664463043,
+            0.03524884954094887,
+            0.16794833540916443
+          ],
+          "retrieved_types": [
+            "health",
+            "health",
+            "health",
+            "general",
+            "health"
+          ],
+          "answer_preview": "Sure, let's dive into the details of health insurance!\n\n1. Health insurance is a type of insurance that covers the cost of medical expenses associated with illness and injuries. The insurer agrees to provide specified health insurance at an agreed-upon price (premium).\n\n2. Typica"
+        }
+      ]
+    },
+    {
+      "id": "clean-life-01",
+      "category": "clean_control",
+      "query": "Explain life insurance in detail",
+      "expected_topic": "life",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.44503211975097656,
+            0.3828970491886139,
+            0.0023580617271363735,
+            0.0004909413983114064,
+            0.0012424736050888896,
+            0.05059484764933586,
+            0.001073125866241753
+          ],
+          "retrieved_types": [
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life"
+          ],
+          "answer_preview": "Sure, let's dive into life insurance in detail:\n\n1. Life insurance is a contract where the insurer agrees to pay a specified amount to the person assured (or their nominee) upon the occurrence of a specific event, typically the death of the insured individual.\n\n2. The essence of "
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "original_point_count": 8,
+          "final_point_count": 8,
+          "points_dropped": 0,
+          "point_scores": [
+            0.46947234869003296,
+            0.376425564289093,
+            0.0012210580753162503,
+            0.005439788103103638,
+            0.001325093093328178,
+            0.12727856636047363,
+            0.01457709725946188,
+            0.13559351861476898
+          ],
+          "retrieved_types": [
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life"
+          ],
+          "answer_preview": "Sure, let\u2019s dive into life insurance in detail:\n\n1. Life insurance is a contract where the insurer agrees to pay a specified sum of money to the person assured (or their nominee) upon the occurrence of a specific event, typically the death of the insured person.\n\n2. The essence o"
+        }
+      ]
+    },
+    {
+      "id": "clean-travel-01",
+      "category": "clean_control",
+      "query": "Explain travel insurance in detail",
+      "expected_topic": "travel",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        }
+      ]
+    },
+    {
+      "id": "clean-home-01",
+      "category": "clean_control",
+      "query": "Explain home insurance in detail",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.28348010778427124,
+            0.15846577286720276,
+            0.06407108157873154,
+            0.05593389272689819,
+            0.8396598100662231,
+            0.018074680119752884,
+            0.030396785587072372
+          ],
+          "retrieved_types": [
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "So here's the full picture on that:\n\n1. Home insurance protects your home and its contents from various risks such as fire, theft, and natural disasters.\n2. It typically includes coverage for the structure of your home (the building itself), personal belongings inside your home, "
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "original_point_count": 8,
+          "final_point_count": 7,
+          "points_dropped": 1,
+          "point_scores": [
+            0.28316858410835266,
+            0.04377179965376854,
+            0.04844522103667259,
+            0.02758675254881382,
+            0.008123901672661304,
+            0.9178456664085388,
+            0.03206850588321686
+          ],
+          "retrieved_types": [
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Home insurance protects your property from various risks such as fire, theft, and natural disasters.\n2. It typically covers the replacement cost of damaged or destroyed property, ensuring you can rebuild or replace what was lost.\n3. The sum"
+        }
+      ]
+    },
+    {
+      "id": "clean-fire-01",
+      "category": "clean_control",
+      "query": "Explain fire insurance in detail",
+      "expected_topic": "fire",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Sure, let's dive into fire insurance in detail:\n\n1. Fire insurance typically covers risks beyond just fire, including lightning, explosion, aircraft damage, riot, strike, and malicious damage.\n2. It also covers various weather-related events such as storms, cyclones, typhoons, hu"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-marine-01",
+      "category": "clean_control",
+      "query": "Explain marine insurance in detail",
+      "expected_topic": "marine",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-liability-01",
+      "category": "clean_control",
+      "query": "Explain liability insurance in detail",
+      "expected_topic": "liability",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-cyber-01",
+      "category": "clean_control",
+      "query": "Explain cyber insurance in detail",
+      "expected_topic": "cyber",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-crop-01",
+      "category": "clean_control",
+      "query": "Explain crop insurance in detail",
+      "expected_topic": "crop",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-commercial-01",
+      "category": "clean_control",
+      "query": "Explain commercial insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-personal-accident-standalone-01",
+      "category": "clean_control",
+      "query": "What is standalone personal accident insurance and what does it cover?",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-engineering-02",
+      "category": "clean_control",
+      "query": "What does machinery breakdown insurance cover?",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-fidelity-01",
+      "category": "clean_control",
+      "query": "What is fidelity guarantee insurance?",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-aviation-01",
+      "category": "clean_control",
+      "query": "Explain aviation insurance in detail",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-burglary-followup-01",
+      "category": "clean_control",
+      "query": "Explain burglary insurance in detail",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-repeat-01",
+      "category": "clean_control",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-repeat-02",
+      "category": "clean_control",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-engineering-repeat-01",
+      "category": "clean_control",
+      "query": "Explain engineering insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-personal-accident-repeat-01",
+      "category": "clean_control",
+      "query": "Explain personal accident insurance in detail",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-term-life-01",
+      "category": "clean_control",
+      "query": "What are the exclusions in term insurance?",
+      "expected_topic": "life",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "phrasing-motor-claim-01",
+      "category": "clean_control",
+      "query": "How do I file a claim under my motor insurance policy?",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        }
+      ]
+    },
+    {
+      "id": "phrasing-health-coverage-01",
+      "category": "clean_control",
+      "query": "What is covered and excluded under health insurance?",
+      "expected_topic": "health",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "phrasing-travel-walkthrough-01",
+      "category": "clean_control",
+      "query": "Walk me through how travel insurance claims work",
+      "expected_topic": "travel",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        }
+      ]
+    },
+    {
+      "id": "phrasing-life-what-are-all-01",
+      "category": "clean_control",
+      "query": "What are all the types of life insurance available?",
+      "expected_topic": "life",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        }
+      ]
+    },
+    {
+      "id": "adjacent-home-fire-01",
+      "category": "clean_control",
+      "query": "How does home insurance protect against fire damage?",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-liability-professional-01",
+      "category": "clean_control",
+      "query": "Explain professional liability insurance in detail",
+      "expected_topic": "liability",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-third-party-01",
+      "category": "clean_control",
+      "query": "What does third party motor insurance cover?",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        }
+      ]
+    },
+    {
+      "id": "clean-crop-claim-01",
+      "category": "clean_control",
+      "query": "How do I claim under my crop insurance policy?",
+      "expected_topic": "crop",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "marine-icc-legitimate-01",
+      "category": "exemption_control",
+      "query": "Explain marine cargo insurance in detail",
+      "expected_topic": "marine",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-health-group-01",
+      "category": "clean_control",
+      "query": "Explain group health insurance in detail",
+      "expected_topic": "health",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "water-damage-pet-leak-01",
+      "category": "known_contamination_repro",
+      "query": "How do I file a claim after water damage?",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        }
+      ]
+    },
+    {
+      "id": "water-damage-detailed-pet-01",
+      "category": "known_contamination_repro",
+      "query": "Explain in detail how to file a claim after water damage to my property",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "compare-motor-health-01",
+      "category": "clean_control",
+      "query": "Compare motor insurance and health insurance",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "compare-fire-marine-01",
+      "category": "clean_control",
+      "query": "What's the difference between fire insurance and marine insurance?",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "pet-insurance-direct-01",
+      "category": "clean_control",
+      "query": "Explain pet insurance in detail",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "workmens-compensation-01",
+      "category": "clean_control",
+      "query": "Explain workmen's compensation insurance in detail",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "householders-insurance-01",
+      "category": "clean_control",
+      "query": "What does householder's insurance cover?",
+      "expected_topic": "home",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "jewellery-insurance-01",
+      "category": "clean_control",
+      "query": "Explain jewellery insurance in detail",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "keyman-insurance-01",
+      "category": "clean_control",
+      "query": "What is keyman insurance and why do businesses buy it?",
+      "expected_topic": "general",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "followup-motor-then-detail-01",
+      "category": "clean_control",
+      "query": "What is motor insurance? -> Explain it in more detail",
+      "expected_topic": "motor",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "followup-personal-accident-elaborate-01",
+      "category": "known_contamination_repro",
+      "query": "What is personal accident insurance? -> Can you elaborate on all the details?",
+      "expected_topic": "personal_accident",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "enumerate-liability-types-01",
+      "category": "clean_control",
+      "query": "What are all the types of liability insurance?",
+      "expected_topic": "liability",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Error: Could not generate an answer due to an internal error."
+        }
+      ]
+    },
+    {
+      "id": "adjacent-travel-medical-01",
+      "category": "clean_control",
+      "query": "Does travel insurance cover medical emergencies abroad?",
+      "expected_topic": "travel",
+      "repeats": 2,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "original_point_count": null,
+          "final_point_count": 0,
+          "points_dropped": null,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        }
+      ]
+    }
+  ]
+}

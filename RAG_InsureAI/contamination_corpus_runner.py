@@ -142,11 +142,25 @@ def run_case(case: dict, repeats: int) -> dict:
                 for p in trace.get("points", [])
                 if isinstance(p.get("relevance_score"), (int, float))
             ]
+            # original_point_count is what the model actually generated;
+            # final_point_count is what survived (contamination_trace.py
+            # writes both). Their difference is what Phase 2's plan calls
+            # "legitimate points dropped" when this case is a clean/
+            # exemption control — the contamination boolean above only
+            # catches forbidden-phrase leaks, not a gate over-firing on a
+            # correct answer, which is exactly the failure mode the OLD
+            # ratio-to-max gate design had (see project memory).
+            orig_n = trace.get("original_point_count")
+            final_n = trace.get("final_point_count", len(trace.get("points", [])))
+            points_dropped = (orig_n - final_n) if isinstance(orig_n, int) else None
             results.append({
                 "run": r,
                 "contaminated": bool(hits),
                 "forbidden_hits": hits,
                 "point_count": len(trace.get("points", [])),
+                "original_point_count": orig_n,
+                "final_point_count": final_n,
+                "points_dropped": points_dropped,
                 "point_scores": point_scores,
                 "retrieved_types": [c.get("policy_type") for c in trace.get("retrieved_chunks", [])],
                 "answer_preview": answer.strip()[:280],
@@ -216,6 +230,28 @@ def main() -> None:
     repro_rate, repro_c, repro_t = _rate(repro)
     ctrl_rate, ctrl_c, ctrl_t = _rate(controls)
 
+    # Points-dropped audit — the plan's actual Phase-2 exit criterion for
+    # controls is "zero legitimate points dropped," which is a DIFFERENT,
+    # stricter check than the contamination rate above: a gate could drop
+    # a real point from a clean-control answer without that point ever
+    # having contained a forbidden phrase, so ctrl_rate alone can't see
+    # it. This is exactly the failure mode the old ratio-to-max gate
+    # design had (gutted 5-6/7-8 legitimate points), so this is checked
+    # every time the gate is active, not assumed safe from the rate alone.
+    def _drop_events(group):
+        events = []
+        for c in group:
+            for run in c["runs"]:
+                d = run.get("points_dropped")
+                if isinstance(d, int) and d > 0:
+                    events.append({"id": c["id"], "run": run["run"], "dropped": d,
+                                    "original": run.get("original_point_count"),
+                                    "final": run.get("final_point_count")})
+        return events
+
+    control_drops = _drop_events(controls)
+    repro_drops = _drop_events(repro)
+
     # Score-band split for Phase-2 calibration: relevance scores of points
     # in answers that DID contaminate vs. those that stayed clean.
     contam_scores, clean_scores = [], []
@@ -248,6 +284,17 @@ def main() -> None:
         n_rate, n_c, n_t = _rate(narrative)
         print(f"  narrative_structure_repro:       {n_rate:.1f}%  ({n_c}/{n_t} runs)")
     print()
+    print(f"Legitimate points dropped on clean+exemption controls: {len(control_drops)}   <- MUST be 0")
+    if control_drops:
+        print("  *** GATE DROPPED POINTS ON A CONTROL CASE — this is the failure mode ***")
+        print("  *** the old ratio-to-max design had. Do not trust this run. ***")
+        for e in control_drops:
+            print(f"    {e['id']} run{e['run']}: dropped {e['dropped']} of {e['original']} -> {e['final']} left")
+    if repro_drops:
+        print(f"Points dropped on known_contamination_repro (expected/good): {len(repro_drops)}")
+        for e in repro_drops:
+            print(f"    {e['id']} run{e['run']}: dropped {e['dropped']} of {e['original']} -> {e['final']} left")
+    print()
     print("Per-point relevance score bands (for Phase-2 threshold calibration):")
     print(f"  points in CONTAMINATED answers:  {_pctiles(contam_scores)}")
     print(f"  points in CLEAN answers:         {_pctiles(clean_scores)}")
@@ -261,6 +308,8 @@ def main() -> None:
         "overall_rate_pct": round(all_rate, 2),
         "repro_rate_pct": round(repro_rate, 2),
         "control_rate_pct": round(ctrl_rate, 2),
+        "control_point_drops": control_drops,
+        "repro_point_drops": repro_drops,
         "contaminated_point_scores": _pctiles(contam_scores),
         "clean_point_scores": _pctiles(clean_scores),
         "cases": case_results,
