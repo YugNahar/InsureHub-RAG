@@ -3139,6 +3139,98 @@ def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str
     return ""
 
 
+# ── Rider-to-standalone-product misattribution detector (log-only) ─────────
+# Confirmed live 2026-07-23: "Hospital cash and surgical care riders" — an
+# optional add-on to a TERM LIFE policy, the source video explicitly framing
+# it as "for those without comprehensive health insurance" — got restated in
+# a generated answer as if it were a feature of "a mediclaim policy" itself.
+# This is a different failure axis than the existing cross-policy-TYPE
+# contamination work (Phase 0-2, plan.md): every source here is genuinely,
+# correctly on-topic (all health/hospital-bill-adjacent) — nothing from the
+# wrong policy TYPE leaked in. The failure is the model blending a fact
+# across two DIFFERENT NAMED PRODUCTS that happened to both be retrieved,
+# not a wrong-type retrieval. A dedicated prompt rule now asks the model not
+# to do this (see prompt_template.py, "sounds grounded but isn't" rule (d)),
+# but confirmed live that prompt-only compliance holds only part of the
+# time (3/4 fresh test runs after the prompt fix still merged rider content
+# into "health insurance"/"mediclaim" framing without saying "rider").
+#
+# Log-only for now, same measure-before-act approach this codebase already
+# used for the point-relevance gate (Phase 0 traced real frequency before
+# Phase 2 built an active gate) — not enough real-traffic data yet to know
+# how often this actually fires, or how precise the signal is, to justify
+# an active correction. Revisit once there's real trace volume to look at.
+_RIDER_MARKER_RE = re.compile(r"\brider(s)?\b", re.IGNORECASE)
+# Requires 2+ words immediately before "rider(s)", each 3+ letters — a bare
+# regex with no minimum word count (tried first) matched garbage like "This
+# riders" or "What are the riders" from unrelated sentences that merely
+# happen to end in the word "rider(s)" (a generic listicle intro, a stray
+# mid-sentence occurrence), which then false-fired on almost any answer
+# containing a common short word like "this". Requiring a real 2+ word
+# phrase filters those out while still matching genuine feature names
+# ("Hospital cash and surgical care riders", "Accidental death benefit
+# rider").
+_RIDER_FEATURE_RE = re.compile(
+    r"\b([a-z]{3,}(?:[ ,&/-]+[a-z]{3,}){1,6})\s+riders?\b", re.IGNORECASE,
+)
+# Filler words that satisfy the 3+-letter/2+-word shape above but aren't a
+# real feature name on their own — confirmed live in _RIDER_FEATURE_RE's
+# false-positive sweep (e.g. "another interesting riders", "what are the
+# riders").
+_RIDER_FEATURE_STOPWORDS = frozenset({
+    "this", "that", "what", "some", "unique", "another", "interesting",
+    "coming", "are", "the", "for", "and", "very", "also", "one", "two",
+})
+_STANDALONE_PRODUCT_TERMS = (
+    "mediclaim", "medi-claim", "medi claim",
+    "health insurance", "health policy", "health plan", "medical insurance",
+)
+
+
+def _detect_rider_misattribution(answer_text: str, chunks: list) -> Optional[dict]:
+    """
+    True (well, a dict) when the answer names a standalone health product
+    (mediclaim/health insurance) without ever saying "rider", while also
+    reusing 2+ distinctive words from a chunk that explicitly describes a
+    "<feature> rider(s)" — i.e. the answer likely dropped the "this is an
+    add-on, not an inherent feature" context the source itself made clear.
+
+    Deliberately loose (word-overlap, not exact-phrase) since the model
+    paraphrases freely — this only needs to be a good-enough signal to
+    measure real-world frequency, not a precise auto-corrector. Scans every
+    chunk and every match rather than stopping at the first hit, and keeps
+    the strongest (most-overlapping) candidate — a KB with several rider
+    mentions shouldn't have its verdict decided by whichever happened to be
+    retrieved first.
+    """
+    if _RIDER_MARKER_RE.search(answer_text):
+        # Answer already says "rider" somewhere -- it's correctly framing
+        # this as an add-on, not attributing it to a standalone product.
+        return None
+    answer_lower = answer_text.lower()
+    if not any(term in answer_lower for term in _STANDALONE_PRODUCT_TERMS):
+        return None
+    best_hits, best_result = 0, None
+    for chunk in chunks:
+        text = getattr(chunk, "page_content", "") or ""
+        for m in _RIDER_FEATURE_RE.finditer(text):
+            feature_phrase = m.group(1).strip()
+            feature_words = [
+                w for w in re.findall(r"[a-z]+", feature_phrase.lower())
+                if len(w) > 3 and w not in _RIDER_FEATURE_STOPWORDS
+            ]
+            if len(feature_words) < 2:
+                continue
+            hits = sum(1 for w in feature_words if w in answer_lower)
+            if hits >= 2 and hits > best_hits:
+                best_hits = hits
+                best_result = {
+                    "feature_phrase": feature_phrase,
+                    "source": chunk.metadata.get("source") or chunk.metadata.get("source_url"),
+                }
+    return best_result
+
+
 # ── Short follow-up detection & reformulation ──────────────────────────────
 # When a user sends a very short message (e.g. "yes", "ok", "what about that")
 # the raw text has no standalone semantic content for vector retrieval, causing
@@ -6167,6 +6259,23 @@ class MultiSourceRAG:
                 "[ask_stream] discarded low-confidence Rule4 answer (top_rerank=%.3f < 0.05)",
                 _top_rerank,
             )
+
+        # ── Rider-to-standalone-product misattribution (log only) ──────────────
+        # See _detect_rider_misattribution's own docstring/comment for the
+        # confirmed-live failure this watches for. Mode-agnostic (not gated
+        # on _keyword_detailed) since the confirmed case was a brief-mode
+        # prose answer, not a detailed numbered list.
+        try:
+            _rider_hit = _detect_rider_misattribution(_corrected_text or _reply_stripped, all_chunks)
+            if _rider_hit:
+                logger.info(
+                    "[ask_stream] possible rider-to-standalone-product misattribution: "
+                    "feature=%r from source=%r — answer names a standalone product "
+                    "without ever saying \"rider\"",
+                    _rider_hit["feature_phrase"], _rider_hit["source"],
+                )
+        except Exception as _rider_exc:
+            logger.debug("[ask_stream] rider-misattribution check skipped: %s", _rider_exc)
 
         # ── Truncation detection (log only, never discard content) ────────────
         # Used to trim the answer down to its last complete sentence when the
