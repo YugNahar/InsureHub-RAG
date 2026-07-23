@@ -1301,6 +1301,16 @@ _TYPE_QUERY_EXEMPT_WORDS = {
     "motor": ("motor", "vehicle", "car", "bike", "scooter", "motorcycle", "driving", "driver"),
 }
 
+# A point naming a sibling policy type as somewhere ELSE a loss is covered
+# ("this is excluded here; covered under your motor/fire policy instead")
+# or explicitly as an exclusion is legitimate, standard insurance-document
+# language, not evidence the point is actually ABOUT that sibling type.
+_EXCLUSION_LANGUAGE_RE = re.compile(
+    r"\bexclu\w*\b|\bnot\s+covered\b|\bdoes\s+not\s+cover\b|"
+    r"\bcovered\s+(?:by|under|elsewhere)\b",
+    re.IGNORECASE,
+)
+
 
 def _text_has_giveaway_contamination(
     text: str, query_lower: str, query_policy_type: str = "general",
@@ -1352,6 +1362,22 @@ def _text_has_giveaway_contamination(
         if any(w in query_lower for w in _exempt_words):
             continue
         if any(term in text_lower for term in _terms):
+            # A point NAMING a sibling type isn't automatically ABOUT that
+            # type — a standard coordination-of-benefits/anti-duplication
+            # exclusion clause ("X is excluded here because it's covered
+            # under your motor policy") is completely normal, correct
+            # insurance-document language, and its own sibling-type
+            # classification is identical either way (both come back
+            # "motor" — type confirmation, which fixed the Phase 2 gate's
+            # false positives, does NOT separate this case; the giveaway
+            # term itself is the same word whether the point is about that
+            # type or just redirecting to it). Confirmed live 2026-07-23: a
+            # correct jewellery-exclusions point naming "motor insurance
+            # policies" as where an overlapping loss is instead covered
+            # got deleted wholesale. Same negation-style guard the
+            # fines-claim check already uses below, applied here too.
+            if _EXCLUSION_LANGUAGE_RE.search(text_lower):
+                continue
             return True
     return False
 
