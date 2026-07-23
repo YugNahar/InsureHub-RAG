@@ -6527,6 +6527,13 @@ class MultiSourceRAG:
         _POINT_ISOLATED_ABS_CEILING = 0.15
         _POINT_CONFIDENCE_FLOOR = 0.5
         _POINT_GATE_ACTIVE = os.getenv("POINT_RELEVANCE_GATE_ACTIVE", "").strip().lower() in ("1", "true", "yes")
+        # Demoted points get reordered, not removed, so original_point_count
+        # == final_point_count even when this gate fires — the trace's
+        # point-count fields can no longer show whether it acted. This
+        # threads through which points (if any) were actually demoted this
+        # request, so a corpus sweep can verify demotions land only on
+        # confirmed-foreign content and never on a clean-control case.
+        _pr_demoted: list = []
         if _keyword_detailed:
             try:
                 _relevance_src = (_corrected_text or _reply_stripped).strip()
@@ -6593,6 +6600,10 @@ class MultiSourceRAG:
                                 # to the end in their original relative
                                 # order; every point the model wrote is
                                 # still in the answer.
+                                _pr_demoted = [
+                                    {"text": _rel_points[i][:200], "confirmed_type": classify_query_policy_type(_rel_points[i])}
+                                    for i in _confirmed_idx
+                                ]
                                 _demote_set = set(_confirmed_idx)
                                 _reordered_points = (
                                     [p for i, p in enumerate(_rel_points) if i not in _demote_set]
@@ -6642,6 +6653,7 @@ class MultiSourceRAG:
                         "query_candidate_type": _query_candidate_type,
                         "original_point_count": len(_trace_original_points),
                         "final_point_count": len(_trace_final_points),
+                        "point_relevance_demoted": _pr_demoted,
                         "retrieved_chunks": [
                             {
                                 "source": c.metadata.get("source") or c.metadata.get("source_url"),

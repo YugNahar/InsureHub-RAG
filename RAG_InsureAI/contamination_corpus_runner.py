@@ -153,6 +153,15 @@ def run_case(case: dict, repeats: int) -> dict:
             orig_n = trace.get("original_point_count")
             final_n = trace.get("final_point_count", len(trace.get("points", [])))
             points_dropped = (orig_n - final_n) if isinstance(orig_n, int) else None
+            # The guarded gate (2026-07-23) demotes instead of deleting, so
+            # original_point_count == final_point_count even when it fires —
+            # points_dropped above is now expected to always be 0 for this
+            # specific mechanism. point_relevance_demoted is the real signal:
+            # which points (if any) this gate moved, and what type it
+            # confirmed them as. A demotion on a clean/exemption control is
+            # the failure mode to watch for, same spirit as points_dropped
+            # was for the deleting version.
+            demoted = trace.get("point_relevance_demoted") or []
             results.append({
                 "run": r,
                 "contaminated": bool(hits),
@@ -161,6 +170,7 @@ def run_case(case: dict, repeats: int) -> dict:
                 "original_point_count": orig_n,
                 "final_point_count": final_n,
                 "points_dropped": points_dropped,
+                "point_relevance_demoted": demoted,
                 "point_scores": point_scores,
                 "retrieved_types": [c.get("policy_type") for c in trace.get("retrieved_chunks", [])],
                 "answer_preview": answer.strip()[:280],
@@ -230,14 +240,21 @@ def main() -> None:
     repro_rate, repro_c, repro_t = _rate(repro)
     ctrl_rate, ctrl_c, ctrl_t = _rate(controls)
 
-    # Points-dropped audit — the plan's actual Phase-2 exit criterion for
-    # controls is "zero legitimate points dropped," which is a DIFFERENT,
-    # stricter check than the contamination rate above: a gate could drop
-    # a real point from a clean-control answer without that point ever
-    # having contained a forbidden phrase, so ctrl_rate alone can't see
-    # it. This is exactly the failure mode the old ratio-to-max gate
-    # design had (gutted 5-6/7-8 legitimate points), so this is checked
-    # every time the gate is active, not assumed safe from the rate alone.
+    # Points-dropped audit. IMPORTANT — as of the 2026-07-23 guarded gate,
+    # this number is NOT attributable to the Phase-2 point-relevance gate;
+    # that gate demotes (reorders), it structurally cannot reduce
+    # original_point_count -> final_point_count by construction. Verified
+    # live: reproducing one of this sweep's drop cases showed
+    # point_relevance_demoted=[] in the trace while the log showed
+    # "dropped 1 cross-topic-contaminated point(s)" and "dropped sentence/
+    # point claiming fines coverage" firing instead — pre-existing filters
+    # (_text_has_giveaway_contamination and the fines-claim check) that
+    # exist independently of this plan's Phase 2 work and were already
+    # active in the gate-OFF baseline (which happened to show 0 drops
+    # simply because that batch's specific generations didn't trigger
+    # them). Kept here as a general "did total point count change" signal
+    # — useful, but read it as "some correction fired," not "the gate did
+    # this." point_relevance_demoted below is the gate-specific signal.
     def _drop_events(group):
         events = []
         for c in group:
@@ -251,6 +268,25 @@ def main() -> None:
 
     control_drops = _drop_events(controls)
     repro_drops = _drop_events(repro)
+
+    # Demote audit — the 2026-07-23 guarded gate reorders instead of
+    # deleting, so points_dropped above will be 0 for it even when it
+    # fires. This is the equivalent check for the new mechanism: any
+    # demotion on a clean/exemption control is a false positive (the
+    # guards should have prevented it), any demotion on a repro case is
+    # the gate doing its job.
+    def _demote_events(group):
+        events = []
+        for c in group:
+            for run in c["runs"]:
+                for d in run.get("point_relevance_demoted") or []:
+                    events.append({"id": c["id"], "run": run["run"],
+                                    "confirmed_type": d.get("confirmed_type"),
+                                    "text": d.get("text")})
+        return events
+
+    control_demotes = _demote_events(controls)
+    repro_demotes = _demote_events(repro)
 
     # Score-band split for Phase-2 calibration: relevance scores of points
     # in answers that DID contaminate vs. those that stayed clean.
@@ -284,16 +320,27 @@ def main() -> None:
         n_rate, n_c, n_t = _rate(narrative)
         print(f"  narrative_structure_repro:       {n_rate:.1f}%  ({n_c}/{n_t} runs)")
     print()
-    print(f"Legitimate points dropped on clean+exemption controls: {len(control_drops)}   <- MUST be 0")
+    print(f"Total point-count reduction on clean+exemption controls: {len(control_drops)}  "
+          f"(NOT necessarily the Phase-2 gate — see point_relevance_demoted below for that)")
     if control_drops:
-        print("  *** GATE DROPPED POINTS ON A CONTROL CASE — this is the failure mode ***")
-        print("  *** the old ratio-to-max design had. Do not trust this run. ***")
+        print("  Some correction mechanism removed a point on a control case. Check")
+        print("  point_relevance_demoted below to see if it was THIS gate or another filter.")
         for e in control_drops:
             print(f"    {e['id']} run{e['run']}: dropped {e['dropped']} of {e['original']} -> {e['final']} left")
     if repro_drops:
         print(f"Points dropped on known_contamination_repro (expected/good): {len(repro_drops)}")
         for e in repro_drops:
             print(f"    {e['id']} run{e['run']}: dropped {e['dropped']} of {e['original']} -> {e['final']} left")
+    print()
+    print(f"Points DEMOTED on clean+exemption controls: {len(control_demotes)}   <- MUST be 0")
+    if control_demotes:
+        print("  *** GATE DEMOTED A POINT ON A CONTROL CASE — the guards failed to prevent this ***")
+        for e in control_demotes:
+            print(f"    {e['id']} run{e['run']}: confirmed_type={e['confirmed_type']!r} text={e['text'][:90]!r}")
+    if repro_demotes:
+        print(f"Points demoted on known_contamination_repro (expected/good): {len(repro_demotes)}")
+        for e in repro_demotes:
+            print(f"    {e['id']} run{e['run']}: confirmed_type={e['confirmed_type']!r} text={e['text'][:90]!r}")
     print()
     print("Per-point relevance score bands (for Phase-2 threshold calibration):")
     print(f"  points in CONTAMINATED answers:  {_pctiles(contam_scores)}")
@@ -310,6 +357,8 @@ def main() -> None:
         "control_rate_pct": round(ctrl_rate, 2),
         "control_point_drops": control_drops,
         "repro_point_drops": repro_drops,
+        "control_point_demotes": control_demotes,
+        "repro_point_demotes": repro_demotes,
         "contaminated_point_scores": _pctiles(contam_scores),
         "clean_point_scores": _pctiles(clean_scores),
         "cases": case_results,
