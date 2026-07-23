@@ -3104,9 +3104,24 @@ def _strip_rule4_fallback(text: str, trust_content: bool = True) -> Optional[str
     sentence_end = re.search(r'[.!?]\s+', tail)
     real_after = tail[sentence_end.end():].strip() if sentence_end else ""
     # Drop a leading handoff-filler sentence from real_after if the model
-    # chained it right after ("...Let me get one of our agents on it...")
+    # chained it right after ("...Let me get one of our agents on it...").
+    # Optional "but (don't worry,)?" prefix added 2026-07-23 — the canned
+    # refusal template in prompt_template.py (line 183) phrases this exact
+    # filler sentence as "But don't worry, I can get one of our agents to
+    # help you out!", not "Let me get...". Without the prefix, that whole
+    # sentence survived into real_after untouched — the standard refusal
+    # ("Hmm, I don't have that specific info...") has TWO sentences, both
+    # boilerplate, but only the first (before the marker) was ever being
+    # recognized as boilerplate; the second read as "real content" and got
+    # returned verbatim. Confirmed live this then fed straight into the
+    # warm-lead-in fallback further downstream, which doesn't recognize a
+    # sentence starting with "But" as a natural opener and prepends "So, "
+    # (lowercasing "But"->"but" to fit), producing the nonsensical
+    # "So, but don't worry, I can get one of our agents to help you out!"
+    # actually shown to a live user instead of the correct full refusal.
     handoff_lead = re.match(
-        r'(let me get (?:one of our agents|a human agent)[^.!?]*[.!?]\s*)',
+        r'((?:but\s+)?(?:don\'t worry,?\s*)?(?:let me get|i can get)\s+'
+        r'(?:one of our agents|a human agent)[^.!?]*[.!?]\s*)',
         real_after, re.IGNORECASE,
     )
     if handoff_lead:

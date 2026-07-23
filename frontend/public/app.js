@@ -550,11 +550,15 @@ async function streamInto(assistantMsg, queryText) {
         if (evt.correctedText) raw = evt.correctedText;
         if (evt.needsHuman) requestHandoff();
         if (evt.offlineEscalated) {
-          state.messages.push(msg(
-            'assistant',
-            'No agents are available right now. Your question has been emailed to our support team and someone will reach out to you soon.',
-            Date.now(),
-          ));
+          // Was pushed as role 'assistant' — rendered as a second full AI
+          // bubble (avatar, timestamp, copy/feedback controls) right under
+          // the actual answer, which read as two separate replies to one
+          // question. This is a status notice, not a reply — same category
+          // as the "You're now connected with an agent" / "no agents
+          // available" notices the WS-polling path already renders via
+          // pushSystemMessage() (see section 8b) as a centered pill with no
+          // avatar. Reuse that exact path for consistency.
+          pushSystemMessage('No agents are available right now. Your question has been emailed to our support team and someone will reach out to you soon.');
         }
       }
     }
