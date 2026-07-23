@@ -1451,6 +1451,35 @@ _GENERAL_STOPWORDS = frozenset({
 })
 
 
+def _is_duplicate_of_existing_type(label: str, active_types: set) -> bool:
+    """
+    True if `label` (e.g. "crop_insurance", "personal_accident_cover") is
+    just a rephrasing of a type ALREADY in the active vocabulary, not a
+    genuinely new one. classify_candidate_type() is only ever reached
+    after the CLOSED-vocabulary classifier already said "general" for
+    this text — so when the open-ended LLM (which has zero knowledge of
+    the 12-name hardcoded list) confidently names an EXISTING type back,
+    that isn't evidence of a new type at all. It's evidence the closed
+    classifier missed real, already-covered content and this text fell
+    through to the open-ended fallback by mistake.
+    Confirmed live 2026-07-23: candidate_vocab.json had accumulated
+    "crop_insurance" (15), "life_insurance" (21), "health_insurance" (6),
+    "transit_insurance" (8), "marine_insurance" (6), "home_insurance" (5),
+    "personal_accident_cover" (8), "fidelity_guarantee_insurance" (2) —
+    all duplicates of hardcoded types, none of them a real gap. Left
+    unguarded, an automatic promotion step would have created parallel,
+    conflicting entries for types that already exist.
+    Word-level check, not exact-label match: split on "_" and normalize
+    each word (reusing _normalize_policy_type's existing synonym table)
+    since the LLM's answer is always "<topic> insurance"/"<topic> cover"
+    style, never the bare internal key.
+    """
+    for word in label.split("_"):
+        if _normalize_policy_type(word) in active_types:
+            return True
+    return False
+
+
 def _extract_candidate_keywords(text: str) -> list[str]:
     """
     Pick the words that actually distinguish THIS text, ranked by how often
@@ -1546,6 +1575,21 @@ ANSWER:"""
 
     label = normalize_candidate_label(raw)
     if label is None:
+        return None
+
+    if _is_duplicate_of_existing_type(label, get_active_vocab().keys()):
+        # Not a new type — evidence the closed classifier missed real
+        # existing-type content. Surfaced distinctly so it isn't silently
+        # lost, but never enters the candidate vocabulary (would corrupt
+        # any promotion step's counts) and never overrides the "general"
+        # official tag either — the closed-classifier miss is a real, but
+        # separate, problem this function isn't responsible for fixing.
+        logger.info(
+            "[CANDIDATE_TYPE] closed-classifier miss suspected: open-ended "
+            "guess %r duplicates an existing type (source=%r) — check "
+            "regex/prompt coverage for that type instead of promoting this",
+            label, source[:60],
+        )
         return None
 
     upsert_candidate(label, _extract_candidate_keywords(text), source, source_type)

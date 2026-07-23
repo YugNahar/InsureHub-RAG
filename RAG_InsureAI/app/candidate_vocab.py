@@ -156,6 +156,85 @@ def match_candidate_vocab(text: str) -> Optional[str]:
     return None
 
 
+# 2026-07-23: promotion wired up (previously built but never called — see
+# module history). Threshold requires BOTH a real repeat count AND source
+# diversity, not guess_count alone: candidate_vocab.json had accumulated
+# entries like "pet_insurance" (guess_count=16) that were mostly this
+# session's own repeated test-corpus runs hitting the same fixed query
+# set, not independent real-world confirmation. Two guards against
+# promoting noise:
+#   - _PROMOTION_MIN_GUESS_COUNT: a one-off LLM guess (most candidates
+#     never exceed guess_count=1-2, see live data) shouldn't become
+#     permanent retrieval-filter vocabulary.
+#   - _PROMOTION_MIN_DISTINCT_SOURCES: guess_count alone can't tell "16
+#     independent confirmations" from "1 document re-chunked 16 times" or
+#     "the same test query repeated 16 times" — distinct sources can.
+_PROMOTION_MIN_GUESS_COUNT = 5
+_PROMOTION_MIN_DISTINCT_SOURCES = 2
+
+
+def _count_distinct_sources(label: str) -> int:
+    """Distinct source signatures logged for `label` in candidate_log.jsonl
+    — the real diversity signal guess_count alone can't provide."""
+    sources = set()
+    if not os.path.exists(_CANDIDATE_LOG_PATH):
+        return 0
+    try:
+        with open(_CANDIDATE_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("label") == label:
+                    sources.add((rec.get("source") or "")[:120])
+    except Exception as exc:
+        logger.warning("[candidate_vocab] distinct-source count failed for %r: %s", label, exc)
+    return len(sources)
+
+
+def maybe_promote(label: str) -> bool:
+    """
+    Auto-promote `label` into the active vocabulary once it has crossed
+    the evidence thresholds above. Called after every upsert_candidate()
+    so promotion fires the moment a candidate qualifies, not on a
+    separate schedule. Idempotent — already-promoted labels are skipped
+    via the active-vocab check, not re-promoted or re-logged.
+    """
+    if label in get_active_vocab_extra():
+        return False
+    entry = get_candidate_vocab().get(label)
+    if not entry or entry.get("guess_count", 0) < _PROMOTION_MIN_GUESS_COUNT:
+        return False
+    distinct = _count_distinct_sources(label)
+    if distinct < _PROMOTION_MIN_DISTINCT_SOURCES:
+        return False
+    keywords = entry.get("keywords") or []
+    # Query-side confirmations always pass keywords=[] (a short question
+    # isn't a good source of distinguishing vocabulary — see
+    # upsert_candidate's callers) — a type promoted mostly from query-side
+    # evidence would otherwise get an EMPTY regex, silently defeating the
+    # whole point of promotion: the fast/cheap regex classifier that runs
+    # before any LLM call would have nothing to match on. Confirmed live
+    # 2026-07-23: "pet_insurance" (16 guesses, all source_type="query")
+    # promoted with keywords=[] before this fallback existed. Guarantee at
+    # least the label's own natural-language phrase is always matchable.
+    natural_phrase = label.replace("_", " ")
+    if natural_phrase not in keywords:
+        keywords = keywords + [natural_phrase]
+    desc = (
+        f"Auto-promoted open-vocabulary type: {natural_phrase}. "
+        f"Seen {entry.get('guess_count')} times across {distinct} distinct sources."
+    )
+    promote_to_active_vocab(label, desc, keywords)
+    logger.info(
+        "[candidate_vocab] AUTO-PROMOTED %r into active vocabulary "
+        "(guess_count=%d, distinct_sources=%d)",
+        label, entry.get("guess_count"), distinct,
+    )
+    return True
+
+
 def upsert_candidate(label: str, keywords: List[str], source: str, source_type: str) -> None:
     """
     Record one open-ended guess: grow the candidate vocabulary and append to
@@ -198,3 +277,10 @@ def upsert_candidate(label: str, keywords: List[str], source: str, source_type: 
             logger.warning("[candidate_vocab] log append failed: %s", exc)
 
     logger.info("[candidate_vocab] guess %r from %s %r", label, source_type, source[:80])
+    # Outside the lock above — maybe_promote() takes its own lock via
+    # promote_to_active_vocab(); nesting them would deadlock (plain
+    # threading.Lock, not reentrant).
+    try:
+        maybe_promote(label)
+    except Exception as exc:
+        logger.warning("[candidate_vocab] promotion check failed for %r: %s", label, exc)
