@@ -5008,15 +5008,29 @@ class MultiSourceRAG:
             # is genuinely worth measuring (it's what a latency baseline's
             # "refusal" case actually exercises). Reuses the same TIMING
             # line format so a log-scraping harness needs only one regex.
-            _t_ttft_ms = round((time.time() - _t_request_start) * 1000)
+            # Nothing streams on this path, so TTFT is the whole request —
+            # one timestamp for both, not two near-identical time.time()
+            # calls.
             _t_total_ms = round((time.time() - _t_request_start) * 1000)
+            _t_ttft_ms = _t_total_ms
+            # `other` MUST be computed the same way the main TIMING line
+            # does at the end of this function, not hardcoded to 0 — it is
+            # defined there as "total minus the named phases", i.e. exactly
+            # the untimed glue and the fallback/standalone-retry tiers.
+            # Passing a literal 0 asserts there is no unaccounted time,
+            # which on a refusal is badly wrong: measured live, ~48% of a
+            # refusal's wall clock sits in the pre-refusal retry cascade
+            # and reporting 0 hid all of it.
+            _t_other_ms = _t_total_ms - sum(
+                v for v in (_t_retrieval_ms, _t_grounding_ms) if v is not None
+            )
             logger.info(
                 "[ask_stream] TIMING total=%dms ttft=%s retrieval=%s grounding=%s llm=%s other=%dms "
                 "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r question=%r",
                 _t_total_ms,
                 f"{_t_ttft_ms}ms",
                 f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
-                "n/a", "n/a", 0,
+                "n/a", "n/a", _t_other_ms,
                 f"{_t_preprocess_ms}ms" if _t_preprocess_ms is not None else "n/a",
                 "n/a", "n/a",
                 _keyword_detailed,
@@ -5371,8 +5385,22 @@ class MultiSourceRAG:
             # Reuses the identical format string; retrieval+grounding are
             # both real here (unlike the reranker-gate case), llm/promptbuild
             # never ran.
-            _t_ttft_ms = round((time.time() - _t_request_start) * 1000)
+            #
+            # `other` is where this path's single largest cost lives, so it
+            # is computed exactly as the main TIMING line does rather than
+            # hardcoded — see the same note at the reranker-gate refusal.
+            # _t_promptbuild_start is set right after the grounding gather
+            # but _t_promptbuild_ms is only assigned much later (past this
+            # return), so everything between — _vllm_clean_query, the
+            # fallback retrieval+rerank, the standalone-retry tier, and
+            # their two extra _verify_grounding_any_chunk round-trips — is
+            # untimed and lands here. Measured live: ~5.8s of an ~11.9s
+            # refusal, i.e. more than retrieval, previously logged as 0.
             _t_total_ms = round((time.time() - _t_request_start) * 1000)
+            _t_ttft_ms = _t_total_ms
+            _t_other_ms = _t_total_ms - sum(
+                v for v in (_t_retrieval_ms, _t_grounding_ms) if v is not None
+            )
             logger.info(
                 "[ask_stream] TIMING total=%dms ttft=%s retrieval=%s grounding=%s llm=%s other=%dms "
                 "preprocess=%s promptbuild=%s postllm=%s detailed=%s query=%r question=%r",
@@ -5380,7 +5408,7 @@ class MultiSourceRAG:
                 f"{_t_ttft_ms}ms",
                 f"{_t_retrieval_ms}ms" if _t_retrieval_ms is not None else "n/a",
                 f"{_t_grounding_ms}ms" if _t_grounding_ms is not None else "n/a",
-                "n/a", 0,
+                "n/a", _t_other_ms,
                 f"{_t_preprocess_ms}ms" if _t_preprocess_ms is not None else "n/a",
                 "n/a", "n/a",
                 _keyword_detailed,
@@ -6442,11 +6470,62 @@ class MultiSourceRAG:
         # large in both cases. The minority constraint, not the gap size,
         # is what separates the two — gap size alone is not sufficient.
         #
-        # Still log-only pending broader validation across the full corpus
-        # before ever setting POINT_RELEVANCE_GATE_ACTIVE=1.
+        # 2026-07-22: activated once, immediately reverted. The isolation/
+        # gap math above is necessary but not sufficient — a full-corpus
+        # retest with per-run points_dropped instrumentation (added to
+        # contamination_corpus_runner.py) found it deleted 8 legitimate
+        # points across 4 different clean-control answers while the one
+        # real, already-known leak (motor jargon in a personal-accident
+        # answer) survived unchanged. Root cause: the cross-encoder scores
+        # a point against the QUERY string, and "explain X in detail"
+        # queries make every point in the answer score low (0.001-0.44,
+        # nothing confident) — the isolation math then faithfully finds a
+        # gap *inside that noise* and deletes whichever point is lowest,
+        # which is just as often a correct, narrow sub-detail ("Assignment
+        # differs from Nomination" in a life-insurance answer) as it is
+        # real contamination. No absolute score ceiling fixes this: real
+        # contamination and the false-positive deletions score in the
+        # same ~0.001-0.05 band. See contamination_gate_active_phase2.json
+        # for the full data.
+        #
+        # Two independent guards added below, neither of which existed in
+        # the reverted version:
+        #   1. CONFIDENCE FLOOR — only even attempt isolation when at
+        #      least one point in the answer scores confidently on-topic
+        #      (>= 0.5). If the model can't confidently place its OWN best
+        #      point, the internal gaps between the rest are noise, not
+        #      signal — this alone rules out every false positive seen in
+        #      the retest (their maxima were 0.28-0.44).
+        #   2. FOREIGN-TYPE CONFIRMATION — a candidate only survives if ITS
+        #      OWN TEXT classifies (via the existing classify_query_
+        #      policy_type, already used for retrieval filtering) as a
+        #      real, SPECIFIC type that differs from this query's own
+        #      type. A narrow-but-correct sub-detail classifies "general"
+        #      or matches the query's type and is spared; genuine cross-
+        #      topic content (a marine ICC clause, a motor-rider clause)
+        #      classifies as that foreign type and is caught. Tested
+        #      directly against the retest's actual points: every false
+        #      positive classifies general/same-type (survives); the
+        #      marine-in-transit true positive classifies "marine"
+        #      (caught). Known gap, accepted: contamination laundered
+        #      through a "general"-tagged source chunk (the crop-in-motor
+        #      case) also classifies "general" and slips through this
+        #      guard too — this stops being purely type-agnostic and
+        #      leans on the type classifier's own blind spot. Not worse
+        #      than before (that case wasn't caught by the reverted
+        #      version either), but not the full fix.
+        #
+        # Action changed from DELETE to DEMOTE. Even with both guards, the
+        # signal underneath is the same one that just produced real false
+        # positives — deleting is irreversible and this session's finding
+        # doesn't justify trusting it that far yet. Demoting confirmed
+        # points to the end of the list costs nothing when the gate is
+        # wrong (the content is still there, just deprioritized) and still
+        # de-emphasizes genuine contamination when it's right.
         _POINT_MIN_GAP_RATIO = 5.0
         _POINT_MAX_MINORITY_FRACTION = 0.4
         _POINT_ISOLATED_ABS_CEILING = 0.15
+        _POINT_CONFIDENCE_FLOOR = 0.5
         _POINT_GATE_ACTIVE = os.getenv("POINT_RELEVANCE_GATE_ACTIVE", "").strip().lower() in ("1", "true", "yes")
         if _keyword_detailed:
             try:
@@ -6459,7 +6538,11 @@ class MultiSourceRAG:
                 # group in the first place.
                 if len(_rel_points) >= 3:
                     _rel_scores = _score_points_against_query(retrieval_query, _rel_points)
-                    if _rel_scores and len(_rel_scores) == len(_rel_points):
+                    if (
+                        _rel_scores
+                        and len(_rel_scores) == len(_rel_points)
+                        and max(_rel_scores) >= _POINT_CONFIDENCE_FLOOR
+                    ):
                         _n_points = len(_rel_points)
                         # Sort INDICES by score (not the point strings
                         # themselves) — unambiguous even if two points
@@ -6485,16 +6568,37 @@ class MultiSourceRAG:
                             and len(_drop_idx) == len(_isolated_idx)
                             and _best_ratio >= _POINT_MIN_GAP_RATIO
                         ):
-                            _drop_set = set(_drop_idx)
-                            _kept_rel_points = [p for i, p in enumerate(_rel_points) if i not in _drop_set]
+                            # Guard 2: foreign-type confirmation. classify
+                            # each RAW candidate's own text; only points
+                            # that name a real, different type survive
+                            # into _confirmed_idx.
+                            _confirmed_idx = []
+                            for _di in _drop_idx:
+                                try:
+                                    _pt_type = classify_query_policy_type(_rel_points[_di])
+                                except Exception:
+                                    _pt_type = "general"
+                                if _pt_type != "general" and _pt_type != _query_policy_type:
+                                    _confirmed_idx.append(_di)
                             logger.info(
-                                "[ask_stream] point-relevance gate CANDIDATE drop=%d/%d active=%s "
-                                "(gap=%.2fx, sorted_scores=%s)",
-                                len(_drop_idx), _n_points, _POINT_GATE_ACTIVE,
+                                "[ask_stream] point-relevance gate CANDIDATE demote=%d/%d "
+                                "confirmed=%d active=%s (gap=%.2fx, sorted_scores=%s, "
+                                "query_type=%s)",
+                                len(_drop_idx), _n_points, len(_confirmed_idx), _POINT_GATE_ACTIVE,
                                 _best_ratio, [round(_rel_scores[i], 4) for i in _rank_order],
+                                _query_policy_type,
                             )
-                            if _POINT_GATE_ACTIVE and _kept_rel_points:
-                                _rebuilt5 = _rebuild_from_points(_rel_opener, _kept_rel_points, _rel_closer)
+                            if _POINT_GATE_ACTIVE and _confirmed_idx:
+                                # Demote, don't delete: confirmed points move
+                                # to the end in their original relative
+                                # order; every point the model wrote is
+                                # still in the answer.
+                                _demote_set = set(_confirmed_idx)
+                                _reordered_points = (
+                                    [p for i, p in enumerate(_rel_points) if i not in _demote_set]
+                                    + [_rel_points[i] for i in _confirmed_idx]
+                                )
+                                _rebuilt5 = _rebuild_from_points(_rel_opener, _reordered_points, _rel_closer)
                                 _corrected_text = _rebuilt5
                                 _kv_reply = _rebuilt5
             except Exception as _rel_exc:
