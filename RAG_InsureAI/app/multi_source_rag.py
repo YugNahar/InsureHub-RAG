@@ -20,6 +20,7 @@ from rapidfuzz import fuzz, process
 from turbovec_store import _rerank_windows, _get_shared_reranker
 from metadata_tagger import (
     classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
+    _is_duplicate_of_existing_type,
 )
 import contamination_trace
 
@@ -2441,6 +2442,27 @@ ANSWER:"""
 
     label = normalize_candidate_label(raw)
     if label is None:
+        return None
+    # Same dedup guard as classify_candidate_type() (metadata_tagger.py) —
+    # this open-ended LLM has zero knowledge of the 12 hardcoded type
+    # names, so it can rename an EXISTING type under different phrasing
+    # ("term insurance" for a query the closed classifier already
+    # correctly resolved to "life") and pollute the promotion pipeline
+    # with a fake "new type" that's really just evidence of nothing new.
+    # Confirmed live 2026-07-23: "term_insurance" logged 4x from a query
+    # that classify_query_policy_type() already correctly tags "life"
+    # (life's own regex list literally contains \bterm insurance\b) —
+    # this function runs independently of that result whenever the
+    # retrieved pool has a chunk carrying a candidate_policy_type to
+    # compare against, so a query resolving correctly elsewhere doesn't
+    # stop this path from mislogging it as a new candidate.
+    if _is_duplicate_of_existing_type(label, get_active_vocab().keys()):
+        logger.info(
+            "[CANDIDATE_TYPE] query-side closed-classifier miss suspected: "
+            "open-ended guess %r duplicates an existing type (query=%r) — "
+            "not logging as a new candidate",
+            label, query[:60],
+        )
         return None
     upsert_candidate(label, [], query, "query")
     logger.debug("[CANDIDATE_TYPE] query open-ended guess: %r -> %r", query, label)

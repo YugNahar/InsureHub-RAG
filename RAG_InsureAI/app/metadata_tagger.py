@@ -1486,20 +1486,39 @@ def _is_duplicate_of_existing_type(label: str, active_types: set) -> bool:
     through to the open-ended fallback by mistake.
     Confirmed live 2026-07-23: candidate_vocab.json had accumulated
     "crop_insurance" (15), "life_insurance" (21), "health_insurance" (6),
-    "transit_insurance" (8), "marine_insurance" (6), "home_insurance" (5),
-    "personal_accident_cover" (8), "fidelity_guarantee_insurance" (2) —
-    all duplicates of hardcoded types, none of them a real gap. Left
-    unguarded, an automatic promotion step would have created parallel,
-    conflicting entries for types that already exist.
-    Word-level check, not exact-label match: split on "_" and normalize
-    each word (reusing _normalize_policy_type's existing synonym table)
-    since the LLM's answer is always "<topic> insurance"/"<topic> cover"
-    style, never the bare internal key.
+    "marine_insurance" (6), "home_insurance" (5), "personal_accident_cover"
+    (8), "marine_cargo_insurance" (5), "group_health_insurance" (5),
+    "unit_linked_life_insurance" (1) — all duplicates of hardcoded types,
+    none of them a real gap. Left unguarded, an automatic promotion step
+    would have created parallel, conflicting entries for types that
+    already exist.
+
+    Two checks, either one is sufficient:
+    - Word-level: split on "_" and normalize each word (reusing
+      _normalize_policy_type's existing synonym table) since the LLM's
+      answer is always "<topic> insurance"/"<topic> cover" style, never
+      the bare internal key. Catches direct synonym renamings
+      ("auto_insurance" -> "motor" via the synonym table) instantly with
+      no extra work.
+    - Classifier-level (added 2026-07-23): run the label's own natural
+      phrase back through classify_query_policy_type() — reuses the same
+      tuned regex/phrase list every real query is judged against, instead
+      of a second hand-maintained word list that inevitably drifts out of
+      sync with it. Confirmed live this catches real gaps the word-level
+      check missed: "term_insurance" (4 guesses, all the identical query
+      "What are the exclusions in term insurance?") and
+      "transit_insurance" (8 guesses, all "Explain transit insurance in
+      detail") both slipped through the word-level check — "term" and
+      "transit" aren't in the synonym table — but their natural phrases
+      ("term insurance", "transit insurance") directly match life's
+      \\bterm insurance\\b and marine's \\btransit insurance\\b regex
+      respectively, i.e. the closed classifier already names them
+      correctly and always has. Neither is a real gap.
     """
     for word in label.split("_"):
         if _normalize_policy_type(word) in active_types:
             return True
-    return False
+    return classify_query_policy_type(label.replace("_", " ")) != "general"
 
 
 def _extract_candidate_keywords(text: str) -> list[str]:
