@@ -798,7 +798,11 @@ _DETAIL_PATTERN = re.compile(r'\bin\s+(?:\w+\s+){0,2}details?\b', re.IGNORECASE)
 # pattern as _DETAIL_PATTERN's own "in detail" gap and _strip_video_self_reference's
 # video-reference gap.
 _TYPES_OF_QUERY_RE = re.compile(r"\b(?:types?|kinds?)\s+of\b", re.IGNORECASE)
-_COMPARISON_QUERY_RE = re.compile(r"\bcompare\b|\bdifference\s+between\b|\bvs\.?\b|\bversus\b", re.IGNORECASE)
+_COMPARISON_QUERY_RE = re.compile(
+    r"\bcompare\b|\bdifference\s+between\b|\bvs\.?\b|\bversus\b|"
+    r"\bwhat\s+(?:is|are)\b[^.?!]*\band\b",  # "what are Form A and Form B ...?" — two named items joined by "and", not just an explicit "compare"
+    re.IGNORECASE,
+)
 
 
 def _needs_detailed_answer(question: str) -> bool:
@@ -3447,6 +3451,199 @@ REFORMATTED:"""
         )
         return None
     return reformatted
+
+
+# ── Named-pair depth enforcement (deterministic trigger, LLM-executed) ─────
+# prompt_template.py's COMPARISON QUESTIONS rule already asks the model to
+# give both named items equal depth — confirmed live (2026-07-24) this
+# alone isn't reliable even after strengthening it with a concrete example:
+# "What are Form A and Form B motor insurance?" explained Form B (the
+# Comprehensive Policy) in real detail and reduced Form A to a throwaway
+# clause ("which is typically a basic policy") or dropped it to one
+# dismissive sentence, on 3/3 fresh runs AFTER the prompt fix — while
+# asked about Form A alone, the model explains it fine (same KNOWLEDGE
+# BASE, same retrieved source pages in both cases — confirmed by comparing
+# the "sources" list of both requests). This is a content-completeness
+# gap, not a formatting one — _enforce_numbered_list_format can't fix it,
+# it only reformats whatever content exists into numbered lines, lopsided
+# or not.
+#
+# Two capitalized phrases joined by "and" ("Form A and Form B") is the
+# detection signal — deliberately narrower than _COMPARISON_QUERY_RE
+# (which also matches lowercase-noun comparisons like "health insurance
+# and term insurance"): those already got comparable per-side depth in
+# testing (see agent_routing/numbered-list verification), and generic
+# capitalization-based entity extraction is unreliable on lowercase common
+# nouns. This targets specifically the failure mode confirmed live: named,
+# capitalized, KNOWLEDGE-BASE-specific labels (forms, plan names, scheme
+# names) that read as short, memorable strings the model recites easily
+# without expanding.
+_NAMED_PAIR_RE = re.compile(r"\b((?:[A-Z][\w-]*\s*){1,3})and\s+((?:[A-Z][\w-]*\s*){1,3})\b")
+
+
+# Confirmed live: the model sometimes hedges rather than actually
+# explaining a shortchanged item ("Form A is the other standard form but
+# isn't detailed here.") — a sentence that's just as LONG as a real
+# explanation, so length alone doesn't separate them. Anything matching
+# this is never counted as real coverage, regardless of length.
+_HEDGE_RE = re.compile(
+    r"\b(?:isn'?t|is\s+not|not)\s+(?:detailed|covered|explained|discussed|specified)\s+here\b|"
+    r"\bno\s+(?:further|more)\s+details?\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_generic_joint_mention(text: str, name_a: str, name_b: str) -> str:
+    """Drops any sentence of the shape "X and Y are types/kinds/forms of
+    ..." — the generic scene-setter every one of these answers opens
+    with, restating the question rather than saying anything specific
+    about either name. Left in, it makes both names look like they have
+    "real" non-trailing coverage even when one is never elaborated on
+    anywhere else, defeating _is_comparison_trailing_only's whole point.
+    Detection-only — never touches the actual returned answer text."""
+    a, b = re.escape(name_a), re.escape(name_b)
+    generic_re = re.compile(rf"(?:{a}\s+and\s+{b}|{b}\s+and\s+{a})\s+are\b[^.!?]*[.!?]", re.IGNORECASE)
+    return generic_re.sub(" ", text)
+
+
+def _is_comparison_trailing_only(text: str, name: str) -> bool:
+    """True if EVERY occurrence of `name` in `text` sits inside a
+    "compared to X / than X / unlike X / versus X" trailing clause —
+    i.e. `name` is only ever the OBJECT of a comparison, never its own
+    subject with real elaboration. Confirmed live: a single sentence can
+    fold both named items together ("Form B, also known as the
+    Comprehensive Policy, offers more coverage compared to Form A, which
+    is typically a basic policy.") — Form B gets a real appositive
+    description, Form A gets a throwaway relative clause tacked onto the
+    comparison. Neither name gets an EXCLUSIVE sentence here (both
+    _sentence_chars_mentioning counts come back 0, since the one sentence
+    mentions both), which would otherwise look like "can't tell, skip" —
+    this catches that specific shape instead of missing it."""
+    name_l = name.lower()
+    text_l = text.lower()
+    positions = [mm.start() for mm in re.finditer(re.escape(name_l), text_l)]
+    if not positions:
+        return False
+    trailing_re = re.compile(r"(?:compared\s+to|than|unlike|versus|vs\.?)\s+" + re.escape(name_l))
+    trailing_positions = {mm.start() + mm.group().lower().rindex(name_l) for mm in trailing_re.finditer(text_l)}
+    return all(p in trailing_positions for p in positions)
+
+
+def _sentence_chars_mentioning(text: str, name: str, other_name: str) -> int:
+    """Total character count of every sentence in `text` where `name`
+    appears near the START (subject position) AND `other_name` does NOT
+    appear anywhere in it — a proxy for "this sentence is exclusively
+    ABOUT `name`", not a shared intro sentence naming both (which would
+    otherwise inflate both sides' counts equally and mask a real
+    imbalance) or a passing mention in a sentence really about the other
+    item ("Form B ... compared to Form A" is about Form B; a naive
+    "mentions anywhere" check would wrongly credit Form A with that whole
+    sentence too). Hedge sentences (see _HEDGE_RE) never count, however
+    long they are."""
+    sentences = re.split(r"(?<=[.!?])(?<!\d\.)\s+", text)
+    name_l, other_l = name.lower(), other_name.lower()
+    total = 0
+    for s in sentences:
+        s_l = s.lower()
+        idx = s_l.find(name_l)
+        if 0 <= idx <= 25 and other_l not in s_l and not _HEDGE_RE.search(s):
+            total += len(s)
+    return total
+
+
+async def _enforce_named_pair_depth(query: str, context_text: str, answer_text: str) -> Optional[str]:
+    """
+    When the query names two specific capitalized items joined by "and"
+    (see _NAMED_PAIR_RE) and the answer's coverage of one is starved
+    relative to the other, makes ONE LLM call to APPEND a real explanation
+    of the shortchanged item — grounded ONLY in `context_text` (the same
+    retrieved KNOWLEDGE BASE the main answer was generated from), additive
+    -only (never edits or removes the existing answer, same safety
+    discipline as _correct_rider_misattribution — appending can't produce
+    the "So, but don't worry..." orphaned-fragment failure mode a
+    delete/splice approach already caused once in this codebase).
+
+    Returns None (no correction) when: the query doesn't name a pair, the
+    answer is a refusal message, too short to judge, both named items
+    already got comparable coverage, or the LLM call fails, times out, or
+    the KNOWLEDGE BASE genuinely has nothing more to say about the
+    shortchanged item (explicitly allowed to say so — this never invents
+    content, see the prompt's own grounding rule below).
+    """
+    m = _NAMED_PAIR_RE.search(query)
+    if not m:
+        return None
+    name_a, name_b = m.group(1).strip(), m.group(2).strip()
+    if not name_a or not name_b or name_a.lower() == name_b.lower():
+        return None
+    if answer_text.strip().lower().startswith("hmm, i don't have"):
+        return None
+    if len(answer_text) < 80:
+        return None
+
+    chars_a = _sentence_chars_mentioning(answer_text, name_a, name_b)
+    chars_b = _sentence_chars_mentioning(answer_text, name_b, name_a)
+    starved_name: Optional[str] = None
+    if chars_a == 0 and chars_b == 0:
+        # Neither name has its OWN exclusive sentence — could genuinely be
+        # unrelated to this failure mode, or could be exactly the shape
+        # where both names got folded into one shared sentence with one
+        # getting real elaboration and the other reduced to a "compared
+        # to X" trailing clause. Only the latter is actionable here.
+        _stripped = _strip_generic_joint_mention(answer_text, name_a, name_b)
+        a_trailing = _is_comparison_trailing_only(_stripped, name_a)
+        b_trailing = _is_comparison_trailing_only(_stripped, name_b)
+        if a_trailing and not b_trailing:
+            starved_name = name_a
+        elif b_trailing and not a_trailing:
+            starved_name = name_b
+        else:
+            return None  # both or neither trailing-only — can't tell, skip
+    else:
+        lo, hi = sorted((chars_a, chars_b))
+        if hi > 0 and lo / hi >= 0.5:
+            return None  # already comparably balanced
+        starved_name = name_a if chars_a < chars_b else name_b
+    logger.debug(
+        "[ask_stream] named-pair depth: a=%r(%d) b=%r(%d) starved=%r",
+        name_a, chars_a, name_b, chars_b, starved_name,
+    )
+
+    prompt = f"""The KNOWLEDGE BASE below is what an answer about "{name_a}" and "{name_b}"
+was generated from. The EXISTING ANSWER explains "{starved_name}" far less than the other
+one. Write 1-2 sentences that explain what "{starved_name}" actually is/covers/means,
+using ONLY facts stated in the KNOWLEDGE BASE below — never external knowledge, never a
+guess. If the KNOWLEDGE BASE genuinely says nothing more about "{starved_name}" beyond
+what the EXISTING ANSWER already says, reply with exactly the single word "NONE".
+
+KNOWLEDGE BASE:
+{context_text[:6000]}
+
+EXISTING ANSWER:
+{answer_text}
+
+Reply with ONLY the 1-2 new sentences (or "NONE") — no lead-in, no commentary."""
+
+    try:
+        raw = await _backend_completion(prompt, max_tokens=200, timeout=35, temperature=0)
+    except Exception as exc:
+        logger.debug("[ask_stream] named-pair depth call failed: %s", exc)
+        return None
+    if not raw:
+        return None
+    addition = raw.strip()
+    if not addition or addition.upper() == "NONE" or len(addition) > 600:
+        return None
+    if addition[-1] not in ".!?":
+        addition += "."
+
+    sign_off_re = re.compile(
+        r"(Let me know if you want more details! 😊|Hope that clears it up! Let me know if you want me to dig into any part of this\. 😊)\s*$"
+    )
+    sm = sign_off_re.search(answer_text)
+    if sm:
+        return answer_text[:sm.start()].rstrip() + " " + addition + " " + answer_text[sm.start():]
+    return answer_text.rstrip() + " " + addition
 
 
 # ── Short follow-up detection & reformulation ──────────────────────────────
@@ -6515,6 +6712,21 @@ class MultiSourceRAG:
                 _kv_reply = _rider_corrected_text
         except Exception as _rider_exc:
             logger.debug("[ask_stream] rider-misattribution correction skipped: %s", _rider_exc)
+
+        try:
+            # Runs BEFORE the numbered-list formatter below so a content
+            # addition here gets swept into the list structure by that
+            # pass too, rather than landing as a stray unnumbered sentence
+            # appended after an already-numbered list.
+            _depth_corrected_text = await _enforce_named_pair_depth(
+                question, _full_context_uncompressed, _corrected_text or _reply_stripped
+            )
+            if _depth_corrected_text:
+                logger.info("[ask_stream] expanded a shortchanged named item in a two-item answer")
+                _corrected_text = _depth_corrected_text
+                _kv_reply = _depth_corrected_text
+        except Exception as _depth_exc:
+            logger.debug("[ask_stream] named-pair depth enforcement skipped: %s", _depth_exc)
 
         try:
             _list_formatted_text = await _enforce_numbered_list_format(
