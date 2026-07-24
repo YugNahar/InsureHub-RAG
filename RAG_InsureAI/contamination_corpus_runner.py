@@ -35,6 +35,33 @@ Usage:
   python3 contamination_corpus_runner.py --id motor       # id substring
   python3 contamination_corpus_runner.py --repeats 3      # N samples/case
   python3 contamination_corpus_runner.py --out baseline.json
+
+Phase 4 (plan.md): THIS is the regression command. Run it before/after any
+change to retrieval, prompts, or the contamination filters
+(_TYPE_GIVEAWAY_TERMS, _EXCLUSION_LANGUAGE_RE, the window-scoping in Phase
+1, etc.) — "it still looks right on the query I tested" is not sufficient
+evidence on its own; this corpus is. Exits non-zero on a hard regression
+(see PASS/FAIL criteria below) so it can gate a deploy, not just print
+numbers for a human to eyeball.
+
+  PASS/FAIL criteria (2026-07-24, calibrated from real sweep data, not
+  guessed — see contamination_baseline_phase2.json /
+  contamination_guarded_gate_phase2_bigsweep.json for the sweeps this
+  came from):
+    - HARD FAIL: any contamination on a clean/exemption control
+      (control_rate_pct > 0). This has been the one true invariant across
+      every phase of this project — a clean-topic answer picking up
+      off-topic content is never acceptable, unlike the repro corpus's
+      own rate, which has never measured at a true zero.
+    - WARN (still exits 0, but flagged loudly): repro_rate_pct more than
+      double the last known-good baseline (~4.17%, so 8.5% is the current
+      warn line) — wide enough to absorb normal run-to-run noise
+      (observed range across 3 real sweeps this session: 0%-4.17%) without
+      false-alarming, tight enough to catch an actual regression.
+  Recommended: --repeats 5+ before trusting a PASS/FAIL verdict for a real
+  decision — confirmed live this session that a --repeats 2 sweep's "0%"
+  reading was pure sample-size noise, not a real result (see plan.md's
+  Phase 2 write-up).
 """
 import argparse
 import json
@@ -367,6 +394,26 @@ def main() -> None:
         with open(args.out, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"\nFull results -> {args.out}")
+
+    # ── PASS/FAIL verdict (Phase 4, plan.md) ────────────────────────────────
+    # See this file's module docstring for the criteria and why these
+    # specific numbers were chosen (calibrated from real sweep data, not
+    # guessed). Non-zero exit lets this gate a deploy, not just print
+    # numbers for a human to eyeball each time.
+    _REPRO_WARN_RATE_PCT = 8.5  # ~2x the last known-good baseline (~4.17%)
+    _hard_fail = ctrl_rate > 0.0
+    _warn = repro_rate > _REPRO_WARN_RATE_PCT
+    print()
+    if _hard_fail:
+        print(f"*** FAIL — contamination on a clean/exemption control ({ctrl_rate:.1f}%, must be 0) ***")
+    elif _warn:
+        print(f"*** WARN — repro rate {repro_rate:.1f}% is more than 2x the ~4.17% known-good baseline ***")
+    else:
+        print(f"PASS — control rate 0%, repro rate {repro_rate:.1f}% within normal range")
+    if args.repeats < 5:
+        print(f"(--repeats {args.repeats} — confirmed live this session that --repeats 2 can read 0% on pure "
+              f"sample-size noise; use --repeats 5+ before trusting this verdict for a real decision)")
+    sys.exit(1 if _hard_fail else 0)
 
 
 if __name__ == "__main__":

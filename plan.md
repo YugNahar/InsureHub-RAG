@@ -2,7 +2,7 @@
 
 **Author:** Opus (planning only — no code here)
 **Implementer:** Sonnet
-**Status:** ready to build
+**Status:** Phases 0-1 done and active. Phase 2 built, tested at real scale (280 runs), and closed — no measurable benefit, reverted to off. Phase 3 skipped (its own precondition wasn't met). Phase 4 done — `contamination_corpus_runner.py` is the standing regression command. See each phase's OUTCOME/DONE note below for details.
 **Scope:** `RAG_InsureAI/app/` — primarily `multi_source_rag.py`, with touches to `prompt_template.py` and a new diagnostics module. No frontend, no ingestion re-run required for the core fix.
 
 ---
@@ -110,9 +110,43 @@ This is the dynamic, type-agnostic core. It catches the residual contamination t
 
 **Exit criteria:** on the corpus, contamination rate approaches ~0; on the clean-control set, **zero** legitimate points dropped; added latency within budget (measure against the existing `TIMING` line).
 
+**OUTCOME (2026-07-22 through 2026-07-24) — exit criteria NOT met, phase closed:**
+First attempt (delete-based, ungated) actively deleted a real point from a
+correct answer ("Explain life insurance in detail" lost "Assignment
+differs from Nomination") on a clean-control retest — reverted same day.
+Redesigned as a guarded, demote-not-delete gate (confidence floor +
+foreign-type confirmation before acting, reorders to the end instead of
+removing). Confirmed safe across two full-corpus sweeps (zero real
+content loss even on its one false-positive firing), but never shown to
+work: a 112-run sweep read 0% contamination with the gate active, but a
+follow-up 280-run sweep (56 cases x 5 repeats,
+`contamination_guarded_gate_phase2_bigsweep.json`) showed that "0%" was
+sample-size noise, not a real effect — rates with the gate active
+(overall 0.71%, repro 3.33%) were statistically indistinguishable from
+the gate-off baseline (0.89%, 4.17%). The gate itself fired only twice in
+280 runs: one confirmed false positive on a clean control, one ambiguous
+demotion on a repro case uncreditable from n=1. **Verdict: real cost
+(added complexity, a nonzero false-positive rate) for zero demonstrated
+benefit.** Reverted to `POINT_RELEVANCE_GATE_ACTIVE=0` in `.env`, with
+the full history and this verdict documented there so it isn't
+re-enabled on a small sample again. If this is revisited, it needs a
+genuinely different detection approach, not a threshold retune of the
+same per-point cross-encoder score — that axis was tested at real scale
+and didn't separate contaminated points from clean ones distinctly
+enough to act on.
+
 ---
 
 ### Phase 3 — Consolidate and retire the brittle filters
+
+**SKIPPED (2026-07-24)** — this phase's own stated precondition
+("only after Phase 2 proves out") was not met; see the Phase 2 outcome
+above. Deleting `_TYPE_GIVEAWAY_TERMS` / `_text_has_giveaway_contamination`
+/ etc. now, with nothing proven to replace them, would remove real
+working defenses for no gain and very likely make contamination worse,
+not better — the opposite of this phase's own exit criteria. Left as
+future work, gated on a future Phase 2 redesign actually proving out,
+not on a deadline. Original phase description kept below for reference.
 
 Only after Phase 2 proves out on both corpus and control set:
 - Delete `_TYPE_GIVEAWAY_TERMS` (`:1282`), `_TYPE_QUERY_EXEMPT_WORDS` (`:1299`), `_text_has_giveaway_contamination` (`:1304`), and the detailed/brief/history/retrieval contamination blocks that depend on them (`:6179`, `:6268`, `:6319`) — replaced by the single Phase-2 gate.
@@ -128,6 +162,23 @@ Only after Phase 2 proves out on both corpus and control set:
 - Wire the Phase-0 corpus + contamination metric into a **repeatable regression command** (script under `RAG_InsureAI/`, same spirit as the existing deploy/verify cycle). Running it is the definition of done for any future retrieval/prompt change.
 - Document the single knob (the relative-drop threshold + absolute floor) and how it was calibrated, so it is tuned from data, never guessed.
 - Add a short note to `CLAUDE.md`/memory: contamination is now a *measured rate on a corpus*, not a per-query bug — fixes must move the metric, and new contamination reports get **added to the corpus first**, then fixed. This institutionalizes the escape from whack-a-mole.
+
+**DONE (2026-07-24):** `contamination_corpus_runner.py` is now the regression
+command — see its own module docstring for usage and the calibrated
+PASS/FAIL criteria (hard fail on any control-set contamination, warn above
+2x the known-good repro baseline). It exits non-zero on a hard regression,
+so it can gate a deploy rather than needing a human to read percentages
+every time. "The single knob" from the original bullet doesn't apply as
+written — Phase 2 (the thing that knob belonged to) didn't pan out and is
+off — so there's no active Phase-2 threshold to document; the real,
+currently-active defenses are Phase 1's window-scoping and the existing
+hardcoded filters (`_TYPE_GIVEAWAY_TERMS`, `_EXCLUSION_LANGUAGE_RE`), which
+have no comparable single knob to calibrate. No repo-level `CLAUDE.md`
+existed to add the "measured rate, not a per-query bug" note to, so it's
+recorded here instead, plus in this session's memory: **the definition of
+done for any future contamination-adjacent change in this codebase is a
+`contamination_corpus_runner.py --repeats 5` PASS, not "the one query I
+tried looks right."**
 
 ---
 
