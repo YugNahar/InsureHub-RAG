@@ -587,6 +587,22 @@ async def session_cancel_handoff(session_id: str):
     return {"cancelled": cancelled, "status": session.status if session else "unknown"}
 
 
+@app.post("/session/{session_id}/reset-agent")
+async def session_reset_agent(session_id: str):
+    """Reset a session's active_agent back to "layla" — called by the
+    frontend's "Clear chat" action. session_id never rotates on a clear
+    (see frontend/public/app.js's file header — RAG conversation history
+    is deliberately left untouched by a clear), which meant a user who
+    clicked "Clear chat" while mid-conversation with a specialist agent
+    (e.g. Ava) stayed permanently routed to that agent afterward — the
+    visible thread looked fresh but every new message still silently went
+    to the old agent. This only resets agent routing state, not
+    conversation history, so it doesn't change that established
+    behavior."""
+    ok = await _agent_hub.set_active_agent(session_id, "layla")
+    return {"ok": ok}
+
+
 @app.get("/session/{session_id}/poll")
 async def session_poll(session_id: str, after: int = 0):
     """

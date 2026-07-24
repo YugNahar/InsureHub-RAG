@@ -119,6 +119,17 @@ const API = {
     } catch { /* best-effort HTTP fallback when WS is down */ }
   },
 
+  // session_id never rotates on "Clear chat" (see file header), but a
+  // specialist agent (e.g. Ava) handoff is sticky server-side keyed by
+  // that same session_id — without this, clearing the visible thread
+  // left every future message still silently routed to the old agent.
+  async resetAgent(sessionId) {
+    if (MOCK_MODE) return;
+    try {
+      await fetch(`${this.baseUrl}/session/${sessionId}/reset-agent`, { method: 'POST' });
+    } catch { /* best-effort — worst case the next message re-triggers routing */ }
+  },
+
   // Async generator yielding { type: 'chunk', text } | { type: 'done', ... }.
   async *streamAsk(query, sessionId, signal) {
     if (MOCK_MODE) {
@@ -802,6 +813,7 @@ function clearChat() {
   renderThread();
   announce('Chat cleared.');
   el.composerInput.focus();
+  API.resetAgent(state.sessionId);
 }
 
 /* =========================================================================
