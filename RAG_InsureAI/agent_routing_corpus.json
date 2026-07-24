@@ -1,0 +1,34 @@
+{
+  "known_travel": [
+    { "id": "travel-01", "query": "I need travel insurance for my trip to Dubai next month" },
+    { "id": "travel-02", "query": "Schengen visa insurance please" },
+    { "id": "travel-03", "query": "can I speak with Ava" },
+    { "id": "travel-04", "query": "insurance for my honeymoon in Bali" },
+    { "id": "travel-05", "query": "I am flying to Europe next week, do I need any insurance?" },
+    { "id": "travel-06", "query": "Hajj insurance for my father" },
+    { "id": "travel-07", "query": "trip insurance for a backpacking trip through Southeast Asia" },
+    { "id": "travel-08", "query": "connect me with the travel agent" },
+    { "id": "travel-09", "query": "I'm going on holiday to Thailand, what cover do I need?" },
+    { "id": "travel-10", "query": "insurance for a Umrah pilgrimage" }
+  ],
+  "clean_control": [
+    { "id": "control-motor", "query": "What is covered under motor insurance?" },
+    { "id": "control-health", "query": "How do I file a health insurance claim?" },
+    { "id": "control-life", "query": "What are the types of life insurance?" },
+    { "id": "control-home", "query": "Does my home insurance cover flood damage?" },
+    { "id": "control-marine", "query": "What is third party liability in marine insurance?" },
+    { "id": "control-cyber", "query": "How does cyber insurance work?" },
+    { "id": "control-fire", "query": "What does fire insurance typically exclude?" },
+    { "id": "control-liability", "query": "What is covered under professional liability insurance?" },
+    { "id": "control-pa", "query": "What benefits does personal accident insurance provide?" },
+    { "id": "control-crop", "query": "How does crop insurance compensation work?" },
+    { "id": "control-general", "query": "What documents do I need to renew my policy?" },
+    { "id": "control-greeting", "query": "Hi, how are you?" }
+  ],
+  "adversarial": [
+    { "id": "adv-road-trip", "query": "my car got damaged on a road trip" },
+    { "id": "adv-abroad-health", "query": "does my health insurance cover me while I am abroad" },
+    { "id": "adv-flight-delay", "query": "my flight to Dubai got delayed, does insurance cover this" },
+    { "id": "adv-visa-docs", "query": "what documents do I need for a visa application" }
+  ]
+}

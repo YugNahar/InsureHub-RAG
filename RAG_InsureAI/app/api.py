@@ -305,42 +305,21 @@ _travel_base.metadata.create_all(bind=_travel_engine)
 app.include_router(_travel_chat_router)
 
 import re as _bot_re
-from travel_bot.routers.chat import chat_endpoint as _ava_chat_endpoint
-from travel_bot.schemas.chat import ChatRequest as _AvaChatRequest
-from travel_bot.core.database import SessionLocal as _AvaSessionLocal
 
-_TRAVEL_INTENT_PATTERN = _bot_re.compile(
-    r"\b(travel insurance|trip insurance|travel cover|insure my trip|"
-    r"insurance for (my|a) (trip|vacation|holiday|travel)|"
-    r"going abroad|travelling abroad|traveling abroad|"
-    r"schengen (visa|insurance)|hajj|umrah|"
-    r"flight insurance|visa insurance|backpacking trip|"
-    r"honeymoon (trip|insurance)|holiday insurance|"
-    r"(talk|speak|chat|connect) (to|with) (a |the )?(travel (agent|specialist|bot|advisor)|ava)|"
-    r"(travel (agent|specialist|bot|advisor)) (please|available)?|"
-    r"(can|could) (i|you) (talk|speak|connect) .{0,20}travel)\b"
-)
+# Multi-agent routing (app/agent_router/) — replaces the single hardcoded
+# _TRAVEL_INTENT_PATTERN regex this block used to define with a real,
+# extensible registry + a two-stage classifier (embedding similarity,
+# falling back to a constrained LLM call only for ambiguous queries).
+# "import agent_router.agents" is a side-effecting import: it registers
+# every known agent (currently just "ava") — see agent_router/agents/__init__.py.
+# The bare "import agent_router" (before .agents) makes the package's own
+# name resolvable for the "from agent_router import ..." line below when
+# Python hasn't seen the package yet in this process.
+import agent_router.agents  # noqa: F401 — triggers register_agent() for every agent
+from agent_router import registry as _agent_registry, core as _agent_router_core
 
 _CONFIRM_YES_RE = _bot_re.compile(r"\b(yes|yeah|yep|sure|ok(ay)?|please do|go ahead|connect me)\b")
 _CONFIRM_NO_RE  = _bot_re.compile(r"\b(no|nope|nah|not now|don'?t|skip)\b")
-
-_AGENT_DISPLAY_NAMES = {"ava": "Ava, our travel insurance specialist"}
-
-def _call_bot_agent(agent_name: str, session_id: str, message: str) -> str:
-    """Bridges to a specialized bot module's own chat endpoint (currently
-    only 'ava' -> travel_bot). Returns the bot's reply text. Each bot module
-    keeps its own DB/session — this just calls its existing FastAPI route
-    function directly as a plain function, since chat_endpoint is defined
-    with `def` (sync), not `async def`."""
-    if agent_name != "ava":
-        return "Sorry, that specialist isn't available yet."
-    db = _AvaSessionLocal()
-    try:
-        req = _AvaChatRequest(session_id=session_id, message=message)
-        resp = _ava_chat_endpoint(req, db)
-        return resp.response
-    finally:
-        db.close()
 
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -791,6 +770,7 @@ async def _warmup_pipeline():
     # mainly pre-loads video_store/webpage_store/ContextCompressor rather
     # than duplicating the doc pipeline load above.
     await asyncio.to_thread(_get_multi_rag)
+    await _agent_router_core.embeddings.warm_agent_embeddings()
     logger.info("Pipeline warmed up — embedding model loaded and ready.")
 app.add_middleware(
     CORSMiddleware,
@@ -1777,7 +1757,7 @@ async def ask_stream(req: AskRequest):
             _msg_lower = req.question.strip().lower()
             if _CONFIRM_YES_RE.search(_msg_lower):
                 await _agent_hub.set_active_agent(req.session_id, _target)
-                _opening = _call_bot_agent(_target, req.session_id, "")
+                _opening = await _agent_registry.get_agent(_target).invoke(req.session_id, "")
                 async def _handoff_yes_gen():
                     asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
                     asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _opening))
@@ -1796,7 +1776,8 @@ async def ask_stream(req: AskRequest):
                 return StreamingResponse(_handoff_no_gen(), media_type="text/plain",
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
             else:
-                _reask = f"Just to confirm — would you like me to connect you with {_AGENT_DISPLAY_NAMES.get(_target, _target)}? (yes/no)"
+                _target_def = _agent_registry.get_agent(_target)
+                _reask = f"Just to confirm — would you like me to connect you with {_target_def.display_name if _target_def else _target}? (yes/no)"
                 async def _handoff_reask_gen():
                     yield _reask
                     yield "\n\n" + _json.dumps({"sources": [], "done": True})
@@ -1804,7 +1785,7 @@ async def ask_stream(req: AskRequest):
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
 
         elif _bot_sess.active_agent != "layla":
-            _bot_reply = _call_bot_agent(_bot_sess.active_agent, req.session_id, req.question)
+            _bot_reply = await _agent_registry.get_agent(_bot_sess.active_agent).invoke(req.session_id, req.question)
             async def _bot_gen():
                 asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
                 asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _bot_reply))
@@ -1874,9 +1855,14 @@ async def ask_stream(req: AskRequest):
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
         )
 
-    if _TRAVEL_INTENT_PATTERN.search(req.question.lower()):
-        await _agent_hub.request_agent_confirmation(req.session_id, "ava")
-        _offer = "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+    _routing_decision = await _agent_router_core.select_agent(req.question)
+    if _routing_decision.agent_name:
+        _target_agent = _agent_registry.get_agent(_routing_decision.agent_name)
+        await _agent_hub.request_agent_confirmation(req.session_id, _routing_decision.agent_name)
+        _offer = (
+            f"It sounds like you're after {_target_agent.intent_phrase}! "
+            f"Want me to connect you with {_target_agent.display_name}? (yes/no)"
+        )
         async def _offer_gen():
             asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
             asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _offer))

@@ -53,6 +53,9 @@ python-jose[cryptography]>=3.3.0
 sqlalchemy>=2.0.0
 pydantic-settings>=2.0.0
 
+# ── MCP Agent Router (app/agent_router) ────────────────────────────────────────
+mcp[cli]>=1.28.0,<2.0.0
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 rapidfuzz>=3.10.0
 python-dotenv>=1.0.0

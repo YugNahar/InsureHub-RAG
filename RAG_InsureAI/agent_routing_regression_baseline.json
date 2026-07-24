@@ -1,0 +1,164 @@
+{
+  "known_travel": [
+    {
+      "id": "travel-01",
+      "query": "I need travel insurance for my trip to Dubai next month",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-02",
+      "query": "Schengen visa insurance please",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-03",
+      "query": "can I speak with Ava",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-04",
+      "query": "insurance for my honeymoon in Bali",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-05",
+      "query": "I am flying to Europe next week, do I need any insurance?",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-06",
+      "query": "Hajj insurance for my father",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-07",
+      "query": "trip insurance for a backpacking trip through Southeast Asia",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-08",
+      "query": "connect me with the travel agent",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-09",
+      "query": "I'm going on holiday to Thailand, what cover do I need?",
+      "repeats": 1,
+      "offer_count": 1
+    },
+    {
+      "id": "travel-10",
+      "query": "insurance for a Umrah pilgrimage",
+      "repeats": 1,
+      "offer_count": 1
+    }
+  ],
+  "clean_control": [
+    {
+      "id": "control-motor",
+      "query": "What is covered under motor insurance?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-health",
+      "query": "How do I file a health insurance claim?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-life",
+      "query": "What are the types of life insurance?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-home",
+      "query": "Does my home insurance cover flood damage?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-marine",
+      "query": "What is third party liability in marine insurance?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-cyber",
+      "query": "How does cyber insurance work?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-fire",
+      "query": "What does fire insurance typically exclude?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-liability",
+      "query": "What is covered under professional liability insurance?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-pa",
+      "query": "What benefits does personal accident insurance provide?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-crop",
+      "query": "How does crop insurance compensation work?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-general",
+      "query": "What documents do I need to renew my policy?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "control-greeting",
+      "query": "Hi, how are you?",
+      "repeats": 1,
+      "offer_count": 0
+    }
+  ],
+  "adversarial": [
+    {
+      "id": "adv-road-trip",
+      "query": "my car got damaged on a road trip",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "adv-abroad-health",
+      "query": "does my health insurance cover me while I am abroad",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "adv-flight-delay",
+      "query": "my flight to Dubai got delayed, does insurance cover this",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "adv-visa-docs",
+      "query": "what documents do I need for a visa application",
+      "repeats": 1,
+      "offer_count": 0
+    }
+  ]
+}
