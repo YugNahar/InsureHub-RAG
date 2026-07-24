@@ -3468,17 +3468,65 @@ REFORMATTED:"""
 # it only reformats whatever content exists into numbered lines, lopsided
 # or not.
 #
-# Two capitalized phrases joined by "and" ("Form A and Form B") is the
-# detection signal — deliberately narrower than _COMPARISON_QUERY_RE
-# (which also matches lowercase-noun comparisons like "health insurance
-# and term insurance"): those already got comparable per-side depth in
-# testing (see agent_routing/numbered-list verification), and generic
-# capitalization-based entity extraction is unreliable on lowercase common
-# nouns. This targets specifically the failure mode confirmed live: named,
-# capitalized, KNOWLEDGE-BASE-specific labels (forms, plan names, scheme
-# names) that read as short, memorable strings the model recites easily
-# without expanding.
-_NAMED_PAIR_RE = re.compile(r"\b((?:[A-Z][\w-]*\s*){1,3})and\s+((?:[A-Z][\w-]*\s*){1,3})\b")
+# The underlying bug is general — ANY two specifically named things in one
+# question or point can end up with one explained and the other
+# shortchanged, not just capitalized labels like "Form A"/"Form B" (that
+# was just the reproduction case, not the scope of the fix — capitalization
+# was an implementation shortcut, not a property of the actual failure).
+# _PHRASE deliberately does NOT require capitalization, so "health
+# insurance and term insurance" is extracted exactly like "Form A and Form
+# B" — the depth-balance check downstream (_sentence_chars_mentioning
+# etc.) doesn't care about casing either. The negative lookahead excludes
+# WH-words/aux-verbs from starting a captured phrase — without it, "What
+# is car insurance and how does it work?" would greedily capture "how does
+# it work" as if it were a second named item, since it's 4 word-chars that
+# otherwise fit the shape. Capped at 2 words (not 4): confirmed live that a
+# longer cap over-captures a shared trailing category noun into the SECOND
+# name with nothing to stop it there — "What are Form A and Form B motor
+# insurance?" extracted name_b as "Form B motor insurance" instead of
+# "Form B", since nothing bounds the second phrase's end the way the
+# literal "and" bounds the first. 2 words still covers every real case
+# seen (Form A/Form B, health insurance/term insurance) and a slightly
+# truncated capture (e.g. "personal accident" instead of "personal
+# accident insurance") is still distinctive enough for the substring
+# matching _sentence_chars_mentioning does downstream — it only needs to
+# recognize which sentences are about which name, not reproduce the exact
+# phrase.
+_PHRASE = r"(?!(?:how|why|what|where|when|does|do|did|is|are|can|will|would|should|could|shall)\b)(?:the\s+)?[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,1}"
+
+# Patterns tried against the QUERY, in order — these are all genuine
+# comparison-intent phrasings ("compare X and Y", "what are X and Y",
+# etc.), so a match here is a strong, low-false-positive signal of which
+# two things the user is actually asking about.
+_NAMED_PAIR_QUERY_PATTERNS = [
+    re.compile(rf"\bcompare\s+({_PHRASE})\s+and\s+({_PHRASE})", re.IGNORECASE),
+    re.compile(rf"\bdifference\s+between\s+({_PHRASE})\s+and\s+({_PHRASE})", re.IGNORECASE),
+    re.compile(rf"\b({_PHRASE})\s+(?:vs\.?|versus)\s+({_PHRASE})", re.IGNORECASE),
+    re.compile(rf"\bwhat\s+(?:is|are)\s+({_PHRASE})\s+and\s+({_PHRASE})", re.IGNORECASE),
+]
+
+# Tried against the ANSWER text (not the query) — this is the
+# in-detailed-answer sub-point shape confirmed live ("There are two forms
+# of motor insurance policies: Form A and Form B.") where the ORIGINAL
+# question never named either item, so nothing in the query itself could
+# have triggered the patterns above. Deliberately scoped narrow (requires
+# the explicit "are types/kinds/forms of" framing) rather than matching
+# any "X and Y" in the answer — that would false-positive on every
+# ordinary list ("covers damage and theft").
+_NAMED_PAIR_ANSWER_PATTERN = re.compile(
+    rf"\b({_PHRASE})\s+and\s+({_PHRASE})\s+are\s+(?:types|kinds|forms)\s+of\b", re.IGNORECASE
+)
+
+
+def _extract_named_pair(text: str, patterns: List[re.Pattern]) -> Optional[Tuple[str, str]]:
+    for pat in patterns:
+        m = pat.search(text)
+        if not m:
+            continue
+        a, b = m.group(1).strip(), m.group(2).strip()
+        if a and b and a.lower() != b.lower():
+            return a, b
+    return None
 
 
 # Confirmed live: the model sometimes hedges rather than actually
@@ -3553,29 +3601,32 @@ def _sentence_chars_mentioning(text: str, name: str, other_name: str) -> int:
 
 async def _enforce_named_pair_depth(query: str, context_text: str, answer_text: str) -> Optional[str]:
     """
-    When the query names two specific capitalized items joined by "and"
-    (see _NAMED_PAIR_RE) and the answer's coverage of one is starved
-    relative to the other, makes ONE LLM call to APPEND a real explanation
-    of the shortchanged item — grounded ONLY in `context_text` (the same
+    When the query (or, failing that, the answer itself — see
+    _NAMED_PAIR_ANSWER_PATTERN) names two specific things — any casing,
+    "Form A and Form B" or "health insurance and term insurance" alike —
+    and the answer's coverage of one is starved relative to the other,
+    makes ONE LLM call to APPEND a real explanation of the shortchanged
+    item — grounded ONLY in `context_text` (the same
     retrieved KNOWLEDGE BASE the main answer was generated from), additive
     -only (never edits or removes the existing answer, same safety
     discipline as _correct_rider_misattribution — appending can't produce
     the "So, but don't worry..." orphaned-fragment failure mode a
     delete/splice approach already caused once in this codebase).
 
-    Returns None (no correction) when: the query doesn't name a pair, the
-    answer is a refusal message, too short to judge, both named items
-    already got comparable coverage, or the LLM call fails, times out, or
-    the KNOWLEDGE BASE genuinely has nothing more to say about the
-    shortchanged item (explicitly allowed to say so — this never invents
-    content, see the prompt's own grounding rule below).
+    Returns None (no correction) when: neither the query nor the answer
+    names a pair, the answer is a refusal message, too short to judge,
+    both named items already got comparable coverage, or the LLM call
+    fails, times out, or the KNOWLEDGE BASE genuinely has nothing more to
+    say about the shortchanged item (explicitly allowed to say so — this
+    never invents content, see the prompt's own grounding rule below).
     """
-    m = _NAMED_PAIR_RE.search(query)
-    if not m:
+    pair = (
+        _extract_named_pair(query, _NAMED_PAIR_QUERY_PATTERNS)
+        or _extract_named_pair(answer_text, [_NAMED_PAIR_ANSWER_PATTERN])
+    )
+    if not pair:
         return None
-    name_a, name_b = m.group(1).strip(), m.group(2).strip()
-    if not name_a or not name_b or name_a.lower() == name_b.lower():
-        return None
+    name_a, name_b = pair
     if answer_text.strip().lower().startswith("hmm, i don't have"):
         return None
     if len(answer_text) < 80:
