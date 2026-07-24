@@ -790,6 +790,16 @@ def _wants_example(text: str) -> bool:
 # all match.
 _DETAIL_PATTERN = re.compile(r'\bin\s+(?:\w+\s+){0,2}details?\b', re.IGNORECASE)
 
+# Used by _enforce_numbered_list_format (below _strip_video_self_reference) —
+# these two query shapes are the ones prompt_template.py's FORMAT section
+# explicitly requires a numbered list for (TYPES/KINDS QUESTIONS, COMPARISON
+# QUESTIONS), and confirmed live the prompt rule alone isn't fully reliable —
+# the exact same "prompt-only compliance holds most but not all of the time"
+# pattern as _DETAIL_PATTERN's own "in detail" gap and _strip_video_self_reference's
+# video-reference gap.
+_TYPES_OF_QUERY_RE = re.compile(r"\b(?:types?|kinds?)\s+of\b", re.IGNORECASE)
+_COMPARISON_QUERY_RE = re.compile(r"\bcompare\b|\bdifference\s+between\b|\bvs\.?\b|\bversus\b", re.IGNORECASE)
+
 
 def _needs_detailed_answer(question: str) -> bool:
     """True when the question expects a comprehensive, multi-part, or procedural answer."""
@@ -3334,6 +3344,109 @@ def _strip_video_self_reference(text: str) -> str:
     if not changed:
         return text
     return " ".join(s for s in sentences if s.strip())
+
+
+# ── Numbered-list format enforcement (deterministic backstop) ──────────────
+# prompt_template.py's FORMAT section requires a numbered list, one point per
+# line, for TYPES/KINDS QUESTIONS and COMPARISON QUESTIONS — confirmed live
+# (2026-07-24) the prompt rule alone isn't fully reliable: the same query
+# ("What are different types of life insurance?") returned a clean numbered
+# list on most fresh test runs but plain prose on others, no code change in
+# between — the same "prompt-only compliance holds most but not all of the
+# time" pattern as _DETAIL_PATTERN's "in detail" gap and
+# _strip_video_self_reference's video-reference gap above, this time driven
+# by vLLM's own batched-inference run-to-run variance rather than a phrasing
+# gap in the prompt. Since it's a sampling issue, not a prompt-wording issue,
+# strengthening the prompt text further (already tried twice this session)
+# won't close it — only a deterministic backstop can.
+_NUMBERED_LINE_RE = re.compile(r"(?m)^\s*\d+\.\s")
+
+
+def _has_numbered_list_format(text: str) -> bool:
+    return len(_NUMBERED_LINE_RE.findall(text)) >= 2
+
+
+async def _enforce_numbered_list_format(query: str, answer_text: str) -> Optional[str]:
+    """
+    When `query` is a TYPES/KINDS or COMPARISON question (see
+    _TYPES_OF_QUERY_RE / _COMPARISON_QUERY_RE) and `answer_text` came back as
+    prose instead of the required numbered list, makes ONE narrow,
+    temperature=0 LLM call whose only job is to RESTRUCTURE the existing
+    text into numbered lines — never to add, remove, or reword any fact.
+    Purely a formatting pass, not a regeneration.
+
+    Returns None (no correction, safe to keep the original prose) when: the
+    query isn't one of these two shapes, the answer already has numbered
+    lines, the answer is a refusal message, the answer is too short to
+    plausibly hold 2+ distinct points, or the reformat call fails, times
+    out, or produces something that fails a basic length-sanity check
+    (guards against a truncated or hallucinated rewrite slipping through).
+    """
+    if not (_TYPES_OF_QUERY_RE.search(query) or _COMPARISON_QUERY_RE.search(query)):
+        return None
+    if _has_numbered_list_format(answer_text):
+        return None
+    if answer_text.strip().lower().startswith("hmm, i don't have"):
+        return None
+    if len(answer_text) < 80:
+        # Too short to plausibly hold 2+ distinct points — a genuine
+        # one-fact answer the KNOWLEDGE BASE only partially supports, not a
+        # formatting failure prompt_template.py's own rules already cover
+        # (TYPES/KINDS QUESTIONS: "if the KB genuinely gives zero detail...
+        # fall back to rule 8's decline instead of an empty-feeling list").
+        return None
+
+    prompt = f"""Reformat the ANSWER below into a numbered list — one distinct point per
+line, each starting with "1. ", "2. ", "3. " etc. Do NOT add, remove, change, or reword
+any fact or word — only restructure it with line breaks and numbering, preserving the
+exact wording. If the ANSWER genuinely does not contain 2 or more distinct separable
+points, return it completely unchanged, exactly as given, with no numbering added and no
+extra commentary.
+
+ANSWER:
+{answer_text}
+
+REFORMATTED:"""
+
+    try:
+        # timeout=35, not the 3s used by the tiny classification calls
+        # elsewhere in this file (e.g. _classify_query_policy_type_llm) —
+        # confirmed live those calls generate ~10 tokens while this one
+        # generates up to 700, and the main answer generation itself over
+        # this same backend has been observed taking 7-38s (see ask_stream's
+        # own TIMING log) for comparable output lengths. A short timeout
+        # here just silently no-ops the whole fix on the backend's normal
+        # slow path instead of actually reformatting.
+        raw = await _backend_completion(
+            prompt, max_tokens=min(700, max(200, len(answer_text) // 3 + 150)),
+            timeout=35, temperature=0,
+        )
+    except Exception as exc:
+        logger.debug("[ask_stream] numbered-list reformat call failed: %s", exc)
+        return None
+    if not raw:
+        return None
+    reformatted = raw.strip()
+
+    # Drop any conversational preamble before the first numbered point
+    # ("Here's the reformatted list:\n\n1. ...") — the model is a chat
+    # model, not a raw completion model, so a stray lead-in is possible even
+    # with an explicit "no extra commentary" instruction.
+    first_marker = re.search(r"(?m)^\s*1\.\s", reformatted)
+    if first_marker:
+        reformatted = reformatted[first_marker.start():]
+
+    if not _has_numbered_list_format(reformatted):
+        return None
+    # A pure restructure shouldn't shrink or grow the content meaningfully —
+    # guards against a truncated or hallucinated rewrite.
+    if not (0.6 * len(answer_text) <= len(reformatted) <= 1.6 * len(answer_text)):
+        logger.debug(
+            "[ask_stream] numbered-list reformat rejected on length sanity check (%d -> %d chars)",
+            len(answer_text), len(reformatted),
+        )
+        return None
+    return reformatted
 
 
 # ── Short follow-up detection & reformulation ──────────────────────────────
@@ -6402,6 +6515,17 @@ class MultiSourceRAG:
                 _kv_reply = _rider_corrected_text
         except Exception as _rider_exc:
             logger.debug("[ask_stream] rider-misattribution correction skipped: %s", _rider_exc)
+
+        try:
+            _list_formatted_text = await _enforce_numbered_list_format(
+                question, _corrected_text or _reply_stripped
+            )
+            if _list_formatted_text:
+                logger.info("[ask_stream] reformatted prose answer into a numbered list")
+                _corrected_text = _list_formatted_text
+                _kv_reply = _list_formatted_text
+        except Exception as _list_exc:
+            logger.debug("[ask_stream] numbered-list format enforcement skipped: %s", _list_exc)
 
         # ── Truncation detection (log only, never discard content) ────────────
         # Used to trim the answer down to its last complete sentence when the
