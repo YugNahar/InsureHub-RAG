@@ -32,21 +32,33 @@ from . import embeddings, llm_fallback, registry
 
 logger = logging.getLogger(__name__)
 
-# Calibrated 2026-07-24 against 25 real queries (8 known-travel phrases,
-# 14 clean-control queries spanning every other existing policy type,
-# 3 adversarial travel-adjacent-but-not-travel-insurance queries) — see
-# agent_router's calibration notes / commit message for the raw numbers.
-# Confirmed BGE-base similarity for short insurance-domain queries runs
-# much higher across the board than multi_source_rag.py's near-duplicate
-# thresholds (0.94/0.97) would suggest — even unrelated queries like
-# "What is motor insurance?" scored 0.673 against Ava's description,
-# since all insurance-domain text shares heavy vocabulary overlap. The
-# real separation found: known-travel min 0.780, clean-control max
-# 0.674 — a clean gap with no overlap in this sample. Adversarial
-# queries (0.681-0.776) correctly fall in the ambiguous band between the
-# two thresholds, which is exactly where they belong.
-_HIGH_CONFIDENCE_THRESHOLD = 0.78  # at/above known-travel's observed floor
-_LOW_CONFIDENCE_FLOOR = 0.68        # just above clean-control's observed ceiling (0.674)
+# Recalibrated 2026-07-24 (2nd pass) after narrowing Ava's scope from
+# "travel insurance topic" to "travel insurance QUOTE/PURCHASE intent"
+# (see agent_router/agents/ava.py's docstring — the topic-level scoping
+# was routing plain informational questions like "What is travel
+# insurance?" into the Ava handoff, which was wrong since only the
+# quote/bind/issue flow is implemented). That narrowing broke the old
+# 0.78/0.68 calibration: embeddings encode TOPIC, not speech-act, so
+# "What is travel insurance?" (informational) and "get me a quote for my
+# trip" (purchase) score nearly identically on pure topic similarity —
+# real observed overlap: quote-intent phrases scored as low as 0.780,
+# while informational travel-insurance questions scored up to 0.861,
+# well inside the old high-confidence band.
+#
+# Refit against the same real-query discipline: quote-intent min 0.780
+# still sets the floor a genuine quote request needs to even enter
+# consideration, but the embedding-only HIGH threshold had to move up to
+# 0.90 (clears every observed informational-question score, only lets
+# through unambiguous quote phrasing like "sign me up for travel
+# insurance" / "can I speak with Ava"). Everything between the two
+# thresholds — which now includes EVERY informational travel-insurance
+# question, not just adversarial edge cases — leans entirely on the LLM
+# fallback's purchase-vs-informational-intent instruction (see
+# llm_fallback.py) to do the real discrimination work. Confirmed live:
+# 12/12 on a quote-vs-informational-vs-adversarial discrimination set
+# after sharpening that prompt.
+_HIGH_CONFIDENCE_THRESHOLD = 0.90  # clears every observed informational-question score
+_LOW_CONFIDENCE_FLOOR = 0.68        # unchanged — still above ordinary clean-control's ceiling
 
 
 @dataclass

@@ -16,22 +16,38 @@ DB rows, and far enough into the quote flow, a real outbound email/lead)
 for what should be a read-only routing check. See "Test Queries Trigger
 Real Emails" precedent for why that matters.
 
-Three sets (agent_routing_corpus.json):
-  * known_travel   — expect the offer to fire (agent_name="ava").
-  * clean_control  — one real query per existing policy type + a greeting;
-                      expect NO offer. Any hit here is a false-positive
-                      route that would hijack an ordinary Layla query.
-  * adversarial    — travel-adjacent wording that is NOT travel insurance;
-                      expect NO offer, but via the noisier LLM-fallback
-                      band, so treated as WARN not HARD FAIL (see below).
+Four sets (agent_routing_corpus.json):
+  * known_travel        — genuine quote/purchase-intent phrasings; expect
+                           the offer to fire (agent_name="ava").
+  * travel_info_not_ava — informational travel-insurance questions with NO
+                           purchase intent ("What is travel insurance?",
+                           "does it cover trip cancellation?"); expect NO
+                           offer. This is the regression check for the
+                           real bug this corpus was extended for: Ava's
+                           first cut scoped on TOPIC ("travel insurance")
+                           rather than INTENT (quote/buy), so any
+                           travel-insurance-flavored RAG question hijacked
+                           the handoff. HARD FAIL class, same as
+                           clean_control — only the quote/bind/issue flow
+                           is implemented today, so a purely informational
+                           question must never be routed away from Layla's
+                           own knowledge base.
+  * clean_control        — one real query per existing policy type + a
+                            greeting; expect NO offer. Any hit here is a
+                            false-positive route that would hijack an
+                            ordinary Layla query.
+  * adversarial           — travel-adjacent wording that is NOT travel
+                             insurance; expect NO offer, but via the
+                             noisier LLM-fallback band, so treated as WARN
+                             not HARD FAIL (see below).
 
-  PASS/FAIL criteria (2026-07-24, first cut for this corpus — mirrors
-  contamination_corpus_runner.py's discipline, not yet calibrated against
-  a large historical sweep since this is the corpus's first run):
-    - HARD FAIL: any clean_control false positive (control_offer_rate > 0).
+  PASS/FAIL criteria (2026-07-24, updated after the quote-vs-informational
+  rescoping — mirrors contamination_corpus_runner.py's discipline):
+    - HARD FAIL: any clean_control OR travel_info_not_ava false positive.
       Same invariant as the contamination runner's clean-control rule — an
-      ordinary, unambiguous query must never get hijacked into an agent
-      offer.
+      ordinary, unambiguous query (including a purely informational
+      question about an agent's own topic) must never get hijacked into
+      an agent offer.
     - WARN (exits 0): any adversarial false positive, or any known_travel
       case that fails to trigger the offer (recall miss) — both flow
       through the ambiguous LLM-fallback band, which this project has
@@ -104,7 +120,7 @@ def run_case(case: dict, repeats: int) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--set", choices=["known_travel", "clean_control", "adversarial"], default=None)
+    ap.add_argument("--set", choices=["known_travel", "travel_info_not_ava", "clean_control", "adversarial"], default=None)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -112,7 +128,7 @@ def main() -> None:
     with open(CORPUS_PATH) as f:
         corpus = json.load(f)
 
-    sets = [args.set] if args.set else ["known_travel", "clean_control", "adversarial"]
+    sets = [args.set] if args.set else list(corpus.keys())
     all_results = {}
     for set_name in sets:
         cases = corpus[set_name]
@@ -134,14 +150,16 @@ def main() -> None:
     hard_fail = False
     warn = False
 
-    if "clean_control" in all_results:
-        total = sum(r["repeats"] for r in all_results["clean_control"])
-        hits = sum(r["offer_count"] for r in all_results["clean_control"])
+    for hard_fail_set in ("clean_control", "travel_info_not_ava"):
+        if hard_fail_set not in all_results:
+            continue
+        total = sum(r["repeats"] for r in all_results[hard_fail_set])
+        hits = sum(r["offer_count"] for r in all_results[hard_fail_set])
         rate = (hits / total * 100) if total else 0.0
-        print(f"\nclean_control false-positive rate: {rate:.1f}% ({hits}/{total})")
+        print(f"\n{hard_fail_set} false-positive rate: {rate:.1f}% ({hits}/{total})")
         if hits > 0:
             hard_fail = True
-            print("  HARD FAIL: a clean-control query triggered the agent-handoff offer.")
+            print(f"  HARD FAIL: a {hard_fail_set} query triggered the agent-handoff offer.")
 
     if "adversarial" in all_results:
         total = sum(r["repeats"] for r in all_results["adversarial"])

@@ -1,15 +1,24 @@
 {
   "known_travel": [
-    { "id": "travel-01", "query": "I need travel insurance for my trip to Dubai next month" },
-    { "id": "travel-02", "query": "Schengen visa insurance please" },
-    { "id": "travel-03", "query": "can I speak with Ava" },
-    { "id": "travel-04", "query": "insurance for my honeymoon in Bali" },
-    { "id": "travel-05", "query": "I am flying to Europe next week, do I need any insurance?" },
-    { "id": "travel-06", "query": "Hajj insurance for my father" },
-    { "id": "travel-07", "query": "trip insurance for a backpacking trip through Southeast Asia" },
-    { "id": "travel-08", "query": "connect me with the travel agent" },
-    { "id": "travel-09", "query": "I'm going on holiday to Thailand, what cover do I need?" },
-    { "id": "travel-10", "query": "insurance for a Umrah pilgrimage" }
+    { "id": "travel-01", "query": "can you get me a quote for my travel to India" },
+    { "id": "travel-02", "query": "can you help me with a travel quote" },
+    { "id": "travel-03", "query": "what will be the premium if I am going to Dubai" },
+    { "id": "travel-04", "query": "I want to buy travel insurance for my trip to Thailand" },
+    { "id": "travel-05", "query": "get me a travel insurance quote for my trip to the UK" },
+    { "id": "travel-06", "query": "how much will it cost to insure my trip to Bali" },
+    { "id": "travel-07", "query": "I need to purchase travel insurance for my upcoming trip" },
+    { "id": "travel-08", "query": "quote me travel insurance for my Schengen visa" },
+    { "id": "travel-09", "query": "sign me up for travel insurance" },
+    { "id": "travel-10", "query": "can I speak with Ava" }
+  ],
+  "travel_info_not_ava": [
+    { "id": "info-what-is", "query": "What is travel insurance?" },
+    { "id": "info-trip-cancel", "query": "Does travel insurance cover trip cancellation?" },
+    { "id": "info-what-covers", "query": "What does travel insurance typically cover?" },
+    { "id": "info-how-works", "query": "How does travel insurance work?" },
+    { "id": "info-med-evac", "query": "Is medical evacuation covered under travel insurance?" },
+    { "id": "info-exclusions", "query": "What is excluded from travel insurance policies?" },
+    { "id": "info-schengen-need", "query": "Do I need travel insurance for a Schengen visa?" }
   ],
   "clean_control": [
     { "id": "control-motor", "query": "What is covered under motor insurance?" },

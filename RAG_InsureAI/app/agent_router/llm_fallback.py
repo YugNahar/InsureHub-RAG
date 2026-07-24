@@ -39,6 +39,13 @@ this message should be handed off to ONE specialist agent below, or Layla should
 {label_list}
   - none: Layla should keep handling this herself
 
+A request to GET A QUOTE, BUY, PURCHASE, or find out the COST/PRICE of something an
+agent handles counts as that agent — even without the literal word "quote" (e.g. "how
+much would it cost to insure my trip" is a quote request). A general question about
+what something IS, what it covers, or how it works, with no purchase/pricing intent,
+stays "none" even if it matches an agent's topic — Layla answers those from her own
+knowledge base.
+
 MESSAGE: {query}
 
 Reply with ONLY the agent name or the word "none" — nothing else."""

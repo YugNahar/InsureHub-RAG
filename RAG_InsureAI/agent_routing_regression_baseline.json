@@ -2,63 +2,107 @@
   "known_travel": [
     {
       "id": "travel-01",
-      "query": "I need travel insurance for my trip to Dubai next month",
+      "query": "can you get me a quote for my travel to India",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-02",
-      "query": "Schengen visa insurance please",
+      "query": "can you help me with a travel quote",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-03",
-      "query": "can I speak with Ava",
+      "query": "what will be the premium if I am going to Dubai",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-04",
-      "query": "insurance for my honeymoon in Bali",
+      "query": "I want to buy travel insurance for my trip to Thailand",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-05",
-      "query": "I am flying to Europe next week, do I need any insurance?",
+      "query": "get me a travel insurance quote for my trip to the UK",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-06",
-      "query": "Hajj insurance for my father",
+      "query": "how much will it cost to insure my trip to Bali",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-07",
-      "query": "trip insurance for a backpacking trip through Southeast Asia",
+      "query": "I need to purchase travel insurance for my upcoming trip",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-08",
-      "query": "connect me with the travel agent",
+      "query": "quote me travel insurance for my Schengen visa",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-09",
-      "query": "I'm going on holiday to Thailand, what cover do I need?",
+      "query": "sign me up for travel insurance",
       "repeats": 1,
       "offer_count": 1
     },
     {
       "id": "travel-10",
-      "query": "insurance for a Umrah pilgrimage",
+      "query": "can I speak with Ava",
       "repeats": 1,
       "offer_count": 1
+    }
+  ],
+  "travel_info_not_ava": [
+    {
+      "id": "info-what-is",
+      "query": "What is travel insurance?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "info-trip-cancel",
+      "query": "Does travel insurance cover trip cancellation?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "info-what-covers",
+      "query": "What does travel insurance typically cover?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "info-how-works",
+      "query": "How does travel insurance work?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "info-med-evac",
+      "query": "Is medical evacuation covered under travel insurance?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "info-exclusions",
+      "query": "What is excluded from travel insurance policies?",
+      "repeats": 1,
+      "offer_count": 0
+    },
+    {
+      "id": "info-schengen-need",
+      "query": "Do I need travel insurance for a Schengen visa?",
+      "repeats": 1,
+      "offer_count": 0
     }
   ],
   "clean_control": [
