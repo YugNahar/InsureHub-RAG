@@ -119,17 +119,6 @@ const API = {
     } catch { /* best-effort HTTP fallback when WS is down */ }
   },
 
-  // session_id never rotates on "Clear chat" (see file header), but a
-  // specialist agent (e.g. Ava) handoff is sticky server-side keyed by
-  // that same session_id — without this, clearing the visible thread
-  // left every future message still silently routed to the old agent.
-  async resetAgent(sessionId) {
-    if (MOCK_MODE) return;
-    try {
-      await fetch(`${this.baseUrl}/session/${sessionId}/reset-agent`, { method: 'POST' });
-    } catch { /* best-effort — worst case the next message re-triggers routing */ }
-  },
-
   // Async generator yielding { type: 'chunk', text } | { type: 'done', ... }.
   async *streamAsk(query, sessionId, signal) {
     if (MOCK_MODE) {
@@ -802,18 +791,30 @@ function autoResizeTextarea() {
    11. CLEAR CHAT
    ========================================================================= */
 
-// Empties the visible thread only — session_id is untouched, so this is
-// NOT a new conversation from the backend's point of view (see file
-// header). Matches the user's explicit "same session id, just cleared"
-// requirement, not a "new chat window" model.
+// Starts a genuinely new conversation: rotates session_id so the backend
+// (Layla RAG history, agent_hub's active_agent/sticky-routing state, and
+// Ava's own quote-flow state) has no memory of what came before — a stale
+// active_agent could otherwise strand the user talking to a specialist
+// bot they can no longer see any trace of. The OLD session_id and
+// everything logged under it are NEVER deleted server-side — only this
+// client stops using it — so the full prior conversation (including
+// anything Ava collected) stays visible to the human-agent dashboard and
+// super-admin exactly as before. This supersedes an earlier explicit
+// requirement to keep session_id fixed across a clear (see git history);
+// that made sense before agent routing existed, but left no way back to
+// Layla once "stuck" on a specialist except a manual super-admin override.
 function clearChat() {
   activeAbortController?.abort();
+  ws?.close();
+  ws = null;
+  state.sessionId = uid();
   state.messages = [];
+  pollSeen = 0;
   saveState();
   renderThread();
   announce('Chat cleared.');
   el.composerInput.focus();
-  API.resetAgent(state.sessionId);
+  connectAgentChannel();
 }
 
 /* =========================================================================

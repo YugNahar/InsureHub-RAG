@@ -316,7 +316,7 @@ import re as _bot_re
 # name resolvable for the "from agent_router import ..." line below when
 # Python hasn't seen the package yet in this process.
 import agent_router.agents  # noqa: F401 — triggers register_agent() for every agent
-from agent_router import registry as _agent_registry, core as _agent_router_core
+from agent_router import registry as _agent_registry, core as _agent_router_core, interrupt as _agent_router_interrupt
 
 _CONFIRM_YES_RE = _bot_re.compile(r"\b(yes|yeah|yep|sure|ok(ay)?|please do|go ahead|connect me)\b")
 _CONFIRM_NO_RE  = _bot_re.compile(r"\b(no|nope|nah|not now|don'?t|skip)\b")
@@ -585,22 +585,6 @@ async def session_cancel_handoff(session_id: str):
     cancelled = await _agent_hub.cancel_handoff(session_id)
     session = _agent_hub.get_session(session_id)
     return {"cancelled": cancelled, "status": session.status if session else "unknown"}
-
-
-@app.post("/session/{session_id}/reset-agent")
-async def session_reset_agent(session_id: str):
-    """Reset a session's active_agent back to "layla" — called by the
-    frontend's "Clear chat" action. session_id never rotates on a clear
-    (see frontend/public/app.js's file header — RAG conversation history
-    is deliberately left untouched by a clear), which meant a user who
-    clicked "Clear chat" while mid-conversation with a specialist agent
-    (e.g. Ava) stayed permanently routed to that agent afterward — the
-    visible thread looked fresh but every new message still silently went
-    to the old agent. This only resets agent routing state, not
-    conversation history, so it doesn't change that established
-    behavior."""
-    ok = await _agent_hub.set_active_agent(session_id, "layla")
-    return {"ok": ok}
 
 
 @app.get("/session/{session_id}/poll")
@@ -1801,14 +1785,29 @@ async def ask_stream(req: AskRequest):
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
 
         elif _bot_sess.active_agent != "layla":
-            _bot_reply = await _agent_registry.get_agent(_bot_sess.active_agent).invoke(req.session_id, req.question)
-            async def _bot_gen():
-                asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
-                asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _bot_reply))
-                yield _bot_reply
-                yield "\n\n" + _json.dumps({"sources": [], "done": True})
-            return StreamingResponse(_bot_gen(), media_type="text/plain",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
+            # A message mid-specialist-conversation might be a genuine,
+            # unrelated question the user wants Layla to answer instead of
+            # the specialist (confirmed live: "What is motor insurance?"
+            # while mid-Ava-quote got Ava's own canned menu reply). If so,
+            # deliberately do NOT touch active_agent or call the specialist
+            # at all — just fall through to the normal Layla RAG flow below
+            # for this one turn. The specialist's own conversation state
+            # (its own DB, keyed by session_id) is untouched, so the next
+            # continuation-shaped message (a plan number, a name, contact
+            # info) resumes it exactly where it left off — no explicit
+            # "resume" logic needed, this is what makes that free.
+            _is_interruption = await _agent_router_interrupt.is_interruption(
+                req.question, _bot_sess.active_agent
+            )
+            if not _is_interruption:
+                _bot_reply = await _agent_registry.get_agent(_bot_sess.active_agent).invoke(req.session_id, req.question)
+                async def _bot_gen():
+                    asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
+                    asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _bot_reply))
+                    yield _bot_reply
+                    yield "\n\n" + _json.dumps({"sources": [], "done": True})
+                return StreamingResponse(_bot_gen(), media_type="text/plain",
+                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
 
     # Fast-path: greetings bypass the LLM entirely — instant reply
     # Fast-path: ILLEGAL content — firm refusal, no RAG, no handoff
