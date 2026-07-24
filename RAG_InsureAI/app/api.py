@@ -1439,16 +1439,25 @@ async def ask(req: AskRequest):
 
 @app.post("/conversation/reset/{session_id}")
 async def reset_conversation(session_id: str):
-    """Reset the conversational agent's state for a session (clears pending
-    questions and LLM-facing memory) — used when the user starts a New Chat.
-    The session itself (its agent_hub record and full transcript) is left
-    completely intact for Super Admin / Agent Dashboard visibility; only a
-    system marker is appended so admins can see where the reset occurred."""
+    """Reset a session's state for a New Chat, on the SAME session_id — the
+    frontend's "Clear chat" calls this. The session itself (its agent_hub
+    record and full transcript) is left completely intact for Super Admin /
+    Agent Dashboard visibility; only a system marker is appended so admins
+    can see where the reset occurred, and admins keep seeing one continuous
+    session per user rather than a new dashboard entry every time someone
+    clears their chat.
+
+    Also resets active_agent back to "layla" (agent_router) — without this,
+    a user mid-conversation with a specialist agent (e.g. Ava) who clicked
+    Clear chat stayed permanently routed to that agent afterward: the
+    visible thread looked fresh but every new message still silently went
+    to the old agent. Confirmed live."""
     agent = _get_conversation_agent()
     agent.reset_session(session_id)
     await _delete_agent_session(session_id)
     # Also clear the stored conversation history if desired
     await _delete_conversation_history(session_id)
+    await _agent_hub.set_active_agent(session_id, "layla")
     if session_id and session_id != "default":
         try:
             await _agent_hub.log_message(session_id, "system", "— New Chat started —")

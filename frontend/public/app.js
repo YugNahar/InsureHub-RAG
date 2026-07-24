@@ -3,10 +3,12 @@
    Single persistent chat window, no sidebar, no multi-conversation
    switching — matches the real production Layla product (confirmed
    against the prior React client, frontend/src/App.tsx, which never had
-   a conversation-history sidebar either). "Clear chat" empties the
-   visible thread only; session_id is generated once and never rotates,
-   so backend-side conversation context (multi_source_rag.py's
-   _get_conversation_history(session_id)) is untouched by a clear.
+   a conversation-history sidebar either). session_id is generated once
+   and never rotates — even across "Clear chat" (see clearChat()) — so the
+   human-agent dashboard and super-admin always see one continuous session
+   per user. "Clear chat" empties the visible thread client-side and resets
+   server-side conversational/routing state via API.resetConversation() on
+   that SAME session_id; the full transcript is never deleted server-side.
    ========================================================================= */
 
 'use strict';
@@ -117,6 +119,17 @@ const API = {
     try {
       await fetch(`${this.baseUrl}/session/${sessionId}/cancel-handoff`, { method: 'POST' });
     } catch { /* best-effort HTTP fallback when WS is down */ }
+  },
+
+  // Resets server-side conversation/agent-routing state on the SAME
+  // session_id (never deletes the session or its transcript — see
+  // clearChat()) so the human-agent dashboard / super-admin keep seeing
+  // one continuous session per user across a "Clear chat".
+  async resetConversation(sessionId) {
+    if (MOCK_MODE) return;
+    try {
+      await fetch(`${this.baseUrl}/conversation/reset/${sessionId}`, { method: 'POST' });
+    } catch { /* best-effort — worst case stale agent-routing state lingers until the next reset */ }
   },
 
   // Async generator yielding { type: 'chunk', text } | { type: 'done', ... }.
@@ -791,30 +804,25 @@ function autoResizeTextarea() {
    11. CLEAR CHAT
    ========================================================================= */
 
-// Starts a genuinely new conversation: rotates session_id so the backend
-// (Layla RAG history, agent_hub's active_agent/sticky-routing state, and
-// Ava's own quote-flow state) has no memory of what came before — a stale
-// active_agent could otherwise strand the user talking to a specialist
-// bot they can no longer see any trace of. The OLD session_id and
-// everything logged under it are NEVER deleted server-side — only this
-// client stops using it — so the full prior conversation (including
-// anything Ava collected) stays visible to the human-agent dashboard and
-// super-admin exactly as before. This supersedes an earlier explicit
-// requirement to keep session_id fixed across a clear (see git history);
-// that made sense before agent routing existed, but left no way back to
-// Layla once "stuck" on a specialist except a manual super-admin override.
+// session_id stays fixed across a clear — deliberate, explicit requirement:
+// the human-agent dashboard and super-admin should keep seeing ONE
+// continuous session per user, not a new dashboard entry every time
+// someone clicks Clear chat. Only the VISIBLE thread is erased client-side;
+// nothing is deleted server-side — API.resetConversation() resets
+// server-side state on that SAME session_id instead (RAG conversational
+// memory, and agent_router's active_agent back to "layla" so a user who
+// was mid-conversation with a specialist agent, e.g. Ava, doesn't stay
+// silently stuck talking to it after "clearing"), and appends a "— New
+// Chat started —" marker so admins can see exactly where the reset
+// happened in the still-intact full transcript.
 function clearChat() {
   activeAbortController?.abort();
-  ws?.close();
-  ws = null;
-  state.sessionId = uid();
   state.messages = [];
-  pollSeen = 0;
   saveState();
   renderThread();
   announce('Chat cleared.');
   el.composerInput.focus();
-  connectAgentChannel();
+  API.resetConversation(state.sessionId);
 }
 
 /* =========================================================================
