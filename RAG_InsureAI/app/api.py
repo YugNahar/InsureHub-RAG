@@ -299,8 +299,11 @@ create_login_endpoint(app)
 # /api/chat, distinct from every existing route here. See the router's own
 # module for the full quote/bind/issue conversation flow.
 from travel_bot.routers.chat import router as _travel_chat_router
-from travel_bot.core.database import Base as _travel_base, engine as _travel_engine
+from travel_bot.core.database import Base as _travel_base, engine as _travel_engine, SessionLocal as _travel_session_local
 import travel_bot.models.field_definition as _travel_field_definition  # noqa: F401 — registers the table below; only written by seed_field_definitions.py, never read by the live chat flow
+from travel_bot.models.session import ChatSession as _TravelChatSession
+from travel_bot.models.message import Message as _TravelMessage
+from travel_bot.models.extracted_value import ExtractedValue as _TravelExtractedValue
 _travel_base.metadata.create_all(bind=_travel_engine)
 app.include_router(_travel_chat_router)
 
@@ -1437,6 +1440,17 @@ async def ask(req: AskRequest):
         ) from exc
 
 
+def _reset_travel_bot_state_sync(session_id: str) -> None:
+    db = _travel_session_local()
+    try:
+        db.query(_TravelChatSession).filter(_TravelChatSession.session_id == session_id).delete()
+        db.query(_TravelMessage).filter(_TravelMessage.session_id == session_id).delete()
+        db.query(_TravelExtractedValue).filter(_TravelExtractedValue.request_id == session_id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
 @app.post("/conversation/reset/{session_id}")
 async def reset_conversation(session_id: str):
     """Reset a session's state for a New Chat, on the SAME session_id — the
@@ -1451,13 +1465,33 @@ async def reset_conversation(session_id: str):
     a user mid-conversation with a specialist agent (e.g. Ava) who clicked
     Clear chat stayed permanently routed to that agent afterward: the
     visible thread looked fresh but every new message still silently went
-    to the old agent. Confirmed live."""
+    to the old agent. Confirmed live.
+
+    ALSO resets Ava's own state (travel_bot's ChatSession/Message/
+    ExtractedValue rows, all keyed by this same session_id) — confirmed
+    live this was still missing even after the active_agent fix above: a
+    user who'd given Ava their name/contact earlier, then cleared chat and
+    started a fresh quote request later, had Ava skip straight past "what's
+    your name" to whatever field was still missing from the OLD
+    conversation — because session_id never rotates, Ava's own DB (a
+    completely separate SQLite database from everything else this endpoint
+    resets) just resumed exactly where it left off. FieldExtractionLog
+    (the append-only audit trail of when each field was captured) is
+    deliberately NOT touched — same "reset working state, keep the audit
+    history admin-visible" pattern as agent_hub's own message log above."""
     agent = _get_conversation_agent()
     agent.reset_session(session_id)
     await _delete_agent_session(session_id)
     # Also clear the stored conversation history if desired
     await _delete_conversation_history(session_id)
     await _agent_hub.set_active_agent(session_id, "layla")
+    try:
+        await asyncio.to_thread(_reset_travel_bot_state_sync, session_id)
+    except Exception:
+        logger.warning(
+            "[reset_conversation] Failed to reset travel_bot state for session_id=%s",
+            session_id, exc_info=True,
+        )
     if session_id and session_id != "default":
         try:
             await _agent_hub.log_message(session_id, "system", "— New Chat started —")
