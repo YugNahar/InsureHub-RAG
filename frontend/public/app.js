@@ -313,6 +313,14 @@ const el = {
 let userScrolledAway = false;
 let activeAbortController = null;
 
+// Set by clearChat(), awaited at the top of sendMessage() — closes a real
+// race: API.resetConversation() used to be fire-and-forget, so a user who
+// cleared the chat and immediately sent a new message (paste + enter, or
+// just typing fast) could have that message reach the backend BEFORE the
+// reset did, landing on the still-stale active_agent and silently going
+// to whatever specialist agent the session was stuck on. Confirmed live.
+let pendingResetPromise = null;
+
 // Human-agent handoff state — not persisted to localStorage; re-derived
 // from the server on every poll tick / page load, since the backend is
 // the source of truth for whether an agent is actually connected.
@@ -508,6 +516,8 @@ async function regenerateResponse(assistantMsg) {
    ========================================================================= */
 
 async function sendMessage(text) {
+  if (pendingResetPromise) await pendingResetPromise;
+
   const value = (text ?? el.composerInput.value).trim();
   if (!value) return;
 
@@ -815,6 +825,11 @@ function autoResizeTextarea() {
 // silently stuck talking to it after "clearing"), and appends a "— New
 // Chat started —" marker so admins can see exactly where the reset
 // happened in the still-intact full transcript.
+//
+// pendingResetPromise: sendMessage() awaits this before doing anything, so
+// a message sent right after clearing (paste + enter, or just typing
+// fast) can never reach the backend before the reset does — see that
+// variable's own comment for the race this closes.
 function clearChat() {
   activeAbortController?.abort();
   state.messages = [];
@@ -822,7 +837,9 @@ function clearChat() {
   renderThread();
   announce('Chat cleared.');
   el.composerInput.focus();
-  API.resetConversation(state.sessionId);
+  pendingResetPromise = API.resetConversation(state.sessionId).finally(() => {
+    pendingResetPromise = null;
+  });
 }
 
 /* =========================================================================
