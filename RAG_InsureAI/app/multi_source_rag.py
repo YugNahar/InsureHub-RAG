@@ -3187,21 +3187,36 @@ _STANDALONE_PRODUCT_TERMS = (
 )
 
 
-def _detect_rider_misattribution(answer_text: str, chunks: list) -> Optional[dict]:
+def _detect_rider_misattribution(answer_text: str, context_text: str) -> Optional[dict]:
     """
     True (well, a dict) when the answer names a standalone health product
     (mediclaim/health insurance) without ever saying "rider", while also
-    reusing 2+ distinctive words from a chunk that explicitly describes a
-    "<feature> rider(s)" — i.e. the answer likely dropped the "this is an
+    reusing 2+ distinctive words from context text that explicitly describes
+    a "<feature> rider(s)" — i.e. the answer likely dropped the "this is an
     add-on, not an inherent feature" context the source itself made clear.
 
+    Takes the PRE-COMPRESSION context string (_full_context_uncompressed,
+    already captured earlier in ask_stream for exactly this reason — see
+    its own comment there), not the post-compression `all_chunks` used for
+    generation. Confirmed live this distinction is load-bearing, not
+    theoretical: the compressor keeps only the highest-scoring ~7% of each
+    chunk's text (one real trace showed "12901 chars across 5 chunks ->
+    target 900 chars"), and it kept the sentences describing the rider's
+    coverage while dropping the SAME chunk's "...riders, who is it for?"
+    framing sentence — so checking the compressed chunks the model actually
+    saw found zero matches for a case that had very clearly happened (the
+    generated answer itself proved the model saw the rider content from
+    somewhere). The pre-compression string is what was actually retrieved,
+    which is the correct question to ask here, same reasoning
+    _full_context_uncompressed's own existing comment already gives for
+    every other check that reads it.
+
     Deliberately loose (word-overlap, not exact-phrase) since the model
-    paraphrases freely — this only needs to be a good-enough signal to
-    measure real-world frequency, not a precise auto-corrector. Scans every
-    chunk and every match rather than stopping at the first hit, and keeps
-    the strongest (most-overlapping) candidate — a KB with several rider
-    mentions shouldn't have its verdict decided by whichever happened to be
-    retrieved first.
+    paraphrases freely — this only needs to be a good-enough signal, not a
+    precise auto-corrector. Scans every match rather than stopping at the
+    first hit, and keeps the strongest (most-overlapping) candidate — a KB
+    with several rider mentions shouldn't have its verdict decided by
+    whichever happened to appear first in the joined string.
     """
     if _RIDER_MARKER_RE.search(answer_text):
         # Answer already says "rider" somewhere -- it's correctly framing
@@ -3211,24 +3226,114 @@ def _detect_rider_misattribution(answer_text: str, chunks: list) -> Optional[dic
     if not any(term in answer_lower for term in _STANDALONE_PRODUCT_TERMS):
         return None
     best_hits, best_result = 0, None
-    for chunk in chunks:
-        text = getattr(chunk, "page_content", "") or ""
-        for m in _RIDER_FEATURE_RE.finditer(text):
-            feature_phrase = m.group(1).strip()
-            feature_words = [
-                w for w in re.findall(r"[a-z]+", feature_phrase.lower())
-                if len(w) > 3 and w not in _RIDER_FEATURE_STOPWORDS
-            ]
-            if len(feature_words) < 2:
-                continue
-            hits = sum(1 for w in feature_words if w in answer_lower)
-            if hits >= 2 and hits > best_hits:
-                best_hits = hits
-                best_result = {
-                    "feature_phrase": feature_phrase,
-                    "source": chunk.metadata.get("source") or chunk.metadata.get("source_url"),
-                }
+    for m in _RIDER_FEATURE_RE.finditer(context_text or ""):
+        feature_phrase = m.group(1).strip()
+        feature_words = [
+            w for w in re.findall(r"[a-z]+", feature_phrase.lower())
+            if len(w) > 3 and w not in _RIDER_FEATURE_STOPWORDS
+        ]
+        if len(feature_words) < 2:
+            continue
+        hits = sum(1 for w in feature_words if w in answer_lower)
+        if hits >= 2 and hits > best_hits:
+            best_hits = hits
+            best_result = {"feature_phrase": feature_phrase}
     return best_result
+
+
+def _correct_rider_misattribution(answer_text: str, context_text: str) -> Optional[str]:
+    """
+    Active correction on top of _detect_rider_misattribution(): appends a
+    short clarifying parenthetical to whichever sentence carries the
+    misattributed rider content — never edits or removes any existing
+    text. Deliberately additive-only: _strip_rule4_fallback's own
+    handoff_lead gap (fixed 2026-07-23, same day) is a direct, confirmed
+    example of what goes wrong when this codebase deletes/splices
+    generated text instead — it left an orphaned sentence fragment that a
+    DIFFERENT downstream fixer (the warm-lead-in fallback) then mangled
+    further into "So, but don't worry...". Appending a parenthetical at
+    the end of the flagged sentence can't produce that failure mode —
+    worst case it reads as a slightly redundant aside, never a broken one.
+
+    Returns None when nothing needs correcting (mirrors
+    _detect_rider_misattribution's own None-means-clean contract).
+    """
+    hit = _detect_rider_misattribution(answer_text, context_text)
+    if not hit:
+        return None
+    feature_words = [
+        w for w in re.findall(r"[a-z]+", hit["feature_phrase"].lower())
+        if len(w) > 3 and w not in _RIDER_FEATURE_STOPWORDS
+    ]
+    sentences = re.split(r"(?<=[.!?])(?<!\d\.)\s+", answer_text)
+    best_idx, best_hits = None, 1  # same >=2-hit bar the detector itself uses
+    for i, sent in enumerate(sentences):
+        hits = sum(1 for w in feature_words if w in sent.lower())
+        if hits > best_hits:
+            best_hits, best_idx = hits, i
+    if best_idx is None:
+        return None
+    sent = sentences[best_idx].rstrip()
+    m = re.match(r"^(.*?)([.!?]+)?$", sent, re.DOTALL)
+    body = (m.group(1).rstrip() if m else sent) or sent
+    punct = (m.group(2) if m and m.group(2) else ".")
+    sentences[best_idx] = (
+        f"{body} (usually available as an optional add-on rider, "
+        f"not a standard policy feature){punct}"
+    )
+    return " ".join(sentences)
+
+
+# ── Video-transcript self-reference stripping (deterministic) ──────────────
+# Backstop for prompt_template.py's "never say 'the video'/'this video'"
+# rule (all 3 grounded prompts) — confirmed live the prompt rule alone
+# isn't fully reliable (roughly 1 in 4-5 generations still said "The video
+# mentions that..." even with the explicit instruction in place, the same
+# "prompt-only compliance isn't fully reliable" pattern as every other
+# formatting rule in this file). Purely subtractive on a narrow, confirmed
+# phrase shape, and ONLY at the very start of a sentence — a whole leading
+# clause ("The video mentions that X" -> "X") drops cleanly with just a
+# recapitalized first letter, the same lesson the warm-lead-in fallback
+# already learned about not leaving a stray lowercase opener behind.
+# Deliberately does NOT also strip a mid-sentence occurrence ("As I
+# mentioned earlier, this video shows X, and Y") — tried that, confirmed
+# live it produces broken grammar ("As I mentioned earlier, X, and Y" loses
+# the verb tying the clauses together). Every real instance seen so far was
+# sentence-initial anyway; a mid-sentence occurrence is a smaller, rarer
+# residual gap that's safer to leave alone than to risk a broken splice.
+#
+# "that" is REQUIRED, not optional — also tried making it optional (to also
+# catch "The video mentions a term insurance plan that provides X"), and
+# confirmed live that's unsafe too: stripping down to just "a term
+# insurance plan that provides X" leaves a bare noun phrase with no main
+# verb, not a real sentence — the leading "that" is what guarantees
+# whatever follows is already a complete subject-verb clause on its own,
+# since "mentions THAT" always introduces one. Without "that" present, the
+# verb's object is a noun phrase, not a clause, and this fixer correctly
+# leaves it alone rather than risk a fragment.
+_VIDEO_SELF_REF_RE = re.compile(
+    r"\A(?:the|this|that|our|my)\s+videos?\s+"
+    r"(?:mentions?|shows?|explains?|says?|discusses?|covers?|notes?|states?|talks?\s+about)\s+"
+    r"that\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_video_self_reference(text: str) -> str:
+    sentences = re.split(r"(?<=[.!?])(?<!\d\.)\s+", text)
+    changed = False
+    for i, sent in enumerate(sentences):
+        m = _VIDEO_SELF_REF_RE.match(sent)
+        if not m:
+            continue
+        rest = sent[m.end():]
+        if rest:
+            rest = rest[0].upper() + rest[1:]
+        sentences[i] = rest
+        changed = True
+    if not changed:
+        return text
+    return " ".join(s for s in sentences if s.strip())
 
 
 # ── Short follow-up detection & reformulation ──────────────────────────────
@@ -6260,22 +6365,43 @@ class MultiSourceRAG:
                 _top_rerank,
             )
 
-        # ── Rider-to-standalone-product misattribution (log only) ──────────────
-        # See _detect_rider_misattribution's own docstring/comment for the
-        # confirmed-live failure this watches for. Mode-agnostic (not gated
-        # on _keyword_detailed) since the confirmed case was a brief-mode
-        # prose answer, not a detailed numbered list.
+        # ── Video self-reference + rider misattribution (active, additive-only) ─
+        # Both are deterministic backstops for prompt rules confirmed live to
+        # only partially hold on their own — see _strip_video_self_reference's
+        # and _correct_rider_misattribution's own docstrings/comments for the
+        # confirmed failures each targets. Mode-agnostic (not gated on
+        # _keyword_detailed) since both confirmed cases were brief-mode prose
+        # answers, not detailed numbered lists. Both are additive/subtractive
+        # only on a narrow, confirmed-safe shape — neither ever restructures
+        # or deletes a sentence the way the old point-relevance delete-based
+        # gate did (see plan.md history), so worst case either is a no-op.
         try:
-            _rider_hit = _detect_rider_misattribution(_corrected_text or _reply_stripped, all_chunks)
-            if _rider_hit:
-                logger.info(
-                    "[ask_stream] possible rider-to-standalone-product misattribution: "
-                    "feature=%r from source=%r — answer names a standalone product "
-                    "without ever saying \"rider\"",
-                    _rider_hit["feature_phrase"], _rider_hit["source"],
-                )
+            _video_stripped_text = _strip_video_self_reference(_corrected_text or _reply_stripped)
+            if _video_stripped_text != (_corrected_text or _reply_stripped):
+                logger.info("[ask_stream] stripped a sentence-initial video self-reference")
+                _corrected_text = _video_stripped_text
+                _kv_reply = _video_stripped_text
+        except Exception as _video_exc:
+            logger.debug("[ask_stream] video self-reference strip skipped: %s", _video_exc)
+
+        try:
+            # Pre-compression context (_full_context_uncompressed, captured
+            # earlier) not the post-compression all_chunks used for
+            # generation -- see _detect_rider_misattribution's own comment
+            # for why: confirmed live the compressor can keep a rider's
+            # coverage sentence while dropping the same chunk's "...riders,
+            # who is it for?" framing sentence, which made the post-
+            # compression version of this check never fire on a case that
+            # had very clearly happened.
+            _rider_corrected_text = _correct_rider_misattribution(
+                _corrected_text or _reply_stripped, _full_context_uncompressed
+            )
+            if _rider_corrected_text:
+                logger.info("[ask_stream] appended rider-vs-standalone-product clarifier")
+                _corrected_text = _rider_corrected_text
+                _kv_reply = _rider_corrected_text
         except Exception as _rider_exc:
-            logger.debug("[ask_stream] rider-misattribution check skipped: %s", _rider_exc)
+            logger.debug("[ask_stream] rider-misattribution correction skipped: %s", _rider_exc)
 
         # ── Truncation detection (log only, never discard content) ────────────
         # Used to trim the answer down to its last complete sentence when the
