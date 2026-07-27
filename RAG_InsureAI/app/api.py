@@ -1913,21 +1913,32 @@ async def ask_stream(req: AskRequest):
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
         )
 
-    _routing_decision = await _agent_router_core.select_agent(req.question)
-    if _routing_decision.agent_name:
-        _target_agent = _agent_registry.get_agent(_routing_decision.agent_name)
-        await _agent_hub.request_agent_confirmation(req.session_id, _routing_decision.agent_name)
-        _offer = (
-            f"It sounds like you're after {_target_agent.intent_phrase}! "
-            f"Want me to connect you with {_target_agent.display_name}? (yes/no)"
-        )
-        async def _offer_gen():
-            asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
-            asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _offer))
-            yield _offer
-            yield "\n\n" + _json.dumps({"sources": [], "done": True})
-        return StreamingResponse(_offer_gen(), media_type="text/plain",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
+    # A single message can ask for two genuinely different things where
+    # only ONE half is a specialist-agent request ("What is travel
+    # insurance and can you give me a quote?") — confirmed live the whole-
+    # query select_agent() check below doesn't confidently trigger on
+    # these, since half the sentence reads as an ordinary informational
+    # question and drags the combined signal back toward "stay with
+    # Layla," silently dropping the quote request entirely. Checked FIRST,
+    # before the whole-query check, so a genuine compound-mixed case never
+    # also falls through to (and gets overridden by) the whole-query path.
+    _compound_routing = await _agent_router_core.select_compound_routing(req.question)
+    if not _compound_routing:
+        _routing_decision = await _agent_router_core.select_agent(req.question)
+        if _routing_decision.agent_name:
+            _target_agent = _agent_registry.get_agent(_routing_decision.agent_name)
+            await _agent_hub.request_agent_confirmation(req.session_id, _routing_decision.agent_name)
+            _offer = (
+                f"It sounds like you're after {_target_agent.intent_phrase}! "
+                f"Want me to connect you with {_target_agent.display_name}? (yes/no)"
+            )
+            async def _offer_gen():
+                asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
+                asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _offer))
+                yield _offer
+                yield "\n\n" + _json.dumps({"sources": [], "done": True})
+            return StreamingResponse(_offer_gen(), media_type="text/plain",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
 
     greeting_reply = _greeting_reply(req.question)
     if greeting_reply:
@@ -1962,10 +1973,18 @@ async def ask_stream(req: AskRequest):
             for t in history_list[-_MAX_HISTORY_TURNS * 2:]
         )
 
+        # Only the RAG-answerable half of a compound-mixed query (see the
+        # select_compound_routing() check above) — the ORIGINAL req.question
+        # is still what's logged/saved to history below, so the transcript
+        # shows exactly what the user typed even though generation itself
+        # only answers half of it (the offer for the other half gets
+        # appended once generation finishes, further down).
+        _rag_question = _compound_routing.rag_question if _compound_routing else req.question
+
         full_text = ""
         try:
             buf = ""
-            async for token in multi.ask_stream(req.question, history=history_str, document_filter=None):
+            async for token in multi.ask_stream(_rag_question, history=history_str, document_filter=None):
                 if token.startswith('\n\n{'):
                     if buf:
                         stripped = _strip_markdown(buf)
@@ -1976,6 +1995,18 @@ async def ask_stream(req: AskRequest):
                         final_data = _json.loads(token.strip())
                     except Exception:
                         final_data = {"sources": [], "done": True}
+                    if _compound_routing:
+                        _target_agent = _agent_registry.get_agent(_compound_routing.agent_name)
+                        if _target_agent:
+                            _offer_suffix = (
+                                f"\n\nAlso, it sounds like you're after {_target_agent.intent_phrase}! "
+                                f"Want me to connect you with {_target_agent.display_name}? (yes/no)"
+                            )
+                            yield _offer_suffix
+                            full_text += _offer_suffix
+                            if final_data.get("corrected_text"):
+                                final_data["corrected_text"] += _offer_suffix
+                            await _agent_hub.request_agent_confirmation(req.session_id, _compound_routing.agent_name)
                     sources = final_data.get("sources", [])
                     # Prefer corrected_text over the raw streamed full_text: when
                     # multi_source_rag.py strips a Rule4 disclaimer the model

@@ -92,3 +92,53 @@ async def select_agent(query: str) -> RoutingDecision:
         logger.info("[agent_router] LLM fallback routed: %r -> %r (embedding best=%.3f)", query, llm_pick, best_score)
         return RoutingDecision(llm_pick, best_score, "llm")
     return RoutingDecision(None, best_score, "llm")
+
+
+@dataclass
+class CompoundRoutingDecision:
+    rag_question: str   # the sub-question Layla should answer via RAG
+    agent_name: str      # the agent to offer for the OTHER sub-question
+
+
+async def select_compound_routing(query: str) -> Optional[CompoundRoutingDecision]:
+    """Handles a single message that asks for two genuinely different
+    things where ONE half is a specialist-agent request and the other
+    half is an ordinary question Layla should answer — confirmed live:
+    "What is travel insurance and can you give me quotation for travel
+    insurance?" got answered ENTIRELY as a RAG question (a clean 3-point
+    explanation of what travel insurance is) with the quote request
+    silently dropped — select_agent() on the WHOLE compound sentence
+    doesn't confidently trigger the Ava offer, because half the sentence
+    reads as a plain informational question, which drags the combined
+    embedding/LLM signal back toward "stay with Layla."
+
+    Splits the query with multi_source_rag._split_compound_question() (the
+    existing, already-proven compound-question splitter — see its own
+    docstring; this reuses it rather than duplicating splitting logic),
+    then runs select_agent() on EACH half independently. Only returns a
+    decision when exactly ONE half routes to an agent and the other does
+    NOT — both-agent (ambiguous which one "wins", and today there's only
+    one agent anyway so this can't happen yet but stays future-proof) and
+    neither-agent (ordinary compound RAG question, nothing to add) both
+    return None, falling through to this project's existing single-query
+    handling unchanged.
+    """
+    try:
+        from multi_source_rag import _split_compound_question
+    except Exception as exc:
+        logger.debug("[agent_router] could not import _split_compound_question: %s", exc)
+        return None
+
+    split = await _split_compound_question(query)
+    if not split:
+        return None
+    q1, q2 = split
+
+    d1, d2 = await select_agent(q1), await select_agent(q2)
+    if d1.agent_name and not d2.agent_name:
+        logger.info("[agent_router] compound routing: %r -> agent=%r, rag=%r", query, d1.agent_name, q2)
+        return CompoundRoutingDecision(rag_question=q2, agent_name=d1.agent_name)
+    if d2.agent_name and not d1.agent_name:
+        logger.info("[agent_router] compound routing: %r -> agent=%r, rag=%r", query, d2.agent_name, q1)
+        return CompoundRoutingDecision(rag_question=q1, agent_name=d2.agent_name)
+    return None
