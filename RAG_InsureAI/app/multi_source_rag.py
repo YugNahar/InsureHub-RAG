@@ -790,13 +790,13 @@ def _wants_example(text: str) -> bool:
 # all match.
 _DETAIL_PATTERN = re.compile(r'\bin\s+(?:\w+\s+){0,2}details?\b', re.IGNORECASE)
 
-# Used by _enforce_numbered_list_format (below _strip_video_self_reference) —
+# Used by _enforce_numbered_list_format (below _strip_source_self_reference) —
 # these two query shapes are the ones prompt_template.py's FORMAT section
 # explicitly requires a numbered list for (TYPES/KINDS QUESTIONS, COMPARISON
 # QUESTIONS), and confirmed live the prompt rule alone isn't fully reliable —
 # the exact same "prompt-only compliance holds most but not all of the time"
-# pattern as _DETAIL_PATTERN's own "in detail" gap and _strip_video_self_reference's
-# video-reference gap.
+# pattern as _DETAIL_PATTERN's own "in detail" gap and _strip_source_self_reference's
+# source-reference gap.
 _TYPES_OF_QUERY_RE = re.compile(r"\b(?:types?|kinds?)\s+of\b", re.IGNORECASE)
 _COMPARISON_QUERY_RE = re.compile(
     r"\bcompare\b|\bdifference\s+between\b|\bvs\.?\b|\bversus\b|"
@@ -3298,46 +3298,57 @@ def _correct_rider_misattribution(answer_text: str, context_text: str) -> Option
     return " ".join(sentences)
 
 
-# ── Video-transcript self-reference stripping (deterministic) ──────────────
-# Backstop for prompt_template.py's "never say 'the video'/'this video'"
-# rule (all 3 grounded prompts) — confirmed live the prompt rule alone
-# isn't fully reliable (roughly 1 in 4-5 generations still said "The video
-# mentions that..." even with the explicit instruction in place, the same
-# "prompt-only compliance isn't fully reliable" pattern as every other
-# formatting rule in this file). Purely subtractive on a narrow, confirmed
-# phrase shape, and ONLY at the very start of a sentence — a whole leading
-# clause ("The video mentions that X" -> "X") drops cleanly with just a
-# recapitalized first letter, the same lesson the warm-lead-in fallback
-# already learned about not leaving a stray lowercase opener behind.
-# Deliberately does NOT also strip a mid-sentence occurrence ("As I
-# mentioned earlier, this video shows X, and Y") — tried that, confirmed
-# live it produces broken grammar ("As I mentioned earlier, X, and Y" loses
-# the verb tying the clauses together). Every real instance seen so far was
-# sentence-initial anyway; a mid-sentence occurrence is a smaller, rarer
-# residual gap that's safer to leave alone than to risk a broken splice.
+# ── Source self-reference stripping (deterministic) ─────────────────────────
+# Backstop for prompt_template.py's "never say 'the video'/'this video',
+# never name a file/document" rule (all 3 grounded prompts) — confirmed
+# live the prompt rule alone isn't fully reliable (roughly 1 in 4-5
+# generations still said "The video mentions that..." even with the
+# explicit instruction in place), the same "prompt-only compliance isn't
+# fully reliable" pattern as every other formatting rule in this file.
 #
-# "that" is REQUIRED, not optional — also tried making it optional (to also
-# catch "The video mentions a term insurance plan that provides X"), and
-# confirmed live that's unsafe too: stripping down to just "a term
+# Originally video-only; broadened 2026-07-26 after a live "explain travel
+# insurance in detail" answer said "The guide mentions that you can find
+# more information about definitions..." and "The guide suggests visiting
+# the customer service web page..." — the SAME self-reference leak, just
+# for a PDF/document source instead of a video transcript. The existing
+# rule already banned this in spirit (rule 14/9: "never repeat [the
+# source label], or part of one, to the user"), it just hadn't been
+# generalized past the one confirmed phrase shape ("the video ...").
+#
+# Purely subtractive on a narrow, confirmed phrase shape, and ONLY at the
+# very start of a sentence — a whole leading clause ("The guide mentions
+# that X" -> "X") drops cleanly with just a recapitalized first letter,
+# the same lesson the warm-lead-in fallback already learned about not
+# leaving a stray lowercase opener behind. Deliberately does NOT also
+# strip a mid-sentence or trailing occurrence ("...are also covered in
+# the guide.") — tried the mid-sentence case for the video-only version
+# and confirmed live it produces broken grammar; every dominant real
+# instance seen so far is sentence-initial anyway, a mid-sentence/trailing
+# occurrence is a smaller, rarer residual gap safer to leave to the
+# prompt rule than to risk a broken splice on.
+#
+# "that" is REQUIRED, not optional — also tried making it optional (to
+# also catch "The guide mentions a term insurance plan that provides X"),
+# and confirmed live that's unsafe too: stripping down to just "a term
 # insurance plan that provides X" leaves a bare noun phrase with no main
 # verb, not a real sentence — the leading "that" is what guarantees
 # whatever follows is already a complete subject-verb clause on its own,
 # since "mentions THAT" always introduces one. Without "that" present, the
 # verb's object is a noun phrase, not a clause, and this fixer correctly
 # leaves it alone rather than risk a fragment.
-_VIDEO_SELF_REF_RE = re.compile(
-    r"\A(?:the|this|that|our|my)\s+videos?\s+"
+_SOURCE_SELF_REF_RE = re.compile(
+    r"\A(?:the|this|that|our|my)\s+(?:videos?|guides?|documents?|policy\s+wording|sources?|articles?)\s+"
     r"(?:mentions?|shows?|explains?|says?|discusses?|covers?|notes?|states?|talks?\s+about)\s+"
     r"that\s+",
     re.IGNORECASE,
 )
 
 
-def _strip_video_self_reference(text: str) -> str:
+def _strip_source_self_reference(text: str) -> str:
     sentences = re.split(r"(?<=[.!?])(?<!\d\.)\s+", text)
     changed = False
     for i, sent in enumerate(sentences):
-        m = _VIDEO_SELF_REF_RE.match(sent)
+        m = _SOURCE_SELF_REF_RE.match(sent)
         if not m:
             continue
         rest = sent[m.end():]
@@ -3358,7 +3369,7 @@ def _strip_video_self_reference(text: str) -> str:
 # list on most fresh test runs but plain prose on others, no code change in
 # between — the same "prompt-only compliance holds most but not all of the
 # time" pattern as _DETAIL_PATTERN's "in detail" gap and
-# _strip_video_self_reference's video-reference gap above, this time driven
+# _strip_source_self_reference's source-reference gap above, this time driven
 # by vLLM's own batched-inference run-to-run variance rather than a phrasing
 # gap in the prompt. Since it's a sampling issue, not a prompt-wording issue,
 # strengthening the prompt text further (already tried twice this session)
@@ -6726,24 +6737,25 @@ class MultiSourceRAG:
                 _top_rerank,
             )
 
-        # ── Video self-reference + rider misattribution (active, additive-only) ─
+        # ── Source self-reference + rider misattribution (active, additive-only) ─
         # Both are deterministic backstops for prompt rules confirmed live to
-        # only partially hold on their own — see _strip_video_self_reference's
+        # only partially hold on their own — see _strip_source_self_reference's
         # and _correct_rider_misattribution's own docstrings/comments for the
         # confirmed failures each targets. Mode-agnostic (not gated on
-        # _keyword_detailed) since both confirmed cases were brief-mode prose
-        # answers, not detailed numbered lists. Both are additive/subtractive
-        # only on a narrow, confirmed-safe shape — neither ever restructures
-        # or deletes a sentence the way the old point-relevance delete-based
-        # gate did (see plan.md history), so worst case either is a no-op.
+        # _keyword_detailed) since confirmed cases exist in both brief-mode
+        # prose and detailed numbered-list answers. Both are additive/
+        # subtractive only on a narrow, confirmed-safe shape — neither ever
+        # restructures or deletes a sentence the way the old point-relevance
+        # delete-based gate did (see plan.md history), so worst case either
+        # is a no-op.
         try:
-            _video_stripped_text = _strip_video_self_reference(_corrected_text or _reply_stripped)
-            if _video_stripped_text != (_corrected_text or _reply_stripped):
-                logger.info("[ask_stream] stripped a sentence-initial video self-reference")
-                _corrected_text = _video_stripped_text
-                _kv_reply = _video_stripped_text
-        except Exception as _video_exc:
-            logger.debug("[ask_stream] video self-reference strip skipped: %s", _video_exc)
+            _source_stripped_text = _strip_source_self_reference(_corrected_text or _reply_stripped)
+            if _source_stripped_text != (_corrected_text or _reply_stripped):
+                logger.info("[ask_stream] stripped a sentence-initial source self-reference")
+                _corrected_text = _source_stripped_text
+                _kv_reply = _source_stripped_text
+        except Exception as _source_exc:
+            logger.debug("[ask_stream] source self-reference strip skipped: %s", _source_exc)
 
         try:
             # Pre-compression context (_full_context_uncompressed, captured
