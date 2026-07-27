@@ -3904,6 +3904,21 @@ async def _split_compound_question(question: str) -> Optional[tuple[str, str]]:
         return None
     lines = [ln.strip().strip('"') for ln in raw.strip().split("\n") if ln.strip()]
     lines = [re.sub(r"^(line\s*\d\s*:\s*|\d+[.)]\s*)", "", ln, flags=re.IGNORECASE) for ln in lines]
+    if len(lines) == 1:
+        # Confirmed live: the model sometimes ignores "one per line" and
+        # produces a genuinely correct split anyway, just both questions
+        # on the SAME line ("What is travel insurance? How can I file a
+        # quotation to travel to India?") — this was silently discarded as
+        # "not compound" and fell through to the old whole-query problem
+        # this splitter exists to avoid in the first place. Recover by
+        # splitting on a question-mark-then-space boundary; only accept it
+        # if that yields exactly two non-empty pieces — three or more (a
+        # genuinely garbled or triple-barreled output) still correctly
+        # falls through to the len(lines) != 2 check below and returns
+        # None, same conservative default as before.
+        parts = [p.strip() for p in re.split(r"(?<=\?)\s+", lines[0]) if p.strip()]
+        if len(parts) == 2:
+            lines = parts
     if len(lines) != 2:
         return None
     if not lines[0].endswith("?") or not lines[1].endswith("?"):
