@@ -16,11 +16,18 @@ for calibrating the Phase-2 topic-relevance threshold — separating the
 score band of genuinely off-topic points from on-topic ones.
 
 Design notes:
-  * Before every request it purges the query KV cache and truncates the
-    trace file inside the container, so (a) repeat queries in the corpus
-    are real fresh samples of the model's nondeterminism rather than
-    cache hits, and (b) each request's trace record can be read back
-    unambiguously. This is the established "purge query_kv_cache.json
+  * Before every request it removes the query KV cache FILE and truncates
+    the trace file inside the container, so each request's trace record can
+    be read back unambiguously.
+
+    IMPORTANT — removing that file does NOT bust the cache. QueryKVCache
+    keeps its entries in an in-memory dict loaded from the file once at
+    startup, so a live process keeps serving from memory regardless. Fresh
+    samples therefore require DISABLE_QUERY_CACHE=1 in the container, which
+    _assert_query_cache_disabled() now enforces at startup rather than
+    letting the run emit confident, meaningless numbers (confirmed live
+    2026-07-28: byte-identical answers across repeats with the cache on).
+    This is the established "purge query_kv_cache.json
     before retesting" gotcha, applied per-request.
   * Contamination is scored by labeled forbidden_phrases (ground truth
     from real observed failures), NOT by the semantic signal — the
@@ -94,6 +101,41 @@ def _docker(cmd: str, capture: bool = False) -> str:
 
 def _reset_state() -> None:
     _docker(f"rm -f {KV_CACHE_PATH} {TRACE_PATH}")
+
+
+def _assert_query_cache_disabled() -> None:
+    """Abort unless the query KV cache is disabled in the container.
+
+    Deleting KV_CACHE_PATH (what _reset_state does, and what this runner's
+    docstring has always claimed makes each repeat a fresh sample) does NOT
+    actually bust the cache: kv_cache.QueryKVCache keeps `self._data` as an
+    in-memory dict loaded from that file once at __init__, so a running
+    process keeps serving from memory no matter how often the file is
+    removed. That made the purge a no-op the moment DISABLE_QUERY_CACHE was
+    turned off.
+
+    Confirmed live 2026-07-28: with the cache enabled, a 10x repeat of one
+    query returned BYTE-IDENTICAL answers for runs 5-10 — impossible from
+    this nondeterministic vLLM, and a silent invalidation of the whole
+    measurement. Every calibrated PASS/FAIL threshold in this file was
+    measured with the cache inert, so a run with it enabled isn't
+    comparable to those baselines even setting the staleness aside.
+
+    Fail loudly rather than emit a confident, wrong number.
+    """
+    raw = _docker("printenv DISABLE_QUERY_CACHE 2>/dev/null", capture=True).strip()
+    if raw.lower() not in ("1", "true", "yes"):
+        print(
+            f"ERROR: DISABLE_QUERY_CACHE={raw or '(unset)'} in container {CONTAINER!r} — "
+            "the query KV cache is ENABLED.\n"
+            "  Repeats would be served from the in-memory cache, so this run would grade\n"
+            "  cache hits, not fresh generations, and the numbers would be meaningless.\n"
+            "  Deleting query_kv_cache.json does NOT help — the cache lives in memory.\n"
+            "  Fix: set DISABLE_QUERY_CACHE=1 in RAG_InsureAI/.env, recreate the container\n"
+            "  (docker compose up -d api), re-run, then restore the flag afterwards.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 def _read_trace_record() -> dict:
@@ -226,6 +268,10 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=1, help="samples per case (default 1)")
     ap.add_argument("--out", help="write full JSON results to this path")
     args = ap.parse_args()
+
+    # Must run BEFORE any request — an enabled cache silently turns every
+    # repeat into a cache hit and makes the whole run meaningless.
+    _assert_query_cache_disabled()
 
     corpus = json.load(open(CORPUS_PATH))
     cases = corpus["cases"]
