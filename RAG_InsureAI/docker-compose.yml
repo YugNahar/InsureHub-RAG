@@ -26,6 +26,19 @@ x-common: &common
         memory: 1G
   env_file:
     - .env
+  environment:
+    # Pins the embedder/reranker (turbovec_store.py's _resolve_model_device)
+    # to CPU explicitly instead of leaving it to CUDA auto-detection.
+    # Deliberate: those two model loads have NO try/except fallback, so on a
+    # host where CUDA is *detected but not actually usable* (GPU visible to
+    # the daemon but not granted to the container, driver/toolkit mismatch),
+    # the load raises and the service fails to start. An explicit "cpu"
+    # short-circuits detection entirely and is a no-op on a CPU-only host.
+    # To move to GPU: build with the docker-compose.gpu.yml overlay AND set
+    # MODEL_DEVICE=cuda (or drop it to re-enable auto-detect) once the GPU is
+    # confirmed reachable — `docker run --rm --gpus all nvidia/cuda:...
+    # nvidia-smi` is the check.
+    MODEL_DEVICE: ${MODEL_DEVICE:-cpu}
   volumes:
     - insurehub_data:/root/.insurehub
     - insurehub_tmp:/root/.insurehub_tmp
