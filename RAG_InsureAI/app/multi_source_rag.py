@@ -3865,10 +3865,24 @@ _CLARIFY_PARSE_RE = re.compile(r'more on "(.+?)" or "(.+?)"\?', re.IGNORECASE)
 # unreliable-at-binary-classification pattern seen elsewhere this session
 # (e.g. the grounding-check prompt). A structural check is deterministic
 # and, unlike the model, actually gets this right.
+#
+# Also includes a set of imperative "ask the assistant to do something"
+# verbs (get/give/tell/show/explain/connect/help/provide/send/quote) so
+# imperative-shaped compounds match too, not just question-shaped ones —
+# confirmed live, "get me a quote for travel insurance and also tell me
+# what documents I need for a visa" has zero wh-words/aux-verbs (neither
+# clause is phrased as a question), so the original pattern missed it
+# entirely: the whole query silently routed as one big travel-quote
+# request and the visa-docs half was never answered at all. Same
+# "and"-conjunction safeguard as above keeps single-topic imperatives
+# ("give me the difference between home and fire insurance" — one
+# trigger, "and" just joins two nouns) from false-triggering.
 _COMPOUND_STRUCTURE_RE = re.compile(
-    r"\b(what|how|when|where|why|does|do|did|is|are|was|were|can|could|will|would|should)\b"
+    r"\b(what|how|when|where|why|does|do|did|is|are|was|were|can|could|will|would|should"
+    r"|get|give|tell|show|explain|connect|help|provide|send|quote)\b"
     r".{2,60}?\band\b.{0,20}?"
-    r"\b(what|how|when|where|why|does|do|did|is|are|was|were|can|could|will|would|should)\b",
+    r"\b(what|how|when|where|why|does|do|did|is|are|was|were|can|could|will|would|should"
+    r"|get|give|tell|show|explain|connect|help|provide|send|quote)\b",
     re.IGNORECASE,
 )
 
@@ -3921,7 +3935,16 @@ async def _split_compound_question(question: str) -> Optional[tuple[str, str]]:
             lines = parts
     if len(lines) != 2:
         return None
-    if not lines[0].endswith("?") or not lines[1].endswith("?"):
+    # Confirmed live: for an imperative-shaped input ("get me a quote and
+    # explain trip cancellation coverage"), the model correctly splits into
+    # two clean, complete standalone asks but keeps them as directives
+    # ("Get me a travel insurance quote.", "Explain trip cancellation
+    # coverage.") rather than rephrasing into questions — there's nothing
+    # to turn into a "?" when the original wasn't a question either. A
+    # trailing "." is just as strong a completeness signal as "?" here; a
+    # genuinely garbled/truncated line (missing terminal punctuation
+    # entirely) still correctly falls through to the return None below.
+    if lines[0][-1:] not in "?." or lines[1][-1:] not in "?.":
         return None
     return (lines[0], lines[1])
 
@@ -4944,7 +4967,7 @@ class MultiSourceRAG:
                     _split = await _split_compound_question(_last_q)
                     if _split:
                         _q1, _q2 = _split
-                        _clarify_text = _CLARIFY_TEMPLATE.format(q1=_q1.rstrip("?"), q2=_q2.rstrip("?"))
+                        _clarify_text = _CLARIFY_TEMPLATE.format(q1=_q1.rstrip("?."), q2=_q2.rstrip("?."))
                         import json as _json_clarify
                         yield _clarify_text
                         yield "\n\n" + _json_clarify.dumps({
