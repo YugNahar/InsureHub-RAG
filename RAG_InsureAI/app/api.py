@@ -1995,18 +1995,6 @@ async def ask_stream(req: AskRequest):
                         final_data = _json.loads(token.strip())
                     except Exception:
                         final_data = {"sources": [], "done": True}
-                    if _compound_routing:
-                        _target_agent = _agent_registry.get_agent(_compound_routing.agent_name)
-                        if _target_agent:
-                            _offer_suffix = (
-                                f"\n\nAlso, it sounds like you're after {_target_agent.intent_phrase}! "
-                                f"Want me to connect you with {_target_agent.display_name}? (yes/no)"
-                            )
-                            yield _offer_suffix
-                            full_text += _offer_suffix
-                            if final_data.get("corrected_text"):
-                                final_data["corrected_text"] += _offer_suffix
-                            await _agent_hub.request_agent_confirmation(req.session_id, _compound_routing.agent_name)
                     sources = final_data.get("sources", [])
                     # Prefer corrected_text over the raw streamed full_text: when
                     # multi_source_rag.py strips a Rule4 disclaimer the model
@@ -2026,6 +2014,29 @@ async def ask_stream(req: AskRequest):
                     ai_cant_answer = _agent_hub.response_needs_human(
                         _text_for_handoff_check, sources, _upstream_needs_human
                     )
+                    # Suppress the compound-routing agent offer when the RAG half
+                    # hard-refused (empty sources / grounding failure / reranker
+                    # gate) — confirmed live this reads as jarring to a real user:
+                    # "I don't have that, escalating to a human" immediately
+                    # followed by an unrelated agent pitch in the same breath.
+                    # Checked here (after ai_cant_answer, using the SAME signal
+                    # that drives the human-escalation decision below) rather than
+                    # a separate ad-hoc "did retrieval fail" check, since
+                    # response_needs_human() is already this codebase's one
+                    # authoritative answer to "did this response actually answer
+                    # the question."
+                    if _compound_routing and not ai_cant_answer:
+                        _target_agent = _agent_registry.get_agent(_compound_routing.agent_name)
+                        if _target_agent:
+                            _offer_suffix = (
+                                f"\n\nAlso, it sounds like you're after {_target_agent.intent_phrase}! "
+                                f"Want me to connect you with {_target_agent.display_name}? (yes/no)"
+                            )
+                            yield _offer_suffix
+                            full_text += _offer_suffix
+                            if final_data.get("corrected_text"):
+                                final_data["corrected_text"] += _offer_suffix
+                            await _agent_hub.request_agent_confirmation(req.session_id, _compound_routing.agent_name)
                     agents_online  = _agent_hub.online_count() > 0
                     needs_human         = ai_cant_answer and agents_online
                     offline_escalated   = ai_cant_answer and not agents_online
