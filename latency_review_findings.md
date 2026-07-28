@@ -82,3 +82,190 @@ The plan's Phase 1a explicitly requires the image to ship **CUDA-enabled torch**
 4. **G1** — GPU image/compose config, then re-measure on the server (the only place the GPU win is visible).
 5. **G2, M1, M2** — cleanup.
 6. **P2** — re-run the contamination Phase 2 sweep.
+
+---
+---
+
+# Round 2 — Opus review of `9e97aea` (Sonnet's fixes) + the first baseline
+
+**Verdict: the harness bugs are genuinely fixed; the baseline they produced is not yet trustworthy.**
+B1/B2/D1/D2/D3/D4/M1 all verified closed. But the committed baseline has one
+instrumentation line that reports a factually wrong number, and three
+methodological problems that make it unsafe to use as the before/after
+reference Phase 4 depends on.
+
+## Confirmed fixed (checked, not taken on trust)
+
+- **D1** — `question=%r` present at all three TIMING sites. The regex change to
+  `query=(?:'[^']*'|"[^"]*")` is non-capturing, so groups 1–10 keep their
+  meaning; the apostrophe case (`question="What's excluded under it?"`, where
+  `%r` flips to double quotes) matches. Live-confirmed on both a generation and
+  a refusal request.
+- **D2** — reranker-gate refusal instrumented; Sonnet then found live that the
+  plan's own refusal query actually exits at the *grounding-check* refusal
+  (`:5363`), not the reranker gate, and instrumented that too. Catching that
+  required running it, not reading it. Good.
+- **D3** — fresh `session_id` per `(case, pass)`; confirmed in the logs
+  (`latency-baseline-refusal-warm-e17decf0`).
+- **B2** — `TimingNotFound` + `sys.exit(1)`. This fix *proved itself*: it is what
+  surfaced the stderr bug below instead of printing a plausible-looking table.
+- **D4** — tail 60 → 300. **M1** — `_cell()` helper.
+- **The stderr bug** — `docker logs` with `capture_output=True` split stdout from
+  stderr, and 100% of this app's log output (every TIMING line) is on stderr.
+  A pure code review could not have found this; only running it could.
+- **Phase 0's literal exit criterion** ("committed clean per-phase + TTFT baseline
+  table") is met.
+
+## R1 — BLOCKER (correctness): the refusal TIMING line reports `other=0ms` while ~48% of its wall clock is unaccounted
+
+Every generation row balances to within 1–3 ms. Both refusal rows do not:
+
+| case | total | retrieval | grounding | preprocess | accounted | **gap** | reported `other` |
+|---|---|---|---|---|---|---|---|
+| refusal cold | 13347 | 4908 | 983 | 759 | 6650 | **6697** | `0ms` |
+| refusal warm | 11920 | 4938 | 551 | 637 | 6126 | **5794** | `0ms` |
+
+Cause is structural, not a rounding artifact. `_t_promptbuild_start` is set at
+`:5086` (right after the grounding gather) and `_t_promptbuild_ms` is assigned
+**only** at `:5874` — far past both refusal exits (`:5014`, `:5377`). Everything
+between is unmeasured, and on a refusal that span is the entire pre-refusal
+retry cascade:
+
+`_vllm_clean_query` (LLM call) → optional fallback `_retrieve_doc_chunks` +
+rerank → `_verify_grounding_any_chunk` (LLM call) → standalone-retry
+`_retrieve_doc_chunks` → `_verify_grounding_any_chunk` (LLM call)
+
+Both new lines then pass a hardcoded literal `0` for `other=%dms`, so the log
+actively asserts that gap is zero. The main TIMING line at `:7907` computes
+`other = total − (retrieval + grounding + llm)` and its own comment explains
+that the retry tiers land in `other` **by design** — the new lines broke that
+contract.
+
+**Consequence:** the committed table says refusals are retrieval-dominated
+(4.9 s of 11.9 s). In fact the single largest cost is a ~5.8 s chain of extra
+LLM round-trips that does not appear anywhere. Optimising from this table
+optimises the wrong phase.
+
+**Fix:** compute `other` the same way `:7907` does. Recommended follow-up: give
+the retry cascade its own field — it is ~48% of refusal latency and, when a
+retry fires on a *generation* path, it is currently silently folded into
+`promptbuild`, which mislabels it there too.
+
+## R2 — the baseline is n=1 per cell against a remote, shared vLLM host
+
+`VLLM_HOST=http://123.253.124.14:7000` is remote; "idle backend" cannot be
+enforced for it. Two full runs today, **zero code change between them**:
+
+| case | run 1 warm | run 2 warm | spread |
+|---|---|---|---|
+| brief_1 | 55307 | 15242 | **3.6×** |
+| followup | 17187 | 25810 | 1.5× |
+| detailed_2 (cold) | 39802 | 55853 | 1.4× |
+| detailed_1 | 37035 | 36362 | 1.02× |
+
+Generation-heavy cases are fairly stable (±5–40%), but `brief_1` swung 3.6×.
+Phase 4 wants to re-run this and attribute the delta to a code change. A single
+sample can be a 3.6× outlier, so it cannot support that.
+**Fix:** N ≥ 3 measured reps per cell; report median plus spread.
+
+## R3 — the cold/warm split measures nothing and doubles runtime
+
+`_purge_kv_cache()` clears `query_kv_cache.json` only. The thing "warm" exists to
+warm — the compressor's in-process `_sent_cache` — is never reset between
+passes, cases, or runs. Logs show it accumulating monotonically
+(`cache size=8/3000` → `15/3000` …) and surviving from earlier manual testing,
+so the "cold" pass is already warm. Retrieval cold → warm across the six cases:
+−8%, −15%, +8%, −4%, −6%, +1% (mean ≈ −4%, i.e. noise).
+**Fix:** drop the split and spend the doubled runtime on R2's repeats, keeping a
+single discarded warm-up per query (which is what the plan's "run twice, take
+the 2nd" actually asks for).
+
+## R4 — the harness cannot evaluate Phase 3 at all
+
+`run_case` calls `_ask(turn, session_id)` and discards the return value, so no
+answer text, length, or finish reason is recorded. Phase 3's exit criterion is
+*"detailed answers tighter/complete, `total` unchanged-or-better, no quality
+regression"* — none of which is measurable from what is captured.
+
+Worse, `llm=` is confounded by output length: `VLLM_MAX_TOKENS=512` at the
+measured 7–8 tok/s is ~64 s for a full cap, and `brief_1`'s 49 s outlier is
+consistent with hitting it. Without token counts, "the system got slower" and
+"the model wrote more" are indistinguishable.
+**Fix:** record answer length + finish reason per run.
+
+## R5 — match is against the raw line, not the captured question
+
+`_read_timing_for_question` filters with `needle not in line`, testing the whole
+line — including the `query=` field — while the regex already captures the
+question as **group 11 and never uses it**. `brief_1`'s text is byte-identical to
+`followup`'s turn 1, so the set already contains duplicate question text; it is
+one reordering away from a silent cross-match. No live collision in the current
+run (verified).
+**Fix:** validate against `m.group(11)`.
+
+## R6 — 2 of 11 refusal exits are instrumented
+
+Eleven sites yield the refusal string; two now emit TIMING. With B2 now hard-
+failing on zero matches, a query that drifts to any other refusal exit fails the
+**whole** run rather than one row. That is the right trade over silence, but it
+makes the fixed 6-query set brittle to KB changes.
+
+## R7 / R8 — minor
+
+- **R7.** Both refusal lines call `time.time()` twice for what is meant to be one
+  instant (`_t_ttft_ms`, `_t_total_ms`). Use one.
+- **R8.** `ttft` means different things per row: a strict prefix of `total` on
+  generation rows, exactly equal to `total` on refusal rows. Unmarked in the
+  table; averaging the column would be meaningless.
+
+## What the baseline *does* establish reliably
+
+The ratios are stable across both runs even where absolute numbers are not, and
+they confirm the plan's sequencing:
+
+- generation = **61–77%** of total on detailed queries (llm 26.6–33.5 s of 36–43 s) → plan Decision 3 (GPU vLLM) is the dominant lever, as written;
+- retrieval = **5–8 s**, the clear second → Phase 1a (GPU embedder/reranker);
+- grounding < 1 s, promptbuild < 0.4 s → not worth touching.
+
+So the strategy is safe. The individual numbers are not yet a baseline.
+
+## CORRECTION to Round 1 — G1 was wrong
+
+Round 1 stated *"Neither `Dockerfile` nor `docker-compose.yml` was touched."*
+**That was false.** Commit `0e37e8f` (2026-07-21, a day *before* the review)
+already added:
+
+- `Dockerfile` — `ARG TORCH_DEVICE=cpu` with a real CUDA branch installing torch
+  from the `cu121` index, placed *before* `requirements.txt` so pip cannot
+  resolve a conflicting CPU wheel over it;
+- `docker-compose.yml` — `TORCH_DEVICE: ${TORCH_DEVICE:-cpu}` build arg;
+- `docker-compose.gpu.yml` — a complete overlay setting `TORCH_DEVICE: cuda`
+  plus `deploy.resources.reservations.devices` for both services, deliberately
+  leaving the base compose CPU-safe.
+
+I did not check for a GPU overlay file before asserting its absence. The
+CUDA-wheel and device-reservation halves of G1 were done.
+
+**The real gap was one level down: nothing in the deploy path used the overlay.**
+`deploy-server.sh` ran `docker compose build api` / `up -d api` with no `-f`
+flags, and wrote a systemd unit doing the same — so on a GPU host the documented
+deploy still built the CPU image, and any reboot would have reverted a manual
+GPU deploy back to CPU. Same silent-no-op failure Round 1 described, located in
+the deploy script rather than the compose files.
+
+**Fixed:** `deploy-server.sh` now probes for a GPU (host `nvidia-smi` *and* a real
+`docker run --gpus all` check, since the first does not imply the second),
+selects the overlay accordingly with `FORCE_GPU` / `FORCE_CPU` overrides, carries
+the same file list into the systemd unit, and asserts the plan's Phase 1a exit
+criterion after deploy by grepping the container's own `device=` log line —
+reporting loudly if a GPU build ended up on CPU.
+
+## Still open
+
+- **Decision 3** — relocating generation onto a GPU-hosted vLLM. Not a compose
+  change: `VLLM_HOST` points at an external `:7000` that this repo does not
+  manage. Still the single largest lever (61–77% of detailed-query latency).
+- **Phase 1a verification** — the GPU path cannot be exercised from this Mac.
+  Unverified until it runs on the server.
+- **R6** — 9 uninstrumented refusal exits.
+- **P2** — contamination Phase 2 corpus sweep re-run.

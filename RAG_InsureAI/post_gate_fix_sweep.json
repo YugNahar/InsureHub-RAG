@@ -1,0 +1,1670 @@
+{
+  "timestamp": 1784712111.2028701,
+  "api_url": "http://localhost:8501/ask-stream",
+  "case_count": 56,
+  "repeats": 1,
+  "overall_rate_pct": 1.79,
+  "repro_rate_pct": 8.33,
+  "control_rate_pct": 0.0,
+  "contaminated_point_scores": {},
+  "clean_point_scores": {
+    "n": 267,
+    "min": 0.0,
+    "p10": 0.0013,
+    "median": 0.0597,
+    "p90": 0.8466,
+    "max": 0.9986
+  },
+  "cases": [
+    {
+      "id": "motor-marine-icc-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8860894441604614,
+            0.14400236308574677,
+            0.6412308812141418,
+            0.018372897058725357,
+            0.40094760060310364,
+            0.33180350065231323,
+            0.5874324440956116,
+            0.010074320249259472
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance is a type of insurance that covers various aspects related to motor vehicles, including private cars and motorcycles.\n2. At the end of the lesson, you will understand what motor insurance means, how to buy "
+        }
+      ]
+    },
+    {
+      "id": "motor-health-domiciliary-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7092847228050232,
+            0.0005803206586278975,
+            0.38062623143196106,
+            0.28537148237228394,
+            0.5106155276298523,
+            0.02581794559955597,
+            0.9112781882286072,
+            0.19334882497787476
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a type of insurance that covers various risks associated with driving a motor vehicle.\n2. It is typically divided into three broad categories: private cars, motor cycles, and other motor vehicles.\n3. When you"
+        }
+      ]
+    },
+    {
+      "id": "motor-crop-general-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8750709891319275,
+            0.09749054163694382,
+            0.3333698809146881,
+            0.7830742597579956,
+            0.0028571465518325567,
+            0.6506518125534058,
+            0.01760236918926239,
+            0.013386418111622334
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a contract between the insured and the insurer where the insurer agrees to indemnify the financial liability in the event of loss to the insured.\n2. For insurance purposes, motor vehicles are broadly classifi"
+        }
+      ]
+    },
+    {
+      "id": "engineering-marine-hull-01",
+      "category": "known_contamination_repro",
+      "query": "Explain engineering insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8963841199874878,
+            0.06896796077489853,
+            0.001672340789809823,
+            0.6041625142097473,
+            0.0008921538246795535,
+            0.7966323494911194,
+            0.0013266620226204395,
+            0.7805261015892029
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of engineering insurance:\n\n1. Engineering insurance covers risks associated with construction, maintenance, and operation of various engineering projects and facilities.\n2. It includes a range of policies tailored to different aspects of engineer"
+        }
+      ]
+    },
+    {
+      "id": "burglary-fidelity-01",
+      "category": "known_contamination_repro",
+      "query": "Explain burglary insurance in detail",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.8381173610687256,
+            0.0017602015286684036,
+            0.01819213666021824,
+            0.03394175320863724,
+            0.3368142545223236,
+            3.751965778064914e-05,
+            0.9959949254989624
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into the details of burglary insurance:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department's premium income.\n2. It includes theft of property from the premises after the"
+        }
+      ]
+    },
+    {
+      "id": "transit-motor-vehicles-act-01",
+      "category": "known_contamination_repro",
+      "query": "Explain transit insurance in detail",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.881294310092926,
+            0.4066818058490753,
+            0.07121703028678894,
+            0.2246023565530777,
+            0.7809538245201111,
+            0.8465915322303772,
+            0.0018227605614811182
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into transit insurance in detail:\n\n1. Transit insurance typically covers goods being transported from one place to another. This can include various modes of transport, such as road, rail, air, or sea.\n2. When you're looking at transit insurance, it\u2019s important t"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-motor-rider-01",
+      "category": "known_contamination_repro",
+      "query": "Explain personal accident insurance in detail",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.0015950562665238976,
+            0.002524272771552205,
+            0.0036411501932889223,
+            0.0013022765051573515,
+            0.006369772832840681,
+            0.022551488131284714,
+            0.0143827423453331,
+            0.02756557986140251
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into personal accident insurance!\n\n1. **Age, Height, Weight, and Occupation**: These factors are crucial as they can influence the likelihood of an accident occurring. For instance, certain occupations might pose higher risks, and the age and health conditions of"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-full-picture-01",
+      "category": "known_contamination_repro",
+      "query": "give me the full picture on personal accident cover, don't leave anything out",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.6495241522789001,
+            0.11158270388841629,
+            0.006325741298496723,
+            0.0006063894252292812,
+            0.012250133790075779,
+            0.002296882215887308,
+            9.571655391482636e-05,
+            0.0011539870174601674
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, here\u2019s the full picture on personal accident cover:\n\n1. Personal accident insurance is one of the main products under general insurance.\n2. When applying for personal accident insurance, you need to provide details such as age, occupation, height, weight, and any physical s"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-vehicle-exempt-01",
+      "category": "exemption_control",
+      "query": "Explain in detail how personal accident cover works for my vehicle",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "term-insurance-exclusions-driving-01",
+      "category": "known_contamination_repro",
+      "query": "What are the exclusions in term insurance?",
+      "expected_topic": "life",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are the events that the insurer won't cover. Typically, these include things like suicide within a certain period after taking out the policy, criminal activities, and war. Once you've paid your premiums, if something covered by the exclusions hap"
+        }
+      ]
+    },
+    {
+      "id": "ncb-tpa-type-agnostic-01",
+      "category": "exemption_control",
+      "query": "what's the difference between NCB and TPA",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-example-third-party-01",
+      "category": "narrative_structure_repro",
+      "query": "What is personal accident insurance? -> can you give me an example",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Sure thing! Imagine someone who works as a construction worker and gets personal accident insurance. If they have an accident on the job and are injured, the insurance would cover medical expenses and possibly lost wages. Let me know if you need any more details! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-01",
+      "category": "clean_control",
+      "query": "What does a comprehensive motor policy cover?",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9985170960426331,
+            0.973476231098175,
+            0.9544041156768799,
+            0.2904137372970581,
+            0.3400154411792755,
+            0.39997467398643494,
+            0.9732595682144165,
+            0.010433455929160118
+          ],
+          "retrieved_types": [
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. A comprehensive motor policy covers the loss or damage to the vehicle itself, including accessories.\n2. It includes loss or damage to the property or life of the insured.\n3. Third-party coverage is included, meaning it covers liability for "
+        }
+      ]
+    },
+    {
+      "id": "clean-health-01",
+      "category": "clean_control",
+      "query": "Explain health insurance in detail",
+      "expected_topic": "health",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.40698930621147156,
+            0.01132611371576786,
+            0.0528135672211647,
+            0.16194048523902893,
+            0.02414390631020069,
+            0.043002594262361526,
+            0.005938070826232433,
+            0.014268668368458748
+          ],
+          "retrieved_types": [
+            "health",
+            "general",
+            "health",
+            "health",
+            "general",
+            "health"
+          ],
+          "answer_preview": "Sure, let's dive into the details of health insurance:\n\n1. Health insurance is a type of insurance that covers medical expenses. It is a contract between an insurer and an individual or group, where the insurer agrees to provide specified health insurance coverage at a particular"
+        }
+      ]
+    },
+    {
+      "id": "clean-life-01",
+      "category": "clean_control",
+      "query": "Explain life insurance in detail",
+      "expected_topic": "life",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.4784511923789978,
+            0.3727409541606903,
+            0.022597162052989006,
+            0.00041152213816531,
+            0.001354085630737245,
+            0.01951693929731846,
+            0.003088313154876232,
+            0.009932277724146843
+          ],
+          "retrieved_types": [
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life"
+          ],
+          "answer_preview": "Sure, let's dive into the details of life insurance:\n\n1. Life insurance is a contract where the insurer agrees to pay a sum of money to the person assured (or their nominee) upon the occurrence of a specified event, typically the death of the insured individual.\n\n2. The essence o"
+        }
+      ]
+    },
+    {
+      "id": "clean-travel-01",
+      "category": "clean_control",
+      "query": "Explain travel insurance in detail",
+      "expected_topic": "travel",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        }
+      ]
+    },
+    {
+      "id": "clean-home-01",
+      "category": "clean_control",
+      "query": "Explain home insurance in detail",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.28127843141555786,
+            0.1010386124253273,
+            0.48493143916130066,
+            0.002507003489881754,
+            0.0026591795030981302,
+            0.009819136932492256,
+            0.009119542315602303,
+            0.012819771654903889
+          ],
+          "retrieved_types": [
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "So here's the full picture on that:\n\n1. Home insurance protects your property against various risks such as fire, theft, and natural disasters.\n2. The sum insured should represent the actual value of your property, ensuring adequate coverage.\n3. It's essential to understand the c"
+        }
+      ]
+    },
+    {
+      "id": "clean-fire-01",
+      "category": "clean_control",
+      "query": "Explain fire insurance in detail",
+      "expected_topic": "fire",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8095780611038208,
+            0.0025248839519917965,
+            0.0013266506139189005,
+            3.729306990862824e-05,
+            0.0006892039091326296,
+            0.0001455423334846273,
+            7.849041139706969e-05,
+            0.003999381326138973
+          ],
+          "retrieved_types": [
+            "fire",
+            "fire"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Fire insurance typically covers risks beyond just fire, including lightning, explosion, aircraft damage, riot, strike, and malicious damage.\n2. It also covers various weather-related events such as storms, cyclones, typhoons, hurricanes, fl"
+        }
+      ]
+    },
+    {
+      "id": "clean-marine-01",
+      "category": "clean_control",
+      "query": "Explain marine insurance in detail",
+      "expected_topic": "marine",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7698814868927002,
+            0.02086980827152729,
+            0.0007482696673832834,
+            0.4298815131187439,
+            0.5125917196273804,
+            6.968944217078388e-05,
+            0.0033741050865501165,
+            0.011344031430780888
+          ],
+          "retrieved_types": [
+            "general",
+            "marine",
+            "marine",
+            "marine",
+            "marine"
+          ],
+          "answer_preview": "Okay, let me break this down properly for you:\n\n1. Marine insurance primarily covers two main areas: hull insurance and cargo insurance.\n2. Hull insurance is specifically designed to protect the physical structure of the ship, including the hull and machinery.\n3. Cargo insurance "
+        }
+      ]
+    },
+    {
+      "id": "clean-liability-01",
+      "category": "clean_control",
+      "query": "Explain liability insurance in detail",
+      "expected_topic": "liability",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.5031834840774536,
+            0.06762220710515976,
+            0.8961857557296753,
+            0.006968096364289522,
+            0.27789655327796936,
+            0.011209170334041119,
+            0.031230837106704712
+          ],
+          "retrieved_types": [
+            "liability",
+            "liability",
+            "general",
+            "liability",
+            "liability",
+            "liability"
+          ],
+          "answer_preview": "Sure, let's dive into the details of liability insurance!\n\n1. Liability insurance is designed to cover the financial responsibility of the insured towards a third party in case of loss or damage.\n2. It's important because it ensures that the insured can meet their legal obligatio"
+        }
+      ]
+    },
+    {
+      "id": "clean-cyber-01",
+      "category": "clean_control",
+      "query": "Explain cyber insurance in detail",
+      "expected_topic": "cyber",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8239302039146423,
+            0.026141950860619545,
+            0.002485359087586403,
+            0.025225523859262466,
+            0.03378022089600563,
+            0.0005271403933875263,
+            0.02016705833375454,
+            0.8060818910598755
+          ],
+          "retrieved_types": [
+            "commercial",
+            "life",
+            "general",
+            "general",
+            "crop",
+            "health"
+          ],
+          "answer_preview": "Sure, let's dive into cyber insurance:\n\n1. Cyber insurance is designed to protect businesses against financial losses resulting from cyber incidents such as data breaches, malware attacks, and system failures.\n2. It typically covers various aspects including data recovery, legal "
+        }
+      ]
+    },
+    {
+      "id": "clean-crop-01",
+      "category": "clean_control",
+      "query": "Explain crop insurance in detail",
+      "expected_topic": "crop",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8687538504600525,
+            0.0492042638361454,
+            0.0014620242873206735,
+            0.003165559144690633,
+            0.009097288362681866,
+            0.8663920760154724,
+            0.03106219694018364,
+            0.6407291293144226
+          ],
+          "retrieved_types": [
+            "crop",
+            "general",
+            "crop",
+            "crop",
+            "crop",
+            "crop",
+            "general"
+          ],
+          "answer_preview": "1. Crop insurance is designed to protect agriculturalists against financial losses resulting from uncertainties that may lead to crop failures or losses due to named or all unforeseen perils beyond their control.\n2. This type of insurance is crucial for the rural population and i"
+        }
+      ]
+    },
+    {
+      "id": "clean-commercial-01",
+      "category": "clean_control",
+      "query": "Explain commercial insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.4336263835430145,
+            0.03560997173190117,
+            0.013830915093421936,
+            0.010557908564805984,
+            0.015067461878061295,
+            0.007538795471191406,
+            0.014988149516284466,
+            0.0019763344898819923
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into commercial insurance in detail:\n\n1. Commercial insurance aims to protect the economic value of assets or the life of a person within a business context. It helps businesses manage risks associated with operations, employees, and property.\n\n2. The business of"
+        }
+      ]
+    },
+    {
+      "id": "clean-personal-accident-standalone-01",
+      "category": "clean_control",
+      "query": "What is standalone personal accident insurance and what does it cover?",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-engineering-02",
+      "category": "clean_control",
+      "query": "What does machinery breakdown insurance cover?",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, machinery breakdown insurance covers the repair or replacement of damaged or broken machinery. The insurer typically assesses the damage and decides whether to repair or replace the affected parts. Let me know if you want more details! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-fidelity-01",
+      "category": "clean_control",
+      "query": "What is fidelity guarantee insurance?",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-aviation-01",
+      "category": "clean_control",
+      "query": "Explain aviation insurance in detail",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9118240475654602,
+            0.21508413553237915,
+            0.00016784931358415633,
+            0.017667876556515694,
+            0.005499663297086954,
+            0.7556164264678955,
+            0.0012122674379497766,
+            0.0008714345749467611
+          ],
+          "retrieved_types": [
+            "general",
+            "home",
+            "health",
+            "general",
+            "general",
+            "general",
+            "general",
+            "travel"
+          ],
+          "answer_preview": "Sure, let's dive into aviation insurance:\n\n1. Aviation insurance specifically covers aircraft and related operations, including planes and helicopters.\n2. It is designed to protect against various risks and liabilities associated with air travel and operations.\n3. For \"low freque"
+        }
+      ]
+    },
+    {
+      "id": "clean-burglary-followup-01",
+      "category": "clean_control",
+      "query": "Explain burglary insurance in detail",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.8352304697036743,
+            0.22988314926624298,
+            0.036083195358514786,
+            0.023322120308876038,
+            4.248185723554343e-05,
+            0.022242402657866478,
+            0.03201218321919441
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department\u2019s premium income.\n2. It includes not only the standard burglary policy but also oth"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-repeat-01",
+      "category": "clean_control",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.5908688902854919,
+            0.43352624773979187,
+            0.3212340176105499,
+            0.08881141990423203,
+            0.9059502482414246,
+            0.03329813852906227,
+            0.002650740323588252,
+            0.09868106991052628
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance covers private cars and motorcycles among others, classifying them into different categories based on their type.\n2. When you buy motor insurance, you're entering into a contract where the insurer promises to in"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-repeat-02",
+      "category": "clean_control",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8550435304641724,
+            0.13979916274547577,
+            0.25946301221847534,
+            0.6238206028938293,
+            0.27763763070106506,
+            0.8936523199081421,
+            0.019274193793535233,
+            0.0053221192210912704
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a type of insurance that protects you against financial losses resulting from accidents involving your vehicle. It is a contract between the insured and the insurer, where the insurer agrees to compensate for"
+        }
+      ]
+    },
+    {
+      "id": "clean-engineering-repeat-01",
+      "category": "clean_control",
+      "query": "Explain engineering insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8596106171607971,
+            0.5343523025512695,
+            0.0026710096281021833,
+            0.000810716359410435,
+            0.15954849123954773,
+            0.059704333543777466,
+            0.03124750405550003,
+            0.002162853954359889
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into engineering insurance in detail:\n\n1. Engineering insurance covers risks associated with the design, construction, and maintenance of buildings and infrastructure. It includes various types of coverage tailored to the specific needs of the project.\n\n2. Common"
+        }
+      ]
+    },
+    {
+      "id": "clean-personal-accident-repeat-01",
+      "category": "clean_control",
+      "query": "Explain personal accident insurance in detail",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.0029393068980425596,
+            0.005818346049636602,
+            0.002345090499147773,
+            0.0005576257244683802,
+            0.05699656903743744,
+            0.00657945079728961,
+            0.1874137818813324,
+            0.03637350723147392
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of personal accident insurance:\n\n1. Age, height, weight, and occupation are key factors that need to be disclosed. These can influence the likelihood of an accident occurring.\n2. Previous medical history is also crucial. Conditions that might inc"
+        }
+      ]
+    },
+    {
+      "id": "clean-term-life-01",
+      "category": "clean_control",
+      "query": "What are the exclusions in term insurance?",
+      "expected_topic": "life",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are specific situations where the insurer won't pay out. Typically, these include death due to suicide within a certain period (usually 1-2 years), criminal activities, war, and more. Let me know if you want more details! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "phrasing-motor-claim-01",
+      "category": "clean_control",
+      "query": "How do I file a claim under my motor insurance policy?",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, to file a claim under your motor insurance policy, you'll need to gather some key documents first. You'll need:\n\n1. Driving Licence\n2. Registration Certificate Book\n3. Fitness Certificate (if applicable, especially for commercial vehicles)\n4. Permit (if applicable, especially"
+        }
+      ]
+    },
+    {
+      "id": "phrasing-health-coverage-01",
+      "category": "clean_control",
+      "query": "What is covered and excluded under health insurance?",
+      "expected_topic": "health",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, let's break it down. Under health insurance, hospitalization and domiciliary hospitalization expenses for illness or accidental injury during the policy period are typically covered. However, there are exclusions. \n\nFor example, if you have a known medical condition and were "
+        }
+      ]
+    },
+    {
+      "id": "phrasing-travel-walkthrough-01",
+      "category": "clean_control",
+      "query": "Walk me through how travel insurance claims work",
+      "expected_topic": "travel",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        }
+      ]
+    },
+    {
+      "id": "phrasing-life-what-are-all-01",
+      "category": "clean_control",
+      "query": "What are all the types of life insurance available?",
+      "expected_topic": "life",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 5,
+          "point_scores": [
+            0.7446303963661194,
+            0.2374388724565506,
+            0.4156200885772705,
+            0.05376449227333069,
+            0.13371862471103668
+          ],
+          "retrieved_types": [
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life",
+            "life"
+          ],
+          "answer_preview": "Sure, let's go through the types of life insurance available:\n\n1. Ordinary Whole Life Insurance: This provides lifelong coverage and allows for protection and flexibility in investment.\n2. Limited Payment Whole Life Insurance: Similar to ordinary whole life but with payments limi"
+        }
+      ]
+    },
+    {
+      "id": "adjacent-home-fire-01",
+      "category": "clean_control",
+      "query": "How does home insurance protect against fire damage?",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "clean-liability-professional-01",
+      "category": "clean_control",
+      "query": "Explain professional liability insurance in detail",
+      "expected_topic": "liability",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9659279584884644,
+            0.07916755229234695,
+            0.08183421194553375,
+            0.1679518222808838,
+            0.09823352098464966,
+            0.04285742715001106,
+            0.002075084950774908,
+            0.4940444529056549
+          ],
+          "retrieved_types": [
+            "liability",
+            "liability",
+            "liability",
+            "liability",
+            "general",
+            "liability"
+          ],
+          "answer_preview": "Sure, let's break down professional liability insurance in detail:\n\n1. Professional liability insurance, also known as professional indemnity insurance, is designed to protect professionals such as doctors, solicitors, chartered accountants, architects, and others against their l"
+        }
+      ]
+    },
+    {
+      "id": "clean-motor-third-party-01",
+      "category": "clean_control",
+      "query": "What does third party motor insurance cover?",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, third party motor insurance covers damage to property and bodily injury to third parties. The policy limits liability for death or bodily injury to third parties, but there's no limit on the amount that can be claimed for these. Legal costs for third parties are also covered."
+        }
+      ]
+    },
+    {
+      "id": "clean-crop-claim-01",
+      "category": "clean_control",
+      "query": "How do I claim under my crop insurance policy?",
+      "expected_topic": "crop",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, claiming under your crop insurance policy involves a few steps. First, you need to complete a claims form. This form should include details about the damage to your crops. Then, you send the form to the insurance company, either by post or through their online system. The ins"
+        }
+      ]
+    },
+    {
+      "id": "marine-icc-legitimate-01",
+      "category": "exemption_control",
+      "query": "Explain marine cargo insurance in detail",
+      "expected_topic": "marine",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9500895738601685,
+            0.6228691935539246,
+            0.0003618843911681324,
+            0.5239323973655701,
+            0.0024419669061899185,
+            0.012996392324566841,
+            0.01070401445031166,
+            3.802252467721701e-05
+          ],
+          "retrieved_types": [
+            "marine",
+            "general",
+            "general",
+            "marine",
+            "marine",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into marine cargo insurance in detail:\n\n1. Marine cargo insurance is a contract of utmost good faith, meaning both parties must disclose all relevant information truthfully. If this isn't done, the contract might be avoided by the other party.\n2. Marine cargo pol"
+        }
+      ]
+    },
+    {
+      "id": "clean-health-group-01",
+      "category": "clean_control",
+      "query": "Explain group health insurance in detail",
+      "expected_topic": "health",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9619502425193787,
+            0.04576591029763222,
+            0.10579260438680649,
+            0.029340334236621857,
+            0.014848644845187664,
+            0.8673226833343506,
+            0.038065355271101,
+            0.080098457634449
+          ],
+          "retrieved_types": [
+            "health",
+            "health",
+            "health",
+            "health",
+            "health"
+          ],
+          "answer_preview": "1. Group health insurance allows an insurer to agree to provide specified health insurance at an agreed-upon price (premium) to a group, such as employees of an organization or holders of credit cards or deposit holders in a bank. This type of insurance often provides either dire"
+        }
+      ]
+    },
+    {
+      "id": "water-damage-pet-leak-01",
+      "category": "known_contamination_repro",
+      "query": "How do I file a claim after water damage?",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 1,
+      "any_contaminated": true,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": true,
+          "forbidden_hits": [
+            "vet"
+          ],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, you want to know how to file a claim for water damage. Let me walk you through it:\n\n1. **Visit the Adjuster**: Just like visiting a vet for your pet, you need to contact the adjuster assigned to your claim. They\u2019ll assess the damage.\n2. **Gather Documentation**: Collect photo"
+        }
+      ]
+    },
+    {
+      "id": "water-damage-detailed-pet-01",
+      "category": "known_contamination_repro",
+      "query": "Explain in detail how to file a claim after water damage to my property",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.2804214060306549,
+            0.30226659774780273,
+            0.2527935802936554,
+            0.08204860985279083,
+            0.42017367482185364,
+            0.28022897243499756,
+            0.0005217312718741596,
+            0.005460066720843315
+          ],
+          "retrieved_types": [
+            "general",
+            "home",
+            "general",
+            "general",
+            "home",
+            "general"
+          ],
+          "answer_preview": "Sure, let's go through the process of filing a claim after experiencing water damage to your property:\n\n1. Intimate the insurance company of the occurrence of the water damage. This means you should notify your insurer as soon as possible about the incident.\n2. Evaluate/Register "
+        }
+      ]
+    },
+    {
+      "id": "compare-motor-health-01",
+      "category": "clean_control",
+      "query": "Compare motor insurance and health insurance",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, let's break it down. Motor insurance covers the vehicle itself, its accessories, and any damage or loss to your property or life. It also includes third-party coverage, meaning it protects others if you're involved in an accident. On the other hand, health insurance focuses o"
+        }
+      ]
+    },
+    {
+      "id": "compare-fire-marine-01",
+      "category": "clean_control",
+      "query": "What's the difference between fire insurance and marine insurance?",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, fire insurance covers risks like fire, lightning, explosion, and more, while marine insurance deals with risks related to ships, cargo, and other maritime activities. Fire insurance is for property on land, whereas marine insurance is for the sea. Let me know if you want more"
+        }
+      ]
+    },
+    {
+      "id": "pet-insurance-direct-01",
+      "category": "clean_control",
+      "query": "Explain pet insurance in detail",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7366647124290466,
+            0.4141214191913605,
+            0.5187110304832458,
+            0.015750233083963394,
+            0.01709146983921528,
+            0.1650109440088272,
+            0.021392185240983963,
+            0.9141339659690857
+          ],
+          "retrieved_types": [
+            "general",
+            "health",
+            "health",
+            "general",
+            "health",
+            "health",
+            "health",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of pet insurance:\n\n1. Pet insurance is a type of policy designed to help offset the cost of veterinary care when your dog, cat, or another companion animal becomes sick or injured.\n2. Annual renewal and underwriting of pet insurance policies are "
+        }
+      ]
+    },
+    {
+      "id": "workmens-compensation-01",
+      "category": "clean_control",
+      "query": "Explain workmen's compensation insurance in detail",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9104627966880798,
+            0.1348404735326767,
+            0.08315148949623108,
+            0.3698562681674957,
+            0.07946883141994476,
+            0.9517703652381897,
+            0.20810556411743164,
+            0.5500766038894653
+          ],
+          "retrieved_types": [
+            "liability",
+            "general",
+            "general",
+            "general",
+            "general",
+            "liability"
+          ],
+          "answer_preview": "Sure, let's dive into workmen's compensation insurance:\n\n1. Workmen's compensation insurance, also known as Employer\u2019s Liability Policy, offers protection against legal liabilities that might arise under various acts such as the Workmen\u2019s Compensation Act, Fatal Accidents Act, an"
+        }
+      ]
+    },
+    {
+      "id": "householders-insurance-01",
+      "category": "clean_control",
+      "query": "What does householder's insurance cover?",
+      "expected_topic": "home",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, Householders insurance typically covers property loss, such as a stolen car or a burnt house. It also includes coverage for personal accident and medical and health insurance. Let me know if you want more details! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "jewellery-insurance-01",
+      "category": "clean_control",
+      "query": "Explain jewellery insurance in detail",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.1601407825946808,
+            0.12541741132736206,
+            0.0008729179971851408,
+            0.0011382787488400936,
+            0.02094254456460476,
+            0.024228444322943687,
+            0.021397775039076805
+          ],
+          "retrieved_types": [
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into the details of jewellery insurance:\n\n1. Jewellery and valuables are comprehensively covered under All Risks policies.\n2. The coverage includes various types of items such as jewellery, plates, watches, personal ornaments, and other valuables.\n3. Loss or dama"
+        }
+      ]
+    },
+    {
+      "id": "keyman-insurance-01",
+      "category": "clean_control",
+      "query": "What is keyman insurance and why do businesses buy it?",
+      "expected_topic": "general",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "Hmm, I don't have that specific information in my knowledge base right now. Let me get one of our agents on it, they'll be able to help you better! \ud83d\ude0a"
+        }
+      ]
+    },
+    {
+      "id": "followup-motor-then-detail-01",
+      "category": "clean_control",
+      "query": "What is motor insurance? -> Explain it in more detail",
+      "expected_topic": "motor",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9985639452934265,
+            0.3358619809150696,
+            0.7777281999588013,
+            0.13761065900325775,
+            0.07899405807256699,
+            0.24584035575389862,
+            0.4449005126953125,
+            0.6179800033569336
+          ],
+          "retrieved_types": [
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "1. Motor insurance is a combined coverage for vehicles, including accessories, and protection against financial liability for loss or damage to property or life.\n2. It includes coverage for own damage, which means if your vehicle is damaged in an accident, the insurance will help"
+        }
+      ]
+    },
+    {
+      "id": "followup-personal-accident-elaborate-01",
+      "category": "known_contamination_repro",
+      "query": "What is personal accident insurance? -> Can you elaborate on all the details?",
+      "expected_topic": "personal_accident",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.01627766713500023,
+            0.001620520488359034,
+            0.5907331109046936,
+            0.004700428806245327,
+            0.04532620310783386,
+            0.12664110958576202,
+            0.0031718399841338396,
+            0.0022781009320169687
+          ],
+          "retrieved_types": [
+            "personal_accident"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. **Age, Height, Weight, Occupation, and Medical History**: These factors are crucial as they can influence the likelihood of accidents. The policyholder must disclose their age, height, weight, and occupation, especially if it increases the "
+        }
+      ]
+    },
+    {
+      "id": "enumerate-liability-types-01",
+      "category": "clean_control",
+      "query": "What are all the types of liability insurance?",
+      "expected_topic": "liability",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 3,
+          "point_scores": [
+            0.21169854700565338,
+            0.8069335222244263,
+            0.6143559813499451
+          ],
+          "retrieved_types": [
+            "liability",
+            "liability",
+            "liability",
+            "liability"
+          ],
+          "answer_preview": "Sure, let's go through the types of liability insurance:\n\n1. Product Liability: This type of insurance is for manufacturers who might be held responsible if a product they produce causes death, bodily injury, or property damage.\n2. Public Liability: This policy provides protectio"
+        }
+      ]
+    },
+    {
+      "id": "adjacent-travel-medical-01",
+      "category": "clean_control",
+      "query": "Does travel insurance cover medical emergencies abroad?",
+      "expected_topic": "travel",
+      "repeats": 1,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "It sounds like you're after travel insurance! Want me to connect you with Ava, our travel insurance specialist, who can get you a live quote? (yes/no)"
+        }
+      ]
+    }
+  ]
+}

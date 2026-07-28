@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Widget Preview — InsureHub host page mock</title>
+<style>
+  /* Rough stand-in for InsureHub's own page chrome, using the same real
+     values the widget itself uses (see raginsureai-widget.js header) —
+     just enough to test the widget in a realistic setting: same trigger
+     button markup/selector, same fixed bottom-right stack it has to
+     clear, same base font/background. This is NOT a copy of the real
+     site's markup, just enough scaffolding to verify the widget doesn't
+     collide with anything. */
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Inter", system-ui, sans-serif;
+    background: #F8FAFC;
+    color: #111827;
+  }
+  .hero {
+    background: #93C5FD;
+    padding: 48px 24px;
+  }
+  .hero__inner { max-width: 960px; margin: 0 auto; }
+  .hero p { font-size: 1.1rem; margin: 0 0 8px; }
+  h1 { font-size: 3rem; font-weight: 800; margin: 8px 0 0; line-height: 1.05; }
+  h1 .accent { color: #DC2626; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; max-width: 640px; margin-top: 32px; }
+  .card {
+    background: #fff; border: 2px solid transparent; border-radius: 12px;
+    padding: 20px; text-align: center; font-weight: 700; cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  .card.selected { border-color: #51A3FF; background: rgba(81,163,255,0.05); }
+  .filler { max-width: 960px; margin: 40px auto; padding: 0 24px; color: #4B5563; line-height: 1.7; }
+
+  /* ===== The exact fixed stack the real site uses, same selectors ===== */
+  .btn-stack {
+    position: fixed; bottom: 16px; right: 16px; z-index: 40;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  @media (min-width: 768px) {
+    .btn-stack { bottom: 24px; right: 24px; gap: 12px; }
+  }
+  .btn-stack button {
+    width: 48px; height: 48px; border-radius: 999px; border: none;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.18); cursor: pointer;
+  }
+  @media (min-width: 768px) {
+    .btn-stack button { width: 56px; height: 56px; }
+  }
+  .btn-whatsapp { background: #25D366; }
+  .btn-chatbot { background: #fff; border: 1px solid #E5E7EB; }
+</style>
+</head>
+<body>
+
+  <section class="hero">
+    <div class="hero__inner">
+      <p>Getting insurance can be confusing. InsureHub makes it simple.</p>
+      <h1>Click. Pick.<br /><span class="accent">Insure.</span></h1>
+      <div class="cards">
+        <div class="card">CAR</div>
+        <div class="card">HOME</div>
+        <div class="card selected">TRAVEL</div>
+        <div class="card">HEALTH</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="filler">
+    <p>Rest of the InsureHub page would continue here — this preview only exists to test the widget against the real fixed-button layout it has to coexist with.</p>
+    <p>Try: opening the panel, sending an example question, resizing the window below 600px to check the fullscreen sheet behavior, pressing Escape, and clicking outside the panel.</p>
+  </div>
+
+  <div class="btn-stack">
+    <button type="button" class="btn-whatsapp" aria-label="Chat on WhatsApp">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M12 2C6.48 2 2 6.48 2 12c0 1.85.5 3.58 1.35 5.07L2 22l5.09-1.32C8.53 21.53 10.21 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z"/></svg>
+    </button>
+    <button type="button" class="btn-chatbot" aria-label="Open Chatbot">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="8" width="16" height="12" rx="3" stroke="#51A3FF" stroke-width="1.8"/><circle cx="9" cy="14" r="1.4" fill="#51A3FF"/><circle cx="15" cy="14" r="1.4" fill="#51A3FF"/><path d="M12 8V4M9 4H15" stroke="#51A3FF" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <div id="raginsureai-widget-root"></div>
+  <script>
+    // Local testing against the real running RAG_InsureAI backend instead
+    // of MOCK_MODE — flip the second flag back to nothing (or delete
+    // these two lines) to go back to demoing with no backend required.
+    // Requires: docker container `insurehub_api` running and healthy on
+    // 8501, and this page served from an origin in api.py's CORS
+    // allowlist (this file is served on :8080, which already is one).
+    window.RAGINSUREAI_MOCK_MODE = false;
+    window.RAGINSUREAI_API_BASE_URL = 'http://localhost:8501';
+  </script>
+  <script src="raginsureai-widget.js"></script>
+</body>
+</html>

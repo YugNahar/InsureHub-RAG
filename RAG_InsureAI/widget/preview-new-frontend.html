@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Preview — new Layla frontend on the InsureHub host page</title>
+<style>
+  /* Same real-extracted host-page scaffolding as preview.html (hero
+     colors, card styling, the exact fixed WhatsApp+chatbot button stack
+     markup/selectors/spacing) — NOT the literal live site, since its
+     exact URL isn't available in this session; this reproduces the real
+     extracted theme values/markup documented in raginsureai-widget.js's
+     header instead of guessing. The panel below is a live iframe of the
+     ACTUAL new production frontend running at :8501 — not a mockup of
+     it — so what you see here is pixel-for-pixel what's really deployed.
+  */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: "Inter", system-ui, sans-serif;
+    background: #F8FAFC;
+    color: #111827;
+  }
+  .hero { background: #93C5FD; padding: 48px 24px; }
+  .hero__inner { max-width: 960px; margin: 0 auto; }
+  .hero p { font-size: 1.1rem; margin: 0 0 8px; }
+  h1 { font-size: 3rem; font-weight: 800; margin: 8px 0 0; line-height: 1.05; }
+  h1 .accent { color: #DC2626; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; max-width: 640px; margin-top: 32px; }
+  .card {
+    background: #fff; border: 2px solid transparent; border-radius: 12px;
+    padding: 20px; text-align: center; font-weight: 700; cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  .card.selected { border-color: #51A3FF; background: rgba(81,163,255,0.05); }
+  .filler { max-width: 960px; margin: 40px auto; padding: 0 24px; color: #4B5563; line-height: 1.7; }
+
+  /* ===== The exact fixed stack the real site uses, same selectors ===== */
+  .btn-stack {
+    position: fixed; bottom: 16px; right: 16px; z-index: 40;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  @media (min-width: 768px) { .btn-stack { bottom: 24px; right: 24px; gap: 12px; } }
+  .btn-stack button {
+    width: 48px; height: 48px; border-radius: 999px; border: none;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.18); cursor: pointer;
+  }
+  @media (min-width: 768px) { .btn-stack button { width: 56px; height: 56px; } }
+  .btn-whatsapp { background: #25D366; }
+  .btn-chatbot { background: #fff; border: 1px solid #E5E7EB; transition: transform 120ms ease; }
+  .btn-chatbot:hover { transform: scale(1.05); }
+
+  /* ===== New frontend panel — a live iframe of the real :8501 app,
+     not a re-created copy, so this is exactly what's deployed. Sized as
+     a large right-side drawer (common modern chat-widget pattern —
+     Intercom/Drift-style full-height messenger) rather than a small
+     360px box, since the new frontend was built as a full page, not a
+     compact widget, and reads better at this size. ===== */
+  .chat-panel {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: 100%; max-width: 460px;
+    background: #fff;
+    box-shadow: -12px 0 40px rgba(15, 38, 71, 0.18);
+    z-index: 2147483000;
+    transform: translateX(100%);
+    transition: transform 320ms cubic-bezier(0.2, 0.8, 0.3, 1);
+    display: flex; flex-direction: column;
+  }
+  .chat-panel.is-open { transform: translateX(0); }
+  .chat-panel iframe { flex: 1; width: 100%; height: 100%; border: none; }
+
+  .chat-panel__close {
+    position: absolute; top: 10px; right: 10px; z-index: 1;
+    width: 32px; height: 32px; border-radius: 8px; border: none;
+    background: rgba(17,24,39,0.06); color: #4B5563;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+  }
+  .chat-panel__close:hover { background: rgba(17,24,39,0.12); }
+
+  .panel-scrim {
+    position: fixed; inset: 0; background: rgba(15,38,71,0.25);
+    z-index: 2147482999; opacity: 0; pointer-events: none;
+    transition: opacity 220ms ease;
+  }
+  .panel-scrim.is-open { opacity: 1; pointer-events: auto; }
+
+  @media (max-width: 500px) {
+    .chat-panel { max-width: 100%; }
+  }
+
+  .note {
+    position: fixed; top: 12px; left: 12px; z-index: 100;
+    background: #111827; color: #fff; font-size: 12px; line-height: 1.5;
+    padding: 8px 12px; border-radius: 8px; max-width: 320px; opacity: 0.85;
+  }
+</style>
+</head>
+<body>
+
+  <div class="note">Preview only — host page reproduces real extracted InsureHub theme values, not the literal live URL. Panel is a live iframe of the actual new frontend at :8501.</div>
+
+  <section class="hero">
+    <div class="hero__inner">
+      <p>Getting insurance can be confusing. InsureHub makes it simple.</p>
+      <h1>Click. Pick.<br /><span class="accent">Insure.</span></h1>
+      <div class="cards">
+        <div class="card">CAR</div>
+        <div class="card">HOME</div>
+        <div class="card selected">TRAVEL</div>
+        <div class="card">HEALTH</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="filler">
+    <p>Rest of the InsureHub page would continue here.</p>
+    <p>Click the chatbot button (bottom-right) to open the new Layla frontend as it would sit on this page.</p>
+  </div>
+
+  <div class="btn-stack">
+    <button type="button" class="btn-whatsapp" aria-label="Chat on WhatsApp">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M12 2C6.48 2 2 6.48 2 12c0 1.85.5 3.58 1.35 5.07L2 22l5.09-1.32C8.53 21.53 10.21 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z"/></svg>
+    </button>
+    <button type="button" class="btn-chatbot" id="chatTrigger" aria-label="Open Chatbot">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="8" width="16" height="12" rx="3" stroke="#51A3FF" stroke-width="1.8"/><circle cx="9" cy="14" r="1.4" fill="#51A3FF"/><circle cx="15" cy="14" r="1.4" fill="#51A3FF"/><path d="M12 8V4M9 4H15" stroke="#51A3FF" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <div class="panel-scrim" id="scrim"></div>
+  <div class="chat-panel" id="chatPanel">
+    <button type="button" class="chat-panel__close" id="closeBtn" aria-label="Close chat">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6L18 18M6 18L18 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <iframe id="chatFrame" title="Layla chat" src="about:blank"></iframe>
+  </div>
+
+  <script>
+    const trigger = document.getElementById('chatTrigger');
+    const panel = document.getElementById('chatPanel');
+    const scrim = document.getElementById('scrim');
+    const closeBtn = document.getElementById('closeBtn');
+    const frame = document.getElementById('chatFrame');
+    let loaded = false;
+
+    function open() {
+      if (!loaded) { frame.src = 'http://localhost:8501/'; loaded = true; }
+      panel.classList.add('is-open');
+      scrim.classList.add('is-open');
+    }
+    function close() {
+      panel.classList.remove('is-open');
+      scrim.classList.remove('is-open');
+    }
+    trigger.addEventListener('click', () => {
+      panel.classList.contains('is-open') ? close() : open();
+    });
+    closeBtn.addEventListener('click', close);
+    scrim.addEventListener('click', close);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  </script>
+</body>
+</html>

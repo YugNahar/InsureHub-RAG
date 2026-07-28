@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Preview — redesigned Agent Dashboard over the main site</title>
+<style>
+  /* =========================================================================
+     ILLUSTRATIVE MOCKUP, not an extraction — insure-hub-react-*.azurewebsites.net
+     is a separate app, not in this repo, and is gated behind login, so its
+     exact CSS isn't available here. This reconstructs the CRM-dashboard host
+     page from the user-provided screenshot's visual language (light theme,
+     blue primary, white cards, sidebar nav) purely so the panel below can be
+     seen in a realistic surrounding context.
+
+     The panel itself is NOT a mockup — it's a live iframe of the actual
+     redesigned :8501/agent-dashboard, so what you see inside that floating
+     card is pixel-for-pixel what's really deployed.
+     ========================================================================= */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #F1F5F9;
+    color: #0F172A;
+  }
+  .mock-banner {
+    background: #FEF3C7; color: #92400E; font-size: 0.78rem; text-align: center;
+    padding: 7px 12px; font-weight: 600; border-bottom: 1px solid #FDE68A;
+  }
+
+  /* ── Host chrome (mockup) ── */
+  .topbar {
+    height: 56px; background: #fff; border-bottom: 1px solid #E2E8F0;
+    display: flex; align-items: center; justify-content: space-between; padding: 0 20px;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.05rem; }
+  .brand-badge {
+    width: 30px; height: 30px; border-radius: 8px; background: #2563EB;
+    display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px;
+  }
+  .topbar-right { display: flex; align-items: center; gap: 16px; color: #64748B; }
+  .avatar-km {
+    width: 32px; height: 32px; border-radius: 50%; background: #2563EB; color: #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 0.78rem; font-weight: 700;
+  }
+
+  .shell { display: flex; min-height: calc(100vh - 56px - 30px); }
+  .host-sidebar {
+    width: 210px; background: #EFF6FF; border-right: 1px solid #DBEAFE; padding: 18px 12px; flex-shrink: 0;
+  }
+  .host-nav-item {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px;
+    font-size: 0.85rem; font-weight: 600; color: #475569; margin-bottom: 4px;
+  }
+  .host-nav-item.active { background: #2563EB; color: #fff; }
+
+  .host-main { flex: 1; padding: 24px 28px; min-width: 0; }
+  .host-main h1 { font-size: 1.5rem; font-weight: 700; margin: 0 0 16px; }
+  .filter-row { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  .filter-chip {
+    background: #fff; border: 1px solid #E2E8F0; border-radius: 8px; padding: 8px 14px;
+    font-size: 0.8rem; color: #475569; box-shadow: 0 1px 2px rgba(15,23,42,.04);
+  }
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; max-width: 640px; }
+  .stat-card {
+    background: #fff; border: 1px solid #E2E8F0; border-radius: 12px; padding: 16px 18px;
+    box-shadow: 0 1px 3px rgba(15,23,42,.06); display: flex; flex-direction: column; gap: 6px;
+  }
+  .stat-top { display: flex; align-items: center; justify-content: space-between; }
+  .stat-icon {
+    width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 14px;
+  }
+  .stat-icon.blue { background: #2563EB; }
+  .stat-icon.red { background: #DC2626; }
+  .stat-val { font-size: 1.5rem; font-weight: 700; }
+  .stat-label { font-size: 0.75rem; color: #64748B; font-weight: 600; }
+  .stat-delta { font-size: 0.72rem; }
+  .stat-delta.down { color: #DC2626; }
+  .stat-delta.up { color: #16A34A; }
+
+  /* ── The floating panel hosting the real redesigned dashboard ── */
+  .panel-wrap {
+    position: absolute; top: 92px; left: 226px; width: 700px; height: 560px;
+    background: #fff; border-radius: 14px; box-shadow: 0 24px 60px rgba(15,23,42,.22);
+    border: 1px solid #E2E8F0; overflow: hidden; display: flex; flex-direction: column;
+  }
+  .panel-wrap iframe { flex: 1; width: 100%; border: none; }
+  .panel-label {
+    position: absolute; top: 66px; left: 226px; font-size: 0.72rem; font-weight: 700;
+    color: #2563EB; text-transform: uppercase; letter-spacing: .05em;
+  }
+
+  @media (max-width: 980px) {
+    .panel-wrap { position: static; width: 100%; height: 640px; margin-top: 20px; box-shadow: none; border-radius: 0; }
+    .panel-label { position: static; display: block; margin: 20px 0 6px; }
+    .host-main { padding-bottom: 0; }
+  }
+</style>
+</head>
+<body>
+
+<div class="mock-banner">PREVIEW — host chrome below is an illustrative mockup of the main site from the provided screenshot; the panel is a LIVE iframe of the real :8501/agent-dashboard</div>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-badge">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 2L3 6.5V11C3 16.2 6.8 20.9 12 22C17.2 20.9 21 16.2 21 11V6.5L12 2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+    </div>
+    INSURE HUB
+  </div>
+  <div class="topbar-right">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div class="avatar-km">KM</div>
+  </div>
+</div>
+
+<div class="shell" style="position:relative">
+  <div class="host-sidebar">
+    <div class="host-nav-item active">▤ Dashboard</div>
+    <div class="host-nav-item">📈 Pipeline</div>
+    <div class="host-nav-item">👥 Clients</div>
+  </div>
+
+  <div class="host-main">
+    <h1>Dashboard</h1>
+    <div class="filter-row">
+      <div class="filter-chip">Product: All Products</div>
+      <div class="filter-chip">Agent: All Agents</div>
+      <div class="filter-chip">Date Range: Current Month</div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-top"><span class="stat-label">Total Leads</span><div class="stat-icon blue">👤</div></div>
+        <div class="stat-val">89</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-top"><span class="stat-label">Policy Issued</span><div class="stat-icon blue">📄</div></div>
+        <div class="stat-val">25</div>
+        <div class="stat-delta down">↓ -124 policies vs last month</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-top"><span class="stat-label">Payment Failed</span><div class="stat-icon red">👤</div></div>
+        <div class="stat-val">2</div>
+        <div class="stat-delta down">↓ -1 failed payments vs last month</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-top"><span class="stat-label">Quotes Generated</span><div class="stat-icon blue">📝</div></div>
+        <div class="stat-val">87</div>
+        <div class="stat-delta down">↓ -193 quotes vs last month</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-top"><span class="stat-label">Portal Visitors</span><div class="stat-icon blue">👤</div></div>
+        <div class="stat-val">1284</div>
+        <div class="stat-delta up">↑ +22% from last month</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel-label">↓ Redesigned Agent Dashboard (live)</div>
+  <div class="panel-wrap">
+    <iframe src="http://localhost:8501/agent-dashboard" title="Agent Dashboard preview"></iframe>
+  </div>
+</div>
+
+</body>
+</html>

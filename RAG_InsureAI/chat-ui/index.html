@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>InsureHub Assistant</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- Skip link for keyboard users -->
+  <a class="skip-link" href="#composer-input">Skip to message input</a>
+
+  <div class="app" id="app">
+
+    <!-- ============ SIDEBAR ============ -->
+    <aside class="sidebar" id="sidebar" aria-label="Conversation history">
+      <div class="sidebar__header">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2L3 6.5V11C3 16.2 6.8 20.9 12 22C17.2 20.9 21 16.2 21 11V6.5L12 2Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+              <path d="M8.5 12.2L10.8 14.5L15.5 9.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span class="brand__name">InsureHub</span>
+        </div>
+        <button class="icon-btn sidebar__collapse-btn" id="sidebarCollapseBtn" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M15 6L9 12L15 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+
+      <button class="new-chat-btn" id="newChatBtn" type="button">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        New conversation
+      </button>
+
+      <div class="sidebar__search">
+        <svg class="sidebar__search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <input type="search" id="historySearch" placeholder="Search conversations" aria-label="Search conversations" />
+      </div>
+
+      <nav class="history-list" id="historyList" aria-label="Conversations">
+        <!-- populated by app.js -->
+      </nav>
+
+      <div class="sidebar__footer">
+        <p class="sidebar__disclaimer">
+          Answers are general information, not a substitute for advice from a licensed agent.
+        </p>
+      </div>
+    </aside>
+
+    <!-- Scrim for mobile sidebar / bottom sheet -->
+    <div class="scrim" id="scrim" hidden></div>
+
+    <!-- ============ MAIN COLUMN ============ -->
+    <div class="main">
+
+      <!-- ---------- HEADER ---------- -->
+      <header class="app-header">
+        <button class="icon-btn menu-btn" id="menuBtn" type="button" aria-label="Open conversation history" aria-expanded="false" aria-controls="sidebar">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M3 6H21M3 12H21M3 18H21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+
+        <div class="app-header__title">
+          <span id="conversationTitle">New conversation</span>
+        </div>
+
+        <div class="app-header__actions">
+          <span class="status-pill" id="statusPill" role="status" aria-live="polite">
+            <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+            <span id="statusText">Checking…</span>
+          </span>
+
+          <button class="icon-btn" id="themeToggleBtn" type="button" aria-label="Switch to dark theme" title="Toggle theme">
+            <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="4.5" stroke="currentColor" stroke-width="1.8"/>
+              <path d="M12 2.5V4.5M12 19.5V21.5M4.22 4.22L5.64 5.64M18.36 18.36L19.78 19.78M2.5 12H4.5M19.5 12H21.5M4.22 19.78L5.64 18.36M18.36 5.64L19.78 4.22" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+            <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- ---------- CHAT THREAD ---------- -->
+      <main class="thread-wrap">
+        <div
+          class="thread"
+          id="thread"
+          role="log"
+          aria-live="polite"
+          aria-atomic="false"
+        >
+          <!-- Empty state, message bubbles etc. populated by app.js -->
+        </div>
+
+        <button class="jump-latest-btn" id="jumpLatestBtn" type="button" hidden>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4V20M12 20L6 14M12 20L18 14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Jump to latest
+        </button>
+      </main>
+
+      <!-- ---------- COMPOSER ---------- -->
+      <footer class="composer">
+        <form class="composer__form" id="composerForm">
+          <div class="composer__box">
+            <textarea
+              id="composer-input"
+              class="composer__input"
+              placeholder="Ask about your policy, a claim, or coverage…"
+              rows="1"
+              aria-label="Message"
+            ></textarea>
+            <button class="send-btn" id="sendBtn" type="submit" aria-label="Send message">
+              <svg class="send-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12L20 4L14 20L11 13L4 12Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" fill="none"/></svg>
+              <span class="send-spinner" aria-hidden="true"></span>
+            </button>
+          </div>
+        </form>
+        <p class="composer__disclaimer">
+          InsureHub Assistant gives general information — not a substitute for advice from a licensed agent.
+        </p>
+      </footer>
+
+    </div>
+  </div>
+
+  <!-- Live region used purely for citation-click / feedback confirmations (SR-only) -->
+  <div id="srAnnouncer" class="sr-only" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

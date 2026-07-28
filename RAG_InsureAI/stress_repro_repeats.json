@@ -1,0 +1,1324 @@
+{
+  "timestamp": 1784702557.470859,
+  "api_url": "http://localhost:8501/ask-stream",
+  "case_count": 9,
+  "repeats": 6,
+  "overall_rate_pct": 0.0,
+  "repro_rate_pct": 0.0,
+  "control_rate_pct": 0.0,
+  "contaminated_point_scores": {},
+  "clean_point_scores": {
+    "n": 371,
+    "min": 0.0,
+    "p10": 0.0008,
+    "median": 0.0333,
+    "p90": 0.8017,
+    "max": 0.9939
+  },
+  "cases": [
+    {
+      "id": "motor-marine-icc-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.864136815071106,
+            0.48054176568984985,
+            0.24625596404075623,
+            0.27309006452560425,
+            0.020682353526353836,
+            0.002014604862779379,
+            0.6325127482414246,
+            0.004176050424575806
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a contract between the insured and the insurer where the insurer promises to indemnify the financial liability in the event of loss to the insured. This includes covering losses and injuries caused by drivers"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8439202904701233,
+            0.0010570830199867487,
+            0.29657527804374695,
+            0.7146620750427246,
+            0.039595793932676315,
+            0.006001678295433521,
+            0.0733756497502327,
+            0.26720717549324036
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a contract between the insured and the insurer where the insurer promises to indemnify the financial liability in case of loss to the insured. This includes covering losses and injuries caused by the insured "
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8016719818115234,
+            0.3222392797470093,
+            0.0878281220793724,
+            0.24745871126651764,
+            0.8812358975410461,
+            0.030887484550476074,
+            0.15977969765663147,
+            0.14889082312583923
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a contract between the insured and the insurer where the insurer promises to indemnify the financial liability in the event of loss to the insured. This means that if something happens to your vehicle, the in"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7507584095001221,
+            0.028414133936166763,
+            0.35415443778038025,
+            0.012811399064958096,
+            0.4279472827911377,
+            0.887999951839447,
+            0.0019242760026827455,
+            0.023648206144571304
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance is a type of insurance designed to cover various risks associated with driving a motor vehicle.\n2. It typically covers three broad categories of vehicles: private cars, motorcycles, and others.\n3. Motor ins"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8221549987792969,
+            0.00011569439811864868,
+            0.30682411789894104,
+            0.030855869874358177,
+            0.015963511541485786,
+            0.01849551871418953,
+            0.5106155276298523,
+            0.0039228699170053005
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance covers various aspects related to your vehicle, including protection against financial liabilities that arise from accidents or damage.\n2. Vehicles are typically classified into three broad categories: priv"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7095813751220703,
+            0.344075083732605,
+            0.32071805000305176,
+            0.7406193017959595,
+            0.04273538291454315,
+            0.017330577597022057,
+            0.03396541625261307,
+            0.8123527765274048
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance!\n\n1. Motor insurance covers various types of vehicles, primarily dividing them into private cars and motorcycles. It\u2019s designed to protect the financial liability of the insured in case of loss or damage to their vehicle.\n\n2. W"
+        }
+      ]
+    },
+    {
+      "id": "motor-health-domiciliary-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.6308589577674866,
+            0.015930959954857826,
+            0.3181653618812561,
+            0.031348761171102524,
+            0.015182665549218655,
+            0.0047926283441483974,
+            0.04828602820634842,
+            0.12352682650089264
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance covers private cars and motorcycles, among other motor vehicles.\n2. It is a contract between the insured and the insurer where the insurer promises to indemnify the financial liability in the event of loss "
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8052089214324951,
+            0.01593093015253544,
+            0.18781958520412445,
+            0.7975803017616272,
+            0.14772962033748627,
+            0.19009216129779816,
+            0.007325909100472927,
+            0.003758001606911421
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a type of insurance that covers private cars and motorcycles, among other motor vehicles.\n2. It is a contract between the insured and the insurer where the insurer promises to indemnify the financial liabilit"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7540801763534546,
+            0.0007687961333431304,
+            0.438461571931839,
+            0.27043867111206055,
+            0.025187304243445396,
+            0.003618785412982106,
+            0.6506518125534058,
+            0.017412347719073296
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance refers to a type of insurance that covers various risks associated with motor vehicles.\n2. Motor vehicles are typically classified into three broad categories: private cars, motorcycles, and others.\n3. When you "
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.743376612663269,
+            0.10259058326482773,
+            0.49162206053733826,
+            0.09969519078731537,
+            0.12016407400369644,
+            0.002383267506957054,
+            0.5965264439582825,
+            0.7142928838729858
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance is a type of insurance that covers various risks associated with owning and operating a motor vehicle.\n2. For the purpose of insurance, motor vehicles are broadly classified into three categories: private c"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8860894441604614,
+            0.015161199495196342,
+            0.3333698809146881,
+            0.10268931835889816,
+            0.7841725945472717,
+            0.024439340457320213,
+            0.0032778580207377672,
+            0.10427704453468323
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance is a type of insurance that covers various aspects related to motor vehicles, including private cars and motorcycles.\n2. It is a contract between the insured and the insurer where the insurer promises to in"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.6822901368141174,
+            0.5461200475692749,
+            0.4086878001689911,
+            0.0013988660648465157,
+            0.019359176978468895,
+            0.3601074814796448,
+            0.004134668968617916,
+            0.024742357432842255
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance covers various types of vehicles, broadly classified into private cars, motorcycles, and so on. It\u2019s a contract between the insured and the insurer where the insurer promises to indemnify the financial liab"
+        }
+      ]
+    },
+    {
+      "id": "motor-crop-general-01",
+      "category": "known_contamination_repro",
+      "query": "Explain motor insurance in detail",
+      "expected_topic": "motor",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7834909558296204,
+            0.015161199495196342,
+            0.3667597770690918,
+            0.3202924430370331,
+            0.07056697458028793,
+            0.02709208056330681,
+            0.18279966711997986,
+            0.10486764460802078
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance refers to the coverage for motor vehicles, which includes private cars and motorcycles among others.\n2. It is a contract between the insured and the insurer where the insurer promises to indemnify the financial "
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7309134006500244,
+            0.8121211528778076,
+            0.6589889526367188,
+            0.6730687618255615,
+            0.5281778573989868,
+            0.01080712117254734,
+            0.013589217327535152,
+            0.004502547904849052
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance covers various types of vehicles, primarily classified into private cars and motor cycles. This type of insurance is designed to protect the financial liability of the owner in case of an accident or damage"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.6767902374267578,
+            0.04027150943875313,
+            0.3206315040588379,
+            0.00375400111079216,
+            0.03176997974514961,
+            0.003748183138668537,
+            0.5874324440956116,
+            0.005605029407888651
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance covers various types of motor vehicles, broadly categorized into private cars, motorcycles, and others.\n2. It is a contract between the insured and the insurer where the insurer agrees to compensate the insured "
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.6930025219917297,
+            0.7058407068252563,
+            0.3720591962337494,
+            0.003928277175873518,
+            0.6506518125534058,
+            0.03108527697622776,
+            0.0020411876030266285,
+            0.0016252115601673722
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance!\n\n1. Motor insurance covers various types of motor vehicles, broadly classified into private cars, motorcycles, and so on.\n2. At the heart of motor insurance is a contract between the insured and the insurer. The insurer promis"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7611253261566162,
+            0.4175522029399872,
+            0.3283027410507202,
+            0.5820589065551758,
+            0.15242576599121094,
+            0.017760438844561577,
+            0.016672637313604355,
+            0.20850487053394318
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into motor insurance in detail:\n\n1. Motor insurance is a type of insurance that covers private cars and motorcycles among others. It's designed to protect you financially in case of an accident or damage to your vehicle.\n\n2. When you buy motor insurance, you're e"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.7611253261566162,
+            0.4729144871234894,
+            0.8334010243415833,
+            0.7992153167724609,
+            0.4821292757987976,
+            0.9402715563774109,
+            0.028749441727995872,
+            0.8438320755958557
+          ],
+          "retrieved_types": [
+            "motor",
+            "general",
+            "motor",
+            "motor",
+            "motor",
+            "motor",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of motor insurance:\n\n1. Motor insurance is a type of insurance that covers private cars and motorcycles among others. It's designed to protect you financially in case of an accident or damage to your vehicle.\n\n2. When you buy motor insurance, you"
+        }
+      ]
+    },
+    {
+      "id": "engineering-marine-hull-01",
+      "category": "known_contamination_repro",
+      "query": "Explain engineering insurance in detail",
+      "expected_topic": "commercial",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8767566084861755,
+            0.002675214782357216,
+            0.2529420554637909,
+            0.004043890628963709,
+            0.001011919230222702,
+            0.03602529317140579,
+            0.004185520112514496,
+            0.0014483932172879577
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of engineering insurance:\n\n1. Engineering insurance typically covers risks associated with construction projects, machinery, and infrastructure. It includes both property and liability aspects.\n2. Underwriting is the process where the insurer ass"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9192672967910767,
+            0.10790830850601196,
+            0.0018738714279606938,
+            0.7281706929206848,
+            0.0017327375244349241,
+            0.8489682078361511,
+            0.055069196969270706,
+            0.0007659748662263155
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of engineering insurance!\n\n1. Engineering insurance is designed to cover risks associated with construction projects, machinery, and other engineering-related activities. It includes coverage for both property and liability aspects.\n2. This type "
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 4,
+          "point_scores": [
+            0.8652663230895996,
+            0.0007466918905265629,
+            0.0869012400507927,
+            0.0067508891224861145
+          ],
+          "retrieved_types": [
+            "general",
+            "fire",
+            "crop",
+            "general",
+            "health",
+            "general",
+            "general",
+            "motor"
+          ],
+          "answer_preview": "Sure, let's dive into the details of engineering insurance:\n\n1. Engineering insurance is designed to protect against risks associated with the construction and operation of machinery and equipment in various industries.\n2. It typically comes into play during the project stage, wh"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8700275421142578,
+            0.05446644499897957,
+            0.08925361931324005,
+            0.0016309175407513976,
+            0.0009459114517085254,
+            0.0025598162319511175,
+            0.20383135974407196,
+            0.007485021837055683
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into engineering insurance in detail:\n\n1. Engineering insurance is designed to protect property and interests related to construction projects, machinery, and infrastructure.\n2. It includes coverage for risks such as fire and engineering, which can encompass vari"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8716407418251038,
+            0.20859935879707336,
+            0.8470740914344788,
+            0.0075673325918614864,
+            0.0005357401678338647,
+            0.0013737737899646163,
+            0.0010464320657774806,
+            3.739902240340598e-05
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of engineering insurance!\n\n1. **Nature of Engineering Insurance**: Engineering insurance covers risks associated with construction projects, including machinery breakdown, boiler and pressure plant insurance, and electronic equipment insurance. I"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9720718860626221,
+            0.5034838914871216,
+            0.8331407308578491,
+            0.736362636089325,
+            0.061864305287599564,
+            0.9558961391448975,
+            0.5688614249229431,
+            0.00010078874765895307
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of engineering insurance!\n\n1. **Nature of Engineering Insurance**: Engineering insurance is designed to protect property and interests related to construction, installation, and maintenance activities. It encompasses a wide range of risks associa"
+        }
+      ]
+    },
+    {
+      "id": "burglary-fidelity-01",
+      "category": "known_contamination_repro",
+      "query": "Explain burglary insurance in detail",
+      "expected_topic": "home",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "point_scores": [
+            0.8381173610687256,
+            0.000420571566792205,
+            0.018991384655237198,
+            0.03220398351550102,
+            0.03201218321919441,
+            0.4619978070259094
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department's premium income.\n2. It includes theft of property from the premises following upon"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8352304697036743,
+            0.42413806915283203,
+            0.02648545242846012,
+            0.018595842644572258,
+            0.0002864646085072309,
+            0.03266691043972969,
+            0.03500237315893173,
+            0.0006249165162444115
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into the details of burglary insurance:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department\u2019s premium income.\n2. This insurance includes not just burglary policies but al"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8381173610687256,
+            0.3025544583797455,
+            0.022626705467700958,
+            0.030091406777501106,
+            0.05628294497728348,
+            0.18369603157043457,
+            0.00010447800741530955,
+            0.0012678619241341949
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department's premium income.\n2. It includes not just burglary policies but also other types of"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8748347163200378,
+            0.0004934302414767444,
+            0.019078994169831276,
+            0.03394175320863724,
+            3.7577920011244714e-05,
+            0.19401873648166656,
+            0.002141934121027589,
+            3.824260420515202e-05
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department, contributing significantly to the department's premium income.\n2. It includes theft of property from premises following felonious entry by violent"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 6,
+          "point_scores": [
+            0.8352304697036743,
+            0.000420571566792205,
+            0.2532557547092438,
+            0.021633708849549294,
+            0.03330608829855919,
+            0.0005743905203416944
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department\u2019s premium income.\n2. It includes theft of property from the premises following upon"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8381173610687256,
+            0.025393139570951462,
+            0.026767902076244354,
+            0.06037701666355133,
+            0.12246941030025482,
+            0.00042461149860173464,
+            0.005325343459844589,
+            4.551308666123077e-05
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "home",
+            "home"
+          ],
+          "answer_preview": "Sure, let's dive into burglary insurance in detail:\n\n1. Burglary insurance is a major class of business underwritten in the miscellaneous department and contributes significantly to the department's premium income.\n2. It typically covers theft of property from the premises follow"
+        }
+      ]
+    },
+    {
+      "id": "transit-motor-vehicles-act-01",
+      "category": "known_contamination_repro",
+      "query": "Explain transit insurance in detail",
+      "expected_topic": "general",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9053926467895508,
+            0.0018466206965968013,
+            0.009968156926333904,
+            0.9124849438667297,
+            0.02364337258040905,
+            0.013860010541975498,
+            0.052199944853782654,
+            0.02536635473370552
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into transit insurance in detail:\n\n1. Transit insurance typically covers goods being transported from one place to another, often by multiple modes of transport.\n2. This type of insurance can be sought for various purposes, such as covering frequent consignments "
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8587337136268616,
+            0.01948249153792858,
+            0.011892245151102543,
+            0.06175693869590759,
+            0.0006213700398802757,
+            0.020157841965556145,
+            0.03376562520861626,
+            0.21039021015167236
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Transit insurance covers goods being transported from one place to another.\n2. It can be single or multi-modal, meaning it can cover various transportation methods like road, rail, and sea.\n3. For marine transit, the cover note is valid for"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.902795135974884,
+            0.08712499588727951,
+            0.07251206785440445,
+            0.07309199869632721,
+            0.038415852934122086,
+            0.01281434204429388,
+            0.017062271013855934,
+            0.00036215290310792625
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into the details of transit insurance:\n\n1. **Nature of Insurance**: Transit insurance covers goods being transported from one place to another. This can include various modes of transport such as road, rail, air, and sea.\n\n2. **Coverage Types**: There are differe"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8658441305160522,
+            0.07197240740060806,
+            0.5625277757644653,
+            0.0028681198600679636,
+            0.07248847186565399,
+            0.014460954815149307,
+            0.03173764795064926,
+            0.0002322025684406981
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure thing! Here\u2019s a detailed breakdown of transit insurance:\n\n1. **Nature of Coverage**: Transit insurance covers goods being transported from one place to another. This can include various modes of transport such as road, rail, air, and sea.\n\n2. **Policy Duration**: Policies ar"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8401332497596741,
+            0.07254932820796967,
+            0.04037801921367645,
+            0.06625284999608994,
+            0.01487626414746046,
+            0.06342960894107819,
+            0.0024310804437845945,
+            0.01565311662852764
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure, let's dive into transit insurance in detail:\n\n1. Transit insurance typically covers the movement of goods from one place to another, whether by road, rail, air, or sea.\n2. For marine transit insurance, the cover note is usually valid for the duration of the transit.\n3. In i"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.8537164926528931,
+            0.06977418810129166,
+            0.0701744332909584,
+            0.04478909447789192,
+            0.01789143681526184,
+            0.015822719782590866,
+            0.06664223223924637,
+            0.00035068640136159956
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "general",
+            "marine"
+          ],
+          "answer_preview": "Sure thing! Transit insurance is designed to protect goods during their journey from one place to another. Here\u2019s a detailed breakdown:\n\n1. **Nature of Coverage**: Transit insurance typically covers the risk of loss or damage to goods while they are being transported, whether by "
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-motor-rider-01",
+      "category": "known_contamination_repro",
+      "query": "Explain personal accident insurance in detail",
+      "expected_topic": "personal_accident",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.8773702383041382,
+            0.1843603104352951,
+            8.090219489531592e-05,
+            0.10045202821493149,
+            0.02654014341533184,
+            0.013695472851395607,
+            0.013821202330291271
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. The insurer will look at several factors when considering personal accident insurance. These include your age, height, weight, and occupation. \n\n2. It\u2019s important to disclose any previous medical history, especially if it increases the chan"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.09898799657821655,
+            0.07840438187122345,
+            0.0005844685365445912,
+            0.000276916689472273,
+            0.11265985667705536,
+            0.0035359635949134827,
+            0.002902750624343753
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Personal accident insurance covers you against accidental death or permanent total disability due to an accident.\n2. When applying for this type of insurance, the proposer (that\u2019s you) needs to disclose certain information to the insurer. T"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.03343464434146881,
+            0.008750292472541332,
+            0.00629852432757616,
+            0.0006217944901436567,
+            0.13967880606651306,
+            0.00274922838434577,
+            0.0018553599948063493,
+            0.004823857918381691
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of personal accident insurance:\n\n1. **Age, Height, Weight, and Occupation**: These factors are crucial as they can influence the likelihood of an accident occurring. The insurer will need to know your age, height, weight, and occupation, especial"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.0010865264339372516,
+            0.0017054610652849078,
+            0.0030684086959809065,
+            0.0003759435785468668,
+            0.04517076909542084,
+            0.012240116484463215,
+            0.0025633920449763536,
+            0.0014880435774102807
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. **Age, Height, Weight, Occupation:** These factors are crucial as they help determine the risk level. For instance, certain occupations might pose higher risks, and age and health conditions can also affect the likelihood of accidents.\n\n2. "
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.9939088821411133,
+            0.004816108848899603,
+            0.002796565880998969,
+            0.00023379363119602203,
+            0.031525466591119766,
+            0.03975251689553261,
+            0.002485861536115408,
+            0.02746937982738018
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "Sure, let's dive into the details of personal accident insurance:\n\n1. **Personal Details**: When applying for personal accident insurance, the proposer must disclose their age, height, and weight. These factors help assess the risk involved.\n\n2. **Occupation**: The occupation is "
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.11182381957769394,
+            0.02508234791457653,
+            0.0029400172643363476,
+            8.27503899927251e-05,
+            0.04628259688615799,
+            0.016600586473941803,
+            0.31148844957351685
+          ],
+          "retrieved_types": [
+            "personal_accident",
+            "general"
+          ],
+          "answer_preview": "So here\u2019s the full picture on that:\n\n1. Personal Accident Insurance covers bodily injury or death due to an accident.\n2. The proposer, typically the person buying the insurance, must disclose certain material facts to the insurer.\n3. These include age, height, weight, and occupat"
+        }
+      ]
+    },
+    {
+      "id": "personal-accident-full-picture-01",
+      "category": "known_contamination_repro",
+      "query": "give me the full picture on personal accident cover, don't leave anything out",
+      "expected_topic": "personal_accident",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.6495241522789001,
+            0.062889963388443,
+            0.03658844530582428,
+            0.0025468862149864435,
+            6.25902321189642e-05,
+            0.002249203622341156,
+            0.0004156466748099774
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, here\u2019s the full picture on personal accident cover:\n\n1. Personal accident insurance is one of the main products under general insurance.\n2. It provides coverage against bodily injuries that occur due to accidents.\n3. The details regarding your own damage and the damage to a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.5472995042800903,
+            0.004776140209287405,
+            0.12784376740455627,
+            0.003494198201224208,
+            0.018661580979824066,
+            0.0014313877327367663,
+            0.0016577336937189102,
+            0.0014659969601780176
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, let's go through the full picture on personal accident cover:\n\n1. Personal accident insurance is designed to provide financial protection against bodily injuries sustained by the policyholder.\n2. The policy typically covers various types of accidents, including those occurr"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.19595301151275635,
+            0.03581298515200615,
+            0.002580375177785754,
+            0.0011342576472088695,
+            0.006722202990204096,
+            0.002745272358879447,
+            0.0028975289314985275,
+            0.0006549530662596226
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, let's dive into the full picture of personal accident cover:\n\n1. Personal accident insurance is designed to provide financial protection in case of accidental death or permanent total disability due to an accident.\n2. When applying for personal accident insurance, the insur"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 7,
+          "point_scores": [
+            0.6140725612640381,
+            0.026885271072387695,
+            0.0007240597624331713,
+            4.12683621107135e-05,
+            0.009988515637814999,
+            3.776523226406425e-05,
+            0.0011543959844857454
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, here\u2019s the full picture on personal accident cover:\n\n1. Personal accident insurance is one of the main products of general insurance.\n2. It provides coverage against bodily injuries resulting from accidents.\n3. When applying for personal accident insurance, the insurer requ"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.2089143842458725,
+            0.04293603077530861,
+            3.846571780741215e-05,
+            0.0023811394348740578,
+            0.0011335609015077353,
+            0.00128182175103575,
+            8.679230813868344e-05,
+            0.0009609753033146262
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, let's go through the full picture on personal accident cover:\n\n1. Personal accident insurance is designed to provide coverage in case of accidental death or permanent total disability resulting from an accident.\n2. When applying for personal accident insurance, the insurer "
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 8,
+          "point_scores": [
+            0.3447735011577606,
+            0.03164840489625931,
+            0.005862355697900057,
+            4.88444602524396e-05,
+            0.011882578954100609,
+            0.00010906942043220624,
+            0.0031995531171560287,
+            0.0019673325587064028
+          ],
+          "retrieved_types": [
+            "general",
+            "general",
+            "personal_accident"
+          ],
+          "answer_preview": "Sure, let's go through the full picture on personal accident cover:\n\n1. Personal accident insurance covers injuries sustained by the insured during the course of their daily activities.\n2. When applying for personal accident insurance, the insurer will require details such as age"
+        }
+      ]
+    },
+    {
+      "id": "term-insurance-exclusions-driving-01",
+      "category": "known_contamination_repro",
+      "query": "What are the exclusions in term insurance?",
+      "expected_topic": "life",
+      "repeats": 6,
+      "contaminated_runs": 0,
+      "any_contaminated": false,
+      "runs": [
+        {
+          "run": 0,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance typically refer to situations or risks that the insurance company will not cover. These can include pre-existing medical conditions, suicide within a certain period, and more. Let me know if you want more details! \ud83d\ude0a"
+        },
+        {
+          "run": 1,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are specific conditions or events that the insurance company does not cover. For example, if you have term insurance, it typically doesn't cover death due to suicide within the first two years of the policy, or certain pre-existing medical conditi"
+        },
+        {
+          "run": 2,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance typically include things like suicide within the first two years of the policy, intentional self-harm, and not disclosing pre-existing medical conditions. Let me know if you want more details! \ud83d\ude0a"
+        },
+        {
+          "run": 3,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance typically include things like death due to suicide within the first two years of the policy, or if you die due to not disclosing certain health conditions. Also, if you die due to self-harm or war, those are often excluded. Let me know if you want"
+        },
+        {
+          "run": 4,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are specific conditions where the insurer won't pay out. Typically, these include things like suicide within a certain period (often 1-2 years), criminal activities, or self-inflicted injuries. \n\nLet me know if you want more details! \ud83d\ude0a"
+        },
+        {
+          "run": 5,
+          "contaminated": false,
+          "forbidden_hits": [],
+          "point_count": 0,
+          "point_scores": [],
+          "retrieved_types": [],
+          "answer_preview": "So, exclusions in term insurance are specific conditions or events that the insurer won't cover. For example, if you have term insurance, it typically won't cover death due to suicide within the first two years of the policy, or certain pre-existing medical conditions. Let me kno"
+        }
+      ]
+    }
+  ]
+}
