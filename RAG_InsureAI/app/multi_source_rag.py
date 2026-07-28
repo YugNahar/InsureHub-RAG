@@ -1316,6 +1316,60 @@ _TYPE_QUERY_EXEMPT_WORDS = {
     "motor": ("motor", "vehicle", "car", "bike", "scooter", "motorcycle", "driving", "driver"),
 }
 
+# Curated, closed list of named claim/policy documents and instruments this
+# KB actually discusses. Used by the artifact-grounding check in the
+# currency-filter block below (~_qualifier_mismatched) — same contract as
+# _currency_grounded: if the model names a SPECIFIC document, that name
+# must actually appear in what was retrieved, or the claim mentioning it is
+# dropped. Confirmed live: a motor-insurance answer said the claim
+# procedure needs "original bills and discharge summaries" — "discharge
+# summary/summaries" (a hospital document) appears in ZERO chunks anywhere
+# in this KB. The retrieved motor chunk (m4-3f.pdf) instead says "Discharge
+# voucher (full and final payment)" — the model took the real word
+# "discharge" out of a claim-PAYMENT acknowledgment and re-formed it into a
+# different, wrong-domain document name. _TYPE_GIVEAWAY_TERMS/
+# _text_has_giveaway_contamination cannot catch this: that filter requires
+# the giveaway TERM to already be present in the retrieved context before
+# it will flag anything (see its own docstring) — a term absent from the
+# ENTIRE KB, like "discharge summary" here, can never satisfy that and the
+# check always no-ops. This list intentionally includes both the correct,
+# grounded artifact name AND its most likely wrong-domain confusions (e.g.
+# both "discharge voucher" and "discharge summary") so the SAME single
+# mechanism naturally keeps the real one and drops the fabricated one,
+# rather than needing a hardcoded "X is wrong, Y is right" pairing.
+_ARTIFACT_NOUNS = (
+    "discharge voucher", "discharge summary", "discharge slip",
+    "discharge certificate", "claim form", "cover note",
+    "surveyor's report", "receipted bill", "cash memo",
+    "policy schedule", "bill of lading", "proposal form",
+    "death certificate", "post-mortem report", "postmortem report",
+    "driving licence", "driving license", "registration certificate",
+)
+
+
+def _normalize_word_forms(text: str) -> str:
+    """Lowercases, strips apostrophes, and singularizes a trailing plural
+    's'/'ies' on each word — so a multi-word artifact-noun phrase matches
+    regardless of plural or possessive form ("discharge vouchers" /
+    "surveyor's report" / "surveyor's reports" all normalize the same way
+    as their singular form). Used on both the generated text and the
+    retrieved context so the comparison is apples-to-apples."""
+    cleaned = re.sub(r"['’]", "", (text or "").lower())
+    words = re.findall(r"[a-z]+", cleaned)
+    norm = []
+    for w in words:
+        if w.endswith("ies") and len(w) > 4:
+            norm.append(w[:-3] + "y")
+        elif w.endswith("s") and len(w) > 4 and not w.endswith("ss"):
+            norm.append(w[:-1])
+        else:
+            norm.append(w)
+    return " ".join(norm)
+
+
+# original phrase -> its normalized form, precomputed once
+_ARTIFACT_NOUNS_NORM = {phrase: _normalize_word_forms(phrase) for phrase in _ARTIFACT_NOUNS}
+
 # A point naming a sibling policy type as somewhere ELSE a loss is covered
 # ("this is excluded here; covered under your motor/fire policy instead")
 # or explicitly as an exclusion is legitimate, standard insurance-document
@@ -7958,6 +8012,43 @@ class MultiSourceRAG:
                         found.add(stem)
                 return found
 
+            # _source_window below treats '.' and '\n' as equally strong
+            # sentence-boundary markers — but this KB's PDF-extracted text
+            # is full of ISOLATED single '\n's from mid-sentence line wraps
+            # ("...up \nto €320."), not just real paragraph/chunk breaks.
+            # Confirmed live: for the €320 delayed-luggage figure, this
+            # made the window stop at the nearest line-wrap instead of
+            # reaching back to the actual trigger sentence ("...if luggage
+            # is delayed by more than six hours..."), silently returning
+            # an empty/wrong trigger set. De-wrap into a LOCAL copy used
+            # only for this windowing check — collapses isolated single
+            # '\n's into spaces while leaving real '\n\n' (blank-line)
+            # separators alone, so line-wraps stop masquerading as
+            # sentence boundaries without touching the shared
+            # _full_context_uncompressed other checks below rely on.
+            _dewrapped_ctx = _re5.sub(r'(?<!\n)\n(?!\n)', ' ', _full_context_uncompressed or '')
+
+            # Artifact-noun grounding (Fix A, project_ungrounded_claim_leakage.md):
+            # generalizes the currency-grounding contract below from numbers to a
+            # curated closed list of named claim/policy documents (_ARTIFACT_NOUNS).
+            # Reuses the SAME de-wrapped context as the currency check — a PDF
+            # mid-sentence line-wrap ("discharge \nvoucher") would otherwise split a
+            # two-word artifact name and cause a false "absent" verdict.
+            _ctx_norm_joined = _normalize_word_forms(_dewrapped_ctx)
+
+            def _artifact_mismatched(unit: str) -> bool:
+                _unit_norm = _normalize_word_forms(unit)
+                for _phrase, _norm_phrase in _ARTIFACT_NOUNS_NORM.items():
+                    if not _re5.search(r'\b' + _re5.escape(_norm_phrase) + r'\b', _unit_norm):
+                        continue
+                    if not _re5.search(r'\b' + _re5.escape(_norm_phrase) + r'\b', _ctx_norm_joined):
+                        logger.info(
+                            "[ask_stream] ungrounded artifact noun %r in unit: %r",
+                            _phrase, unit[:150],
+                        )
+                        return True
+                return False
+
             def _source_window(ctx: str, start: int, end: int) -> str:
                 right = ctx.find('.', end)
                 right2 = ctx.find('\n', end)
@@ -7969,11 +8060,29 @@ class MultiSourceRAG:
 
             _question_triggers = _extract_triggers(question or '')
 
-            def _qualifier_mismatched(unit: str) -> bool:
-                if not _question_triggers:
-                    return False
+            def _qualifier_mismatched(unit: str, prev_unit: str = '') -> bool:
                 _figs = _CURRENCY_RE.findall(unit)
                 if not _figs:
+                    return False
+                # Prefer the question's own scenario words when the user
+                # asked about a specific one ("how much for LOST luggage")
+                # — the original, live-verified mechanism (see the big
+                # comment block above). A broad/generic question ("What is
+                # travel insurance?") has no scenario words at all, but the
+                # REPLY can still fabricate a false cause-and-effect story
+                # around a real figure — confirmed live: "...if you fall
+                # ill or have an accident. For example, you might get
+                # compensation of €80 per day per traveler, up to €320" is
+                # a real KB figure, genuinely scoped to DELAYED LUGGAGE, not
+                # illness/accident at all. Falls back to the REPLY's own
+                # local scenario claim instead of the question's — same
+                # 2-unit window as the source side (this unit plus the one
+                # immediately before it), since this KB's prose puts the
+                # causal "if X happens" clause in the sentence before the
+                # one with the number, and the model's paraphrase follows
+                # the same pattern.
+                _local_triggers = _question_triggers or _extract_triggers(f"{prev_unit} {unit}")
+                if not _local_triggers:
                     return False
                 for _fig in _figs:
                     _digits = _fig.replace(',', '').split('.')[0]
@@ -7985,10 +8094,10 @@ class MultiSourceRAG:
                     )
                     _any_occurrence = False
                     _any_compatible = False
-                    for _m in _fig_re.finditer(_full_context_uncompressed or ''):
+                    for _m in _fig_re.finditer(_dewrapped_ctx):
                         _any_occurrence = True
-                        _window_triggers = _extract_triggers(_source_window(_full_context_uncompressed, _m.start(), _m.end()))
-                        if not _window_triggers or (_window_triggers & _question_triggers):
+                        _window_triggers = _extract_triggers(_source_window(_dewrapped_ctx, _m.start(), _m.end()))
+                        if not _window_triggers or (_window_triggers & _local_triggers):
                             _any_compatible = True
                             break
                     if _any_occurrence and not _any_compatible:
@@ -8006,12 +8115,19 @@ class MultiSourceRAG:
                 _units = _re5.split(r'(?<=[.!?])(?<!\d\.)\s+', _num_src)
 
             _kept_units, _dropped_num = [], 0
+            _prev_unit_text = ''
             for _unit in _units:
                 _found = _CURRENCY_RE.findall(_unit)
-                if _found and (not any(_currency_grounded(f) for f in _found) or _qualifier_mismatched(_unit)):
+                _currency_bad = _found and (
+                    not any(_currency_grounded(f) for f in _found)
+                    or _qualifier_mismatched(_unit, _prev_unit_text)
+                )
+                if _currency_bad or _artifact_mismatched(_unit):
                     _dropped_num += 1
+                    _prev_unit_text = _unit
                     continue
                 _kept_units.append(_unit)
+                _prev_unit_text = _unit
 
             if _dropped_num and _kept_units:
                 if _has_points:
@@ -8041,7 +8157,7 @@ class MultiSourceRAG:
                 _corrected_text = _rebuilt5
                 _kv_reply = _rebuilt5
                 logger.info(
-                    "[ask_stream] dropped %d unit(s) containing an ungrounded currency figure",
+                    "[ask_stream] dropped %d unit(s) containing an ungrounded currency figure or artifact noun",
                     _dropped_num,
                 )
                 # Dropping the FIRST unit often means dropping the sentence
@@ -8595,13 +8711,49 @@ class MultiSourceRAG:
                 r"\b(not|n't|except|exclud\w*|never|no\s+cover\w*)\b", re.IGNORECASE
             )
 
-            def _fc_line_wrongly_claims_fines(_ln: str) -> bool:
-                return bool(_FINES_CLAIM_RE.search(_ln)) and not _FINES_NEGATION_RE.search(_ln)
+            # "Condition of average" (the average clause) has exactly one
+            # correct meaning in this KB: the underinsurance doctrine — if
+            # the sum insured is LESS than the actual value, the insured
+            # bears a RATEABLE PROPORTION of any loss, effectively acting
+            # as their own insurer for the shortfall (9.3 INSURANCE LAW AND
+            # PRACTICE.pdf p200/p212). Confirmed live: a detailed motor-
+            # insurance answer misdefined it as "the insured shares the
+            # cost of repairs according to the extent of their liability"
+            # — a different concept with no basis in the KB. Same
+            # drop-don't-rewrite reasoning as the fines check above: wrong
+            # phrasing varies across generations, so there's no single
+            # safe substitution string (unlike TPA's clean acronym swap),
+            # but a point using this term while naming NONE of the correct
+            # concept's anchor words is confidently wrong regardless of
+            # exact wording.
+            # Plural forms matter and are NOT optional: across a 10-run live
+            # batch the model wrote "ConditionS of average" more often than
+            # the singular ("Conditions of average in insurance policy refer
+            # to the sharing of loss between the insured and the insurer"),
+            # and a singular-only pattern silently let those through — the
+            # same fixed-phrase-list fragility this codebase has hit before
+            # (see [[project_fragile_signal_lists]]). Any future term added
+            # here must cover its plural too.
+            _AVERAGE_CLAUSE_RE = re.compile(
+                r"\bconditions?\s+of\s+average\b|\baverage\s+clauses?\b", re.IGNORECASE
+            )
+            _AVERAGE_CLAUSE_CORRECT_ANCHOR_RE = re.compile(
+                r"\bunderinsur\w*\b|\bunder-insur\w*\b|\brateable\s+proportion\b|"
+                r"\bown\s+insurer\b|\bsum\s+insured\b",
+                re.IGNORECASE,
+            )
 
-            if any(_fc_line_wrongly_claims_fines(_ln) for _ln in _false_claim_fixed.split("\n")):
+            def _fc_line_is_always_false_claim(_ln: str) -> bool:
+                if _FINES_CLAIM_RE.search(_ln) and not _FINES_NEGATION_RE.search(_ln):
+                    return True
+                if _AVERAGE_CLAUSE_RE.search(_ln) and not _AVERAGE_CLAUSE_CORRECT_ANCHOR_RE.search(_ln):
+                    return True
+                return False
+
+            if any(_fc_line_is_always_false_claim(_ln) for _ln in _false_claim_fixed.split("\n")):
                 _fc_lines = _false_claim_fixed.split("\n")
                 _fc_kept_lines = [
-                    _ln for _ln in _fc_lines if not _fc_line_wrongly_claims_fines(_ln)
+                    _ln for _ln in _fc_lines if not _fc_line_is_always_false_claim(_ln)
                 ]
                 if len(_fc_kept_lines) < len(_fc_lines):
                     # Renumber if a middle point of a numbered list was
@@ -8617,8 +8769,8 @@ class MultiSourceRAG:
                             _fc_renumbered.append(_ln)
                     _false_claim_fixed = "\n".join(_fc_renumbered)
                     logger.info(
-                        "[ask_stream] dropped sentence/point claiming fines coverage — "
-                        "insurance never covers the insured's own fines/penalties"
+                        "[ask_stream] dropped sentence/point containing an always-false claim "
+                        "(fines coverage or a condition-of-average misdefinition)"
                     )
                 else:
                     # A single-sentence brief-mode reply with no line breaks
@@ -8631,7 +8783,7 @@ class MultiSourceRAG:
                     )
                     _false_claim_whole_reply_discarded = True
                     logger.info(
-                        "[ask_stream] discarded whole reply claiming fines coverage — "
+                        "[ask_stream] discarded whole reply containing an always-false claim — "
                         "no line boundary to drop just that claim"
                     )
 
