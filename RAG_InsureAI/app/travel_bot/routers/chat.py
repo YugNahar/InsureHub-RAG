@@ -309,14 +309,26 @@ def build_friendly_missing_prompt(state: dict, newly_filled: list = None, user_m
     else:
         frags = [FIELD_QUESTIONS.get(f, FIELD_LABELS[f] + "?") for f in to_ask]
 
-    if len(missing) == 1 or len(frags) == 1:
+    # "Just one more thing" is only honest when this ask covers literally
+    # everything left — either it's the single final field, or the
+    # pair-collapse above combined the last two remaining fields into one
+    # question. `len(frags) == 1` on its own isn't enough: it also fires
+    # when the NEXT TWO of a much longer missing list happen to be a
+    # collapsible pair (e.g. email+mobile_number are next but
+    # coverage_type/destination/... still remain after) — confirmed live
+    # this reads as a broken promise once the very next turn asks yet
+    # another question. `len(missing) <= 2` guarantees to_ask already
+    # covers every remaining field, so the collapsed fragment really is
+    # the last ask.
+    if len(missing) <= 2 and len(frags) == 1:
         return f"{ack}Just one more thing — {frags[0]}"
 
     # A second question fragment always starts a fresh sentence after the
     # first one's "?", regardless of context — capitalize it unconditionally.
-    frags[1] = _capitalize_first(frags[1])
+    if len(frags) > 1:
+        frags[1] = _capitalize_first(frags[1])
 
-    if len(missing) == 2:
+    if len(missing) == 2 and len(frags) == 2:
         return f"{ack}Almost there, just two more things — " + " ".join(frags)
 
     # No lead-in phrase here (unlike the two cases above) — the first
