@@ -4166,6 +4166,7 @@ from prompt_template import (
 )
 from context_compressor import ContextCompressor
 from rag import LLM_CONTEXT_WINDOW_CHARS
+import type_vocab_miner as _type_vocab_miner
 
 # ask_stream()'s dynamic context budget (below) used to reserve a flat,
 # hardcoded 700 tokens for "prompt template boilerplate" regardless of
@@ -7529,6 +7530,40 @@ class MultiSourceRAG:
         # fallback as the history-bleed check, since a wrong item embedded in
         # a short brief-mode reply usually contaminates most of the value of
         # the answer anyway.
+        # ── D2 probe: KB-derived foreign-type vocabulary (LOG ONLY) ──────────
+        # plan_dynamic_contamination_coverage.md step D2. Reports what a
+        # dynamic, KB-mined giveaway map WOULD have flagged, and drops
+        # NOTHING. Exists to measure precision against the labeled corpus
+        # before it is ever allowed to gate anything — the explicit lesson
+        # from Phase 2, which shipped a plausible mechanism without a
+        # measured benefit and was reverted after 280 runs.
+        #
+        # Unlike _text_has_giveaway_contamination below, this does NOT
+        # require the term to appear in the retrieved context, so it can see
+        # vocabulary the model invented from parametric knowledge.
+        try:
+            if _query_policy_type and _query_policy_type != "general":
+                _probe_src = (_corrected_text or _reply_stripped)
+                _probe_hits = _type_vocab_miner.foreign_type_hits(_probe_src, _query_policy_type)
+                if _probe_hits:
+                    _probe_q_lower = f"{question} {retrieval_query}".lower()
+                    for _foreign_type, _terms_hit in _probe_hits.items():
+                        # Same exemptions the live filter already uses: a
+                        # query that names the other type (comparisons) and
+                        # standard "covered under your X policy instead"
+                        # phrasing are both legitimate, not contamination.
+                        _exempt_words = _TYPE_QUERY_EXEMPT_WORDS.get(_foreign_type, (_foreign_type,))
+                        if any(_w in _probe_q_lower for _w in _exempt_words):
+                            continue
+                        if _EXCLUSION_LANGUAGE_RE.search(_probe_src.lower()):
+                            continue
+                        logger.info(
+                            "[vocab_probe] would-flag query_type=%s foreign_type=%s hits=%s",
+                            _query_policy_type, _foreign_type, _terms_hit[:8],
+                        )
+        except Exception as _probe_exc:
+            logger.debug("[ask_stream] vocab probe skipped: %s", _probe_exc)
+
         _retrieval_contamination_detected = False
         if not _keyword_detailed and not _history_type_contamination_detected and _query_policy_type != "general":
             try:
@@ -8140,7 +8175,9 @@ class MultiSourceRAG:
                             _next_n += 1
                         else:
                             _renumbered5.append(_unit)
-                    _rebuilt5 = "\n".join(_renumbered5).strip()
+                    # Same orphaned-blank-line collapse as the always-false
+                    # block below — a dropped point leaves its separators.
+                    _rebuilt5 = re.sub(r"\n{3,}", "\n\n", "\n".join(_renumbered5)).strip()
                 else:
                     _rebuilt5 = " ".join(_kept_units).strip()
                     # Checking the literal last character breaks when the
@@ -8743,10 +8780,40 @@ class MultiSourceRAG:
                 re.IGNORECASE,
             )
 
+            # A premium cannot be derived from a value that only exists AFTER
+            # the event it is meant to price — computing a policy-inception
+            # premium from "the market value at the time of loss" is
+            # temporally impossible, not merely a KB mismatch, so this is
+            # false in every context regardless of insurer or policy type.
+            # (The KB agrees separately: motor rating is on cubic capacity,
+            # Insured's Declared Value, zone and age — m4-3f.pdf p9 — while
+            # market value at the time of loss is the CLAIM-SETTLEMENT basis,
+            # p229/p13. The model conflates the two sides of the lifecycle.)
+            # Measured across 18 fresh generations of "explain motor insurance
+            # in detail": 14 hits (~78%) — the most reproducible of the three
+            # errors handled in this block, in 9 different surface phrasings.
+            #
+            # "at the time of loss" is REQUIRED by this pattern and is what
+            # keeps it safe: "premium is based on the vehicle's value" alone
+            # is defensible (IDV is itself value-derived), so that phrasing is
+            # deliberately NOT matched. Requiring an explicit
+            # calculated/computed verb between "premium" and "market value"
+            # further avoids firing on a sentence that correctly contrasts the
+            # two bases ("the claim is settled at market value at the time of
+            # loss, while the premium is based on IDV") — there "premium"
+            # follows the clause rather than governing it.
+            _PREMIUM_MARKET_VALUE_RE = re.compile(
+                r"\bpremium\w*\b[^.]{0,80}?\b(?:calculat\w+|comput\w+)\b[^.]{0,40}?"
+                r"\bmarket\s+value\b[^.]{0,60}?\bat\s+the\s+time\s+of\s+loss\b",
+                re.IGNORECASE,
+            )
+
             def _fc_line_is_always_false_claim(_ln: str) -> bool:
                 if _FINES_CLAIM_RE.search(_ln) and not _FINES_NEGATION_RE.search(_ln):
                     return True
                 if _AVERAGE_CLAUSE_RE.search(_ln) and not _AVERAGE_CLAUSE_CORRECT_ANCHOR_RE.search(_ln):
+                    return True
+                if _PREMIUM_MARKET_VALUE_RE.search(_ln):
                     return True
                 return False
 
@@ -8767,7 +8834,13 @@ class MultiSourceRAG:
                             _fc_next_n += 1
                         else:
                             _fc_renumbered.append(_ln)
-                    _false_claim_fixed = "\n".join(_fc_renumbered)
+                    # Dropping a numbered point removes only its TEXT line;
+                    # the blank lines that separated it from its neighbours
+                    # survive and stack up ("4. ...\n\n\n\n5. ..."). Confirmed
+                    # visible in a live answer once this block started firing
+                    # regularly. Collapse any run of 3+ newlines back to the
+                    # normal one-blank-line separation.
+                    _false_claim_fixed = re.sub(r"\n{3,}", "\n\n", "\n".join(_fc_renumbered))
                     logger.info(
                         "[ask_stream] dropped sentence/point containing an always-false claim "
                         "(fines coverage or a condition-of-average misdefinition)"
