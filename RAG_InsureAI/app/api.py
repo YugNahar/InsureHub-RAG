@@ -1820,12 +1820,30 @@ async def ask_stream(req: AskRequest):
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
             else:
                 _target_def = _agent_registry.get_agent(_target)
-                _reask = f"Just to confirm — would you like me to connect you with {_target_def.display_name if _target_def else _target}? (yes/no)"
-                async def _handoff_reask_gen():
-                    yield _reask
-                    yield "\n\n" + _json.dumps({"sources": [], "done": True})
-                return StreamingResponse(_handoff_reask_gen(), media_type="text/plain",
-                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
+                # A message that's neither yes nor no might be a genuine,
+                # unrelated question the user wants answered right now, not
+                # a non-answer to the pending offer (confirmed live: Layla
+                # offered Ava, the user instead asked "What does travel
+                # insurance covers?", and got the SAME yes/no re-ask on
+                # repeat — Layla appeared "stuck" until the user finally
+                # typed a literal yes/no). Same is_interruption() check the
+                # post-handoff sticky-routing branch below already uses —
+                # if it reads as a fresh question, fall through to the
+                # normal Layla RAG flow for this one turn WITHOUT touching
+                # awaiting_agent_confirmation, so a later "yes"/"no" still
+                # resolves the original offer exactly as if this turn never
+                # happened. Only an ambiguous non-answer (not confidently a
+                # new question) still gets the safe re-ask fallback.
+                _is_interruption = await _agent_router_interrupt.is_interruption(
+                    req.question, _target_def.display_name if _target_def else _target
+                )
+                if not _is_interruption:
+                    _reask = f"Just to confirm — would you like me to connect you with {_target_def.display_name if _target_def else _target}? (yes/no)"
+                    async def _handoff_reask_gen():
+                        yield _reask
+                        yield "\n\n" + _json.dumps({"sources": [], "done": True})
+                    return StreamingResponse(_handoff_reask_gen(), media_type="text/plain",
+                        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
 
         elif _bot_sess.active_agent != "layla":
             # A message mid-specialist-conversation might be a genuine,
