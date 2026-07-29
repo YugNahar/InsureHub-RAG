@@ -706,8 +706,33 @@ function declineHandoffPopup() {
 document.getElementById("login-btn").addEventListener("click", doLogin);
 document.getElementById("inp-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
 
+// Production embeds this page in an iframe with ?token=...&agentName=...&t=...
+// appended to the URL after the portal's own login (see agent-dashboard host
+// integration). Read that first; storage keys stay as a fallback for any
+// other embed path that still sets them directly.
+function getURLParam(name) {
+  try {
+    return new URLSearchParams(window.location.search).get(name) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function sanitizeAgentName(raw) {
+  let out = "";
+  for (const ch of String(raw || "")) {
+    const code = ch.codePointAt(0);
+    if (code < 32 || code === 127) continue; // control chars
+    if (ch === "<" || ch === ">") continue;
+    out += ch;
+  }
+  return out.replace(/\s+/g, " ").trim().slice(0, 60);
+}
+
 function getPanelAuthToken() {
   try {
+    const fromUrl = getURLParam("token");
+    if (fromUrl) return fromUrl;
     return localStorage.getItem("insurehub_token")
       || localStorage.getItem("insure_token")
       || sessionStorage.getItem("insurehub_token")
@@ -720,6 +745,8 @@ function getPanelAuthToken() {
 
 function getPortalAgentName() {
   try {
+    const fromUrl = sanitizeAgentName(getURLParam("agentName"));
+    if (fromUrl) return fromUrl;
     return localStorage.getItem("insure_user")
       || localStorage.getItem("insurehub_user")
       || sessionStorage.getItem("insure_user")
