@@ -567,6 +567,36 @@
       "forbidden_topics": ["health"],
       "must_allow_phrases": ["medical"],
       "notes": "Deliberately adjacent to health insurance (travel medical cover) -- stress test for over-triggering on a legitimately health-adjacent travel query."
+    },
+    {
+      "id": "fire-exclusions-01",
+      "category": "clean_control",
+      "query": "What are the exclusions in fire insurance?",
+      "mode": "detailed",
+      "expected_topic": "fire",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "D0 coverage: fire had zero known_contamination_repro/clean_control diversity before this. Verified live (2 runs) grounded in a real fire-tagged KB chunk (war/nuclear/pollution/electrical-mechanical-breakdown/burglary exclusions) despite that chunk's all_policy_types also listing life/motor."
+    },
+    {
+      "id": "liability-not-covered-01",
+      "category": "clean_control",
+      "query": "What is not covered under liability insurance?",
+      "mode": "detailed",
+      "expected_topic": "liability",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "D0 coverage. Verified live (2 runs): 'fines, penalties, punitive/exemplary damages' exclusion is grounded in a real liability-tagged chunk's own policy-exclusions clause, not a leak from the unrelated motor-fines false-claim pattern (project_always_false_claim_corrections.md)."
+    },
+    {
+      "id": "travel-definitions-terms-01",
+      "category": "clean_control",
+      "query": "What are the definitions and terms used in travel insurance?",
+      "mode": "detailed",
+      "expected_topic": "travel",
+      "forbidden_phrases": [],
+      "forbidden_topics": [],
+      "notes": "D0 coverage. Verified live (2 runs) clean despite travel having 15 chunks in the KB cross-tagged all_policy_types 'travel, health, home' -- no health/home content leaked into the answer."
     }
   ]
 }
