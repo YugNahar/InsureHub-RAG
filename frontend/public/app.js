@@ -680,12 +680,25 @@ function openAgentSocket() {
   }
 }
 
-function startPolling() {
-  if (pollIntervalId) return;
-  pollIntervalId = setInterval(async () => {
+let pollInFlight = false;
+
+async function pollNow() {
+  // Guards against overlapping calls (the 1s interval tick racing a
+  // WS-triggered nudge) reading the same pollSeen cursor and rendering
+  // the same message twice.
+  if (pollInFlight || state.sessionId == null) return;
+  pollInFlight = true;
+  try {
     const data = await API.pollSession(state.sessionId, pollSeen);
     if (data) applyPollResult(data);
-  }, 1000);
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function startPolling() {
+  if (pollIntervalId) return;
+  pollIntervalId = setInterval(pollNow, 1000);
 }
 
 function applyPollResult(data) {
@@ -744,9 +757,17 @@ function pushSystemMessage(text) {
 function handleWsMessage(ev) {
   let payload;
   try { payload = JSON.parse(ev.data); } catch { return; }
-  // agent_message is intentionally NOT handled here — polling owns
-  // message delivery (see this section's header comment) so the same
-  // reply can never be shown twice.
+  if (payload.type === 'agent_message') {
+    // The reply itself is still rendered ONLY by the poll response
+    // (pollNow's pollSeen cursor is the single source of truth, so the
+    // same reply can never be shown twice) — this just wakes polling up
+    // immediately instead of waiting for the next 1s interval tick, which
+    // otherwise can stall up to ~60s if the tab is backgrounded (browsers
+    // throttle setInterval there, but WS message delivery isn't throttled
+    // the same way).
+    pollNow();
+    return;
+  }
   if (payload.type === 'agent_joined') {
     if (chatMode !== 'human') {
       chatMode = 'human';
