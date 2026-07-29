@@ -700,10 +700,18 @@ function applyPollResult(data) {
   }
   if (data.status === 'ai' && chatMode !== 'ai') {
     const wasWaiting = chatMode === 'waiting';
+    const wasHuman = chatMode === 'human';
     chatMode = 'ai';
     agentName = null;
     if (wasWaiting) {
       pushSystemMessage('No agents are available right now. Your question has been emailed to our support team — someone will reach out to you soon.');
+    } else if (wasHuman) {
+      // Fallback for when the WS "agent_left" event was missed (socket
+      // disconnected at the exact moment the agent released/reassigned) —
+      // polling is the source of truth here, same as the wasWaiting case
+      // above, so this can never double-fire with the WS-delivered message
+      // (that path already flips chatMode to 'ai' before the next poll tick).
+      pushSystemMessage('The agent has stepped away. Layla is back to help!');
     }
   }
 
