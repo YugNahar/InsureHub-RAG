@@ -1462,6 +1462,38 @@ def _text_has_giveaway_contamination(
 # ─────────────────────────────────────────────────────────────────────────
 _POINT_LINE_RE = re.compile(r"^\s*(\d+)\.\s+(.*)$")
 
+# Confirmed live: a detailed-mode life-insurance answer's final line was
+# "5. Let me know if you want more details! 😊" — the model numbered its own
+# sign-off as if it were a real list item. _POINT_LINE_RE can't tell a real
+# point from this by shape alone (both are "N. text"), so without this check
+# the sign-off became a bogus final point that survived every downstream
+# filter untouched (none of them had anything to drop). Same core sign-off
+# vocabulary already used to detect this phrasing elsewhere in this file
+# (:7802) — not the full canonical closer strings (:3757), since this only
+# needs to catch the model STARTING a line this way, not match it exactly.
+_SIGNOFF_START_RE = re.compile(
+    r"^(hope that|let me know|feel free|hang tight|glad to|dig into any part)",
+    re.IGNORECASE,
+)
+
+# Same live example exposed a second, more serious problem in the same
+# answer: "So, 1. Different types of life insurance include..." — the warm
+# lead-in landed on the SAME line as point 1 instead of its own line/
+# paragraph (contrast the well-formed "Sure, let's dive in:\n\n1. ..."
+# shape). _POINT_LINE_RE requires the digit at the true start of the line,
+# so this whole line fell through to opener_lines untouched — meaning point
+# 1's real content became invisible to EVERY point-level filter (grounding,
+# cross-topic contamination, the always-false-claim block), since none of
+# them read opener_lines. This is a coverage gap, not just a cosmetic one.
+# Same lead-in vocabulary already used elsewhere in this file (:7806).
+# Deliberately only tried while seen_point is still False — a "1." that
+# turns up mid-answer after the list has already started is never a lead-in
+# glued to a point, so this can't misfire on later points.
+_LEADIN_POINT_LINE_RE = re.compile(
+    r"^\s*(?:so|good question|sure thing|right|ah|hmm)[,:]?\s*(\d+)\.\s+(.*)$",
+    re.IGNORECASE,
+)
+
 
 def _split_numbered_points(text: str) -> Tuple[List[str], List[str], List[str]]:
     """Split numbered-list answer text into (opener_lines, point_texts,
@@ -1477,9 +1509,26 @@ def _split_numbered_points(text: str) -> Tuple[List[str], List[str], List[str]]:
     seen_point = False
     for line in lines:
         m = _POINT_LINE_RE.match(line)
+        if not m and not seen_point:
+            lead_m = _LEADIN_POINT_LINE_RE.match(line)
+            if lead_m:
+                # Keep the lead-in's own punctuation ("So," / "Right:") —
+                # only trims the trailing space before the digit — so IF a
+                # rebuild ever fires (a point downstream of this got
+                # dropped), the recovered opener still reads as a real
+                # sentence fragment rather than a bare stripped word.
+                opener_lines.append(line[:lead_m.start(1)].rstrip())
+                m = lead_m
         if m:
+            content = m.group(2).strip()
+            if _SIGNOFF_START_RE.match(content):
+                # Route to closer_lines, stripped of the spurious "N. "
+                # prefix, so it renders as a normal trailing sign-off
+                # instead of a fabricated final list item.
+                closer_lines.append(content)
+                continue
             seen_point = True
-            point_texts.append(m.group(2).strip())
+            point_texts.append(content)
             continue
         if not seen_point:
             opener_lines.append(line)
