@@ -1,9 +1,11 @@
 # Scope — dynamic, KB-derived cross-topic contamination coverage
 
-**Status (updated 2026-07-28, same day):** **D1 DONE. D2 BUILT + CALIBRATED but its
-MEASUREMENT HAS NOT RUN — that measurement is the whole point of D2, so D2 is NOT
-complete.** D0, D3, D4 not started. Read §6 (Handoff) before writing any code — most of
-what §3 describes already exists.
+**Status (updated 2026-07-29):** **D1 done. D2 measured and FAILED its own kill
+criterion — probe reverted from the request path.** D0, D3, D4 not started.
+`type_vocab_miner.py` stays in the tree (harmless offline, still usable for future
+work) but nothing in `multi_source_rag.py` calls it anymore. Read §6.7 before
+attempting this again — the failure mode is understood and a fix direction exists,
+just not yet built.
 
 **Problem statement (from the user, and it is the correct framing):** the current
 contamination defense is (a) a **hand-maintained list** covering 6 of 12 policy types, and
@@ -255,3 +257,59 @@ calibration, not a *production-precision* one.
   types at all.
 - **D4** (`_point_grounded`'s `min(4, ceil(n/2))` threshold) — untouched on purpose;
   independent change, needs its own before/after sweep, must not be bundled.
+
+### 6.7 D2 result: FAIL, reverted (2026-07-29)
+
+`contamination_corpus_runner.py --repeats 3` (56 cases, cache disabled, nothing
+concurrent) produced 4 `[vocab_probe] would-flag` events. Two of them were on
+**`pet-insurance-direct-01`, a `clean_control` case** (2 of its 3 repeats) — hits
+included `'pet insurance'`, `"pet's"`, `'pets'`, `'veterinary'`, all from an answer that
+opens *"Sure, let's dive into the world of pet insurance! 1. What Is Pet
+Insurance?..."* — i.e. the answer's own, entirely correct topic, flagged as
+**health**-foreign vocabulary.
+
+**Root cause:** `pet_insurance` is an open-vocab candidate type
+([[project_open_vocab_promotion_wired]]) with no `policy_type` bucket of its own in
+`insurance_docs_meta.ndjson` — the miner only ever grouped by the 12 coarse hand-tagged
+buckets (§1's table), so pet-insurance content living inside `health`-tagged chunks
+donated its vocabulary to health's distinctive-term list. The offline D1 calibration
+(21 known-good / 8 known-junk terms) never exercised an open-vocab-candidate query, so
+it looked clean and wasn't — precisely the scenario §6.5's warning names: **do not skip
+straight to D3 because the offline examples looked good.**
+
+Per §6.5, this is the kill criterion firing exactly as specified — stop and revert,
+regardless of how clean the rest looked. It was applied: `foreign_type_hits()`'s call
+site was removed from `ask_stream`, and the now-unused `import type_vocab_miner` in
+`multi_source_rag.py` was removed too. The miner module itself is untouched and still
+runnable standalone; the persisted map and calibrated constants (§6.2) remain valid on
+their own terms, they just aren't wired to anything live.
+
+The other two would-flag events (of the 4 total) are informational, not part of the
+kill-criterion verdict: one landed on `personal-accident-full-picture-01`
+(`known_contamination_repro` — a plausible true-positive candidate, foreign_type=travel,
+hits=`['sudden','unexpected']`); one landed on non-corpus traffic that happened to share
+the capture window (a home-insurance water-damage answer flagged foreign_type=motor on
+`['repair','repairs']` — the SAME failure shape as the pet-insurance case: a generic
+service word legitimately used by a different type's answer, mined as "distinctive" for
+one type only because that's where the corpus happened to concentrate it).
+
+**What a real retry needs, not attempted here:** mine at open-vocab-candidate
+granularity (query `classify_candidate_type()` / `candidate_vocab.py`'s active-vocab
+set, not just the 12 hardcoded `policy_type` values) so `pet_insurance` gets its OWN
+distinctive-term bucket instead of donating to `health`'s. Until that's built, do not
+re-attempt the coarse-grained version — it will reproduce this exact failure on every
+open-vocab type (jewellery, workmens compensation, etc. — see
+[[project_open_vocab_promotion_wired]] for the full candidate list), not just pets.
+
+**A measurement-methodology note worth keeping, independent of the verdict above:**
+correlating `[vocab_probe]` log lines back to specific corpus cases by request ORDER
+alone was unreliable this run — the capture window had 29 stray (non-corpus) requests
+interleaved (from other traffic hitting the same container during the run) and 18
+corpus requests that never produced a `TIMING` line at all (likely a refusal/early-exit
+path that doesn't reach it). What actually worked: since only 4 probe events fired
+total, each was identified unambiguously by reading the `TIMING` line immediately
+following it in the same request's log block (which carries the exact query text) and
+looking that query up directly in `contamination_corpus.json`. This doesn't scale much
+past a handful of events — a future D2 attempt with a probe that fires more often will
+need either session-id tagging on the `[vocab_probe]` log line itself, or a
+query-text-membership filter (not order-based) before any bulk correlation.

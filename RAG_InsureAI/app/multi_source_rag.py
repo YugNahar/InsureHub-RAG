@@ -4215,7 +4215,6 @@ from prompt_template import (
 )
 from context_compressor import ContextCompressor
 from rag import LLM_CONTEXT_WINDOW_CHARS
-import type_vocab_miner as _type_vocab_miner
 
 # ask_stream()'s dynamic context budget (below) used to reserve a flat,
 # hardcoded 700 tokens for "prompt template boilerplate" regardless of
@@ -7579,39 +7578,23 @@ class MultiSourceRAG:
         # fallback as the history-bleed check, since a wrong item embedded in
         # a short brief-mode reply usually contaminates most of the value of
         # the answer anyway.
-        # ── D2 probe: KB-derived foreign-type vocabulary (LOG ONLY) ──────────
-        # plan_dynamic_contamination_coverage.md step D2. Reports what a
-        # dynamic, KB-mined giveaway map WOULD have flagged, and drops
-        # NOTHING. Exists to measure precision against the labeled corpus
-        # before it is ever allowed to gate anything — the explicit lesson
-        # from Phase 2, which shipped a plausible mechanism without a
-        # measured benefit and was reverted after 280 runs.
-        #
-        # Unlike _text_has_giveaway_contamination below, this does NOT
-        # require the term to appear in the retrieved context, so it can see
-        # vocabulary the model invented from parametric knowledge.
-        try:
-            if _query_policy_type and _query_policy_type != "general":
-                _probe_src = (_corrected_text or _reply_stripped)
-                _probe_hits = _type_vocab_miner.foreign_type_hits(_probe_src, _query_policy_type)
-                if _probe_hits:
-                    _probe_q_lower = f"{question} {retrieval_query}".lower()
-                    for _foreign_type, _terms_hit in _probe_hits.items():
-                        # Same exemptions the live filter already uses: a
-                        # query that names the other type (comparisons) and
-                        # standard "covered under your X policy instead"
-                        # phrasing are both legitimate, not contamination.
-                        _exempt_words = _TYPE_QUERY_EXEMPT_WORDS.get(_foreign_type, (_foreign_type,))
-                        if any(_w in _probe_q_lower for _w in _exempt_words):
-                            continue
-                        if _EXCLUSION_LANGUAGE_RE.search(_probe_src.lower()):
-                            continue
-                        logger.info(
-                            "[vocab_probe] would-flag query_type=%s foreign_type=%s hits=%s",
-                            _query_policy_type, _foreign_type, _terms_hit[:8],
-                        )
-        except Exception as _probe_exc:
-            logger.debug("[ask_stream] vocab probe skipped: %s", _probe_exc)
+        # D2 probe (plan_dynamic_contamination_coverage.md) was tried here
+        # and REVERTED 2026-07-29 after its own measurement: it would-flagged
+        # `pet-insurance-direct-01`, a clean_control case, on 2 of 3 repeats
+        # — hits=['pet insurance', "pet's", 'pets', 'veterinary', ...], the
+        # answer's own correct topic, flagged as HEALTH-foreign vocabulary.
+        # Root cause: "pet_insurance" is an open-vocab candidate type with no
+        # policy_type bucket of its own in this KB — its content lives inside
+        # health-tagged chunks, so the miner absorbed pet-insurance
+        # vocabulary into health's distinctive-term list. This is exactly
+        # the kill criterion the plan specified ("would-flags ANY
+        # clean_control case") and was applied per the plan's own rule: stop
+        # and revert, do not proceed to D3, regardless of the clean offline
+        # calibration. type_vocab_miner.py itself stays (harmless offline,
+        # per the plan) — see the module and plan_dynamic_contamination_
+        # coverage.md's Status line for the full writeup and what a future
+        # attempt would need to fix (mine at open-vocab-candidate
+        # granularity, not the coarse hand-tagged policy_type buckets).
 
         _retrieval_contamination_detected = False
         if not _keyword_detailed and not _history_type_contamination_detected and _query_policy_type != "general":
