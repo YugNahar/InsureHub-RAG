@@ -504,6 +504,18 @@ def _quote_price(q: dict):
     return amt if isinstance(amt, (int, float)) and amt > 0 else None
 
 
+def _fmt_amount(amount) -> str:
+    """Formats a raw price/add-on amount to standard 2-decimal currency
+    display with thousands separators. The quote API returns amount_with_vat
+    as a bare float with whatever precision it happens to carry (confirmed
+    live: "34.566", "71.232", "128.331" alongside "77.7", "105.0" in the same
+    quote list) — displaying it unrounded reads as broken to a user even
+    though the underlying number is real, not corrupted. Falls back to a
+    plain str() for the rare non-numeric amount (matches the isinstance
+    guard already used for the "covers up to" value just below)."""
+    return f"{amount:,.2f}" if isinstance(amount, (int, float)) else str(amount)
+
+
 def sort_quotes(quotes: list, sort_by: str = "price_asc") -> list:
     """Sorts a copy of `quotes`. Quotes with no usable price are always
     pushed to the end regardless of sort direction, and shown as "pricing
@@ -563,7 +575,7 @@ def format_quotes_list(state: dict, sort_by: str = "price_asc") -> str:
         plan = q.get("plan", {}).get("name", "Standard")
         price = _quote_price(q)
         currency = q.get("plan", {}).get("price", {}).get("currency", "AED")
-        price_str = f"{price} {currency}" if price else "pricing unavailable"
+        price_str = f"{_fmt_amount(price)} {currency}" if price else "pricing unavailable"
         badge = " ⭐ Best value (medical coverage per AED spent)" if i == best_value_idx else ""
         lines.append(f"Option {i + 1}: {insurer} ({plan}) — {price_str}{badge}")
 
@@ -609,7 +621,7 @@ def format_addons_for_quote(quote: dict) -> str:
                 amount = item.get("amount")
                 currency = item.get("currency", "")
                 value = item.get("value")
-                price_str = f"+{amount} {currency}" if amount is not None else "price on request"
+                price_str = f"+{_fmt_amount(amount)} {currency}" if amount is not None else "price on request"
                 covers_str = f", covers up to {value:,.0f} {currency}" if isinstance(value, (int, float)) and value else ""
                 lines.append(f"- {label}: {price_str}{covers_str}")
             return "\n".join(lines)
@@ -655,7 +667,7 @@ def format_compare_quotes(quotes: list, indices: list) -> str:
     for q, name in zip(selected, names):
         price = _quote_price(q)
         currency = q.get("plan", {}).get("price", {}).get("currency", "")
-        price_str = f"{price} {currency}" if price else "N/A"
+        price_str = f"{_fmt_amount(price)} {currency}" if price else "N/A"
         price_lines.append(f"  {name}: {price_str}")
     blocks.append("\n".join(price_lines))
 
@@ -745,7 +757,7 @@ def build_seasonal_addon_note(state: dict) -> str:
             insurer = q.get("insurer", {}).get("name", "Insurer")
             amount = addon.get("amount")
             currency = addon.get("currency", "")
-            price_str = f"+{amount} {currency}" if amount is not None else "available"
+            price_str = f"+{_fmt_amount(amount)} {currency}" if amount is not None else "available"
             hits.append(f"- Option {i + 1} ({insurer}): {addon.get('label')} ({price_str})")
 
     if not hits:
