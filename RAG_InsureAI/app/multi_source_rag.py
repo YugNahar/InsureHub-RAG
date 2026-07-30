@@ -8001,11 +8001,36 @@ class MultiSourceRAG:
             import re as _re5
             _CURRENCY_RE = _re5.compile(r'(?:[₹$£€]|\bRs\.?\b|\bINR\b|\bEUR\b)\s?([\d,]+(?:\.\d+)?)', _re5.IGNORECASE)
             _num_src = (_corrected_text or _reply_stripped).strip()
-            _ctx_digits = _re5.sub(r'\D', '', _full_context_uncompressed or '')
+            # De-wrapped once, up front, so both the grounding check right
+            # below and the qualifier-mismatch windowing further down share
+            # the same view of context — this KB's PDF-extracted text is
+            # full of ISOLATED single '\n's from mid-sentence line wraps
+            # ("...up \nto €320."), not just real paragraph/chunk breaks;
+            # collapsing them here stops both checks from treating a line-
+            # wrap as a sentence/number boundary. Leaves real '\n\n'
+            # (blank-line) separators alone.
+            _dewrapped_ctx = _re5.sub(r'(?<!\n)\n(?!\n)', ' ', _full_context_uncompressed or '')
+            # Real, standalone number tokens actually present in context —
+            # NOT the previous design, which stripped every non-digit
+            # character from the whole context into one giant digit blob
+            # and checked substring membership. Confirmed live that let a
+            # fully FABRICATED "€170,000" figure through ungrounded: its
+            # digits happened to land as a coincidental substring of
+            # unrelated numbers concatenated together elsewhere in context
+            # (e.g. digits from a page number butting up against digits
+            # from a different, real figure) — no genuine "170,000" (or
+            # "170000") ever appeared as an actual number anywhere in the
+            # source. Extracting real digit-runs and checking SET
+            # membership means a cited figure only counts as grounded if
+            # it matches a genuine number token in the source, not a lucky
+            # substring alignment across unrelated numbers.
+            _ctx_number_tokens = {
+                _t.replace(',', '') for _t in _re5.findall(r'\d[\d,]*(?:\.\d+)?', _dewrapped_ctx)
+            }
 
             def _currency_grounded(num_str: str) -> bool:
                 digits = num_str.replace(',', '').split('.')[0]
-                return bool(digits) and digits in _ctx_digits
+                return bool(digits) and digits in _ctx_number_tokens
 
             # A figure passing the digit-presence check above is grounded in
             # the sense that it appears SOMEWHERE in the retrieved text, but
@@ -8079,21 +8104,12 @@ class MultiSourceRAG:
                         found.add(stem)
                 return found
 
-            # _source_window below treats '.' and '\n' as equally strong
-            # sentence-boundary markers — but this KB's PDF-extracted text
-            # is full of ISOLATED single '\n's from mid-sentence line wraps
-            # ("...up \nto €320."), not just real paragraph/chunk breaks.
-            # Confirmed live: for the €320 delayed-luggage figure, this
-            # made the window stop at the nearest line-wrap instead of
-            # reaching back to the actual trigger sentence ("...if luggage
-            # is delayed by more than six hours..."), silently returning
-            # an empty/wrong trigger set. De-wrap into a LOCAL copy used
-            # only for this windowing check — collapses isolated single
-            # '\n's into spaces while leaving real '\n\n' (blank-line)
-            # separators alone, so line-wraps stop masquerading as
-            # sentence boundaries without touching the shared
-            # _full_context_uncompressed other checks below rely on.
-            _dewrapped_ctx = _re5.sub(r'(?<!\n)\n(?!\n)', ' ', _full_context_uncompressed or '')
+            # _source_window below (and the grounding check above) both rely
+            # on _dewrapped_ctx, defined earlier in this block — this KB's
+            # PDF-extracted text is full of ISOLATED single '\n's from mid-
+            # sentence line wraps ("...up \nto €320."), not just real
+            # paragraph/chunk breaks, and both checks need those collapsed
+            # so a line-wrap can't masquerade as a sentence/number boundary.
 
             # Artifact-noun grounding (Fix A, project_ungrounded_claim_leakage.md):
             # generalizes the currency-grounding contract below from numbers to a
