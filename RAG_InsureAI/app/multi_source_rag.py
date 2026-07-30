@@ -8279,6 +8279,56 @@ class MultiSourceRAG:
                 prev_left = -1 if cur_left == -1 else max(ctx.rfind('.', 0, cur_left), ctx.rfind('\n', 0, cur_left))
                 return ctx[prev_left + 1:right + 1]
 
+            # Confirmed live, reproducible (4/4 fresh runs): "Does my travel
+            # policy cover a cancelled flight?" answered "if your flight is
+            # cancelled because of heavy snowfall, you could be reimbursed".
+            # "Snowfall" genuinely triggers a real KB clause — but that
+            # clause is about a flight being LATE (causing a missed
+            # connection), not CANCELLED; the model borrowed a real cause
+            # word from one clause and re-attached it to a different event
+            # type entirely. _qualifier_mismatched doesn't catch this even
+            # in live variants that DID put a figure in the same sentence:
+            # "weather"/"snowfall" is shared between the two clauses'
+            # trigger words, so the ANY-overlap check reads them as
+            # compatible even though the word that actually defines the
+            # claim ("cancel") has zero support in the source passage that
+            # discusses that cause. And when the wrong claim has no
+            # currency figure of its own (most live runs), _qualifier_
+            # mismatched never runs on it at all, since that whole check is
+            # gated on _CURRENCY_RE matches — this one isn't, mirroring
+            # _artifact_mismatched's unconditional per-unit check above.
+            # Scoped narrowly to the confirmed pattern (event-TYPE word vs.
+            # a shared CAUSE word) rather than becoming a general fact
+            # checker — same discipline as _ARTIFACT_NOUNS.
+            _CAUSE_CONFUSION_TRIGGERS = frozenset({
+                "delay", "delayed", "missed", "miss", "weather",
+                "snowfall", "breakdown",
+            })
+
+            def _event_type_mismatched(unit: str) -> bool:
+                if not _re5.search(r'\bcancel(?:led|lation)?\b', unit, _re5.IGNORECASE):
+                    return False
+                _unit_causes = _extract_triggers(unit) & _CAUSE_CONFUSION_TRIGGERS
+                if not _unit_causes:
+                    return False
+                # Only drop if EVERY cited cause fails to pair with "cancel"
+                # anywhere in context — if even one cause is legitimately
+                # grounded for cancellation, the unit stays (same lenient,
+                # any-compatible-occurrence-is-enough stance used elsewhere
+                # in this block).
+                for _cause in _unit_causes:
+                    _cause_re = _re5.compile(r'\b' + _cause + r'\w*\b', _re5.IGNORECASE)
+                    for _m in _cause_re.finditer(_dewrapped_ctx):
+                        _win = _source_window(_dewrapped_ctx, _m.start(), _m.end())
+                        if _re5.search(r'\bcancel(?:led|lation)?\b', _win, _re5.IGNORECASE):
+                            return False
+                logger.info(
+                    "[ask_stream] event-type mismatch: unit claims 'cancelled' via cause(s) %r, "
+                    "but every occurrence of those causes in context is scoped to something else: %r",
+                    sorted(_unit_causes), unit[:150],
+                )
+                return True
+
             _question_triggers = _extract_triggers(question or '')
 
             def _qualifier_mismatched(unit: str, prev_unit: str = '') -> bool:
@@ -8355,18 +8405,44 @@ class MultiSourceRAG:
             # one — see _qualifier_mismatched's comment on why the fallback
             # window needed widening past a single preceding sentence.
             _prev_unit_text = ''
+            # Set when the immediately-preceding ORIGINAL unit (not
+            # necessarily the last KEPT one) just got dropped — used below
+            # to also drop a follow-up unit that only makes sense as a
+            # continuation of what was just removed.
+            _prev_unit_was_dropped = False
+            # Confirmed live: dropping "...cancelled flight ... heavy
+            # snowfall." (the _event_type_mismatched case above) left the
+            # very next sentence — "The insurer will compensate up to
+            # €5,000 ... in such cases." — with "such cases" now referring
+            # to nothing, since the sentence that established what "such
+            # cases" meant is gone. That leftover figure is independently
+            # real and grounded (it's the illness-cancellation clause's own
+            # cap), so nothing else in this block has a reason to drop it,
+            # but reading like a dangling reference is still wrong output.
+            # NOT anchored to the start of the unit — first version was and
+            # missed every live case: the model phrases this as a TRAILING
+            # modifier ("The insurer will reimburse ... in such cases."),
+            # never as a leading clause, so search anywhere in the unit.
+            _BACKREF_RE = _re5.compile(
+                r'\b(?:in|under)\s+(?:such|this|that|these|those)\s+'
+                r'(?:case|cases|circumstance|circumstances|situation|situations)\b',
+                _re5.IGNORECASE,
+            )
             for _unit in _units:
                 _found = _CURRENCY_RE.findall(_unit)
                 _currency_bad = _found and (
                     not any(_currency_grounded(f) for f in _found)
                     or _qualifier_mismatched(_unit, _prev_unit_text)
                 )
-                if _currency_bad or _artifact_mismatched(_unit):
+                _dangling_backref = _prev_unit_was_dropped and bool(_BACKREF_RE.search(_unit))
+                if _currency_bad or _artifact_mismatched(_unit) or _event_type_mismatched(_unit) or _dangling_backref:
                     _dropped_num += 1
                     _prev_unit_text = f"{_prev_unit_text} {_unit}".strip()
+                    _prev_unit_was_dropped = True
                     continue
                 _kept_units.append(_unit)
                 _prev_unit_text = f"{_prev_unit_text} {_unit}".strip()
+                _prev_unit_was_dropped = False
 
             if _dropped_num and _kept_units:
                 if _has_points:
