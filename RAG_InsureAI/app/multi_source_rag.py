@@ -8122,7 +8122,24 @@ class MultiSourceRAG:
                 _candidates = [r for r in (right, right2) if r != -1]
                 right = min(_candidates) if _candidates else len(ctx)
                 cur_left = max(ctx.rfind('.', 0, start), ctx.rfind('\n', 0, start))
-                prev_left = max(ctx.rfind('.', 0, cur_left), ctx.rfind('\n', 0, cur_left))
+                # cur_left == -1 means no '.'/'\n' at all before `start` — the
+                # figure sits right near the beginning of ctx. Confirmed live
+                # this is a real, non-rare case (retrieved context routinely
+                # starts with a few dozen chars of prose before the first
+                # sentence boundary, and short digit-only figures like "100"
+                # can land inside that span for an unrelated document). str.rfind's
+                # own negative-index slicing semantics turn a naive
+                # `ctx.rfind('.', 0, cur_left)` with cur_left=-1 into "search
+                # ctx[0:-1]" — i.e. almost the ENTIRE string — rather than
+                # "search nothing", producing a bogus prev_left near the far
+                # end of ctx that lands past `right`, so the slice comes back
+                # empty. An empty window is then treated as "no scoping
+                # info", which is READ as automatically compatible — letting
+                # a figure's very first (unrelated, boundary-less) occurrence
+                # short-circuit the whole check before the real, correctly-
+                # scoped occurrence later in context is ever examined. Must
+                # guard explicitly rather than relying on rfind's default.
+                prev_left = -1 if cur_left == -1 else max(ctx.rfind('.', 0, cur_left), ctx.rfind('\n', 0, cur_left))
                 return ctx[prev_left + 1:right + 1]
 
             _question_triggers = _extract_triggers(question or '')
@@ -8142,12 +8159,27 @@ class MultiSourceRAG:
                 # compensation of €80 per day per traveler, up to €320" is
                 # a real KB figure, genuinely scoped to DELAYED LUGGAGE, not
                 # illness/accident at all. Falls back to the REPLY's own
-                # local scenario claim instead of the question's — same
-                # 2-unit window as the source side (this unit plus the one
-                # immediately before it), since this KB's prose puts the
-                # causal "if X happens" clause in the sentence before the
-                # one with the number, and the model's paraphrase follows
-                # the same pattern.
+                # local scenario claim instead of the question's.
+                #
+                # `prev_unit` is now ALL units seen so far in this reply
+                # (accumulated by the caller), not just the immediately-
+                # preceding one. Confirmed live this needed widening: "So,
+                # travel insurance is a contract that protects ... against
+                # travel-related accidents, unexpected medical expenses...
+                # You'll need separate coverage for each adult. It also
+                # helps cover ... travel and accommodation expenses, with
+                # up to €320 per day per traveler." — the causal claim
+                # ("accidents") sits in sentence 1, but the figure is in
+                # sentence 3, with a trigger-free sentence 2 in between. A
+                # strict "this unit plus the ONE before it" window (the
+                # original design, matching how the KB's OWN prose puts the
+                # causal clause immediately before the amount) never saw
+                # sentence 1's claim, so _local_triggers came back empty and
+                # this function returned False before ever checking the
+                # source's actual scoping. The model's paraphrase doesn't
+                # reliably keep the causal clause adjacent to the number the
+                # way the source text does, so the reply side needs the
+                # wider net even though the source side still doesn't.
                 _local_triggers = _question_triggers or _extract_triggers(f"{prev_unit} {unit}")
                 if not _local_triggers:
                     return False
@@ -8182,6 +8214,9 @@ class MultiSourceRAG:
                 _units = _re5.split(r'(?<=[.!?])(?<!\d\.)\s+', _num_src)
 
             _kept_units, _dropped_num = [], 0
+            # Accumulates EVERY prior unit in this reply, not just the last
+            # one — see _qualifier_mismatched's comment on why the fallback
+            # window needed widening past a single preceding sentence.
             _prev_unit_text = ''
             for _unit in _units:
                 _found = _CURRENCY_RE.findall(_unit)
@@ -8191,10 +8226,10 @@ class MultiSourceRAG:
                 )
                 if _currency_bad or _artifact_mismatched(_unit):
                     _dropped_num += 1
-                    _prev_unit_text = _unit
+                    _prev_unit_text = f"{_prev_unit_text} {_unit}".strip()
                     continue
                 _kept_units.append(_unit)
-                _prev_unit_text = _unit
+                _prev_unit_text = f"{_prev_unit_text} {_unit}".strip()
 
             if _dropped_num and _kept_units:
                 if _has_points:
