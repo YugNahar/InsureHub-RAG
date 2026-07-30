@@ -1556,6 +1556,63 @@ def _rebuild_from_points(opener_lines: List[str], points: List[str], closer_line
     return "\n\n".join(pieces)
 
 
+# Two-signal duplicate-point detection: a pair must clear BOTH a
+# cross-encoder score floor AND a lexical word-overlap floor. Neither
+# signal alone was reliable — found through three rounds of live
+# calibration against real detailed-mode answers, not guessed:
+#
+# Round 1 (score only, threshold 0.95): the confirmed real repro (motor
+# insurance, points 5 & 7 restating the same liability claim in different
+# words) scored 0.9998 — but so did several genuinely-different points
+# that merely shared a topic, e.g. "the insurer covers various aspects
+# such as damage to the vehicle, third-party liability, and personal
+# accident" (real, additive coverage detail) scored 0.9525 against a
+# vaguer, unrelated "the insurer promises to cover certain risks" point.
+#
+# Round 2 (score only, raised to 0.98): reduced but didn't eliminate the
+# problem. A live health-insurance answer produced FALSE positives
+# scoring 0.9827-0.9924 — e.g. "Understanding the terms and conditions of
+# the policy is crucial..." (a generic closing-type remark) matched
+# "The insurer covers hospitalization for disease, sickness, or injury..."
+# (a specific coverage fact) at 0.9907. These false-positive scores
+# directly OVERLAP the genuine-duplicate range (0.9818-1.0000) — no single
+# score threshold cleanly separates them. The cross-encoder is
+# systematically fooled by a vague/generic point reading as "related to"
+# — not necessarily "restating" — a specific, information-dense one.
+#
+# Round 3 (added the word-overlap floor): the same real examples' word
+# Jaccard (content words only, stopwords stripped) showed a real gap the
+# score alone didn't: genuine duplicates measured 0.22-0.32 overlap, every
+# false-positive case measured 0.00-0.11, and one legitimately-ambiguous
+# case (a point listing SPECIFIC extra features vs a point naming only
+# the base coverage) sat at 0.17 — appropriately excluded by requiring
+# both signals, since dropping it would have lost real detail. This
+# combined check is deliberately conservative (biased toward missing a
+# softer-worded duplicate over ever merging two genuinely different
+# points) — consistent with this file's general stance that a false
+# positive (dropping real content) is worse than a false negative here.
+_DUPLICATE_POINT_THRESHOLD = 0.98
+_DUPLICATE_POINT_JACCARD_FLOOR = 0.20
+_DUPLICATE_POINT_STOPWORDS = frozenset({
+    'the', 'a', 'an', 'is', 'are', 'of', 'to', 'and', 'or', 'in', 'on', 'for',
+    'with', 'that', 'this', 'these', 'those', 'it', 'its', 'be', 'can', 'will',
+    'up', 'at', 'as', 'by', 'from', 'includes', 'include', 'including', 'such',
+    'other', 'related',
+})
+
+
+def _duplicate_point_word_overlap(a: str, b: str) -> float:
+    """Jaccard overlap of content words (stopwords stripped) between two
+    points — the second signal in _DUPLICATE_POINT_THRESHOLD's gate. See
+    that constant's comment for why score alone isn't reliable enough.
+    """
+    wa = {w for w in re.findall(r"[a-z']+", a.lower()) if w not in _DUPLICATE_POINT_STOPWORDS}
+    wb = {w for w in re.findall(r"[a-z']+", b.lower()) if w not in _DUPLICATE_POINT_STOPWORDS}
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
 def _score_points_against_query(query: str, points: List[str]) -> List[float]:
     """Score each point in *points* for query-relevance via the shared
     cross-encoder reranker, in a single batched .predict() call — reused
@@ -7968,6 +8025,70 @@ class MultiSourceRAG:
         # hollow-answer detector further down can safely check it even if
         # the currency-filter's try block never runs or exits early.
         _dropped_num = 0
+
+        # ── Drop numbered points that just restate an earlier point ───────────
+        # Confirmed live: a detailed-mode motor-insurance answer stated
+        # "Liability under motor insurance is unlimited, meaning the insurer
+        # is responsible for covering all eligible claims up to the limits
+        # of the policy" as point 5, then restated the identical claim in
+        # different words as point 7 ("The liability is unlimited,
+        # indicating that the insurer is obligated to cover all eligible
+        # claims up to the maximum limit of the policy") — the model
+        # repeating itself later in a long answer, not a grounding or
+        # cross-topic issue (both statements are individually true and
+        # grounded). Runs on whatever the earlier point-level filters above
+        # already produced, using the same shared _split_numbered_points/
+        # _rebuild_from_points pair those filters use, so this never drifts
+        # out of sync with their point-numbering. Only applies to numbered-
+        # list (detailed-mode) answers — brief-mode prose has no discrete
+        # points to compare.
+        try:
+            _dedup_src = (_corrected_text or _reply_stripped).strip()
+            if re.search(r'(?:^|\n)\s*\d+\.\s', _dedup_src):
+                _dd_opener, _dd_points, _dd_closer = _split_numbered_points(_dedup_src)
+                if len(_dd_points) >= 2:
+                    _dd_reranker = _get_shared_reranker()
+                    _dd_kept_idx: List[int] = []
+                    _dd_dropped = 0
+                    for _i, _pt in enumerate(_dd_points):
+                        _dd_is_dup = False
+                        _dd_match_idx = -1
+                        _dd_max = 0.0
+                        if _dd_kept_idx:
+                            _dd_scores = [float(_s) for _s in _dd_reranker.predict(
+                                [(_dd_points[_j], _pt) for _j in _dd_kept_idx]
+                            )]
+                            _dd_max_pos = max(range(len(_dd_scores)), key=lambda _k: _dd_scores[_k])
+                            _dd_max = _dd_scores[_dd_max_pos]
+                            _dd_match_idx = _dd_kept_idx[_dd_max_pos]
+                            # Score alone isn't reliable (see
+                            # _DUPLICATE_POINT_THRESHOLD's comment) — also
+                            # require real lexical overlap with the SAME
+                            # matched point, not just any kept point, so a
+                            # generic/vague point can't ride a high score
+                            # against one point plus incidental word-overlap
+                            # with a different one.
+                            if _dd_max >= _DUPLICATE_POINT_THRESHOLD:
+                                _dd_overlap = _duplicate_point_word_overlap(
+                                    _dd_points[_dd_match_idx], _pt
+                                )
+                                _dd_is_dup = _dd_overlap >= _DUPLICATE_POINT_JACCARD_FLOOR
+                        if _dd_is_dup:
+                            _dd_dropped += 1
+                            logger.info(
+                                "[ask_stream] dropped duplicate point %d (score=%.4f, restates point %d): %r",
+                                _i + 1, _dd_max, _dd_match_idx + 1, _pt[:150],
+                            )
+                            continue
+                        _dd_kept_idx.append(_i)
+                    if _dd_dropped:
+                        _rebuilt_dd = _rebuild_from_points(
+                            _dd_opener, [_dd_points[_i] for _i in _dd_kept_idx], _dd_closer
+                        )
+                        _corrected_text = _rebuilt_dd
+                        _kv_reply = _rebuilt_dd
+        except Exception as _dd_exc:
+            logger.debug("[ask_stream] point dedup skipped: %s", _dd_exc)
 
         # ── Drop sentences/points with an ungrounded currency figure ──────────
         # Every prompt's grounding rules say "never state a number... unless
