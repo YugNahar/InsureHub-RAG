@@ -7131,6 +7131,39 @@ class MultiSourceRAG:
                 # show every point that was actually generated, including
                 # ones this filter or the cross-topic filter go on to drop.
                 _trace_original_points = list(_point_texts)
+
+                # _split_numbered_points already correctly excludes a
+                # numbered sign-off ("8. Hope that clears it up!...") from
+                # _point_texts, routing it to _closer_lines instead — but
+                # that correction was only ever WRITTEN BACK to
+                # _corrected_text as a side effect of this filter (or one
+                # of the two below it) also finding something ELSE to drop
+                # in the same pass. Confirmed live: a detailed "pet
+                # insurance" answer with nothing else wrong (no ungrounded
+                # points, no contamination) still shipped with its sign-off
+                # numbered as point 8 in the actual displayed output,
+                # because _kept_points ended up equal to _point_texts below
+                # (nothing grounding-related to drop) — the rebuild never
+                # ran, so the RAW text (still literally containing "8. Hope
+                # that...") is what the user saw, despite the parser
+                # already knowing better. Detected directly: count raw
+                # numbered-line markers in the source and compare to
+                # len(_point_texts) — if the parser silently excluded a
+                # line the raw count still includes (the sign-off), rebuild
+                # immediately and unconditionally, before the `>= 2` gate
+                # below (which exists for the grounding check specifically,
+                # not for this) can skip it.
+                _raw_marker_count = len(_re3.findall(r'(?:^|\n)\s*\d+\.\s', _filter_src))
+                if _raw_marker_count > len(_point_texts):
+                    _rebuilt_signoff = _rebuild_from_points(_opener_lines, _point_texts, _closer_lines)
+                    _corrected_text = _rebuilt_signoff
+                    _kv_reply = _rebuilt_signoff
+                    logger.info(
+                        "[ask_stream] rebuilt to strip a numbered sign-off masquerading as a point "
+                        "(%d raw marker(s), %d real point(s))",
+                        _raw_marker_count, len(_point_texts),
+                    )
+
                 if len(_point_texts) >= 2 and _full_context_uncompressed and _full_context_uncompressed.strip():
                     # Must strip punctuation the same way on both sides.
                     # full_context is raw KB prose, dense with commas
