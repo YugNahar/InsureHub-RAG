@@ -1556,6 +1556,42 @@ def _rebuild_from_points(opener_lines: List[str], points: List[str], closer_line
     return "\n\n".join(pieces)
 
 
+def _numbered_list_needs_signoff_leadin_fix(text: str) -> bool:
+    """True if `text`, in its RAW (unparsed) form, still has either of the
+    two defects _split_numbered_points/_rebuild_from_points already know
+    how to fix: a lead-in glued to point 1's own line ("So, 1. ..."), or a
+    numbered final line that's actually the sign-off ("N. Hope that clears
+    it up!..." / "N. Let me know if you want more details! 😊").
+
+    Deliberately NOT implemented as "compare a raw numbered-marker count
+    to len(point_texts)" (the first version of this check, still used
+    verbatim at one call site below) — that comparison has a blind spot
+    when BOTH defects land in the SAME answer: the lead-in case makes a
+    marker-count regex anchored to true line-start undercount by one
+    (the glued "1." isn't at a line start), and the sign-off case makes
+    point_texts undercount by one too (it's routed to closer_lines) — the
+    two undercounts cancel out and the mismatch check misses both.
+    Confirmed live: "So, 1. Life insurance focuses on providing a death
+    benefit...\\n2. ...\\n5. Let me know if you want more details! 😊" —
+    raw marker count (4, since only 2/3/4/5 are true line-start markers)
+    equaled point count (4, since point 5 routes to closer_lines) even
+    though the text plainly still needed both fixes. This checks each
+    defect directly instead of inferring it from a count.
+    """
+    stripped = (text or '').strip()
+    if not stripped:
+        return False
+    lines = stripped.split('\n')
+    if _LEADIN_POINT_LINE_RE.match(lines[0]):
+        return True
+    _last_point_content = None
+    for line in lines:
+        m = _POINT_LINE_RE.match(line)
+        if m:
+            _last_point_content = m.group(2).strip()
+    return bool(_last_point_content and _SIGNOFF_START_RE.match(_last_point_content))
+
+
 # Two-signal duplicate-point detection: a pair must clear BOTH a
 # cross-encoder score floor AND a lexical word-overlap floor. Neither
 # signal alone was reliable — found through three rounds of live
@@ -7036,6 +7072,37 @@ class MultiSourceRAG:
         except Exception as _list_exc:
             logger.debug("[ask_stream] numbered-list format enforcement skipped: %s", _list_exc)
 
+        # Mode-agnostic (not gated on _keyword_detailed — same precedent as
+        # the source-self-reference/rider-misattribution block above):
+        # _enforce_numbered_list_format just above can turn a BRIEF-mode,
+        # non-detailed answer into a numbered list for "types of"/
+        # "difference between" questions — and its reformat prompt only
+        # says "preserve exact wording", with no instruction to keep a
+        # lead-in separate from point 1 or to recognize a closing sign-off
+        # as non-content. Confirmed live: "What's the difference between
+        # life and personal insurance?" (no "detail" keyword, so the
+        # _keyword_detailed-gated fix a few hundred lines below never
+        # runs) came back reformatted as "So, 1. Life insurance focuses
+        # on...\n2. ...\n5. Let me know if you want more details! 😊" —
+        # both the lead-in-glue and the numbered-sign-off defects, on a
+        # pipeline path neither of this session's earlier fixes for those
+        # exact defects could reach. Runs on whatever _corrected_text is at
+        # this point regardless of which path produced a numbered shape.
+        try:
+            _post_list_src = (_corrected_text or _reply_stripped).strip()
+            if _numbered_list_needs_signoff_leadin_fix(_post_list_src):
+                _pl_opener, _pl_points, _pl_closer = _split_numbered_points(_post_list_src)
+                _pl_rebuilt = _rebuild_from_points(_pl_opener, _pl_points, _pl_closer)
+                _corrected_text = _pl_rebuilt
+                _kv_reply = _pl_rebuilt
+                logger.info(
+                    "[ask_stream] mode-agnostic pass: stripped a numbered sign-off and/or "
+                    "split a glued lead-in from point 1 (%d real point(s))",
+                    len(_pl_points),
+                )
+        except Exception as _pl_exc:
+            logger.debug("[ask_stream] mode-agnostic sign-off/lead-in fix skipped: %s", _pl_exc)
+
         # ── Truncation detection (log only, never discard content) ────────────
         # Used to trim the answer down to its last complete sentence when the
         # stream hit max_tokens mid-sentence. Explicitly disabled per user
@@ -7170,34 +7237,27 @@ class MultiSourceRAG:
 
                 # _split_numbered_points already correctly excludes a
                 # numbered sign-off ("8. Hope that clears it up!...") from
-                # _point_texts, routing it to _closer_lines instead — but
-                # that correction was only ever WRITTEN BACK to
-                # _corrected_text as a side effect of this filter (or one
-                # of the two below it) also finding something ELSE to drop
-                # in the same pass. Confirmed live: a detailed "pet
-                # insurance" answer with nothing else wrong (no ungrounded
-                # points, no contamination) still shipped with its sign-off
-                # numbered as point 8 in the actual displayed output,
-                # because _kept_points ended up equal to _point_texts below
-                # (nothing grounding-related to drop) — the rebuild never
-                # ran, so the RAW text (still literally containing "8. Hope
-                # that...") is what the user saw, despite the parser
-                # already knowing better. Detected directly: count raw
-                # numbered-line markers in the source and compare to
-                # len(_point_texts) — if the parser silently excluded a
-                # line the raw count still includes (the sign-off), rebuild
-                # immediately and unconditionally, before the `>= 2` gate
-                # below (which exists for the grounding check specifically,
-                # not for this) can skip it.
-                _raw_marker_count = len(_re3.findall(r'(?:^|\n)\s*\d+\.\s', _filter_src))
-                if _raw_marker_count > len(_point_texts):
+                # _point_texts, routing it to _closer_lines instead, and
+                # already correctly splits a lead-in glued to point 1's own
+                # line ("So, 1. ...") into a genuine opener. But neither
+                # correction was ever WRITTEN BACK to _corrected_text
+                # unless this filter (or one of the two below it) ALSO
+                # found something else to drop in the same pass — a
+                # "clean" answer shipped with the raw, unfixed text intact
+                # despite the parser already knowing better. See
+                # _numbered_list_needs_signoff_leadin_fix's own docstring
+                # for why this checks each defect directly rather than
+                # comparing a raw-marker count to len(_point_texts) (the
+                # first version of this fix — it has a blind spot when
+                # both defects land in the same answer).
+                if _numbered_list_needs_signoff_leadin_fix(_filter_src):
                     _rebuilt_signoff = _rebuild_from_points(_opener_lines, _point_texts, _closer_lines)
                     _corrected_text = _rebuilt_signoff
                     _kv_reply = _rebuilt_signoff
                     logger.info(
-                        "[ask_stream] rebuilt to strip a numbered sign-off masquerading as a point "
-                        "(%d raw marker(s), %d real point(s))",
-                        _raw_marker_count, len(_point_texts),
+                        "[ask_stream] rebuilt to strip a numbered sign-off and/or split a "
+                        "glued lead-in from point 1 (%d real point(s))",
+                        len(_point_texts),
                     )
 
                 if len(_point_texts) >= 2 and _full_context_uncompressed and _full_context_uncompressed.strip():
@@ -7913,17 +7973,40 @@ class MultiSourceRAG:
                         # letter unless the first word is the pronoun "I"
                         # (and its contractions) or a genuine multi-letter
                         # acronym (NCB, ULIP, TPA) that should stay as-is.
+                        #
+                        # _lead_src can ALSO be an already-numbered list at
+                        # this point — _enforce_numbered_list_format (a few
+                        # hundred lines up) reformats prose into "1. ... 2.
+                        # ..." for types/comparison questions, and its
+                        # reformat call doesn't reliably keep a lead-in
+                        # attached (confirmed live: it dropped "So," rather
+                        # than gluing it, which is what this fallback exists
+                        # to add back). Joining with a single space like the
+                        # plain-prose case does below produces exactly the
+                        # "So, 1. The main difference..." glued-lead-in
+                        # defect this session already fixed twice elsewhere
+                        # for OTHER sources of the same shape (see
+                        # _numbered_list_needs_signoff_leadin_fix) — this is
+                        # a THIRD, independent source of it. A numbered
+                        # list's first token is a digit, not a letter, so
+                        # lowercasing would be a no-op anyway; skip it
+                        # explicitly for clarity and join with a blank line
+                        # instead of a space so point 1 stays its own
+                        # numbered line.
                         _first_word_m = _lead_re.match(r"^(\S+)", _lead_src)
                         _first_word = _first_word_m.group(1) if _first_word_m else ""
+                        _lead_src_is_numbered_list = bool(_lead_re.match(r'^\s*1\.\s', _lead_src))
                         _skip_lower = (
                             _first_word == "I" or _first_word.startswith("I'")
                             or (len(_first_word) > 1 and _first_word.isupper())
+                            or _lead_src_is_numbered_list
                         )
                         _lead_src_cased = (
                             _lead_src if _skip_lower or not _lead_src
                             else _lead_src[0].lower() + _lead_src[1:]
                         )
-                        _with_lead = f"{_chosen_lead} {_lead_src_cased}"
+                        _lead_sep = "\n\n" if _lead_src_is_numbered_list else " "
+                        _with_lead = f"{_chosen_lead}{_lead_sep}{_lead_src_cased}"
                         _corrected_text = _with_lead
                         _kv_reply = _with_lead
             except Exception as _lead_exc:
@@ -8518,6 +8601,87 @@ class MultiSourceRAG:
                 r'|^(?:so|also|however|additionally|furthermore)?[,:]?\s*it\b\s+(?:is|are|was|were|refers?|applies|provided)\b',
                 _re5.IGNORECASE,
             )
+            # Confirmed live (2 of 3 fresh "explain pet insurance in
+            # detail" runs): a numbered point opens with a bare "They
+            # represent the broadest and typically most expensive tier of
+            # coverage..." — nothing earlier in the answer names what
+            # "They" refers to. Traced to KB chunk c8d755f6, whose own
+            # text is fine ("Comprehensive plans combine accident, illness
+            # and wellness coverage into a single package. They represent
+            # the broadest..." — a valid antecedent two sentences earlier
+            # in the SAME source paragraph) — the model sometimes
+            # paraphrases starting mid-passage, keeping the pronoun but
+            # dropping the noun it refers to. Unlike _BACKREF_RE above
+            # (which only fires when THIS filter itself just dropped the
+            # antecedent), this is unconditional: the antecedent was never
+            # generated in the first place, nothing here removed it.
+            #
+            # Scoped deliberately narrow: only a NUMBERED POINT's own
+            # opening word (not flowing prose, where a sentence starting
+            # with "They"/"These" referring to the previous sentence's
+            # subject is normal), and only "they"/"these" — not "it"/
+            # "this"/"those", which are far more often legitimate
+            # self-contained point-openers ("It is mandatory...", "This
+            # policy covers...") or refer back to the answer's own opening
+            # topic rather than an immediately-prior point (a confirmed
+            # legitimate live precedent: "These policies are categorized
+            # into Form A and B", referring to the policy type named in
+            # the answer's own intro sentence). That same construction is
+            # the known, accepted false-positive risk of this narrower
+            # they/these check too — deliberately traded off in favor of
+            # catching the confirmed recurring bug, not eliminated.
+            _BARE_PLURAL_OPENER_RE = _re5.compile(r'^(?:they|these)\b', _re5.IGNORECASE)
+
+            def _dangling_plural_opener(unit: str) -> bool:
+                if not _has_points:
+                    return False
+                _m = _re5.match(r'^\s*\d+\.\s+(.*)$', unit, _re5.DOTALL)
+                if not _m:
+                    return False
+                _lines = [l.strip() for l in _m.group(1).split('\n') if l.strip()]
+                if not _lines:
+                    return False
+                _first = _lines[0]
+                # Three shapes confirmed live this session, all needing a
+                # different slice to find where the point's real content
+                # (as opposed to a header/title) actually begins:
+                #
+                # Case A — no header at all, the pronoun is the point's own
+                # first word: "4. They represent the broadest..."
+                #
+                # Case B — header on its own line, content on the next:
+                # "3. Types of Coverage\nThey represent the broadest..."
+                #
+                # Case C — header and content share one line, split by a
+                # colon: "4. Broadest Tier of Coverage: They represent..."
+                #
+                # In B and C, a short label ("Types of Coverage") doesn't
+                # itself name the specific plural concept ("Comprehensive
+                # Plans") the pronoun needs — known, accepted residual
+                # risk: a header/label that happens to itself BE the plural
+                # antecedent ("Exotic Pets" followed by "They are less
+                # commonly covered...", or "Exotic Pets: They are less
+                # commonly covered...") would also match here and be a
+                # false positive; not observed in this session's testing
+                # across 11 live runs, but not ruled out either.
+                _colon_m = _re5.match(r'^\**([^:]{1,60})\**:\s*(.+)$', _first)
+                if _colon_m and not _re5.search(r'[.!?]\s*$', _colon_m.group(1)):
+                    _content_line = _colon_m.group(2)
+                elif len(_lines) >= 2 and not _re5.search(r'[.!?]\s*$', _first):
+                    _content_line = _re5.sub(r'^[-•*]\s*', '', _lines[1])
+                else:
+                    _content_line = _first
+                _flagged = bool(_BARE_PLURAL_OPENER_RE.match(_content_line))
+                if _flagged:
+                    logger.info(
+                        "[ask_stream] dropped numbered point opening (directly, "
+                        "after a header line, or after a header: colon) with a "
+                        "bare they/these and no antecedent established earlier "
+                        "in the answer: %r",
+                        unit[:150],
+                    )
+                return _flagged
+
             # User policy (2026-07-30): don't state specific currency/
             # payment figures at all unless the user explicitly asked for
             # an example — separate from, and stricter than, the grounding/
@@ -8540,7 +8704,13 @@ class MultiSourceRAG:
                     or _qualifier_mismatched(_unit, _prev_unit_text)
                 )
                 _dangling_backref = _prev_unit_was_dropped and bool(_BACKREF_RE.search(_unit))
-                if _currency_bad or _artifact_mismatched(_unit) or _event_type_mismatched(_unit) or _dangling_backref:
+                if (
+                    _currency_bad
+                    or _artifact_mismatched(_unit)
+                    or _event_type_mismatched(_unit)
+                    or _dangling_backref
+                    or _dangling_plural_opener(_unit)
+                ):
                     _dropped_num += 1
                     _prev_unit_text = f"{_prev_unit_text} {_unit}".strip()
                     _prev_unit_was_dropped = True
