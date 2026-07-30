@@ -5338,7 +5338,43 @@ class MultiSourceRAG:
         if _query_policy_type == "general":
             _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
         if _query_policy_type != "general":
-            _policy_type_filter = {"policy_type": {"$in": [_query_policy_type, "general"]}}
+            _policy_types_for_filter = {_query_policy_type}
+            # Comparison/named-pair questions ("difference between motor
+            # and marine insurance") name TWO distinct types, but the
+            # single-type classification above only ever returns ONE of
+            # them — confirmed live it grabs whichever type word sits
+            # closest to the literal word "insurance" ("motor and marine
+            # insurance" -> "marine", "marine and motor insurance" ->
+            # "motor"). Building the filter from only that one type HARD-
+            # EXCLUDES every chunk tagged with the other, unpicked type —
+            # fatal when that type's content isn't ALSO reachable via a
+            # general-tagged chunk. Confirmed live: "What is the
+            # difference between motor and marine insurance?" refused
+            # outright (sources=0, llm never called) — motor's 31
+            # dedicated chunks entirely excluded by a filter scoped to
+            # marine+general. "What is the difference between fire and
+            # marine insurance?" — the identical single-type
+            # classification quirk, also landing on "marine" — worked only
+            # because fire's content happens to also live in a general-
+            # tagged chunk; that's luck, not something this filter should
+            # depend on. Reuses the SAME named-pair extraction
+            # _enforce_named_pair_depth (downstream, post-generation)
+            # already relies on, so this doesn't invent a new "is this a
+            # comparison" heuristic — it just feeds the existing one into
+            # the filter too. Strictly additive (only ever WIDENS the
+            # `$in` list), so this can't reduce what a non-comparison
+            # query retrieves or reopen any single-type contamination gap.
+            _np_pair = _extract_named_pair(retrieval_query, _NAMED_PAIR_QUERY_PATTERNS)
+            if _np_pair:
+                for _np_name in _np_pair:
+                    _np_probe = (
+                        _np_name if re.search(r'\binsurance\b', _np_name, re.IGNORECASE)
+                        else f"{_np_name} insurance"
+                    )
+                    _np_type = classify_query_policy_type(_np_probe)
+                    if _np_type != "general":
+                        _policy_types_for_filter.add(_np_type)
+            _policy_type_filter = {"policy_type": {"$in": sorted(_policy_types_for_filter) + ["general"]}}
             filter_meta = {"$and": [filter_meta, _policy_type_filter]} if filter_meta else _policy_type_filter
 
         # ── KV cache lookup ───────────────────────────────────────────────────
