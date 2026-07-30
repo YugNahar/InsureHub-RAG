@@ -8423,15 +8423,51 @@ class MultiSourceRAG:
             # missed every live case: the model phrases this as a TRAILING
             # modifier ("The insurer will reimburse ... in such cases."),
             # never as a leading clause, so search anywhere in the unit.
+            #
+            # Second pattern, confirmed live the same way: dropping "the
+            # insurance would cover the loss up to EUR 100 ... due to
+            # bedbugs" left "So, This is provided it's due to bedbugs,
+            # which seems to be a specific condition mentioned." — a bare
+            # leading "This"/"That"/"These"/"Those" as the sentence's own
+            # grammatical subject (or determiner: "This compensation is
+            # given..." — a live variant that a pronoun-only match missed,
+            # since a noun sits between "This" and the verb), referring to
+            # the dropped figure with nothing else to anchor it to.
+            # "This/that/these/those" ARE matched as a bare sentence-start
+            # regardless of what follows, since that construction is a
+            # strong enough back-reference signal on its own; "it" is kept
+            # narrower (requires an immediately-following "is/are/refers/
+            # ...") since it's far too common a sentence-starter otherwise
+            # ("It is mandatory..." routinely starts a genuinely
+            # self-contained sentence). Anchored to the start of the unit
+            # (after an optional short lead-in word) since a mid-sentence
+            # "this"/"it" is too common to safely treat as dangling.
             _BACKREF_RE = _re5.compile(
                 r'\b(?:in|under)\s+(?:such|this|that|these|those)\s+'
-                r'(?:case|cases|circumstance|circumstances|situation|situations)\b',
+                r'(?:case|cases|circumstance|circumstances|situation|situations)\b'
+                r'|^(?:so|also|however|additionally|furthermore)?[,:]?\s*(?:this|that|these|those)\b'
+                r'|^(?:so|also|however|additionally|furthermore)?[,:]?\s*it\b\s+(?:is|are|was|were|refers?|applies|provided)\b',
                 _re5.IGNORECASE,
             )
+            # User policy (2026-07-30): don't state specific currency/
+            # payment figures at all unless the user explicitly asked for
+            # an example — separate from, and stricter than, the grounding/
+            # qualifier-mismatch checks above. Those checks verify a cited
+            # figure is real and correctly scoped; this one asks a simpler
+            # question first — should a figure be volunteered here at all?
+            # Given today's session found repeated, hard-to-fully-close
+            # gaps in figures being misattributed to the wrong scenario
+            # (€320, €170,000, €5,000/cancelled-flight), suppressing them
+            # by default is a simpler, more reliable safety margin than
+            # trying to perfectly verify every case. Checked against the
+            # user's actual question, not the reply — a reply can't be
+            # trusted to only volunteer a figure when it was asked for.
+            _is_example_request = bool(_re5.search(r'\bexamples?\b', question or '', _re5.IGNORECASE))
             for _unit in _units:
                 _found = _CURRENCY_RE.findall(_unit)
                 _currency_bad = _found and (
-                    not any(_currency_grounded(f) for f in _found)
+                    not _is_example_request
+                    or not any(_currency_grounded(f) for f in _found)
                     or _qualifier_mismatched(_unit, _prev_unit_text)
                 )
                 _dangling_backref = _prev_unit_was_dropped and bool(_BACKREF_RE.search(_unit))
