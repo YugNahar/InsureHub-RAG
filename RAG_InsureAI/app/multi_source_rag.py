@@ -5640,10 +5640,67 @@ class MultiSourceRAG:
             # — it's a network call — so it still runs in genuine parallel
             # via its own task while retrieval proceeds.
             _topics_task = asyncio.create_task(_extract_intent_topics(question))
-            all_chunks = await self._retrieve_all_sources_combined(
-                _search_query, filter_meta, doc_top_k=_doc_top_k, summary_top_k=3,
-                media_top_k=_media_top_k, chunk_limit=_chunk_limit,
-            )
+            # Comparison/named-pair questions ("difference between motor
+            # and marine insurance") were fixed at the metadata-filter
+            # level (both named types now stay eligible — see the
+            # policy_type $in widening above), but that alone wasn't
+            # enough: confirmed live via diagnostic logging that even
+            # with motor eligible, the SINGLE combined-query rerank call
+            # below still only surfaced marine chunks (top_rerank=0.312,
+            # low) — a whole comparison SENTENCE doesn't score well
+            # against either topic's narrow, single-type chunk content,
+            # since no ONE chunk represents a two-topic comparison. Fix:
+            # when both named sides independently classify to two
+            # DIFFERENT real KB policy types, run a SEPARATE retrieval
+            # pass per side (each a clean, single-topic query) and merge
+            # the pools, guaranteeing both types get real representation
+            # instead of competing for slots in one combined rerank.
+            #
+            # Guarded narrowly to avoid regressing the "Form A and Form B
+            # motor insurance" shape _extract_named_pair ALSO matches
+            # (used downstream by _enforce_named_pair_depth) — there,
+            # "Form A"/"Form B" are sub-types WITHIN one policy type, not
+            # two different ones, and both classify to "general" in
+            # isolation (no "motor" keyword survives the split). Splitting
+            # retrieval there would replace a perfectly good "Form A and
+            # Form B motor insurance" query with two contextless,
+            # unretrievable half-queries ("Form A insurance"). Only
+            # trigger the split when classify_query_policy_type gives two
+            # DIFFERENT non-general answers — the exact shape of the
+            # confirmed bug, nothing broader.
+            _np_pair_for_retrieval = _extract_named_pair(retrieval_query, _NAMED_PAIR_QUERY_PATTERNS)
+            _np_split_types = None
+            if _np_pair_for_retrieval:
+                _np_a, _np_b = _np_pair_for_retrieval
+                _np_query_a = _np_a if re.search(r'\binsurance\b', _np_a, re.IGNORECASE) else f"{_np_a} insurance"
+                _np_query_b = _np_b if re.search(r'\binsurance\b', _np_b, re.IGNORECASE) else f"{_np_b} insurance"
+                _np_type_a = classify_query_policy_type(_np_query_a)
+                _np_type_b = classify_query_policy_type(_np_query_b)
+                if _np_type_a != "general" and _np_type_b != "general" and _np_type_a != _np_type_b:
+                    _np_split_types = (_np_type_a, _np_type_b)
+            if _np_split_types:
+                _np_per_side_limit = max(2, -(-_chunk_limit // 2))  # ceil(chunk_limit / 2)
+                _chunks_a, _chunks_b = await asyncio.gather(
+                    self._retrieve_all_sources_combined(
+                        _expand_abbreviations(_np_query_a), filter_meta, doc_top_k=_doc_top_k,
+                        summary_top_k=3, media_top_k=_media_top_k, chunk_limit=_np_per_side_limit,
+                    ),
+                    self._retrieve_all_sources_combined(
+                        _expand_abbreviations(_np_query_b), filter_meta, doc_top_k=_doc_top_k,
+                        summary_top_k=3, media_top_k=_media_top_k, chunk_limit=_np_per_side_limit,
+                    ),
+                )
+                logger.info(
+                    "[ask_stream] named-pair split retrieval: %r(%s, %d chunks) + %r(%s, %d chunks)",
+                    _np_query_a, _np_type_a, len(_chunks_a),
+                    _np_query_b, _np_type_b, len(_chunks_b),
+                )
+                all_chunks = self._merge_chunks(_chunks_a + _chunks_b)
+            else:
+                all_chunks = await self._retrieve_all_sources_combined(
+                    _search_query, filter_meta, doc_top_k=_doc_top_k, summary_top_k=3,
+                    media_top_k=_media_top_k, chunk_limit=_chunk_limit,
+                )
             llm_topics = await _topics_task
         else:
             doc_chunks, llm_topics = await asyncio.gather(
