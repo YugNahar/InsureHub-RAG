@@ -7780,9 +7780,34 @@ class MultiSourceRAG:
             try:
                 _hist_ans_src = (_corrected_text or _reply_stripped)
                 _hist_legit_text = f"{question} {retrieval_query} {_full_context_uncompressed}".lower()
+                # Confirmed live: "What is personal insurance?" (a session's
+                # very first message, no prior turns at all) got answered
+                # "...includes policies like accidental death or injury,
+                # disability, and others" — genuinely reasonable phrasing
+                # for personal accident insurance, just not a verbatim
+                # substring of the narrow context retrieved for this
+                # specific broad question. Discarded anyway and replaced
+                # with the refusal message, because this check's ONLY test
+                # was "absent from question/retrieval_query/full_context",
+                # despite its own name and log line claiming "history
+                # bleed" — it never actually looked at `history` to check
+                # whether the flagged word came from a real prior turn.
+                # With no history to have bled from, "absent from this
+                # turn's own grounding" just means the model used
+                # reasonable general knowledge, not that it copied a
+                # WRONG-topic fact from an earlier answer — the one
+                # specific failure mode this check exists to catch (see the
+                # motor/endowment repro in the comment above). Now requires
+                # the flagged word to ALSO actually appear in `history` —
+                # strictly narrower than before (an added AND, not a
+                # replaced OR), so it can only reduce false-positive
+                # discards, never miss a case the old check caught: in the
+                # original repro, "endowment" genuinely was present in the
+                # preceding turn still visible in `history`.
+                _hist_history_lower = (history or "").lower()
                 for _hist_type_m in _TYPE_ATTRIBUTION_RE.finditer(_hist_ans_src.lower()):
                     _hist_type_word = _hist_type_m.group(1).lower()
-                    if _hist_type_word not in _hist_legit_text:
+                    if _hist_type_word not in _hist_legit_text and _hist_type_word in _hist_history_lower:
                         _hist_refusal_text = (
                             "Hmm, I don't have that specific information in my knowledge base right now. "
                             "Let me get one of our agents on it, they'll be able to help you better! 😊"
@@ -7793,7 +7818,8 @@ class MultiSourceRAG:
                         _history_type_contamination_detected = True
                         logger.info(
                             "[ask_stream] discarded brief answer: named %r, absent from "
-                            "question/retrieval_query/full_context — likely history bleed",
+                            "question/retrieval_query/full_context but present in history — "
+                            "likely history bleed",
                             _hist_type_word,
                         )
                         break
