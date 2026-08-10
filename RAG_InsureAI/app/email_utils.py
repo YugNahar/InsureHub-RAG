@@ -26,6 +26,32 @@ AGENT_EMAIL     = os.getenv("AGENT_EMAIL", "lavishdevpura6@gmail.com")
 VLLM_HOST       = os.getenv("VLLM_HOST", "")
 VLLM_MODEL      = os.getenv("VLLM_MODEL", "")
 
+# vLLM is the only LLM backend allowed in production for email composition
+# (Groq was tried and measured far faster, but isn't an approved option on
+# the production side — reverted). This deployment decodes at only ~7-8
+# tokens/sec (confirmed live), so the timeout and max_tokens below are
+# calibrated for THAT throughput, not for a fast backend: max_tokens is
+# capped at 450 (comfortably covers the "under 250/300 words" asked for in
+# each prompt below) and the timeout is set well above 450 tokens' worst-
+# case generation time (~60s) so a normal-length completion has room to
+# actually finish instead of racing a timeout tuned for a fast backend and
+# losing almost every time. smtplib's own timeout (Gmail auth failures are
+# fast, not slow) is unaffected and stays short.
+_LLM_TIMEOUT_S = 75
+_LLM_MAX_TOKENS = 450
+_SMTP_TIMEOUT_S = 10
+
+
+def _get_composer_client():
+    """vLLM only (see note above) — returns (client, model) via the shared
+    remote host, or (None, None) if VLLM_HOST isn't configured. Timeout and
+    retry settings are applied here so every caller gets them uniformly."""
+    if not VLLM_HOST:
+        return None, None
+    from openai import OpenAI
+    client = OpenAI(base_url=f"{VLLM_HOST}/v1", api_key="dummy", timeout=_LLM_TIMEOUT_S, max_retries=0)
+    return client, VLLM_MODEL
+
 # Excel "database" of agent recipient emails — one email per row under an
 # "email" header in the first sheet. Edit this file (add/remove rows) to
 # change who gets escalation emails; no restart or code change needed, since
@@ -165,8 +191,11 @@ def generate_pdf(session_id: str, history, unanswerable_query: str) -> bytes:
 # ── LLM email composition ─────────────────────────────────────────────────────
 
 def compose_email_body(session_id: str, history, unanswerable_query: str) -> str:
-    """Use the VLLM to write a professional HTML email body. Falls back to template."""
-    if not VLLM_HOST:
+    """Writes a professional HTML email body (Groq preferred, vLLM fallback —
+    see _get_composer_client). Falls back to template if neither is configured
+    or the call fails."""
+    client, model = _get_composer_client()
+    if client is None:
         return _template_email(session_id, unanswerable_query, history)
 
     history_lines = []
@@ -203,12 +232,10 @@ Write a concise professional HTML email body to the support agent. Requirements:
 - Use simple tags: <p>, <b>, <span style="background:#fef3c7;padding:2px 6px">, <ul>, <li>"""
 
     try:
-        from openai import OpenAI
-        client = OpenAI(base_url=f"{VLLM_HOST}/v1", api_key="dummy")
         resp = client.chat.completions.create(
-            model=VLLM_MODEL,
+            model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
+            max_tokens=_LLM_MAX_TOKENS,
             temperature=0.4,
         )
         body = resp.choices[0].message.content.strip()
@@ -304,7 +331,7 @@ def send_escalation_email(session_id: str, history, unanswerable_query: str) -> 
                         filename=f"insurehub_session_{session_id}.pdf")
         msg.attach(part)
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT_S) as server:
             server.login(GMAIL_SENDER, GMAIL_PASSWORD)
             server.sendmail(GMAIL_SENDER, recipients, msg.as_string())
 
@@ -319,11 +346,116 @@ def send_escalation_email(session_id: str, history, unanswerable_query: str) -> 
         return False
 
 
-def _email_wrapper(body: str) -> str:
+# ── Quotation email (Ava, travel_bot) ───────────────────────────────────────
+# Sent on-demand from the "Email me this quote" button in the travel-bot
+# chat, not part of the offline-escalation flow above — reuses the same
+# vLLM-composition-with-template-fallback and SMTP-send shape, but goes
+# directly to the customer's own address (no Bcc-to-agents trick, no PDF).
+
+def compose_quotation_email_body(session_id: str, recipient_name: str, trip_summary: str, quotes_text: str) -> str:
+    """Writes a polished quotation summary email (Groq preferred, vLLM
+    fallback — see _get_composer_client). Falls back to a plain template if
+    neither is configured or the call fails — sending should never block on
+    the LLM being unavailable."""
+    client, model = _get_composer_client()
+    if client is None:
+        return _template_quotation_email(recipient_name, trip_summary, quotes_text)
+
+    prompt = f"""You are writing a polished quotation email from a travel-insurance
+assistant ("Ava", part of the InsureHub platform) to a customer who just
+requested their travel insurance quote(s) by email.
+
+CUSTOMER NAME: {recipient_name or "there"}
+SESSION: #{session_id}
+
+TRIP DETAILS:
+{trip_summary}
+
+QUOTE OPTIONS:
+{quotes_text}
+
+Write a warm, professional HTML email body. Requirements:
+- Greet the customer by name (or "there" if no name given)
+- Briefly restate the trip details in one short line
+- Present the quote options clearly (an HTML table or a clean list is fine —
+  keep the exact numbers/insurer/plan names from QUOTE OPTIONS above, do not
+  invent or alter any figures)
+- Close with a friendly note that they can reply with any questions
+- Keep it under 300 words
+- HTML only — no subject line, no To/From headers, just the body content
+- Use simple tags: <p>, <b>, <table>, <tr>, <td>, <ul>, <li>"""
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=_LLM_MAX_TOKENS,
+            temperature=0.4,
+        )
+        body = resp.choices[0].message.content.strip()
+        if not body.strip().startswith("<"):
+            body = f"<p>{body}</p>"
+        return body
+    except Exception as e:
+        logger.warning("LLM quotation-email composition failed: %s — using template", e)
+        return _template_quotation_email(recipient_name, trip_summary, quotes_text)
+
+
+def _template_quotation_email(recipient_name: str, trip_summary: str, quotes_text: str) -> str:
+    quotes_html = "".join(
+        f'<p style="margin:4px 0">{line}</p>' for line in quotes_text.split("\n") if line.strip()
+    )
+    return f"""
+<p>Hi {recipient_name or "there"},</p>
+
+<p>Here's the travel insurance quote you requested from Ava at InsureHub.</p>
+
+<p><b>Trip details:</b><br>{trip_summary}</p>
+
+<p><b>Quote options:</b></p>
+{quotes_html}
+
+<p>Reply to this email if you have any questions — happy to help.</p>
+
+<p>Best regards,<br>
+<b>Ava, InsureHub Travel Insurance</b></p>
+"""
+
+
+def send_quotation_email(to_email: str, subject: str, body_html: str) -> bool:
+    """Sends directly to the customer's own address (unlike the escalation
+    path's Bcc-to-internal-agents trick) and carries no attachment. Returns
+    False on any failure rather than raising — the caller decides how to
+    surface that to the user."""
+    if not GMAIL_SENDER or not GMAIL_PASSWORD:
+        logger.warning(
+            "Quotation email skipped — GMAIL_SENDER / GMAIL_APP_PASSWORD not set."
+        )
+        return False
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = GMAIL_SENDER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(_email_wrapper(body_html, title="✈️ InsureHub — Your Travel Insurance Quote"), "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT_S) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_SENDER, [to_email], msg.as_string())
+
+        logger.info("Quotation email sent to %s", to_email)
+        return True
+    except Exception:
+        logger.exception("Failed to send quotation email to %s", to_email)
+        return False
+
+
+def _email_wrapper(body: str, title: str = "🛡 InsureHub — Support Escalation") -> str:
     return f"""<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 color:#1f2937;max-width:600px;margin:0 auto;padding:20px">
 <div style="background:#4f46e5;color:white;padding:14px 20px;border-radius:8px 8px 0 0">
-  <b>🛡 InsureHub — Support Escalation</b>
+  <b>{title}</b>
 </div>
 <div style="background:#f9fafb;padding:20px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
 {body}

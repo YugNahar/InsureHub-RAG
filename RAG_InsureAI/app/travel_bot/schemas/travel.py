@@ -46,6 +46,37 @@ COVERAGE_TYPE_RULES = {
 
 COVERAGE_TYPE_OPTIONS = list(COVERAGE_TYPE_RULES.keys())
 
+
+def get_locked_fields(coverage_type: str) -> dict:
+    """Returns {"destination": "X"} and/or {"departure": "Y"} for whichever
+    of destination/departure this coverage_type restricts to exactly ONE
+    valid value (e.g. "UAE Inbound" only ever allows destination="United
+    Arab Emirates"; "Hajj and Umrah" only ever allows destination="Saudi
+    Arabia" AND departure="United Arab Emirates"). These should be
+    auto-filled once coverage_type is known, not asked — there's only one
+    correct answer, and asking risks the user typing something
+    validate_coverage_destination() would just reject anyway. A field with
+    multiple valid options (e.g. Schengen's destination) or no restriction
+    (None) is correctly left out — that's a genuine choice, not a lock."""
+    rule = COVERAGE_TYPE_RULES.get(coverage_type)
+    if not rule:
+        return {}
+    locked = {}
+    dest_options = rule.get("destination_options")
+    if dest_options and len(dest_options) == 1:
+        locked["destination"] = dest_options[0]
+    dep_options = rule.get("departure_options")
+    if dep_options and len(dep_options) == 1:
+        locked["departure"] = dep_options[0]
+    return locked
+
+
+# Precomputed once per coverage type — used both server-side (auto-fill
+# backstop) and sent to the frontend (ui.coverage_type_locks) so the form
+# can pre-fill/disable a locked field the moment the user picks a coverage
+# type, without duplicating this rule table as a second copy in JS.
+COVERAGE_TYPE_LOCKS = {ct: get_locked_fields(ct) for ct in COVERAGE_TYPE_RULES}
+
 # ---------------------------------------------------------------------------
 # Users (and sometimes the LLM extractor) write countries as abbreviations,
 # not the full names our validation table checks against ("UAE" vs
@@ -68,6 +99,11 @@ COUNTRY_ALIASES = {
     "u.s.a": "United States",
     "u.s.a.": "United States",
     "us": "United States",
+    "america": "United States",
+    "united states of america": "United States",
+    "britain": "United Kingdom",
+    "great britain": "United Kingdom",
+    "england": "United Kingdom",
 }
 
 

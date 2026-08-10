@@ -89,6 +89,7 @@ _DEFAULT_CORS_ORIGINS = [
     "http://localhost:8002",
     "http://localhost:8501",
     "http://localhost:8080",
+    "http://localhost:8899",  # demo_quotation_site.html — voice-agent abandonment-trigger test page
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8000",
@@ -299,6 +300,7 @@ create_login_endpoint(app)
 # /api/chat, distinct from every existing route here. See the router's own
 # module for the full quote/bind/issue conversation flow.
 from travel_bot.routers.chat import router as _travel_chat_router
+from travel_bot.routers.chat import is_ava_process_question as _is_ava_process_question
 from travel_bot.core.database import Base as _travel_base, engine as _travel_engine, SessionLocal as _travel_session_local
 import travel_bot.models.field_definition as _travel_field_definition  # noqa: F401 — registers the table below; only written by seed_field_definitions.py, never read by the live chat flow
 from travel_bot.models.session import ChatSession as _TravelChatSession
@@ -306,6 +308,29 @@ from travel_bot.models.message import Message as _TravelMessage
 from travel_bot.models.extracted_value import ExtractedValue as _TravelExtractedValue
 _travel_base.metadata.create_all(bind=_travel_engine)
 app.include_router(_travel_chat_router)
+
+# Voice agent integration (2026-08-05) — outbound reactivation calls (Riya,
+# via osvi) for a DIFFERENT product line (Generali Central life insurance
+# quotations on a separate azure-hosted website) than everything else in
+# this file. Mounted the same way travel_bot is directly above: its own DB,
+# its own router, no shared state with Layla/Ava. See
+# voice_agent/osvi_client.py's module docstring — the osvi API call itself
+# is not yet usable (OSVI_INITIATE_CALL_URL/AGENT_UUID/API_TOKEN unset in
+# .env) until the real API Integration Guide confirms the endpoint
+# contract; the scheduling/cancellation logic (the part that guarantees a
+# completed-payment session is never called) works and is testable now.
+from voice_agent.routers.webhook import router as _voice_agent_router
+from voice_agent.core.database import Base as _voice_agent_base, engine as _voice_agent_engine, SessionLocal as _voice_agent_session_local
+from voice_agent.scheduler import scheduler_loop as _voice_agent_scheduler_loop
+_voice_agent_base.metadata.create_all(bind=_voice_agent_engine)
+app.include_router(_voice_agent_router)
+
+
+@app.on_event("startup")
+async def _start_voice_agent_scheduler():
+    app.state.voice_agent_scheduler_task = asyncio.create_task(
+        _voice_agent_scheduler_loop(_voice_agent_session_local)
+    )
 
 import re as _bot_re
 
@@ -922,7 +947,11 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     def _reclassify_chunks_with_llm() -> None:
         try:
             from router import get_insurance_llm
-            from metadata_tagger import verify_and_enrich_section_metadata, classify_candidate_type
+            from metadata_tagger import (
+                verify_and_enrich_section_metadata,
+                classify_candidate_type,
+                derive_document_topic_prior,
+            )
             reclass_llm = get_insurance_llm(temperature=0)
             tvec = pipeline.vector_store._store
 
@@ -930,6 +959,22 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             for cid, chunk in zip(chunk_ids, chunks):
                 sid = chunk.metadata.get("section_id") or cid
                 sections.setdefault(sid, []).append((cid, chunk))
+
+            # Document-level topic prior, computed once from every chunk's
+            # own text (not just one section) — same mechanism used by
+            # SectionChunker.split_documents() in rag.py. This path used to
+            # skip it entirely: each section was reclassified from its own
+            # isolated text with zero visibility into the rest of the
+            # document, the exact failure mode derive_document_topic_prior
+            # exists to fix (see its own docstring — a travel guide's own
+            # medical benefit, read alone, looks like generic health
+            # content). Without this, a document uploaded through the real
+            # /upload endpoint (this function) was never protected by the
+            # fix at all, even though RAGPipeline.add_document()'s own
+            # chunker already was.
+            doc_prior, _doc_prior_share = derive_document_topic_prior(
+                [c.page_content for c in chunks], filename=filename,
+            )
 
             updated = 0
             for section_items in sections.values():
@@ -942,9 +987,18 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 # verifies/corrects here, rather than reclassifying from
                 # scratch — cheaper, and lets a confident regex heading
                 # match (e.g. "MOTOR INSURANCE") skip straight to
-                # confirmation instead of re-deriving it.
-                assigned_type = section_items[0][1].metadata.get("policy_type", "general")
-                enriched = verify_and_enrich_section_metadata(section_text, assigned_type, llm=reclass_llm)
+                # confirmation instead of re-deriving it. But when the
+                # document has a confident doc_prior, start from THAT
+                # instead — see rag.py's SectionChunker for why: a
+                # razor-thin regex call on an isolated section anchors the
+                # VERIFY question on the wrong type, and no amount of
+                # persuasive doc-context text reliably talks the model back
+                # off an anchor already baked into the question.
+                first_pass_type = section_items[0][1].metadata.get("policy_type", "general")
+                assigned_type = doc_prior if doc_prior and doc_prior != "general" else first_pass_type
+                enriched = verify_and_enrich_section_metadata(
+                    section_text, assigned_type, llm=reclass_llm, doc_prior=doc_prior,
+                )
                 fresh = enriched["policy_type"]
                 # Mode-A fallback: the closed vocabulary still can't place
                 # this section even with a real LLM available — this is the
@@ -1800,12 +1854,18 @@ async def ask_stream(req: AskRequest):
             _msg_lower = req.question.strip().lower()
             if _CONFIRM_YES_RE.search(_msg_lower):
                 await _agent_hub.set_active_agent(req.session_id, _target)
-                _opening = await _agent_registry.get_agent(_target).invoke(req.session_id, "")
+                _opening_result = await _agent_registry.get_agent(_target).invoke(req.session_id, "")
+                _opening = _opening_result.get("text", "")
+                _opening_trailer = {"sources": [], "done": True}
+                if _opening_result.get("ui"):
+                    _opening_trailer["ui"] = _opening_result["ui"]
+                if _opening_result.get("collected_fields") is not None:
+                    _opening_trailer["collected_fields"] = _opening_result["collected_fields"]
                 async def _handoff_yes_gen():
                     asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
                     asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _opening))
                     yield _opening
-                    yield "\n\n" + _json.dumps({"sources": [], "done": True})
+                    yield "\n\n" + _json.dumps(_opening_trailer)
                 return StreamingResponse(_handoff_yes_gen(), media_type="text/plain",
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
             elif _CONFIRM_NO_RE.search(_msg_lower):
@@ -1860,13 +1920,31 @@ async def ask_stream(req: AskRequest):
             _is_interruption = await _agent_router_interrupt.is_interruption(
                 req.question, _bot_sess.active_agent
             )
+            # is_interruption's own _GENERAL_QUESTION_RE matches a WH-question
+            # containing "cover" — so "what is coverage type?" mid-Ava-flow
+            # would otherwise fall through to Layla, whose general RAG
+            # knowledge base doesn't document Ava's own vocabulary (the 5
+            # coverage types, etc.) and answers badly. Override back to
+            # "not an interruption" only for Ava's own in-domain process
+            # questions — a genuinely unrelated question ("What is motor
+            # insurance?") has no Ava-domain vocabulary hit and still
+            # correctly falls through to Layla below, unchanged.
+            if _is_interruption and _bot_sess.active_agent == "ava":
+                if await asyncio.to_thread(_is_ava_process_question, req.question):
+                    _is_interruption = False
             if not _is_interruption:
-                _bot_reply = await _agent_registry.get_agent(_bot_sess.active_agent).invoke(req.session_id, req.question)
+                _bot_result = await _agent_registry.get_agent(_bot_sess.active_agent).invoke(req.session_id, req.question)
+                _bot_reply = _bot_result.get("text", "")
+                _bot_trailer = {"sources": [], "done": True}
+                if _bot_result.get("ui"):
+                    _bot_trailer["ui"] = _bot_result["ui"]
+                if _bot_result.get("collected_fields") is not None:
+                    _bot_trailer["collected_fields"] = _bot_result["collected_fields"]
                 async def _bot_gen():
                     asyncio.create_task(_agent_hub.log_message(req.session_id, "user", req.question))
                     asyncio.create_task(_agent_hub.log_message(req.session_id, "ai", _bot_reply))
                     yield _bot_reply
-                    yield "\n\n" + _json.dumps({"sources": [], "done": True})
+                    yield "\n\n" + _json.dumps(_bot_trailer)
                 return StreamingResponse(_bot_gen(), media_type="text/plain",
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"})
 

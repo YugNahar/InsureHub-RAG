@@ -1,3 +1,4 @@
+import re
 import traceback
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -237,7 +238,7 @@ class LLMService:
     # insurance plan/cover type, so those always require manual entry.
     _EXTRACTABLE_FIELDS = [
         "first_name", "last_name", "email", "mobile_number",
-        "destination", "start_date", "end_date", "date_of_birth"
+        "destination", "departure", "start_date", "end_date", "date_of_birth"
     ]
 
     def _deterministic_field_map(self, raw_extraction: dict) -> dict:
@@ -277,11 +278,37 @@ class LLMService:
 
         phone = norm.get("phonenumber") or norm.get("mobilenumber") or norm.get("contactnumber")
         if phone:
-            mapped["mobile_number"] = str(phone).replace(" ", "")
+            phone_digits = re.sub(r"\D", "", str(phone))
+            # Protego's own OCR returns "Country Code" as a SEPARATE field
+            # (e.g. "+91") alongside the bare national number — confirmed
+            # live via a real itinerary upload. Previously discarded
+            # entirely, so mobile_number came back as bare digits with no
+            # country info at all, which meant the frontend's phone-country
+            # picker (which renders from a country+national split, not
+            # mobile_number directly) stayed empty even after a successful
+            # pre-fill. Compose a full "+<code><digits>" number here — same
+            # E.164 shape the form/conversational flows already produce —
+            # so the frontend's own phone-number decomposition can recover
+            # the split (see AVA_FORM's upload handler in app.js).
+            country_code = norm.get("countrycode")
+            if country_code:
+                cc_digits = re.sub(r"\D", "", str(country_code))
+                if cc_digits and phone_digits.startswith(cc_digits):
+                    phone_digits = phone_digits[len(cc_digits):]
+                if cc_digits:
+                    mapped["mobile_number"] = f"+{cc_digits}{phone_digits}"
+                else:
+                    mapped["mobile_number"] = phone_digits
+            else:
+                mapped["mobile_number"] = phone_digits
 
         destination = norm.get("destinationcountry") or norm.get("destination")
         if destination:
             mapped["destination"] = destination
+
+        departure = norm.get("origincountry") or norm.get("origin") or norm.get("departurecountry") or norm.get("fromcountry")
+        if departure:
+            mapped["departure"] = departure
 
         start_date = norm.get("fromdate") or norm.get("departuredate") or norm.get("startdate")
         if start_date:

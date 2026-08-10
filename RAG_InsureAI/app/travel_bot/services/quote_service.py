@@ -3,6 +3,24 @@ import requests
 import json
 from travel_bot.schemas.travel import get_coverage_type_code, MAX_TRAVELLERS_TOTAL
 
+# Dial codes (no leading '+') the intake form's country-code picker can
+# produce — mirrors frontend/public/app.js's COUNTRY_DIAL_CODES. Used to
+# generalize _split_mobile_number() beyond a UAE-only prefix match; see
+# that function's docstring for why this matters now that a user can pick
+# a non-UAE country. Sorted longest-first so e.g. "966" (Saudi Arabia)
+# matches before a shorter code that happens to share its leading digit.
+_KNOWN_DIAL_CODES = sorted({
+    "971", "966", "974", "965", "973", "968",  # Gulf
+    "91", "92", "880", "94", "977", "63", "62", "60", "65", "66", "84",
+    "86", "852", "81", "82", "886",  # South/East/SE Asia
+    "44", "353", "33", "49", "39", "34", "351", "31", "32", "43", "30",
+    "358", "41", "47", "46", "45", "48", "90", "7", "380",  # Europe/Turkey/Russia
+    "1", "52", "55", "54", "56", "57", "51",  # Americas
+    "20", "962", "961", "964", "972", "212", "216", "213",  # MENA
+    "27", "234", "254", "233", "251", "255", "256",  # Africa
+    "61", "64",  # Oceania
+}, key=len, reverse=True)
+
 
 def build_travellers_list(extracted_data: dict) -> list:
     """
@@ -51,13 +69,25 @@ class QuoteService:
         '+971' prefix already in it (e.g. "+971 500024681"), but create-session
         wants country_code and mobile_number as two SEPARATE fields, with no
         '+' (the real InsureHub frontend sends country_code: "971", not "+971").
-        Strips a leading '+' and/or the country code if present; otherwise
-        assumes the whole string is the local number and defaults the code to
-        UAE, matching the '+971' default already assumed elsewhere in this file.
+
+        Generalized (2026-08) from a UAE-only prefix check: the intake
+        form's phone-country picker can now produce a non-UAE number (e.g.
+        "+919876543210" for India), and matching only "971" would silently
+        misread the "91" country code as part of a bogus 12-digit "UAE"
+        local number. Tries each KNOWN dial code as a prefix, longest first
+        (so "966" isn't cut short by a shorter code that shares a leading
+        digit). Falls back to default_country_code when no '+' prefix is
+        present at all — the original assumption for a bare national
+        number — or when the prefix isn't a code we recognize, rather than
+        guessing wrong.
         """
         raw = (mobile_number or "").strip().replace(" ", "").replace("-", "")
         if raw.startswith("+"):
             raw = raw[1:]
+            for code in _KNOWN_DIAL_CODES:
+                if raw.startswith(code):
+                    return code, raw[len(code):]
+            return default_country_code, raw
         if raw.startswith(default_country_code):
             return default_country_code, raw[len(default_country_code):]
         return default_country_code, raw
@@ -144,6 +174,16 @@ class QuoteService:
         first_name = extracted_data.get("first_name", "").strip()
         last_name = extracted_data.get("last_name", "").strip()
 
+        # Was hardcoded "+971" here regardless of the actual number — harmless
+        # while every real number was a UAE one, but the intake form's phone
+        # country picker can now produce e.g. a "+91..." Indian number, which
+        # this would have mislabeled as UAE while also leaving the '+91'
+        # redundantly embedded in mobile_number below. Split once and use the
+        # real code for both fields, same helper create_session already uses.
+        mobile_country_code, mobile_local_number = QuoteService._split_mobile_number(
+            extracted_data.get("mobile_number", "")
+        )
+
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream"
@@ -157,8 +197,8 @@ class QuoteService:
                 "email": extracted_data.get("email", ""),
                 "friends_and_family_contact": "",
                 "marketing_consent": "no",
-                "mobile_country_code": "+971",
-                "mobile_number": extracted_data.get("mobile_number", ""),
+                "mobile_country_code": f"+{mobile_country_code}",
+                "mobile_number": mobile_local_number,
                 "partner_code": ""
             },
             "travel_details": {

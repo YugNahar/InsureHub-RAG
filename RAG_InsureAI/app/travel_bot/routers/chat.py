@@ -5,7 +5,7 @@ import re
 import json
 from sqlalchemy.orm import Session as DBSession
 from sqlalchemy.orm.attributes import flag_modified
-from travel_bot.schemas.chat import ChatRequest, ChatResponse
+from travel_bot.schemas.chat import ChatRequest, ChatResponse, IntakeFormRequest, EmailQuoteRequest
 from travel_bot.models.message import Message
 from travel_bot.models.session import ChatSession
 from travel_bot.models.field_log import FieldExtractionLog
@@ -14,12 +14,15 @@ from travel_bot.models.extracted_value import ExtractedValue
 from travel_bot.core.database import get_db
 from travel_bot.services.llm_service import LLMService
 from travel_bot.services.quote_service import QuoteService
+from travel_bot.services.currency_service import format_dual_currency
 from travel_bot.schemas.travel import (
     validate_coverage_destination,
     infer_coverage_type_from_destination,
     normalize_country,
     normalize_date,
     COVERAGE_TYPE_OPTIONS,
+    COVERAGE_TYPE_LOCKS,
+    COVERAGE_TYPE_RULES,
     MULTI_TRAVELLER_COVER_TYPES,
     MIN_TRAVELLERS_FOR_MULTI,
     MAX_TRAVELLERS_TOTAL,
@@ -28,12 +31,17 @@ from travel_bot.schemas.travel import (
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 llm_service = LLMService()
 
+# Deliberately permissive (accepts business/personal/education addresses
+# alike, not a strict RFC 5322 pattern) but requires a real-looking TLD —
+# used both for the intake-form backstop and the email-quote endpoint.
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$")
+
 # coverage_type (the product / destination rules) and cover_type (who's
 # insured) are deliberately both here as SEPARATE required fields — they are
 # not interchangeable. See app/schemas/travel.py for the full rule table.
 REQUIRED_FIELDS = [
     "first_name", "last_name", "email", "mobile_number",
-    "coverage_type", "destination", "start_date", "end_date",
+    "coverage_type", "destination", "departure", "start_date", "end_date",
     "plan_type", "cover_type", "date_of_birth"
 ]
 
@@ -44,6 +52,7 @@ FIELD_LABELS = {
     "mobile_number": "Mobile number",
     "coverage_type": f"Coverage type ({' / '.join(COVERAGE_TYPE_OPTIONS)})",
     "destination": "Destination country",
+    "departure": "Country you're travelling from",
     "start_date": "Trip start date",
     "end_date": "Trip end date",
     "plan_type": "Plan type (Single Trip / Annual Multi-Trip)",
@@ -81,6 +90,7 @@ FIELD_QUESTIONS = {
     "mobile_number": "Could you please share your mobile number?",
     "coverage_type": "Could you let me know if this is for Hajj & Umrah, UAE Inbound, GCC Countries, Schengen, or Worldwide cover?",
     "destination": "Which country will you be travelling to?",
+    "departure": "And which country will you be travelling from?",
     "start_date": "When would you like the trip to start?",
     "end_date": "And when does it end?",
     "plan_type": "Would you like a Single Trip plan, or Annual Multi-Trip cover?",
@@ -96,6 +106,124 @@ FIELD_OPTIONS_MAP = {
     "plan_type": ["Single Trip", "Annual Multi-Trip"],
     "coverage_type": ["Hajj and Umrah", "UAE Inbound", "GCC Countries", "Schengen", "Worldwide"],
 }
+
+
+# ── In-flow Q&A ("what is coverage type?", "how do I fill this in?") ────────
+# Same two-stage discipline as agent_router.interrupt's _GENERAL_QUESTION_RE:
+# a fast regex catches the obvious cases for free; only a question-shaped
+# message with no obvious vocab hit pays for an LLM call. Answered entirely
+# by Ava's own LLM (llm_service, Groq-backed) — never routed to Layla, since
+# Layla's general RAG knowledge base doesn't document Ava's own vocabulary
+# (the 5 coverage types, etc.) and answers these badly.
+_AVA_PROCESS_VOCAB_RE = re.compile(
+    r"\b(?:coverage\s*type|cover\s*type|plan\s*type|quotation|quote|policy|"
+    r"add-?ons?|destination|departure|hajj|umrah|schengen|worldwide|"
+    r"gcc\b|uae\s*inbound|mobile\s*number|date\s*of\s*birth|passport|"
+    r"emirates\s*id|this\s*form|this\s*field)\b",
+    re.IGNORECASE,
+)
+_QUESTION_SHAPE_RE = re.compile(
+    r"^\s*(?:what|how|why|which|when|where|who|can|could|does|do|is|are)\b|\?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_ava_process_question(message: str) -> bool:
+    """Safe default is False (fall through to the normal phase machine) on
+    any ambiguity — a missed question just gets the existing canned/field-
+    extraction behavior, same as today; a false positive would incorrectly
+    hijack a real form answer, which is the worse failure mode."""
+    text = message.strip()
+    if not text:
+        return False
+    has_vocab = bool(_AVA_PROCESS_VOCAB_RE.search(text))
+    has_question_shape = bool(_QUESTION_SHAPE_RE.search(text))
+    if has_vocab and has_question_shape:
+        return True
+    if not has_question_shape or len(text.split()) <= 3:
+        return False
+    return _classify_ava_process_question_llm(text)
+
+
+def _classify_ava_process_question_llm(message: str) -> bool:
+    # Confirmed live: a vague "is this about the quote process?" framing
+    # over-triggers on ANY insurance-shaped question, including a totally
+    # unrelated one ("What is motor insurance?" -> "yes") — this must stay
+    # narrow, since a false positive here hijacks a question that should
+    # fall through to Layla (see api.py's interruption-gate override), and
+    # a missed one just falls back to today's existing behavior. Explicit
+    # positive/negative examples fixed both misses below.
+    try:
+        llm = llm_service._get_llm(temperature=0.0, max_tokens=5)
+        prompt = f"""A user is filling out a travel insurance quote form, or reviewing a
+quote, from Ava — an assistant that ONLY handles this one specific travel-insurance quote
+flow (coverage types: Hajj and Umrah, UAE Inbound, GCC Countries, Schengen, Worldwide;
+trip dates, destination/departure countries, traveller details, the quotes shown).
+
+Classify the MESSAGE as exactly one of:
+"yes" — a question specifically about THIS travel-quote process: what a form field or
+  coverage-type option means, how to fill something in, or something about a quote
+  Ava has already shown.
+"no" — anything else: a question about a DIFFERENT insurance product (motor, home,
+  health, life, etc.), a general insurance concept not specific to this travel flow, or
+  a request unrelated to getting a travel quote.
+
+Examples:
+"what is coverage type" -> yes
+"how do I fill this in" -> yes
+"what does option 1 include" -> yes
+"why do you need my passport" -> yes
+"what is motor insurance?" -> no
+"does home insurance cover flood damage?" -> no
+"what is a deductible?" -> no
+
+MESSAGE: {message}
+
+Reply with ONLY "yes" or "no" — nothing else."""
+        resp = llm.invoke(prompt)
+        answer = (getattr(resp, "content", "") or "").strip().lower()
+        return answer.startswith("yes")
+    except Exception:
+        return False
+
+
+def answer_ava_process_question(message: str, state: dict) -> str:
+    coverage_lines = []
+    for ct, rule in COVERAGE_TYPE_RULES.items():
+        dest = ", ".join(rule["destination_options"]) if rule.get("destination_options") else "any country"
+        dep = ", ".join(rule["departure_options"]) if rule.get("departure_options") else "any country"
+        coverage_lines.append(f"- {ct}: destination = {dest}; departure = {dep}")
+    coverage_text = "\n".join(coverage_lines)
+
+    field_lines = "\n".join(f"- {FIELD_LABELS.get(f, f)}: {q}" for f, q in FIELD_QUESTIONS.items())
+
+    quotes = state.get("available_quotes") or []
+    quotes_text = ("\n" + quotes_summary_for_email(state)) if quotes else " (none fetched yet)"
+
+    prompt = f"""You are Ava, a travel-insurance quote assistant for InsureHub. A user asked
+a question about the quote process or a quote you've already shown them — answer it
+directly, clearly, and briefly (2-4 sentences, plain text, no markdown headers).
+
+COVERAGE TYPES (destination/departure rules):
+{coverage_text}
+
+FORM FIELDS:
+{field_lines}
+
+CURRENTLY SHOWN QUOTES:{quotes_text}
+
+USER'S QUESTION: {message}
+
+Answer only using the information above. If the question isn't something you can answer
+from this context, say you're not sure and suggest they ask their question a different way."""
+
+    try:
+        llm = llm_service._get_llm(temperature=0.2, max_tokens=300)
+        resp = llm.invoke(prompt)
+        answer = (getattr(resp, "content", "") or "").strip()
+        return answer or "Sorry, I couldn't come up with an answer to that — could you rephrase?"
+    except Exception:
+        return "Sorry, I'm having trouble answering that right now — could you try again in a moment?"
 
 
 def determine_reply_options(state: dict, reply_text: str) -> list:
@@ -153,6 +281,20 @@ def merge_extracted_fields(state: dict, extracted: dict) -> dict:
                 val = normalize_date(val)
             state[key] = val
     return state
+
+
+def apply_coverage_type_locks(state: dict) -> None:
+    """Once coverage_type is known, auto-fills destination and/or departure
+    for whichever of those COVERAGE_TYPE_RULES restricts to exactly one
+    valid value (see COVERAGE_TYPE_LOCKS) — e.g. "UAE Inbound" always means
+    destination="United Arab Emirates", "Hajj and Umrah" always means
+    departure="United Arab Emirates" too. Never overwrites an already-set
+    value (same "don't clobber real signal" rule merge_extracted_fields
+    follows) — this only fills in a field that's still genuinely blank."""
+    locked = COVERAGE_TYPE_LOCKS.get(state.get("coverage_type", ""), {})
+    for field, value in locked.items():
+        if not state.get(field):
+            state[field] = value
 
 
 def _format_date_human(value: str) -> str:
@@ -569,13 +711,34 @@ def format_quotes_list(state: dict, sort_by: str = "price_asc") -> str:
     scores = [(s, i) for s, i in scores if s is not None]
     best_value_idx = max(scores, key=lambda pair: pair[0])[1] if len(scores) >= 2 else None
 
-    lines = [f"Sorted by {_SORT_LABELS.get(sort_by, _SORT_LABELS['price_asc'])} — {len(quotes)} quote(s) found:\n"]
+    # Protego always prices in AED regardless of departure country — this is
+    # a DISPLAY-only conversion for a user who said they're travelling from
+    # somewhere else (e.g. India), never touches what's actually quoted/
+    # charged. See currency_service.format_dual_currency's own docstring.
+    departure = state.get("departure", "")
+
+    # len(quotes) is the FULL pool (e.g. 12); only top5 (max 5) are ever
+    # actually listed below — the old wording ("X quote(s) found:") read as
+    # a mismatch/bug when X > 5 since the message promised more than it
+    # showed. Spell out "showing top N of X" whenever they differ.
+    count_line = (
+        f"Sorted by {_SORT_LABELS.get(sort_by, _SORT_LABELS['price_asc'])} — "
+        f"showing top {len(top5)} of {len(quotes)} quote(s) found:\n"
+        if len(quotes) > len(top5)
+        else f"Sorted by {_SORT_LABELS.get(sort_by, _SORT_LABELS['price_asc'])} — {len(quotes)} quote(s) found:\n"
+    )
+    lines = [count_line]
     for i, q in enumerate(top5):
         insurer = q.get("insurer", {}).get("name", "Insurer")
         plan = q.get("plan", {}).get("name", "Standard")
         price = _quote_price(q)
         currency = q.get("plan", {}).get("price", {}).get("currency", "AED")
-        price_str = f"{_fmt_amount(price)} {currency}" if price else "pricing unavailable"
+        if price and currency == "AED":
+            price_str = format_dual_currency(price, departure)
+        elif price:
+            price_str = f"{_fmt_amount(price)} {currency}"
+        else:
+            price_str = "pricing unavailable"
         badge = " ⭐ Best value (medical coverage per AED spent)" if i == best_value_idx else ""
         lines.append(f"Option {i + 1}: {insurer} ({plan}) — {price_str}{badge}")
 
@@ -584,6 +747,41 @@ def format_quotes_list(state: dict, sort_by: str = "price_asc") -> str:
         "show add-ons for option N, or compare 1 and 2 (etc.)."
     )
     return "\n".join(lines)
+
+
+def quotes_summary_for_email(state: dict) -> str:
+    """Same per-option formatting as format_quotes_list (insurer, plan,
+    dual-currency price) minus the "reply with a number" chat-only CTA —
+    used by email_quote_endpoint so the emailed quote matches what's on
+    screen. Does not re-sort — uses whatever order is currently in
+    state['available_quotes'] (already sorted by the last sort command,
+    or price_asc by default from try_fetch_quotes)."""
+    quotes = state.get("available_quotes", [])[:5]
+    departure = state.get("departure", "")
+    lines = []
+    for i, q in enumerate(quotes):
+        insurer = q.get("insurer", {}).get("name", "Insurer")
+        plan = q.get("plan", {}).get("name", "Standard")
+        price = _quote_price(q)
+        currency = q.get("plan", {}).get("price", {}).get("currency", "AED")
+        if price and currency == "AED":
+            price_str = format_dual_currency(price, departure)
+        elif price:
+            price_str = f"{_fmt_amount(price)} {currency}"
+        else:
+            price_str = "pricing unavailable"
+        lines.append(f"Option {i + 1}: {insurer} ({plan}) — {price_str}")
+    return "\n".join(lines)
+
+
+def trip_summary_for_email(state: dict) -> str:
+    parts = [
+        f"{state.get('destination', '')} ({state.get('coverage_type', '')})",
+        f"{_format_date_human(state.get('start_date', ''))} – {_format_date_human(state.get('end_date', ''))}",
+        f"Travelling from {state.get('departure', '')}" if state.get("departure") else "",
+        f"{state.get('cover_type', '')} cover, {state.get('plan_type', '')}",
+    ]
+    return " · ".join(p for p in parts if p.strip(" ()–"))
 
 
 def parse_option_number(message: str) -> int:
@@ -646,52 +844,60 @@ def _find_section_item(quote: dict, label: str):
     return None
 
 
-def format_compare_quotes(quotes: list, indices: list) -> str:
-    """Plain-text comparison of 2+ selected quotes across a curated set of
-    coverage line items, plus price — grouped by line item with each
-    quote's value indented beneath, since the actual Ava chat bubble has
-    no table renderer at all (confirmed live: it renders message text
-    as-is, so a markdown pipe table used to show up as literal '|' and
-    '---' characters rather than an actual table)."""
+def format_compare_quotes(quotes: list, indices: list, departure: str = "") -> tuple:
+    """Returns (intro_text, table). intro_text ("Comparing X and Y:") is the
+    only text streamed into the chat bubble; table is
+    {"columns": [name, ...], "rows": [{"label": ..., "values": [...]}]},
+    attached separately via ChatResponse.ui (ui.type == "comparison_table")
+    for the frontend to render as a real HTML <table> — the chat bubble
+    itself has no markdown table renderer (confirmed live: a plain-text
+    pipe table used to show up as literal '|' and '---' characters), and
+    this whole file is Ava-only, so the table renderer this feeds is never
+    reachable from Layla's plain RAG replies."""
     selected = [quotes[i] for i in indices if 0 <= i < len(quotes)]
     if len(selected) < 2:
-        return "I need at least 2 valid option numbers to compare — try 'compare 1 and 2'."
+        return "I need at least 2 valid option numbers to compare — try 'compare 1 and 2'.", None
 
     def col_name(q):
         return f"{q.get('insurer', {}).get('name', 'Insurer')} ({q.get('plan', {}).get('name', '')})"
 
     names = [col_name(q) for q in selected]
-    blocks = [f"Comparing {_join_natural(names)}:"]
+    intro = f"Comparing {_join_natural(names)}:"
 
-    price_lines = ["Price"]
-    for q, name in zip(selected, names):
+    rows = []
+
+    price_values = []
+    for q in selected:
         price = _quote_price(q)
         currency = q.get("plan", {}).get("price", {}).get("currency", "")
-        price_str = f"{_fmt_amount(price)} {currency}" if price else "N/A"
-        price_lines.append(f"  {name}: {price_str}")
-    blocks.append("\n".join(price_lines))
+        if price and currency == "AED":
+            price_values.append(format_dual_currency(price, departure))
+        elif price:
+            price_values.append(f"{_fmt_amount(price)} {currency}")
+        else:
+            price_values.append("N/A")
+    rows.append({"label": "Price", "values": price_values})
 
     for label in _COMPARE_LABELS:
-        item_lines, any_found = [f"{label}"], False
-        for q, name in zip(selected, names):
+        item_values, any_found = [], False
+        for q in selected:
             item = _find_section_item(q, label)
             if item is None:
-                item_lines.append(f"  {name}: not listed")
+                item_values.append("not listed")
                 continue
             any_found = True
             val = item.get("value")
             currency = item.get("currency", "")
             if val is False or val is None:
-                val_str = "not covered"
+                item_values.append("not covered")
             elif isinstance(val, (int, float)):
-                val_str = f"{currency} {val:,.0f}".strip()
+                item_values.append(f"{currency} {val:,.0f}".strip())
             else:
-                val_str = str(val)
-            item_lines.append(f"  {name}: {val_str}")
+                item_values.append(str(val))
         if any_found:
-            blocks.append("\n".join(item_lines))
+            rows.append({"label": label, "values": item_values})
 
-    return "\n\n".join(blocks)
+    return intro, {"columns": names, "rows": rows}
 
 
 # Rough hemisphere list used only to decide which months count as "winter"
@@ -878,7 +1084,22 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
         db.add(Message(session_id=request.session_id, role="user", content=request.message))
         db.commit()
 
+        # A question about the process/quote itself ("what is coverage
+        # type?", "how do I fill this in?") — answered directly by Ava's
+        # own LLM and returned immediately, without touching state/phase at
+        # all, so the in-progress form/flow resumes exactly where it left
+        # off on the next message. Checked before the phase machine so it
+        # applies in every phase (QUOTING/CHOOSING/BINDING/ISSUING) — it's a
+        # pure read with zero side effects, safe everywhere.
+        if is_ava_process_question(request.message):
+            answer = answer_ava_process_question(request.message, state)
+            db.add(Message(session_id=request.session_id, role="assistant", content=answer))
+            db.commit()
+            return ChatResponse(response=answer, options=determine_reply_options(state, answer) or None)
+
         final_reply = ""
+        comparison_table = None  # set only by the CHOOSING phase's "compare" branch below
+        showed_quote_list = False  # set wherever a quote list is actually shown, for the "email me this quote" button
 
         if current_phase == "QUOTING":
             # 1. Extract/update fields from the latest message (flat, single-message schema —
@@ -893,6 +1114,7 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
             else:
                 updated_state = llm_service.extract_fields_from_conversation(db, request.session_id, request.message)
             state = merge_extracted_fields(state, updated_state)
+            apply_coverage_type_locks(state)
 
             newly_filled = [f for f in REQUIRED_FIELDS if f in previously_missing and state.get(f)]
 
@@ -950,10 +1172,12 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
                 else:
                     quote_reply = try_fetch_quotes(state, request.message)
                     final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state, newly_filled=newly_filled, user_message=request.message)
+                    showed_quote_list = quote_reply is not None and state.get("phase") == "CHOOSING"
             else:
                 # 4. Individual policy with a complete checklist — fetch quotes now.
                 quote_reply = try_fetch_quotes(state, request.message)
                 final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state, newly_filled=newly_filled, user_message=request.message)
+                showed_quote_list = quote_reply is not None and state.get("phase") == "CHOOSING"
 
         elif current_phase == "CHOOSING":
             msg_clean = request.message.strip()
@@ -966,9 +1190,10 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
 
             if sort_by:
                 final_reply = format_quotes_list(state, sort_by=sort_by)
+                showed_quote_list = True
             elif wants_compare:
                 indices = parse_compare_indices(msg_lower)
-                final_reply = format_compare_quotes(quotes, indices)
+                final_reply, comparison_table = format_compare_quotes(quotes, indices, departure=state.get("departure", ""))
             elif wants_addons:
                 idx = parse_option_number(msg_lower)
                 if 0 <= idx < len(quotes):
@@ -1039,7 +1264,13 @@ def chat_endpoint(request: ChatRequest, db: DBSession = Depends(get_db)):
         db.add(Message(session_id=request.session_id, role="assistant", content=final_reply))
         db.commit()
 
-        return ChatResponse(response=final_reply, options=determine_reply_options(state, final_reply) or None)
+        if comparison_table:
+            ui = {"type": "comparison_table", "table": comparison_table}
+        elif showed_quote_list:
+            ui = {"type": "quote_list"}
+        else:
+            ui = None
+        return ChatResponse(response=final_reply, options=determine_reply_options(state, final_reply) or None, ui=ui)
 
     except Exception as e:
         db.rollback()
@@ -1065,6 +1296,7 @@ def upload_document_endpoint(
         db_session = get_or_create_session(db, session_id)
         state = db_session.extracted_data or {}
         state.setdefault("phase", "QUOTING")
+        showed_quote_list = False
 
         db.add(Message(session_id=session_id, role="user", content=f"📎 Uploaded document: {file.filename}"))
         db.commit()
@@ -1101,6 +1333,7 @@ def upload_document_endpoint(
                 inferred = infer_coverage_type_from_destination(state["destination"])
                 if inferred:
                     state["coverage_type"] = inferred
+            apply_coverage_type_locks(state)
 
             bad_field, consistency_error = check_coverage_consistency(state)
             if consistency_error:
@@ -1119,6 +1352,7 @@ def upload_document_endpoint(
                 quote_reply = try_fetch_quotes(state) if state.get("phase") == "QUOTING" else None
                 if quote_reply is not None:
                     final_reply = quote_reply
+                    showed_quote_list = state.get("phase") == "CHOOSING"
                 else:
                     final_reply = build_missing_fields_reply(state, preamble=preamble)
 
@@ -1129,8 +1363,279 @@ def upload_document_endpoint(
         db.add(Message(session_id=session_id, role="assistant", content=final_reply))
         db.commit()
 
-        return ChatResponse(response=final_reply, options=determine_reply_options(state, final_reply) or None)
+        return ChatResponse(
+            response=final_reply,
+            options=determine_reply_options(state, final_reply) or None,
+            collected_fields=state,
+            ui={"type": "quote_list"} if showed_quote_list else None,
+        )
 
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/submit-intake-form", response_model=ChatResponse)
+def submit_intake_form_endpoint(payload: IntakeFormRequest, db: DBSession = Depends(get_db)):
+    """
+    Structured, single-shot alternative to the QUOTING-phase conversational
+    flow above: the frontend's intake form collects all REQUIRED_FIELDS
+    directly (typed inputs, not free text), so no LLM extraction is
+    needed — values are written straight into state. Deliberately reuses
+    the exact same validation and quote-fetch functions the conversational
+    flow uses (check_coverage_consistency, travellers_requirement_met,
+    try_fetch_quotes) so a form submission and an equivalent conversational
+    answer produce identical downstream behavior — this endpoint only
+    changes HOW the fields are collected, not what happens once they are.
+    """
+    try:
+        db_session = get_or_create_session(db, payload.session_id)
+        state = db_session.extracted_data or {}
+        state.setdefault("phase", "QUOTING")
+
+        if state.get("phase") not in ("QUOTING", "CHOOSING"):
+            raise HTTPException(
+                status_code=409,
+                detail="You've already selected a quote for this trip — details can no longer be edited.",
+            )
+
+        # CHOOSING means a quote was already fetched once — this call is an
+        # edit (via the summary card's "Edit details" button), not a first
+        # submission. Tracked so the protego-session staleness check below
+        # only applies to edits, and so the logged user message reads right.
+        was_editing = state.get("phase") == "CHOOSING"
+        prior_contact = {k: state.get(k, "") for k in ("first_name", "last_name", "email", "mobile_number")}
+
+        db.add(Message(
+            session_id=payload.session_id, role="user",
+            content="✏️ Updated intake form" if was_editing else "📝 Submitted intake form",
+        ))
+        db.commit()
+
+        field_values = {
+            "first_name": payload.first_name.strip(),
+            "last_name": payload.last_name.strip(),
+            "email": payload.email.strip(),
+            "mobile_number": payload.mobile_number.strip(),
+            "coverage_type": payload.coverage_type.strip(),
+            "destination": normalize_country(payload.destination.strip()) if payload.destination.strip() else "",
+            "departure": normalize_country(payload.departure.strip()) if payload.departure.strip() else "",
+            "start_date": normalize_date(payload.start_date.strip()) if payload.start_date.strip() else "",
+            "end_date": normalize_date(payload.end_date.strip()) if payload.end_date.strip() else "",
+            "plan_type": payload.plan_type.strip(),
+            "cover_type": payload.cover_type.strip(),
+            "date_of_birth": normalize_date(payload.date_of_birth.strip()) if payload.date_of_birth.strip() else "",
+        }
+
+        # Backstop for a coverage_type that locks destination/departure to a
+        # single valid value (see apply_coverage_type_locks) — the frontend
+        # is expected to already pre-fill/disable these before the user can
+        # even submit, but a direct API call or a stale client shouldn't be
+        # forced to guess the one correct value either.
+        locked = COVERAGE_TYPE_LOCKS.get(field_values.get("coverage_type", ""), {})
+        for field, value in locked.items():
+            if not field_values.get(field):
+                field_values[field] = value
+
+        missing = [f for f in REQUIRED_FIELDS if not field_values.get(f)]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "missing_fields", "fields": missing},
+            )
+
+        # Backstop for the same two checks the form already does inline
+        # (isValidEmail/isValidPhoneForCountry in app.js) — a direct API
+        # call or a stale client shouldn't be able to skip past either.
+        # Deliberately permissive on email (matches the frontend's own
+        # regex — accepts business/personal/education addresses alike, not
+        # a strict RFC 5322 pattern that rejects valid real-world ones) and
+        # generic on phone (E.164 shape only — the frontend is where the
+        # richer per-country length check lives, since that table only
+        # needs to exist once).
+        if not _EMAIL_RE.match(field_values["email"]):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_field", "field": "email", "message": "Please enter a valid email address."},
+            )
+        if not re.match(r"^\+?[1-9]\d{6,14}$", field_values["mobile_number"]):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_field", "field": "mobile_number", "message": "Please enter a valid mobile number."},
+            )
+
+        # Backstop for the same calendar bounds the form's date inputs
+        # already enforce via min/max (date_of_birth can't be in the
+        # future; a trip can't start in the past or end before it starts).
+        # normalize_date already converted these to YYYY-MM-DD, which
+        # compares correctly as plain strings.
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", field_values["date_of_birth"]) and field_values["date_of_birth"] > today_str:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_field", "field": "date_of_birth", "message": "Date of birth can't be in the future."},
+            )
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", field_values["start_date"]) and field_values["start_date"] < today_str:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_field", "field": "start_date", "message": "Trip start date can't be in the past."},
+            )
+        if (
+            re.match(r"^\d{4}-\d{2}-\d{2}$", field_values["end_date"])
+            and re.match(r"^\d{4}-\d{2}-\d{2}$", field_values["start_date"])
+            and field_values["end_date"] < field_values["start_date"]
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_field", "field": "end_date", "message": "Trip end date can't be before the start date."},
+            )
+
+        state.update(field_values)
+
+        # create_session's payload is built from exactly these four fields
+        # and its result (protego_session_id/client_id) is cached forever
+        # once set — editing one of them and re-fetching without clearing
+        # the cache would leave Protego's own session record tied to the
+        # pre-edit identity while the rest of the quote request uses the
+        # corrected values. fetch_live_quotes itself is fully stateless, so
+        # this is the only staleness risk a second submission introduces.
+        if was_editing and any(state.get(k, "") != prior_contact[k] for k in prior_contact):
+            state.pop("protego_session_id", None)
+            state.pop("protego_client_id", None)
+
+        # Same consistency check the conversational flow runs (chat_endpoint,
+        # QUOTING branch) — pops the offending field on conflict so the form
+        # re-asks for just that one, not the whole form.
+        bad_field, consistency_error = check_coverage_consistency(state)
+        if consistency_error:
+            state.pop(bad_field, None)
+            db_session.extracted_data = state
+            flag_modified(db_session, "extracted_data")
+            sync_field_tracking(db_session, state)
+            db.commit()
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "field_conflict", "field": bad_field, "message": consistency_error},
+            )
+
+        if state.get("cover_type") in MULTI_TRAVELLER_COVER_TYPES:
+            travellers = [
+                {
+                    "first_name": t.first_name.strip(),
+                    "last_name": t.last_name.strip(),
+                    "date_of_birth": normalize_date(t.date_of_birth.strip()) if t.date_of_birth.strip() else "",
+                }
+                for t in payload.additional_travellers
+                if t.first_name.strip() and t.date_of_birth.strip()
+            ]
+            if 1 + len(travellers) > MAX_TRAVELLERS_TOTAL:
+                travellers = travellers[: MAX_TRAVELLERS_TOTAL - 1]
+            state["additional_travellers"] = travellers
+
+            if not travellers_requirement_met(state):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "travellers_required",
+                        "message": f"{state['cover_type']} cover needs at least "
+                                   f"{MIN_TRAVELLERS_FOR_MULTI} travellers — add at least "
+                                   f"{MIN_TRAVELLERS_FOR_MULTI - 1} companion(s) with a name and date of birth.",
+                    },
+                )
+
+            all_travellers = [{
+                "first_name": state.get("first_name", ""),
+                "last_name": state.get("last_name", ""),
+                "date_of_birth": state.get("date_of_birth", ""),
+            }] + travellers
+            upsert_extracted_value(db, payload.session_id, "traveler_details", json.dumps(all_travellers))
+            upsert_extracted_value(db, payload.session_id, "number_of_travelers", str(len(all_travellers)))
+
+        for field in REQUIRED_FIELDS:
+            db.add(FieldExtractionLog(
+                session_id=payload.session_id,
+                field_name=field,
+                field_value=str(state.get(field, "")),
+                source_message="📝 Submitted intake form",
+            ))
+        sync_extracted_values(db, payload.session_id, state, REQUIRED_FIELDS)
+
+        # Set directly from the form's checkbox — try_fetch_quotes's own
+        # marketing-consent gate only fires when the key is absent, so this
+        # skips that conversational yes/no round-trip entirely.
+        state["marketing_consent"] = "yes" if payload.marketing_consent else "no"
+
+        quote_reply = try_fetch_quotes(state)
+        final_reply = quote_reply if quote_reply is not None else build_missing_fields_reply(state)
+        showed_quote_list = quote_reply is not None and state.get("phase") == "CHOOSING"
+
+        db_session.extracted_data = state
+        flag_modified(db_session, "extracted_data")
+        sync_field_tracking(db_session, state)
+
+        db.add(Message(session_id=payload.session_id, role="assistant", content=final_reply))
+        db.commit()
+
+        ui = {"type": "quote_list"} if showed_quote_list else None
+        return ChatResponse(response=final_reply, collected_fields=state, ui=ui)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/email-quote", response_model=ChatResponse)
+def email_quote_endpoint(payload: EmailQuoteRequest, db: DBSession = Depends(get_db)):
+    """Sends the customer their currently-available quotes by email. Reads
+    quote data fresh from the session's own state (never trusts anything
+    the client might send about which quotes are shown) — the "Email me
+    this quote" button just tells this endpoint who to email, nothing
+    about what's in the email itself."""
+    try:
+        db_session = get_or_create_session(db, payload.session_id)
+        state = db_session.extracted_data or {}
+
+        quotes = state.get("available_quotes") or []
+        if not quotes:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "no_quotes", "message": "There's no quote to email yet — get a quote first."},
+            )
+
+        email = payload.email.strip()
+        if not _EMAIL_RE.match(email):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_field", "field": "email", "message": "Please enter a valid email address."},
+            )
+
+        from email_utils import compose_quotation_email_body, send_quotation_email
+
+        recipient_name = state.get("first_name", "").strip()
+        trip_summary = trip_summary_for_email(state)
+        quotes_text = quotes_summary_for_email(state)
+        body_html = compose_quotation_email_body(payload.session_id, recipient_name, trip_summary, quotes_text)
+
+        sent = send_quotation_email(email, "Your InsureHub Travel Insurance Quote", body_html)
+        if not sent:
+            raise HTTPException(
+                status_code=502,
+                detail="Couldn't send the email right now — please try again in a moment.",
+            )
+
+        final_reply = f"✅ Sent your quote to {email}."
+        db.add(Message(session_id=payload.session_id, role="user", content=f"📧 Requested quote by email to {email}"))
+        db.add(Message(session_id=payload.session_id, role="assistant", content=final_reply))
+        db.commit()
+
+        return ChatResponse(response=final_reply)
+
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

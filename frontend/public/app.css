@@ -246,6 +246,102 @@ a { color: var(--teal-600); }
 .msg__bubble strong { font-weight: 700; }
 .msg__bubble code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 0.87em; }
 
+/* Ava quote-comparison table — real <table> markup (see buildComparisonTable()
+   in app.js), not markdown, since the chat bubble has no table renderer.
+   Horizontally scrollable: column headers (insurer + plan name) can be long
+   and the bubble itself is narrow. */
+.compare-table-wrap { margin-top: 10px; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.compare-table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); white-space: nowrap; }
+.compare-table th, .compare-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.compare-table thead th { background: var(--surface-2); font-weight: 700; color: var(--ink-text); }
+.compare-table thead th:first-child { background: var(--surface-2); }
+.compare-table tbody th { font-weight: 600; color: var(--text-muted); background: var(--surface-2); }
+.compare-table tbody tr:last-child th, .compare-table tbody tr:last-child td { border-bottom: none; }
+.compare-table td { color: var(--ink-text); }
+
+/* "Email me this quote" — attached below any quote-list assistant bubble
+   (see buildEmailQuoteButton() in app.js). */
+.email-quote { margin-top: 10px; }
+.email-quote__btn { font-size: var(--fs-sm); font-weight: 600; padding: 7px 14px; border-radius: var(--radius-pill); background: var(--surface-2); border: 1px solid var(--border-strong); color: var(--ink-text); }
+.email-quote__btn:hover { background: var(--border); }
+.email-quote__row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.email-quote__input { flex: 1 1 200px; min-width: 0; padding: 7px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); font-size: var(--fs-sm); }
+.email-quote__send { font-size: var(--fs-sm); font-weight: 700; padding: 7px 16px; border-radius: var(--radius-pill); background: var(--amber-500); color: #fff; }
+.email-quote__send:hover:not(:disabled) { background: var(--amber-600); }
+.email-quote__send:disabled { opacity: 0.6; cursor: default; }
+.email-quote__error { display: block; margin-top: 6px; font-size: var(--fs-xs); color: var(--amber-600); }
+.email-quote__sent { font-size: var(--fs-sm); font-weight: 600; color: var(--success); }
+
+/* Ava intake form card — a special assistant bubble carrying a live form
+   instead of markdown text. See buildAvaFormCard() in app.js. */
+.msg__bubble--form { background: var(--surface); border: 1px solid var(--border); border-top-left-radius: 5px; padding: 16px; }
+.ava-form { display: flex; flex-direction: column; gap: 12px; }
+.ava-form__intro { margin: 0; font-size: var(--fs-base); color: var(--text-muted); }
+.ava-form__error { background: var(--amber-100); border: 1px solid var(--amber-500); color: var(--amber-600); border-radius: var(--radius-sm); padding: 8px 12px; font-size: var(--fs-sm); }
+
+.ava-form__upload-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ava-form__upload-btn { font-size: var(--fs-sm); font-weight: 600; padding: 8px 14px; border-radius: var(--radius-pill); border: 1px dashed var(--teal-500); background: var(--teal-100); color: var(--teal-600); }
+.ava-form__upload-btn:hover { background: var(--teal-500); color: #fff; }
+.ava-form__upload-status { font-size: var(--fs-xs); color: var(--text-muted); }
+
+.ava-form__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.ava-form__field { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-sm); }
+.ava-form__label { font-size: var(--fs-xs); font-weight: 600; color: var(--text-muted); line-height: 1.3; display: block; min-height: calc(1.3em * 2); }
+.ava-form__field input, .ava-form__field select { font: inherit; padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); color: var(--ink-text); }
+.ava-form__field input:disabled { background: var(--surface-2); color: var(--text-muted); cursor: not-allowed; }
+.ava-form__field input:focus, .ava-form__field select:focus { outline: 2px solid var(--teal-500); outline-offset: 1px; }
+.ava-form__field input.is-invalid { border-color: var(--amber-500); }
+.ava-form__field-error { font-size: var(--fs-xs); color: var(--amber-600); }
+
+/* Spans the full card width (not just one auto-fit track) — two side-by-side
+   controls (country + number) need more room than a single "First name"-
+   sized cell has on a narrow screen. The fixed-pixel minmax() lower bounds
+   below (120px/100px) don't shrink past their minimum even when the track
+   is narrower than that, which is exactly what pushed the number input
+   outside the card on mobile — min-width: 0 on the children is required
+   for CSS Grid/Flexbox to allow shrinking below a form control's intrinsic
+   content width at all, it's not automatic. */
+.ava-form__phone-field { grid-column: 1 / -1; min-width: 0; }
+.ava-form__phone-row { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 6px; min-width: 0; }
+.ava-form__phone-row select, .ava-form__phone-row input, .ava-form__phone-row .country-search { min-width: 0; }
+
+/* Searchable country combobox — a plain text input + filtered dropdown list,
+   since a native <select> has no search/type-ahead beyond jumping to the
+   first matching letter, which doesn't scale to ~70 countries. */
+.country-search { position: relative; min-width: 0; }
+.country-search__input { width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); color: var(--ink-text); }
+.country-search__input:focus { outline: 2px solid var(--teal-500); outline-offset: 1px; }
+.country-search__list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20; max-height: 220px; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow-md); }
+.country-search__item { padding: 8px 10px; font-size: var(--fs-sm); cursor: pointer; }
+.country-search__item:hover, .country-search__item.is-active { background: var(--teal-100); }
+.country-search__empty { padding: 8px 10px; font-size: var(--fs-sm); color: var(--text-muted); }
+
+.ava-form__companions { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-2); }
+.ava-form__companion-row { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; align-items: center; }
+.ava-form__companion-row input { font: inherit; padding: 7px 9px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); }
+.ava-form__companion-remove { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface); color: var(--text-muted); }
+.ava-form__companion-remove:hover { background: var(--amber-100); color: var(--amber-600); border-color: var(--amber-500); }
+.ava-form__companion-add { align-self: flex-start; font-size: var(--fs-sm); font-weight: 600; color: var(--teal-600); background: none; border: none; padding: 4px 2px; }
+.ava-form__companion-add:hover { text-decoration: underline; }
+
+.ava-form__consent { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); color: var(--text-muted); cursor: pointer; }
+
+.ava-form__submit { align-self: flex-start; font-size: var(--fs-base); font-weight: 700; padding: 10px 20px; border-radius: var(--radius-pill); background: var(--amber-500); color: #fff; box-shadow: var(--shadow-sm); }
+.ava-form__submit:hover:not(:disabled) { background: var(--amber-600); }
+.ava-form__submit:disabled { opacity: 0.6; cursor: default; }
+
+.ava-form__summary-title { font-size: var(--fs-md); font-weight: 700; color: var(--ink-text); }
+.ava-form__summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px 16px; }
+.ava-form__summary-row { display: flex; justify-content: space-between; gap: 8px; font-size: var(--fs-sm); border-bottom: 1px dashed var(--border); padding-bottom: 4px; }
+.ava-form__summary-label { color: var(--text-muted); }
+.ava-form__edit-btn { align-self: flex-start; margin-top: 10px; font-size: var(--fs-sm); font-weight: 600; padding: 7px 14px; border-radius: var(--radius-pill); background: var(--surface-2); border: 1px solid var(--border-strong); color: var(--ink-text); }
+.ava-form__edit-btn:hover { background: var(--border); }
+
+@media (max-width: 480px) {
+  .ava-form__companion-row { grid-template-columns: 1fr 1fr; }
+  .ava-form__companion-remove { grid-column: span 2; justify-self: start; }
+}
+
 .typing-dots { display: inline-flex; align-items: center; gap: 4px; padding: 4px 2px; }
 .typing-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); animation: typing-bounce 1.1s var(--ease) infinite; }
 .typing-dots span:nth-child(2) { animation-delay: 0.15s; }

@@ -68,6 +68,79 @@ function msg(role, content, timestamp) {
   return { id: uid(), role, content, timestamp, feedback: null };
 }
 
+// The 11 fields Ava's intake form collects — see travel_bot/routers/chat.py
+// REQUIRED_FIELDS. Mirrored here (not fetched) because the shape is fixed
+// and small; field_options (the 3 dropdowns' choices) DOES come from the
+// backend's ui signal, not hardcoded, since FIELD_OPTIONS_MAP is the single
+// source of truth there.
+const AVA_FORM_FIELDS = [
+  'first_name', 'last_name', 'email', 'mobile_number',
+  'coverage_type', 'destination', 'departure', 'start_date', 'end_date',
+  'plan_type', 'cover_type', 'date_of_birth',
+];
+
+// role: 'ava_form' message — a special card rendered inline in the thread
+// (see buildAvaFormCard). formState is the single source of truth for its
+// field values: renderThread() fully rebuilds the DOM from state.messages
+// on every call (including on every streamed token of any concurrent
+// reply), so anything living only in the live DOM would be silently lost
+// on the next unrelated render. Every input writes here on change, and the
+// card is re-rendered FROM this object every time — never the other way
+// around.
+function buildAvaFormMessage(ui, collectedFields) {
+  const values = {};
+  for (const f of AVA_FORM_FIELDS) values[f] = (collectedFields && collectedFields[f]) || '';
+  const coverageTypeLocks = (ui && ui.coverage_type_locks) || {};
+  // Pre-fill immediately if the document/extraction already knew a coverage
+  // type before the form was even shown — same "don't ask what's already
+  // determined" principle as picking coverage_type itself.
+  const initialLocks = coverageTypeLocks[values.coverage_type] || {};
+  for (const [field, value] of Object.entries(initialLocks)) {
+    if (!values[field]) values[field] = value;
+  }
+
+  // Try to decompose an already-known mobile_number (a resumed session, or
+  // one a document upload pre-filled) back into country + national number,
+  // so the phone country picker shows something sensible instead of
+  // reverting to blank the moment the form renders.
+  let mobileCountry = '';
+  let mobileNational = '';
+  if (values.mobile_number) {
+    const raw = values.mobile_number.replace(/[\s-]/g, '');
+    const digits = raw.startsWith('+') ? raw.slice(1) : raw;
+    const match = Object.entries(COUNTRY_DIAL_CODES)
+      .sort((a, b) => b[1].code.length - a[1].code.length)
+      .find(([, entry]) => digits.startsWith(entry.code));
+    if (match) {
+      mobileCountry = match[0];
+      mobileNational = digits.slice(match[1].code.length);
+    } else {
+      mobileNational = digits;
+    }
+  }
+
+  return {
+    id: uid(),
+    role: 'ava_form',
+    content: '',
+    timestamp: Date.now(),
+    feedback: null,
+    formState: {
+      fieldOptions: (ui && ui.field_options) || {},
+      coverageTypeLocks,
+      values,
+      mobileCountry,
+      mobileNational,
+      fieldErrors: {},
+      additionalTravellers: [],
+      marketingConsent: false,
+      submitted: false,
+      quoteReply: null,
+      error: null,
+    },
+  };
+}
+
 /* =========================================================================
    3. API MODULE — real backend by default, mock is the opt-in
    ========================================================================= */
@@ -183,6 +256,8 @@ const API = {
             correctedText: meta.corrected_text || null,
             needsHuman: !!meta.needs_human,
             offlineEscalated: !!meta.offline_escalated,
+            ui: meta.ui || null,
+            collectedFields: meta.collected_fields || null,
           };
         } catch {
           yield { type: 'done' };
@@ -255,6 +330,172 @@ function inlineMd(s) {
   return s
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/`(.+?)`/g, '<code>$1</code>');
+}
+
+// Real HTML <table> for Ava's quote-comparison replies — table is
+// {columns: [name, ...], rows: [{label, values: [...]}]} from
+// travel_bot/routers/chat.py's format_compare_quotes. Wrapped in a
+// horizontally-scrollable container since column names (insurer + plan)
+// can be long and this renders inside a narrow chat bubble.
+function buildComparisonTable(table) {
+  const wrap = document.createElement('div');
+  wrap.className = 'compare-table-wrap';
+
+  const el = document.createElement('table');
+  el.className = 'compare-table';
+
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  headRow.appendChild(document.createElement('th'));
+  for (const col of table.columns) {
+    const th = document.createElement('th');
+    th.textContent = col;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  el.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const row of table.rows) {
+    const tr = document.createElement('tr');
+    const labelCell = document.createElement('th');
+    labelCell.scope = 'row';
+    labelCell.textContent = row.label;
+    tr.appendChild(labelCell);
+    for (const val of row.values) {
+      const td = document.createElement('td');
+      td.textContent = val;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  el.appendChild(tbody);
+
+  wrap.appendChild(el);
+  return wrap;
+}
+
+// "Email me this quote" — attached to any assistant message with
+// isQuoteList set (see the SSE done-handler and submitAvaForm). The quote
+// data itself is never sent from here — /api/chat/email-quote re-reads it
+// from the session's own state server-side, so this only ever needs to
+// know WHO to send it to. UI-only state (is the input row open, was it
+// already sent) lives on the message object itself, not the DOM — a
+// concurrent renderThread() rebuild (e.g. from a background stream chunk)
+// would otherwise silently reset an open input row, same lesson as the
+// Ava form card's own formState.
+function buildEmailQuoteButton(m) {
+  const wrap = document.createElement('div');
+  wrap.className = 'email-quote';
+
+  if (m.emailSentTo) {
+    const sentEl = document.createElement('div');
+    sentEl.className = 'email-quote__sent';
+    sentEl.textContent = `✅ Sent to ${m.emailSentTo}`;
+    wrap.appendChild(sentEl);
+    return wrap;
+  }
+
+  if (!m.emailRowOpen) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'email-quote__btn';
+    btn.textContent = '📧 Email me this quote';
+    btn.addEventListener('click', () => {
+      m.emailRowOpen = true;
+      saveState();
+      rerenderEmailQuoteButton(m);
+    });
+    wrap.appendChild(btn);
+    return wrap;
+  }
+
+  const row = document.createElement('div');
+  row.className = 'email-quote__row';
+
+  const input = document.createElement('input');
+  input.type = 'email';
+  input.className = 'email-quote__input';
+  input.placeholder = 'you@example.com';
+  input.value = m.emailDraft || getDefaultAvaEmail();
+  input.addEventListener('input', () => { m.emailDraft = input.value; });
+
+  const sendBtn = document.createElement('button');
+  sendBtn.type = 'button';
+  sendBtn.className = 'email-quote__send';
+  sendBtn.textContent = 'Send';
+
+  const errEl = document.createElement('span');
+  errEl.className = 'email-quote__error';
+  errEl.hidden = true;
+
+  sendBtn.addEventListener('click', () => sendQuoteEmail(m, input.value, errEl, sendBtn));
+
+  row.appendChild(input);
+  row.appendChild(sendBtn);
+  wrap.appendChild(row);
+  wrap.appendChild(errEl);
+  return wrap;
+}
+
+function rerenderEmailQuoteButton(m) {
+  const container = document.querySelector(`.msg[data-id="${m.id}"] .email-quote`);
+  if (!container) return;
+  container.replaceWith(buildEmailQuoteButton(m));
+}
+
+// Pre-fills the email input from the most recent Ava form's own email
+// field, if any — still asks the user (the field stays editable, matching
+// "ask the mail from the user"), just conveniently defaults instead of
+// starting blank.
+function getDefaultAvaEmail() {
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    const cand = state.messages[i];
+    if (cand.role === 'ava_form' && cand.formState && cand.formState.values && cand.formState.values.email) {
+      return cand.formState.values.email;
+    }
+  }
+  return '';
+}
+
+async function sendQuoteEmail(m, email, errEl, sendBtn) {
+  if (!isValidEmail(email)) {
+    errEl.textContent = 'Enter a valid email address.';
+    errEl.hidden = false;
+    return;
+  }
+  errEl.hidden = true;
+  sendBtn.disabled = true;
+  sendBtn.textContent = 'Sending…';
+
+  try {
+    const res = await fetch(`${API.baseUrl}/api/chat/email-quote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: state.sessionId, email }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const detail = data.detail;
+      errEl.textContent = (detail && typeof detail === 'object' && detail.message)
+        || (typeof detail === 'string' && detail)
+        || 'Something went wrong sending the email.';
+      errEl.hidden = false;
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+      return;
+    }
+    m.emailSentTo = email;
+    m.emailRowOpen = false;
+    saveState();
+    rerenderEmailQuoteButton(m);
+    pushSystemMessage(`✅ Sent your quote to ${email}.`);
+  } catch (err) {
+    errEl.textContent = 'Network error — please try again.';
+    errEl.hidden = false;
+    sendBtn.disabled = false;
+    sendBtn.textContent = 'Send';
+  }
 }
 
 /* =========================================================================
@@ -390,16 +631,26 @@ function buildMessageEl(m) {
   const avatar = document.createElement('div');
   avatar.className = 'msg__avatar';
   avatar.setAttribute('aria-hidden', 'true');
-  avatar.textContent = m.role === 'user' ? 'You' : m.role === 'agent' ? (m.agentName || 'A')[0].toUpperCase() : 'L';
+  avatar.textContent = m.role === 'user' ? 'You' : m.role === 'agent' ? (m.agentName || 'A')[0].toUpperCase() : m.role === 'ava_form' ? 'A' : 'L';
 
   const col = document.createElement('div');
   col.className = 'msg__col';
 
   const bubble = document.createElement('div');
-  bubble.className = 'msg__bubble';
-  bubble.innerHTML = (m.role === 'assistant' || m.role === 'agent')
-    ? renderMarkdown(m.content)
-    : escapeHtml(m.content);
+  bubble.className = m.role === 'ava_form' ? 'msg__bubble msg__bubble--form' : 'msg__bubble';
+  if (m.role === 'ava_form') {
+    bubble.appendChild(buildAvaFormCard(m));
+  } else {
+    bubble.innerHTML = (m.role === 'assistant' || m.role === 'agent')
+      ? renderMarkdown(m.content)
+      : escapeHtml(m.content);
+    if (m.comparisonTable) {
+      bubble.appendChild(buildComparisonTable(m.comparisonTable));
+    }
+    if (m.isQuoteList) {
+      bubble.appendChild(buildEmailQuoteButton(m));
+    }
+  }
 
   if (m.role === 'system') {
     // Centered notice pill (handoff transitions) — no timestamp, no avatar.
@@ -427,6 +678,937 @@ function buildMessageEl(m) {
   wrap.appendChild(avatar);
   wrap.appendChild(col);
   return wrap;
+}
+
+/* =========================================================================
+   6b. AVA INTAKE FORM CARD
+   ========================================================================= */
+
+const AVA_FIELD_LABELS = {
+  first_name: 'First name',
+  last_name: 'Last name',
+  email: 'Email',
+  mobile_number: 'Mobile number',
+  destination: 'Destination country',
+  departure: "Country you're travelling from",
+  start_date: 'Trip start date',
+  end_date: 'Trip end date',
+  date_of_birth: 'Date of birth',
+  coverage_type: 'Coverage type',
+  plan_type: 'Plan type',
+  cover_type: "Who's insured",
+};
+
+const AVA_FIELD_INPUT_TYPES = {
+  email: 'email',
+  mobile_number: 'tel',
+  start_date: 'date',
+  end_date: 'date',
+  date_of_birth: 'date',
+};
+
+const AVA_MULTI_TRAVELLER_COVER_TYPES = ['Group', 'Family'];
+
+// Country -> {code, digits}: dial code (no '+') and the set of national
+// significant number lengths that country's mobile numbers actually use.
+// Best-effort, not a full numbering-plan library (e.g. libphonenumber) —
+// most countries have one common mobile length, a few genuinely allow more
+// than one (Indonesia, Germany, Brazil). Mirrors the dial codes
+// quote_service.py's _KNOWN_DIAL_CODES recognizes server-side, so a number
+// composed here always splits correctly on the backend too.
+// Digit-length ranges below are ITU/national-numbering-plan best-effort,
+// not authoritative for every one of the ~195 countries — where the exact
+// national significant number length wasn't confidently known, a wider
+// plausible range is used instead of a fabricated precise value (still
+// catches obviously-wrong lengths, matches this validator's own documented
+// "better to accept than to wrongly block" philosophy below).
+const _digitRange = (min, max) => Array.from({ length: max - min + 1 }, (_, i) => min + i);
+
+const COUNTRY_DIAL_CODES = {
+  // Gulf / Middle East
+  'United Arab Emirates': { code: '971', digits: [9] },
+  'Saudi Arabia': { code: '966', digits: [9] },
+  'Qatar': { code: '974', digits: [8] },
+  'Kuwait': { code: '965', digits: [8] },
+  'Bahrain': { code: '973', digits: [8] },
+  'Oman': { code: '968', digits: [8] },
+  'Jordan': { code: '962', digits: [9] },
+  'Lebanon': { code: '961', digits: [7, 8] },
+  'Iraq': { code: '964', digits: [10] },
+  'Israel': { code: '972', digits: [9] },
+  'Palestine': { code: '970', digits: [9] },
+  'Syria': { code: '963', digits: [9] },
+  'Yemen': { code: '967', digits: [9] },
+  'Iran': { code: '98', digits: [10] },
+  // South Asia
+  'India': { code: '91', digits: [10] },
+  'Pakistan': { code: '92', digits: [10] },
+  'Bangladesh': { code: '880', digits: [10] },
+  'Sri Lanka': { code: '94', digits: [9] },
+  'Nepal': { code: '977', digits: [10] },
+  'Bhutan': { code: '975', digits: [7, 8] },
+  'Maldives': { code: '960', digits: [7] },
+  'Afghanistan': { code: '93', digits: [9] },
+  // Southeast Asia
+  'Philippines': { code: '63', digits: [10] },
+  'Indonesia': { code: '62', digits: [9, 10, 11, 12] },
+  'Malaysia': { code: '60', digits: [9, 10] },
+  'Singapore': { code: '65', digits: [8] },
+  'Thailand': { code: '66', digits: [9] },
+  'Vietnam': { code: '84', digits: [9, 10] },
+  'Myanmar': { code: '95', digits: _digitRange(7, 10) },
+  'Cambodia': { code: '855', digits: [8, 9] },
+  'Laos': { code: '856', digits: [8, 9, 10] },
+  'Brunei': { code: '673', digits: [7] },
+  'Timor-Leste': { code: '670', digits: [7, 8] },
+  // East Asia
+  'China': { code: '86', digits: [11] },
+  'Hong Kong': { code: '852', digits: [8] },
+  'Macau': { code: '853', digits: [8] },
+  'Japan': { code: '81', digits: [10] },
+  'South Korea': { code: '82', digits: [9, 10] },
+  'North Korea': { code: '850', digits: _digitRange(6, 8) },
+  'Taiwan': { code: '886', digits: [9] },
+  'Mongolia': { code: '976', digits: [8] },
+  // Central Asia / Caucasus
+  'Kazakhstan': { code: '7', digits: [10] },
+  'Uzbekistan': { code: '998', digits: [9] },
+  'Turkmenistan': { code: '993', digits: [8] },
+  'Kyrgyzstan': { code: '996', digits: [9] },
+  'Tajikistan': { code: '992', digits: [9] },
+  'Armenia': { code: '374', digits: [8] },
+  'Azerbaijan': { code: '994', digits: [9] },
+  'Georgia': { code: '995', digits: [9] },
+  // Europe
+  'United Kingdom': { code: '44', digits: [10] },
+  'Ireland': { code: '353', digits: [9] },
+  'France': { code: '33', digits: [9] },
+  'Germany': { code: '49', digits: [10, 11] },
+  'Italy': { code: '39', digits: [9, 10] },
+  'Spain': { code: '34', digits: [9] },
+  'Portugal': { code: '351', digits: [9] },
+  'Netherlands': { code: '31', digits: [9] },
+  'Belgium': { code: '32', digits: [9] },
+  'Austria': { code: '43', digits: [10, 11] },
+  'Greece': { code: '30', digits: [10] },
+  'Finland': { code: '358', digits: [9, 10] },
+  'Switzerland': { code: '41', digits: [9] },
+  'Norway': { code: '47', digits: [8] },
+  'Sweden': { code: '46', digits: [9] },
+  'Denmark': { code: '45', digits: [8] },
+  'Poland': { code: '48', digits: [9] },
+  'Turkey': { code: '90', digits: [10] },
+  'Russia': { code: '7', digits: [10] },
+  'Ukraine': { code: '380', digits: [9] },
+  'Belarus': { code: '375', digits: [9] },
+  'Moldova': { code: '373', digits: [8] },
+  'Romania': { code: '40', digits: [9] },
+  'Bulgaria': { code: '359', digits: [8, 9] },
+  'Serbia': { code: '381', digits: [8, 9] },
+  'Croatia': { code: '385', digits: [8, 9] },
+  'Bosnia and Herzegovina': { code: '387', digits: [8] },
+  'Montenegro': { code: '382', digits: [8] },
+  'North Macedonia': { code: '389', digits: [8] },
+  'Kosovo': { code: '383', digits: [8] },
+  'Albania': { code: '355', digits: [9] },
+  'Slovenia': { code: '386', digits: [8] },
+  'Slovakia': { code: '421', digits: [9] },
+  'Czech Republic': { code: '420', digits: [9] },
+  'Hungary': { code: '36', digits: [8, 9] },
+  'Iceland': { code: '354', digits: [7] },
+  'Estonia': { code: '372', digits: [7, 8] },
+  'Latvia': { code: '371', digits: [8] },
+  'Lithuania': { code: '370', digits: [8] },
+  'Luxembourg': { code: '352', digits: [9] },
+  'Malta': { code: '356', digits: [8] },
+  'Cyprus': { code: '357', digits: [8] },
+  'Monaco': { code: '377', digits: [8, 9] },
+  'San Marino': { code: '378', digits: _digitRange(6, 10) },
+  'Vatican City': { code: '379', digits: _digitRange(6, 10) },
+  'Liechtenstein': { code: '423', digits: [7] },
+  'Andorra': { code: '376', digits: [6] },
+  // Americas
+  'United States': { code: '1', digits: [10] },
+  'Canada': { code: '1', digits: [10] },
+  'Mexico': { code: '52', digits: [10] },
+  'Brazil': { code: '55', digits: [10, 11] },
+  'Argentina': { code: '54', digits: [10, 11] },
+  'Chile': { code: '56', digits: [9] },
+  'Colombia': { code: '57', digits: [10] },
+  'Peru': { code: '51', digits: [9] },
+  'Venezuela': { code: '58', digits: [10] },
+  'Ecuador': { code: '593', digits: [8, 9] },
+  'Bolivia': { code: '591', digits: [8] },
+  'Paraguay': { code: '595', digits: [9] },
+  'Uruguay': { code: '598', digits: [8] },
+  'Guyana': { code: '592', digits: [7] },
+  'Suriname': { code: '597', digits: [6, 7] },
+  'Guatemala': { code: '502', digits: [8] },
+  'Belize': { code: '501', digits: [7] },
+  'Honduras': { code: '504', digits: [8] },
+  'El Salvador': { code: '503', digits: [8] },
+  'Nicaragua': { code: '505', digits: [8] },
+  'Costa Rica': { code: '506', digits: [8] },
+  'Panama': { code: '507', digits: [7, 8] },
+  'Cuba': { code: '53', digits: [8] },
+  'Jamaica': { code: '1', digits: [10] },
+  'Haiti': { code: '509', digits: [8] },
+  'Dominican Republic': { code: '1', digits: [10] },
+  'Bahamas': { code: '1', digits: [10] },
+  'Trinidad and Tobago': { code: '1', digits: [10] },
+  'Barbados': { code: '1', digits: [10] },
+  'Antigua and Barbuda': { code: '1', digits: [10] },
+  'Dominica': { code: '1', digits: [10] },
+  'Grenada': { code: '1', digits: [10] },
+  'Saint Kitts and Nevis': { code: '1', digits: [10] },
+  'Saint Lucia': { code: '1', digits: [10] },
+  'Saint Vincent and the Grenadines': { code: '1', digits: [10] },
+  // Africa
+  'Egypt': { code: '20', digits: [10] },
+  'Morocco': { code: '212', digits: [9] },
+  'Tunisia': { code: '216', digits: [8] },
+  'Algeria': { code: '213', digits: [9] },
+  'Libya': { code: '218', digits: [9] },
+  'Sudan': { code: '249', digits: [9] },
+  'South Sudan': { code: '211', digits: [9] },
+  'South Africa': { code: '27', digits: [9] },
+  'Nigeria': { code: '234', digits: [10] },
+  'Kenya': { code: '254', digits: [9] },
+  'Ghana': { code: '233', digits: [9] },
+  'Ethiopia': { code: '251', digits: [9] },
+  'Tanzania': { code: '255', digits: [9] },
+  'Uganda': { code: '256', digits: [9] },
+  'Rwanda': { code: '250', digits: [9] },
+  'Burundi': { code: '257', digits: [8] },
+  'Angola': { code: '244', digits: [9] },
+  'Zambia': { code: '260', digits: [9] },
+  'Zimbabwe': { code: '263', digits: _digitRange(7, 9) },
+  'Malawi': { code: '265', digits: _digitRange(7, 9) },
+  'Mozambique': { code: '258', digits: [9] },
+  'Namibia': { code: '264', digits: _digitRange(7, 9) },
+  'Botswana': { code: '267', digits: [7, 8] },
+  'Eswatini': { code: '268', digits: [8] },
+  'Lesotho': { code: '266', digits: [8] },
+  'Madagascar': { code: '261', digits: [9] },
+  'Mauritius': { code: '230', digits: [7, 8] },
+  'Seychelles': { code: '248', digits: [6, 7] },
+  'Comoros': { code: '269', digits: [7] },
+  'Djibouti': { code: '253', digits: [8] },
+  'Eritrea': { code: '291', digits: [7] },
+  'Somalia': { code: '252', digits: _digitRange(7, 9) },
+  'Cameroon': { code: '237', digits: [9] },
+  'Central African Republic': { code: '236', digits: [8] },
+  'Chad': { code: '235', digits: [8] },
+  'Congo': { code: '242', digits: [9] },
+  'DR Congo': { code: '243', digits: [9] },
+  'Gabon': { code: '241', digits: [8, 9] },
+  'Equatorial Guinea': { code: '240', digits: [9] },
+  'Sao Tome and Principe': { code: '239', digits: [7] },
+  'Senegal': { code: '221', digits: [9] },
+  'Gambia': { code: '220', digits: [7] },
+  'Guinea': { code: '224', digits: [9] },
+  'Guinea-Bissau': { code: '245', digits: [7] },
+  'Mali': { code: '223', digits: [8] },
+  'Mauritania': { code: '222', digits: [8] },
+  'Niger': { code: '227', digits: [8] },
+  'Burkina Faso': { code: '226', digits: [8] },
+  'Ivory Coast': { code: '225', digits: [8, 10] },
+  'Sierra Leone': { code: '232', digits: [8] },
+  'Liberia': { code: '231', digits: _digitRange(7, 9) },
+  'Togo': { code: '228', digits: [8] },
+  'Benin': { code: '229', digits: [8] },
+  'Cape Verde': { code: '238', digits: [7] },
+  // Oceania
+  'Australia': { code: '61', digits: [9] },
+  'New Zealand': { code: '64', digits: [8, 9] },
+  'Fiji': { code: '679', digits: [7] },
+  'Papua New Guinea': { code: '675', digits: [7, 8] },
+  'Samoa': { code: '685', digits: _digitRange(5, 7) },
+  'Tonga': { code: '676', digits: [5, 7] },
+  'Vanuatu': { code: '678', digits: [5, 7] },
+  'Solomon Islands': { code: '677', digits: [5, 7] },
+  'Kiribati': { code: '686', digits: [5, 8] },
+  'Micronesia': { code: '691', digits: [7] },
+  'Marshall Islands': { code: '692', digits: [7] },
+  'Palau': { code: '680', digits: [7] },
+  'Nauru': { code: '674', digits: [7] },
+  'Tuvalu': { code: '688', digits: [5, 6] },
+};
+
+// A document-upload pre-fill's mobile_number arrives as one E.164-shaped
+// string ("+919876543210"), but the phone widget itself renders from a
+// {country, national} split (fs.mobileCountry/fs.mobileNational), not
+// mobile_number directly — without this, a successfully-extracted number
+// still shows an empty country picker. Longest-code-first avoids a short
+// code false-matching a number that actually belongs to a longer one.
+function decomposeMobileNumber(fullNumber) {
+  const digits = (fullNumber || '').replace(/^\+/, '').replace(/\D/g, '');
+  if (!digits) return null;
+  const candidates = Object.entries(COUNTRY_DIAL_CODES)
+    .filter(([, entry]) => digits.startsWith(entry.code))
+    .sort((a, b) => b[1].code.length - a[1].code.length);
+  if (!candidates.length) return null;
+  const [country, entry] = candidates[0];
+  return { country, national: digits.slice(entry.code.length) };
+}
+
+// Deliberately permissive — accepts any real email shape (business,
+// personal, education, subdomains, plus-addressing) rather than a strict
+// RFC 5322 pattern, which tends to reject valid real-world addresses more
+// often than it catches genuinely malformed ones. The final label must
+// still look like a real TLD (letters only, 2+ chars) — the previous
+// `[^\s@]+$` tail accepted "user@test.1", "user@test.c", and even a bare
+// trailing dot like "user@test.com.", since dots are allowed inside that
+// class too. This can't catch a *real but misspelled* domain
+// ("gmial.com") — no regex can, only DNS/MX lookup or a verification-link
+// send can prove a domain is real and reachable.
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/.test((email || '').trim());
+}
+
+// National-number-only validation against the selected phone country (a
+// missing/unrecognized country just skips the length check — better to
+// accept than to block on a country we don't have data for).
+function isValidPhoneForCountry(nationalNumber, countryName) {
+  const digits = (nationalNumber || '').replace(/\D/g, '');
+  if (!digits) return false;
+  const entry = COUNTRY_DIAL_CODES[countryName];
+  if (!entry) return /^\d{6,14}$/.test(digits);
+  return entry.digits.includes(digits.length);
+}
+
+// Re-renders just this one form card in place from its formState — never
+// the whole thread. Structural changes (a dropdown that toggles the
+// companion section, an upload/submit result) need this; a plain text/date
+// keystroke does not and must NOT call it (renderThread()-style full
+// rebuilds steal input focus — fine for a background render the user isn't
+// looking at, not fine for the field they're actively typing into).
+function rerenderAvaFormCard(m) {
+  const bubble = document.querySelector(`.msg[data-id="${m.id}"] .msg__bubble--form`);
+  if (!bubble) return;
+  bubble.innerHTML = '';
+  bubble.appendChild(buildAvaFormCard(m));
+}
+
+function buildAvaFormCard(m) {
+  const fs = m.formState;
+  const card = document.createElement('div');
+  card.className = 'ava-form';
+
+  if (fs.submitted) {
+    const title = document.createElement('div');
+    title.className = 'ava-form__summary-title';
+    title.textContent = '✅ Details submitted';
+    card.appendChild(title);
+
+    const grid = document.createElement('div');
+    grid.className = 'ava-form__summary-grid';
+    for (const f of AVA_FORM_FIELDS) {
+      const row = document.createElement('div');
+      row.className = 'ava-form__summary-row';
+      const label = document.createElement('span');
+      label.className = 'ava-form__summary-label';
+      label.textContent = `${AVA_FIELD_LABELS[f]}:`;
+      const value = document.createElement('span');
+      value.textContent = fs.values[f] || '—';
+      row.appendChild(label);
+      row.appendChild(value);
+      grid.appendChild(row);
+    }
+    card.appendChild(grid);
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'ava-form__edit-btn';
+    editBtn.textContent = '✏️ Edit details';
+    editBtn.addEventListener('click', () => {
+      fs.submitted = false;
+      fs.editing = true;
+      saveState();
+      rerenderAvaFormCard(m);
+    });
+    card.appendChild(editBtn);
+
+    return card;
+  }
+
+  if (fs.error) {
+    const errBox = document.createElement('div');
+    errBox.className = 'ava-form__error';
+    errBox.textContent = fs.error;
+    card.appendChild(errBox);
+  }
+
+  const intro = document.createElement('p');
+  intro.className = 'ava-form__intro';
+  intro.textContent = 'Fill in your trip details, or upload a document below and I\'ll pre-fill what I can.';
+  card.appendChild(intro);
+
+  // ── Document upload ──────────────────────────────────────────────────
+  const uploadRow = document.createElement('div');
+  uploadRow.className = 'ava-form__upload-row';
+  const uploadBtn = document.createElement('button');
+  uploadBtn.type = 'button';
+  uploadBtn.className = 'ava-form__upload-btn';
+  uploadBtn.textContent = '📄 Upload a document to pre-fill';
+  const uploadInput = document.createElement('input');
+  uploadInput.type = 'file';
+  uploadInput.accept = '.pdf,image/*';
+  uploadInput.style.display = 'none';
+  const uploadStatus = document.createElement('span');
+  uploadStatus.className = 'ava-form__upload-status';
+  uploadStatus.textContent = fs.uploadStatus || '';
+  uploadBtn.addEventListener('click', () => uploadInput.click());
+  uploadInput.addEventListener('change', () => {
+    const file = uploadInput.files && uploadInput.files[0];
+    if (file) handleAvaFormUpload(m, file);
+  });
+  uploadRow.appendChild(uploadBtn);
+  uploadRow.appendChild(uploadInput);
+  uploadRow.appendChild(uploadStatus);
+  card.appendChild(uploadRow);
+
+  // ── Core fields ───────────────────────────────────────────────────────
+  const grid = document.createElement('div');
+  grid.className = 'ava-form__grid';
+  const CORE_FIELDS = ['first_name', 'last_name', 'email', 'date_of_birth', 'destination', 'departure', 'start_date', 'end_date'];
+  for (const f of CORE_FIELDS) {
+    grid.appendChild(buildAvaFormField(m, f));
+    // Mobile number gets its own country-code selector right after email —
+    // matches the order REQUIRED_FIELDS/FIELD_LABELS already use server-side.
+    if (f === 'email') grid.appendChild(buildAvaFormPhoneField(m));
+  }
+  card.appendChild(grid);
+
+  // ── Dropdowns ─────────────────────────────────────────────────────────
+  const dropdownGrid = document.createElement('div');
+  dropdownGrid.className = 'ava-form__grid';
+  for (const f of ['coverage_type', 'plan_type', 'cover_type']) {
+    dropdownGrid.appendChild(buildAvaFormDropdown(m, f));
+  }
+  card.appendChild(dropdownGrid);
+
+  // ── Companion travellers (Group/Family only) ────────────────────────
+  if (AVA_MULTI_TRAVELLER_COVER_TYPES.includes(fs.values.cover_type)) {
+    card.appendChild(buildAvaCompanionSection(m));
+  }
+
+  // ── Marketing consent ─────────────────────────────────────────────────
+  const consentRow = document.createElement('label');
+  consentRow.className = 'ava-form__consent';
+  const consentBox = document.createElement('input');
+  consentBox.type = 'checkbox';
+  consentBox.checked = !!fs.marketingConsent;
+  consentBox.addEventListener('change', () => { fs.marketingConsent = consentBox.checked; saveState(); });
+  consentRow.appendChild(consentBox);
+  consentRow.appendChild(document.createTextNode(' I\'m okay being contacted about relevant offers.'));
+  card.appendChild(consentRow);
+
+  // ── Submit ────────────────────────────────────────────────────────────
+  const submitBtn = document.createElement('button');
+  submitBtn.type = 'button';
+  submitBtn.className = 'ava-form__submit';
+  submitBtn.textContent = fs.submitting
+    ? (fs.editing ? 'Updating…' : 'Getting your quote…')
+    : (fs.editing ? 'Update & get new quote' : 'Get my quote');
+  submitBtn.disabled = !!fs.submitting;
+  submitBtn.addEventListener('click', () => submitAvaForm(m));
+  card.appendChild(submitBtn);
+
+  return card;
+}
+
+// yyyy-mm-dd in the browser's LOCAL date, not UTC — new Date().toISOString()
+// would roll back to yesterday for anyone west of UTC in the evening,
+// wrongly excluding today from "present and future" / "present and past".
+function _todayDateStr() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function buildAvaFormField(m, field) {
+  const fs = m.formState;
+  const wrap = document.createElement('label');
+  wrap.className = 'ava-form__field';
+  const labelText = document.createElement('span');
+  labelText.className = 'ava-form__label';
+  labelText.textContent = AVA_FIELD_LABELS[field];
+  const input = document.createElement('input');
+  input.type = AVA_FIELD_INPUT_TYPES[field] || 'text';
+  input.value = fs.values[field] || '';
+  input.dataset.field = field;
+
+  // Calendar bounds: date of birth can't be in the future; a trip can't
+  // start (or end) in the past. end_date's min also follows the currently
+  // chosen start_date (updated live below) so an end date before the trip
+  // even starts isn't selectable either.
+  if (field === 'date_of_birth') {
+    input.max = _todayDateStr();
+  } else if (field === 'start_date') {
+    input.min = _todayDateStr();
+  } else if (field === 'end_date') {
+    input.min = fs.values.start_date || _todayDateStr();
+  }
+  // destination/departure can be locked to a single value by the chosen
+  // coverage_type (e.g. "UAE Inbound" always means destination="United Arab
+  // Emirates") — see COVERAGE_TYPE_LOCKS server-side. Disabling it here
+  // instead of leaving it editable-but-prefilled avoids a round trip to the
+  // exact same validation error the backend would otherwise return.
+  const lockedValue = (fs.coverageTypeLocks[fs.values.coverage_type] || {})[field];
+  if (lockedValue) {
+    input.value = lockedValue;
+    input.disabled = true;
+    labelText.textContent = `${AVA_FIELD_LABELS[field]} (set by coverage type)`;
+  }
+  input.addEventListener('input', () => {
+    fs.values[field] = input.value;
+    saveState();
+    if (field === 'start_date') {
+      const endInput = wrap.parentElement && wrap.parentElement.querySelector('input[data-field="end_date"]');
+      if (endInput) {
+        endInput.min = input.value || _todayDateStr();
+        if (endInput.value && endInput.value < endInput.min) {
+          endInput.value = '';
+          fs.values.end_date = '';
+          saveState();
+        }
+      }
+    }
+  });
+  wrap.appendChild(labelText);
+  wrap.appendChild(input);
+
+  if (field === 'email') {
+    const errEl = document.createElement('span');
+    errEl.className = 'ava-form__field-error';
+    errEl.hidden = true;
+    const showEmailError = () => {
+      const bad = input.value.trim() && !isValidEmail(input.value);
+      input.classList.toggle('is-invalid', bad);
+      errEl.hidden = !bad;
+      errEl.textContent = bad ? 'Enter a valid email address.' : '';
+    };
+    input.addEventListener('blur', showEmailError);
+    if (input.value) showEmailError();
+    wrap.appendChild(errEl);
+  }
+
+  return wrap;
+}
+
+// Phone number gets its own [country <select>] + [national number] pair
+// instead of one free-text input — the dial code needs to be known both to
+// compose a backend-valid mobile_number ("+<code><national>", see
+// quote_service.py's _split_mobile_number) and to validate the number's
+// length against what that country's numbers actually look like.
+// A plain text input + filtered dropdown list — a native <select> has no
+// search/type-ahead beyond jumping to the first matching letter, which
+// doesn't scale to ~70 countries. `names` is the full option list; typing
+// filters it by substring (case-insensitive); Up/Down move a highlighted
+// row, Enter/click selects it, Escape or losing focus closes the list.
+// Reverts to the last valid selection on blur if what's typed doesn't
+// exactly match an option, so the field can never end up "selected" on
+// text that isn't actually a real country.
+function buildCountrySearchCombobox(names, selectedName, labelFor, onSelect) {
+  const wrap = document.createElement('div');
+  wrap.className = 'country-search';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'country-search__input';
+  input.placeholder = 'Search country…';
+  input.autocomplete = 'off';
+  input.value = selectedName ? labelFor(selectedName) : '';
+
+  const list = document.createElement('div');
+  list.className = 'country-search__list';
+  list.hidden = true;
+
+  let filtered = names;
+  let activeIndex = -1;
+
+  function renderList() {
+    list.innerHTML = '';
+    if (filtered.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'country-search__empty';
+      empty.textContent = 'No matching country';
+      list.appendChild(empty);
+      return;
+    }
+    filtered.forEach((name, i) => {
+      const item = document.createElement('div');
+      item.className = 'country-search__item' + (i === activeIndex ? ' is-active' : '');
+      item.textContent = labelFor(name);
+      // mousedown (not click) + preventDefault so this fires BEFORE the
+      // input's own blur handler would otherwise close the list first.
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        pick(name);
+      });
+      list.appendChild(item);
+    });
+  }
+
+  function openList() {
+    const query = input.value.trim().toLowerCase();
+    filtered = query ? names.filter((n) => n.toLowerCase().includes(query)) : names;
+    activeIndex = -1;
+    renderList();
+    list.hidden = false;
+  }
+
+  function pick(name) {
+    input.value = labelFor(name);
+    list.hidden = true;
+    onSelect(name);
+  }
+
+  input.addEventListener('focus', openList);
+  input.addEventListener('input', openList);
+  input.addEventListener('keydown', (e) => {
+    if (list.hidden && e.key !== 'Escape') openList();
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, filtered.length - 1);
+      renderList();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      renderList();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (filtered[activeIndex]) pick(filtered[activeIndex]);
+    } else if (e.key === 'Escape') {
+      list.hidden = true;
+    }
+  });
+  input.addEventListener('blur', () => {
+    list.hidden = true;
+    const typedMatch = names.find((n) => labelFor(n).toLowerCase() === input.value.trim().toLowerCase());
+    if (typedMatch) {
+      if (typedMatch !== selectedName) pick(typedMatch);
+    } else {
+      input.value = selectedName ? labelFor(selectedName) : '';
+    }
+  });
+
+  wrap.appendChild(input);
+  wrap.appendChild(list);
+  return wrap;
+}
+
+function buildAvaFormPhoneField(m) {
+  const fs = m.formState;
+  const wrap = document.createElement('div');
+  wrap.className = 'ava-form__field ava-form__phone-field';
+  const labelText = document.createElement('span');
+  labelText.className = 'ava-form__label';
+  labelText.textContent = 'Mobile number';
+  wrap.appendChild(labelText);
+
+  const row = document.createElement('div');
+  row.className = 'ava-form__phone-row';
+
+  const syncMobileNumber = () => {
+    const entry = COUNTRY_DIAL_CODES[fs.mobileCountry];
+    fs.values.mobile_number = entry ? `+${entry.code}${fs.mobileNational}` : fs.mobileNational;
+    saveState();
+  };
+  const showPhoneError = () => {
+    const bad = fs.mobileNational && fs.mobileCountry && !isValidPhoneForCountry(fs.mobileNational, fs.mobileCountry);
+    numberInput.classList.toggle('is-invalid', bad);
+    errEl.hidden = !bad;
+    errEl.textContent = bad ? `Doesn't look like a valid ${fs.mobileCountry} number.` : '';
+  };
+
+  const countryNames = Object.keys(COUNTRY_DIAL_CODES).sort();
+  const countryCombobox = buildCountrySearchCombobox(
+    countryNames,
+    fs.mobileCountry,
+    (name) => `${name} (+${COUNTRY_DIAL_CODES[name].code})`,
+    (name) => {
+      fs.mobileCountry = name;
+      syncMobileNumber();
+      showPhoneError();
+    },
+  );
+
+  const numberInput = document.createElement('input');
+  numberInput.type = 'tel';
+  numberInput.placeholder = 'e.g. 501234567';
+  numberInput.value = fs.mobileNational || '';
+
+  const errEl = document.createElement('span');
+  errEl.className = 'ava-form__field-error';
+  errEl.hidden = true;
+
+  numberInput.addEventListener('input', () => {
+    fs.mobileNational = numberInput.value.replace(/[^\d]/g, '');
+    numberInput.value = fs.mobileNational;
+    syncMobileNumber();
+  });
+  numberInput.addEventListener('blur', showPhoneError);
+  if (fs.mobileNational) showPhoneError();
+
+  row.appendChild(countryCombobox);
+  row.appendChild(numberInput);
+  wrap.appendChild(row);
+  wrap.appendChild(errEl);
+  return wrap;
+}
+
+function buildAvaFormDropdown(m, field) {
+  const fs = m.formState;
+  const wrap = document.createElement('label');
+  wrap.className = 'ava-form__field';
+  const labelText = document.createElement('span');
+  labelText.className = 'ava-form__label';
+  labelText.textContent = AVA_FIELD_LABELS[field];
+  const select = document.createElement('select');
+  const blank = document.createElement('option');
+  blank.value = '';
+  blank.textContent = 'Select…';
+  select.appendChild(blank);
+  for (const opt of fs.fieldOptions[field] || []) {
+    const optEl = document.createElement('option');
+    optEl.value = opt;
+    optEl.textContent = opt;
+    if (fs.values[field] === opt) optEl.selected = true;
+    select.appendChild(optEl);
+  }
+  select.addEventListener('change', () => {
+    fs.values[field] = select.value;
+    if (field === 'coverage_type') {
+      // e.g. "UAE Inbound" always means destination="United Arab Emirates" —
+      // fill it in now rather than let the user type/pick something the
+      // backend would just reject (see COVERAGE_TYPE_LOCKS server-side).
+      const locked = fs.coverageTypeLocks[select.value] || {};
+      for (const [lockedField, value] of Object.entries(locked)) {
+        fs.values[lockedField] = value;
+      }
+    }
+    saveState();
+    // cover_type changes what's rendered (the companion section);
+    // coverage_type changes whether destination/departure are locked —
+    // both need a structural re-render. The other dropdown (plan_type)
+    // doesn't affect anything else shown.
+    if (field === 'cover_type' || field === 'coverage_type') rerenderAvaFormCard(m);
+  });
+  wrap.appendChild(labelText);
+  wrap.appendChild(select);
+  return wrap;
+}
+
+function buildAvaCompanionSection(m) {
+  const fs = m.formState;
+  const section = document.createElement('div');
+  section.className = 'ava-form__companions';
+
+  const heading = document.createElement('div');
+  heading.className = 'ava-form__label';
+  heading.textContent = `Travelling with others? Add at least 1 companion (${fs.values.cover_type} cover needs 2+ travellers total).`;
+  section.appendChild(heading);
+
+  fs.additionalTravellers.forEach((t, idx) => {
+    const row = document.createElement('div');
+    row.className = 'ava-form__companion-row';
+
+    const first = document.createElement('input');
+    first.type = 'text';
+    first.placeholder = 'First name';
+    first.value = t.first_name || '';
+    first.addEventListener('input', () => { t.first_name = first.value; saveState(); });
+
+    const last = document.createElement('input');
+    last.type = 'text';
+    last.placeholder = 'Last name';
+    last.value = t.last_name || '';
+    last.addEventListener('input', () => { t.last_name = last.value; saveState(); });
+
+    const dob = document.createElement('input');
+    dob.type = 'date';
+    dob.value = t.date_of_birth || '';
+    dob.addEventListener('input', () => { t.date_of_birth = dob.value; saveState(); });
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'ava-form__companion-remove';
+    removeBtn.textContent = '✕';
+    removeBtn.setAttribute('aria-label', 'Remove companion');
+    removeBtn.addEventListener('click', () => {
+      fs.additionalTravellers.splice(idx, 1);
+      saveState();
+      rerenderAvaFormCard(m);
+    });
+
+    row.appendChild(first);
+    row.appendChild(last);
+    row.appendChild(dob);
+    row.appendChild(removeBtn);
+    section.appendChild(row);
+  });
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'ava-form__companion-add';
+  addBtn.textContent = '+ Add companion';
+  addBtn.addEventListener('click', () => {
+    fs.additionalTravellers.push({ first_name: '', last_name: '', date_of_birth: '' });
+    saveState();
+    rerenderAvaFormCard(m);
+  });
+  section.appendChild(addBtn);
+
+  return section;
+}
+
+async function handleAvaFormUpload(m, file) {
+  const fs = m.formState;
+  fs.uploadStatus = `Reading ${file.name}…`;
+  rerenderAvaFormCard(m);
+
+  const formData = new FormData();
+  formData.append('session_id', state.sessionId);
+  formData.append('file', file);
+
+  try {
+    const res = await fetch(`${API.baseUrl}/api/chat/upload-document`, { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Upload failed');
+
+    // Only fill fields still empty — never clobber something the user
+    // already typed, matching the backend's own merge_extracted_fields
+    // "never overwrite" rule.
+    const collected = data.collected_fields || {};
+    let filledCount = 0;
+    for (const f of AVA_FORM_FIELDS) {
+      if (!fs.values[f] && collected[f]) {
+        fs.values[f] = collected[f];
+        filledCount += 1;
+      }
+    }
+
+    // mobile_number lands as one string, but the phone widget renders
+    // from a country+national split — without this, a correctly extracted
+    // number still shows an empty, unfilled-looking country picker.
+    if (!fs.mobileCountry && !fs.mobileNational && fs.values.mobile_number) {
+      const decomposed = decomposeMobileNumber(fs.values.mobile_number);
+      if (decomposed) {
+        fs.mobileCountry = decomposed.country;
+        fs.mobileNational = decomposed.national;
+      }
+    }
+
+    fs.uploadStatus = filledCount > 0 ? `✓ Pre-filled ${filledCount} field(s) from ${file.name}` : `Uploaded ${file.name} — nothing new to pre-fill`;
+  } catch (err) {
+    fs.uploadStatus = `Couldn't read ${file.name} — fill in your details manually.`;
+  }
+  saveState();
+  rerenderAvaFormCard(m);
+}
+
+async function submitAvaForm(m) {
+  const fs = m.formState;
+
+  // Same checks the two inline field validators run on blur — repeated here
+  // so a user who never blurred a field (e.g. tabbed straight to submit)
+  // can't skip them, and so there's one clear message instead of two silent
+  // inline errors they might not scroll back up to see.
+  if (fs.values.email && !isValidEmail(fs.values.email)) {
+    fs.error = 'Please enter a valid email address.';
+    rerenderAvaFormCard(m);
+    return;
+  }
+  if (!fs.mobileCountry || !fs.mobileNational) {
+    fs.error = 'Please select your mobile number\'s country and enter the number.';
+    rerenderAvaFormCard(m);
+    return;
+  }
+  if (!isValidPhoneForCountry(fs.mobileNational, fs.mobileCountry)) {
+    fs.error = `That doesn't look like a valid ${fs.mobileCountry} mobile number.`;
+    rerenderAvaFormCard(m);
+    return;
+  }
+
+  fs.submitting = true;
+  fs.error = null;
+  rerenderAvaFormCard(m);
+
+  const payload = {
+    session_id: state.sessionId,
+    ...fs.values,
+    additional_travellers: fs.additionalTravellers.filter((t) => t.first_name && t.date_of_birth),
+    marketing_consent: !!fs.marketingConsent,
+  };
+
+  try {
+    const res = await fetch(`${API.baseUrl}/api/chat/submit-intake-form`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    fs.submitting = false;
+
+    if (!res.ok) {
+      const detail = data.detail;
+      if (detail && typeof detail === 'object') {
+        if (detail.error === 'missing_fields') {
+          fs.error = `Please fill in: ${detail.fields.map((f) => AVA_FIELD_LABELS[f] || f).join(', ')}.`;
+        } else if (detail.message) {
+          fs.error = detail.message;
+        } else {
+          fs.error = 'Something didn\'t validate — please check your details.';
+        }
+      } else {
+        fs.error = (typeof detail === 'string' && detail) || 'Something went wrong submitting your details.';
+      }
+      saveState();
+      rerenderAvaFormCard(m);
+      return;
+    }
+
+    const wasEditing = fs.editing;
+    fs.submitted = true;
+    fs.editing = false;
+    fs.error = null;
+    saveState();
+    rerenderAvaFormCard(m);
+
+    // An edit corrects a mistake — it should update the SAME quote message
+    // in place, not leave the old (wrong) quote sitting above a new one.
+    // m.quoteMessageId tracks which message that is; only set on an edit
+    // (first-ever submit always creates a fresh message).
+    const existingQuoteMsg = wasEditing && m.quoteMessageId
+      ? state.messages.find((x) => x.id === m.quoteMessageId)
+      : null;
+
+    if (existingQuoteMsg) {
+      existingQuoteMsg.content = data.response || '';
+      existingQuoteMsg.isQuoteList = !!(data.ui && data.ui.type === 'quote_list');
+      existingQuoteMsg.timestamp = Date.now();
+      // The quote just changed — any email-button state from the old one
+      // (sent/open/draft) no longer matches what's on screen.
+      existingQuoteMsg.emailSentTo = null;
+      existingQuoteMsg.emailRowOpen = false;
+      existingQuoteMsg.emailDraft = null;
+    } else {
+      const quoteMsg = msg('assistant', data.response || '', Date.now());
+      quoteMsg.isQuoteList = !!(data.ui && data.ui.type === 'quote_list');
+      state.messages.push(quoteMsg);
+      m.quoteMessageId = quoteMsg.id;
+    }
+    saveState();
+    renderThread();
+    if (!userScrolledAway) scrollToBottom();
+  } catch (err) {
+    fs.submitting = false;
+    fs.error = 'Network error submitting your details — please try again.';
+    saveState();
+    rerenderAvaFormCard(m);
+  }
 }
 
 function buildMessageControls(m) {
@@ -572,6 +1754,28 @@ async function streamInto(assistantMsg, queryText) {
       } else if (evt.type === 'done') {
         if (evt.correctedText) raw = evt.correctedText;
         if (evt.needsHuman) requestHandoff();
+        if (evt.ui && evt.ui.type === 'ava_form') {
+          state.messages.push(buildAvaFormMessage(evt.ui, evt.collectedFields));
+        }
+        // Ava's quote-comparison reply ("compare 1 and 2") — the chat bubble
+        // has no markdown table renderer (a plain-text pipe table used to
+        // show up as literal '|'/'---' characters), so the backend sends
+        // the comparison as structured data instead of text; attach it to
+        // THIS message (not a new one, unlike ava_form) so buildMessageEl
+        // can render a real <table> below the "Comparing X and Y:" intro.
+        // Only travel_bot/routers/chat.py ever sends this ui.type, so this
+        // is unreachable from Layla's plain RAG replies.
+        if (evt.ui && evt.ui.type === 'comparison_table') {
+          assistantMsg.comparisonTable = evt.ui.table;
+        }
+        // Ava just showed a quote list (initial fetch or a sort-by re-list)
+        // — same ui-marker mechanism as comparison_table, just a plain
+        // marker with no payload since the "email me this quote" button
+        // re-reads the quotes from session state server-side rather than
+        // trusting whatever's in this message.
+        if (evt.ui && evt.ui.type === 'quote_list') {
+          assistantMsg.isQuoteList = true;
+        }
         if (evt.offlineEscalated) {
           // Was pushed as role 'assistant' — rendered as a second full AI
           // bubble (avatar, timestamp, copy/feedback controls) right under
