@@ -29,6 +29,7 @@ from metadata_tagger import (
     regex_first_pass_policy_type,
     verify_and_enrich_section_metadata,
     classify_candidate_type,
+    derive_document_topic_prior,
 )
 from validator import detect_conflict, validate_grounding
 from router import get_insurance_llm, get_general_llm, VLLM_HOST
@@ -323,6 +324,7 @@ class SectionChunker:
         docs: list[Document],
         doc_type: str = "policy_document",
         llm: Any = None,
+        filename: str = "",
     ) -> list[Document]:
         """
         Split documents and annotate each chunk with section/policy_type/keywords.
@@ -344,6 +346,18 @@ class SectionChunker:
         that case.
         """
         chunks = self._splitter.split_documents(docs)
+
+        # Document-level topic prior, computed once from ALL the document's
+        # own chunks (see derive_document_topic_prior's own docstring for
+        # the confirmed failure it fixes: a chunk classified with zero
+        # visibility into its own document can flip to the wrong type on
+        # an incidental mention, even when the rest of the document is
+        # clearly about something else). "" / "general" for a genuinely
+        # multi-topic document — the prompt omits the context block
+        # entirely in that case, so this is a pure no-op for those docs.
+        doc_prior, _doc_prior_share = derive_document_topic_prior(
+            [c.page_content for c in chunks], filename=filename,
+        )
 
         # ── Group chunks by section_id, decide metadata once per group ───────
         sections: dict[str, list[Document]] = {}
@@ -386,7 +400,21 @@ class SectionChunker:
             # answer when a fixed-KB section doesn't state these).
             section_heading = first.metadata.get("section_heading", "")
             first_pass_type = regex_first_pass_policy_type(section_heading, section_text)
-            enriched = verify_and_enrich_section_metadata(section_text, first_pass_type, llm=llm)
+            # For a confidently single-topic document, doc_prior itself is
+            # the starting assignment fed to the LLM verify step, not the
+            # per-section regex first-pass. Confirmed live (2026-07-31): a
+            # razor-thin regex call on an isolated section (e.g. health=3 vs
+            # travel=1) anchors the VERIFY question on the WRONG type, and
+            # persuasive doc-context text alone doesn't reliably overcome an
+            # anchor already baked into the question. Starting from doc_prior
+            # instead reframes VERIFY around the type that's actually
+            # correct; the LLM can still override to a different,
+            # self-contained type when a section genuinely warrants it (see
+            # _build_verify_and_enrich_prompt's DOCUMENT CONTEXT rules).
+            assigned_type = doc_prior if doc_prior and doc_prior != "general" else first_pass_type
+            enriched = verify_and_enrich_section_metadata(
+                section_text, assigned_type, llm=llm, doc_prior=doc_prior,
+            )
             section_policy = enriched["policy_type"]
 
             # Mode-A fallback: the closed 12-type vocabulary couldn't place
@@ -699,7 +727,7 @@ class RAGPipeline:
                 raw_doc.metadata["doc_type"] = doc_type
 
             chunks = self._chunker.split_documents(
-                raw_docs, doc_type=doc_type, llm=llm
+                raw_docs, doc_type=doc_type, llm=llm, filename=uploaded_file.name,
             )
 
             _CHUNK_SKIP_FIELDS = {"insurer_confidence", "policy_type_confidence", "all_insurers", "all_policy_types"}
@@ -769,7 +797,7 @@ class RAGPipeline:
         # blanket doc_tags update (which would otherwise clobber it) and
         # restore it after, matching the same chunk-wins/doc-level-
         # fallback order already used by the main /upload path in api.py.
-        chunks = self._chunker.split_documents(docs, doc_type=doc_type, llm=llm)
+        chunks = self._chunker.split_documents(docs, doc_type=doc_type, llm=llm, filename=url)
 
         self._vector_store.delete_by_field("source_url", url)
 

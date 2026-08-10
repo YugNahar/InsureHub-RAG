@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -1240,7 +1241,137 @@ def _normalize_policy_type(label: str) -> str:
     return _TYPE_SYNONYMS.get(label, label)
 
 
-def _build_verify_and_enrich_prompt(text: str, assigned_type: str) -> str:
+def derive_document_topic_prior(chunk_texts: list[str], filename: str = "") -> tuple[str, float]:
+    """
+    Compute a document-level policy_type prior from a sample of the
+    document's OWN chunk texts, so per-chunk classification isn't done in
+    total isolation from what document it actually lives in.
+
+    Confirmed live (2026-07-31, plan_policy_type_tagging.md): re-tagging a
+    travel guide's chunks using ONLY each chunk's own isolated text flipped
+    several genuinely travel-specific chunks to "health" — a travel-medical
+    benefit for "acute toothache that has begun during the journey", the
+    policy's own exclusions list, its claims-filing process — because the
+    classifier had no way to know these lived in a travel guide, so an
+    incidental "treatment"/"toothache" mention won outright against a
+    document it never got to see. The SAME re-tag also correctly fixed 5
+    known mistags (e.g. a "health"-tagged chunk that was actually the LIFE
+    proposal form's health questionnaire) — and in every one of those
+    cases the CORRECT answer was the chunk's own document's dominant
+    topic. A document-level prior helps both failure modes at once: it
+    gives the classifier grounds to move A chunk BACK toward its
+    document's real subject (the genuine-fix cases) while raising the bar
+    for flipping AWAY from it on a single incidental mention (the
+    regression cases).
+
+    Two signals, filename checked first:
+
+    1. Filename — highest-precision signal when it names its own topic
+       (e.g. "...travelinsuranceguide.pdf"). Checked as a bare substring
+       against each type's canonical name after stripping the leading
+       hash/ID prefix this KB's uploads use and lowercasing — deliberately
+       NOT word-boundary-anchored, since these filenames have no spaces
+       between words ("travelinsuranceguide"). Only used when it's an
+       UNAMBIGUOUS single-type match; a filename naming 2+ types (or
+       none) falls through to signal 2.
+
+    2. Raw regex keyword-score SUM across every chunk of the document —
+       deliberately NOT regex_first_pass_policy_type()'s per-chunk result
+       (which requires each INDIVIDUAL chunk to independently clear a
+       strict confidence bar before it can even count towards the vote).
+       Confirmed live that gate under-counts badly at the document level:
+       a liability-insurance module chunked at ~12 chunks scored a
+       confident regex_first_pass hit on almost none of them individually
+       (liability's regex list is long, specific phrases — "public
+       liability", "professional indemnity" — that don't always repeat
+       within one ~400-word chunk), yet the RAW score total across all 12
+       chunks combined was a clean, wide-margin liability win (17 vs a
+       9-point runner-up). Summing raw hits first, THEN judging dominance
+       once at the document level, recovers signal the per-chunk gate
+       discards.
+
+    Confirmed live this can still genuinely tie: a travel guide scored
+    health=27 and travel=27 in raw sum (travel insurance content
+    legitimately discusses medical treatment abroad at length — that's
+    not a bug in the regex list, the underlying content really does use
+    both vocabularies heavily). This is exactly the shape the filename
+    check exists to resolve before ever reaching the tie-prone body-text
+    signal.
+
+    Returns ("general", 0.0) when neither signal clearly resolves a
+    single type — the correct, expected answer for a genuinely
+    multi-topic document (a large multi-subject reference textbook must
+    land here, not get flattened to whichever type happened to score one
+    point higher).
+    """
+    if filename:
+        # "5e9acf857576_travelinsuranceguide.pdf" -> "travelinsuranceguide"
+        cleaned = re.sub(r"^[0-9a-f]{8,}_", "", filename.lower())
+        cleaned = re.sub(r"\.[a-z0-9]+$", "", cleaned)
+        matched = [t for t in get_active_vocab() if t in cleaned]
+        if len(matched) == 1:
+            return matched[0], 1.0
+
+    totals: dict[str, int] = {}
+    for text in chunk_texts:
+        for ptype, score in _regex_policy_score(text).items():
+            if score:
+                totals[ptype] = totals.get(ptype, 0) + score
+    if not totals:
+        return "general", 0.0
+    best_type = max(totals, key=totals.__getitem__)
+    best_score = totals[best_type]
+    sorted_vals = sorted(totals.values(), reverse=True)
+    runner_up = sorted_vals[1] if len(sorted_vals) > 1 else 0
+    # Three bars, all tuned against this KB's actual documents (see
+    # plan_policy_type_tagging.md Phase 1 verification for the full
+    # per-document score table this was calibrated against):
+    #
+    # 1. best_score >= 10 — minimum absolute evidence; a 2-chunk document
+    #    scoring 1 hit for "fire" shouldn't "dominate" on no real evidence.
+    #
+    # 2. best_score >= runner_up * 1.5 — the winner must clearly lead, not
+    #    just plurality-win.
+    #
+    # 3. runner_up <= 15 — an ABSOLUTE cap on the second-place score, not
+    #    just relative to the winner. This is the one that actually
+    #    separates genuinely single-topic documents from broad reference
+    #    material: a first version of this function used bars 1-2 alone
+    #    and confidently called the 256-chunk multi-subject law textbook
+    #    "life" (194 vs runner-up marine=103 — clears a 1.5x margin on
+    #    sheer document length despite marine ALSO having overwhelming,
+    #    genuine representation) and, separately, a 64-chunk regulatory/
+    #    corporate-governance handbook "life" (61 vs marine=22) — manual
+    #    read of that second document confirmed it discusses IRDA capital
+    #    filings, ULIP product mechanics, IAIS/IASB accounting standards,
+    #    AND a marine cargo-ship damage example, not life insurance
+    #    specifically. Every CONFIRMED single-topic module in this KB has
+    #    a runner-up under 12 (nothing else in the document accumulates
+    #    much evidence at all); both confirmed multi-topic documents have
+    #    a runner-up over 20 (a second topic is ALSO substantively
+    #    present, just discussed less than the first). 15 sits with real
+    #    headroom on both sides of that gap.
+    # 4. breadth (count of types scoring >= 3) <= 6 — catches a shape bars
+    #    1-3 miss: a document that discusses MANY types roughly evenly,
+    #    where the winner still clears bars 1-3 on volume alone even
+    #    though nothing actually dominates. Confirmed live with a
+    #    synthetic 10-section reference PDF (one clearly-written section
+    #    per type: motor/health/life/travel/home/marine/cyber/liability/
+    #    fire/crop) — health won 11 vs runner-up motor=5, clearing bars
+    #    1-3 (11>=10, 11>=5*1.5, 5<=15) despite the document having no
+    #    real dominant topic at all; 9 types scored >=3 there. Every
+    #    CONFIRMED single-topic module in this KB has at most 4 types
+    #    scoring >=3 (nothing else accumulates much evidence); both
+    #    confirmed multi-topic references have 10-11. 6 sits with real
+    #    headroom on both sides of that gap, same discipline as bar 3.
+    breadth = sum(1 for v in totals.values() if v >= 3)
+    if best_score >= 10 and best_score >= runner_up * 1.5 and runner_up <= 15 and breadth <= 6:
+        margin = best_score / (best_score + runner_up) if runner_up else 1.0
+        return best_type, margin
+    return "general", 0.0
+
+
+def _build_verify_and_enrich_prompt(text: str, assigned_type: str, doc_prior: str = "") -> str:
     # Full descriptions, not just bare names — confirmed live this prompt
     # used to hand the model only a comma-separated name list (unlike
     # _build_policy_type_prompt's richer label_list), and a text unambiguously
@@ -1299,8 +1430,9 @@ about cyber insurance even if it never says the words "cyber insurance").
         reply_fields = "IDENTIFIED_TYPE=<the single policy type that clearly applies, or \"general\" if none does>"
         confidence_desc = "how confident you are in this identification"
     else:
-        step1 = f"""STEP 1 — VERIFY: an initial keyword pass tagged this text as policy_type="{assigned_type}".
-Does this text genuinely, primarily discuss "{assigned_type}" insurance?
+        step1 = f"""STEP 1 — VERIFY: this text has been provisionally tagged policy_type="{assigned_type}"
+(see DOCUMENT CONTEXT below if shown, for why). Does this text genuinely,
+primarily discuss "{assigned_type}" insurance?
 - If yes, confirm it.
 - If no, state the ONE type it actually discusses instead — or "general" if it
   genuinely discusses multiple different types with no single dominant one."""
@@ -1308,7 +1440,74 @@ Does this text genuinely, primarily discuss "{assigned_type}" insurance?
                          "CORRECTED_TYPE=<the correct type if VERIFIED=no, otherwise write \"same\">")
         confidence_desc = "how confident you are in this verification"
 
-    return f"""You are verifying and enriching metadata for a section of an insurance document.
+    # Confirmed live (2026-07-31): classifying a chunk with zero visibility
+    # into its own document flips genuinely on-topic chunks to the wrong
+    # type — a travel guide's own "acute toothache during the journey" travel-
+    # medical benefit, read in isolation, looks like generic health content
+    # and got reclassified "health". A document-level prior fixes this
+    # without becoming a rubber stamp: it's a real signal to weigh, not a
+    # verdict — a chunk substantively about a DIFFERENT type (explains that
+    # type's own rules/benefits/procedures, not just an incidental word)
+    # should still be classified as that other type. See
+    # derive_document_topic_prior()'s own docstring for the confirmed
+    # failure case and plan_policy_type_tagging.md for the fuller writeup.
+    doc_context = ""
+    if doc_prior and doc_prior != "general":
+        doc_context = f"""
+- DOCUMENT CONTEXT: this text is one excerpt from a document whose OTHER
+  sections are, on the whole, genuinely about **{doc_prior} insurance** — most
+  chunks from this document are {doc_prior}. Default to {doc_prior} unless
+  THIS excerpt gives you a clear, specific reason not to.
+  - Generic insurance vocabulary is NOT that reason. Words like "treatment",
+    "hospital", "illness", "claim", "exclusion", "benefit", or "claims
+    procedure" appear inside every type of policy, including {doc_prior}
+    itself — a {doc_prior} policy's OWN benefits, exclusions, and claims
+    process will naturally use this vocabulary. Seeing these words is not
+    evidence the excerpt is some OTHER type; it is what {doc_prior}
+    insurance documents are made of. The earlier instruction to classify an
+    excerpt by "that other type's own rules, benefits, or claims procedure"
+    means a SELF-CONTAINED product with its own separate rules — not any
+    sentence that happens to mention treatment or a claim.
+  - A medical/treatment passage framed around a JOURNEY, TRIP, or being
+    ABROAD/ON HOLIDAY (e.g. "treatment that began during the journey",
+    "medical expenses incurred abroad") is the travel policy's OWN medical
+    cover, not standalone health insurance — travel policies routinely
+    include medical benefits as part of what they are; that does not make
+    them health insurance.
+  - A depreciation or age-deduction schedule listing PERSONAL BELONGINGS
+    (electronics, phones, bicycles, sports gear, clothing, bags) — with no
+    mention of a building, dwelling, or burglary — describes what a person
+    carries or owns, not a standalone home/property insurance policy. Words
+    like "household items" or "property is repaired" appearing in such a
+    schedule are describing loss/damage to items a person had WITH them,
+    which is {doc_prior}'s own belongings cover if {doc_prior} routinely
+    covers what people carry (e.g. travel baggage, personal effects) — not
+    evidence of a separate home-insurance document.
+  - Only override {doc_prior} if the excerpt names or clearly describes a
+    DIFFERENT, SELF-CONTAINED insurance product that could not plausibly be
+    a clause of a {doc_prior} policy — e.g. it discusses a named motor
+    own-damage cover, a life-insurance sum-assured/nomination mechanism, or
+    a standalone health policy's hospital network/room-rent cap as its own
+    subject, with no connection to {doc_prior}. A single sentence reusing
+    shared insurance vocabulary is not enough to override."""
+
+    # Investigating (2026-08): a full 414-chunk retag pass consistently
+    # misclassified the SAME ~7 travel-guide chunks the SAME wrong way,
+    # with zero connection/exception errors, while an isolated run of just
+    # those chunks (identical code, identical prompt) always came back
+    # correct. The vLLM server's own /metrics shows a 66% prefix-cache hit
+    # rate server-wide (prefix_cache_hits_total / prefix_cache_queries_total)
+    # on a shared, actively-used deployment — every one of these prompts
+    # shares a long, mostly-fixed instructional prefix across hundreds of
+    # calls in one run, which is exactly the shape automatic prefix caching
+    # targets. This nonce forces every call's prompt to be byte-unique, so
+    # vLLM can never find a matching cached prefix to (correctly or
+    # incorrectly) reuse across chunks — trading away a cache-hit speed
+    # benefit this offline batch workload doesn't need, in exchange for
+    # ruling out cross-request cache-state bleed as a cause. Not confirmed
+    # as THE root cause yet — this is the test, not a verified fix.
+    _cache_buster = f"[ref:{uuid.uuid4().hex[:12]}]\n\n"
+    return _cache_buster + f"""You are verifying and enriching metadata for a section of an insurance document.
 
 {step1}
 - WATCH FOR CONTRAST: text naming a DIFFERENT type specifically to distinguish
@@ -1316,7 +1515,7 @@ Does this text genuinely, primarily discuss "{assigned_type}" insurance?
   cover...", "irrelevant here in a way it would matter for a scheme built
   around X...") is telling you it is NOT that other type — the other type's
   vocabulary appearing in a sentence like that is evidence AGAINST that type,
-  not for it, even though the literal words are present.
+  not for it, even though the literal words are present.{doc_context}
 
 STEP 2 — EXTRACT (from the text only — never guess or invent a value): for each
 field below, give the value ONLY if it is explicitly stated in the text,
@@ -1352,6 +1551,8 @@ def verify_and_enrich_section_metadata(
     text: str,
     assigned_type: str,
     llm: Any = None,
+    *,
+    doc_prior: str = "",
 ) -> dict:
     """
     Step 2: LLM verify + enrich, once per section.
@@ -1361,6 +1562,12 @@ def verify_and_enrich_section_metadata(
     "unknown" is the CORRECT, expected answer when the text doesn't state
     a field explicitly (most sections in a fixed textbook-style KB won't
     name a jurisdiction or effective date) — it is not a failure.
+
+    doc_prior: the document's own dominant policy_type (see
+    derive_document_topic_prior()), or "" / "general" for a genuinely
+    multi-topic document. Passed straight through to the prompt as
+    context, not used for any code-level override here — see
+    _build_verify_and_enrich_prompt for how it's weighed.
 
     Falls back to {"policy_type": assigned_type, ...all "unknown"} when no
     LLM is available or the call fails; callers already have assigned_type
@@ -1373,7 +1580,7 @@ def verify_and_enrich_section_metadata(
         return result
 
     try:
-        prompt = _build_verify_and_enrich_prompt(text, assigned_type)
+        prompt = _build_verify_and_enrich_prompt(text, assigned_type, doc_prior)
         response = llm.invoke(prompt)
         raw = response.content if hasattr(response, "content") else str(response)
 
@@ -1447,6 +1654,18 @@ _CANDIDATE_STOPWORDS = frozenset({
     "covered", "coverage", "claim", "claims", "amount", "period", "under",
     "such", "also", "only", "than", "when", "where", "into", "your", "each",
     "hereby", "herein", "whereas", "provided",
+    # Confirmed live (2026-08-06): "premium" and "risk"/"risks" are as
+    # universal to insurance text as "policy"/"cover"/"claim" above, yet
+    # were missing here — they dominated the frequency-ranked top-8 for
+    # almost every candidate in candidate_vocab.json regardless of that
+    # candidate's actual topic (present in 6+ of 17 unrelated candidate
+    # entries), and got promoted live into micro_insurance's active regex
+    # list, where they silently inflated its score across totally
+    # unrelated documents (a life-insurance module, a motor module, a
+    # liability module) enough to break derive_document_topic_prior()'s
+    # dominance bars for those documents. See policy_type_retag.py's
+    # 2026-08-06 dry-run for the full regression this caused.
+    "premium", "premiums", "risk", "risks",
 })
 
 # General-English function/filler words, on top of the domain list above.
@@ -1470,6 +1689,15 @@ _GENERAL_STOPWORDS = frozenset({
     "because", "however", "therefore", "although", "though", "since",
     "being", "been", "were", "does", "doing", "done", "having", "here",
     "what", "when", "why", "how", "who", "whom", "whose", "plan", "plans",
+    # Confirmed live (2026-08-06) alongside the _CANDIDATE_STOPWORDS
+    # additions above — same failure, plain-English filler/pronoun words
+    # this list's net was supposed to catch but didn't: "they" (pronoun,
+    # "their" was already here but not this form), "people"/"income"/
+    # "poor" (generic-content words, same shape as "understanding"/
+    # "complete"/"guide" already excluded above) — all four ranked into
+    # micro_insurance's promoted keyword list purely from appearing often
+    # in a small sample, with zero topic-specificity.
+    "they", "them", "people", "income", "poor",
 })
 
 
