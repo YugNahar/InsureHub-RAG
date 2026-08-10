@@ -1306,6 +1306,15 @@ _TYPE_GIVEAWAY_TERMS = {
         "vehicle", "owner-driver", "driving record", "driving history",
         "reckless driving", "unnamed passengers",
         "tp (third-party) premium", "own damage",
+        # Added 2026-08-04 (Phase 1, plan_claim_answer_correctness.md):
+        # confirmed live, a life-insurance claim answer asserted "if the
+        # claim involves a third party, such as a car accident" — motor's
+        # own claim-settlement concept, hallucinated with zero motor
+        # content anywhere in that answer's retrieved context.
+        # _POLICY_TYPE_HINTS["motor"]["keywords"] already has "road
+        # accident" but not this exact phrasing; unambiguous, not shared
+        # with any other type.
+        "car accident",
     ),
 }
 # A query naming the type itself is exempt from that type's filter (a
@@ -1315,6 +1324,91 @@ _TYPE_GIVEAWAY_TERMS = {
 _TYPE_QUERY_EXEMPT_WORDS = {
     "motor": ("motor", "vehicle", "car", "bike", "scooter", "motorcycle", "driving", "driver"),
 }
+
+
+def _get_type_assertion_vocab() -> dict:
+    """Phase 1 (plan_claim_answer_correctness.md): per-type vocabulary for
+    the ungrounded-foreign-type-assertion gate below — deliberately a
+    DIFFERENT, complementary list from _TYPE_GIVEAWAY_TERMS, not a
+    replacement for it.
+
+    _text_has_giveaway_contamination (above) catches LEAKAGE: a foreign
+    type's term that genuinely appears in RETRIEVED context (a wrong-type
+    chunk really was pulled in) and then shows up in the answer too — real
+    evidence of a source, just the wrong one for this query. It structurally
+    cannot catch the opposite failure: a foreign-type claim asserted with
+    ZERO supporting evidence anywhere in what was retrieved — pure
+    hallucination, not leakage. Confirmed live 2026-08-04: "How to claim a
+    life insurance?" asserted "if the claim involves a third party, such as
+    a car accident" (motor's third-party/MACT-tribunal concept) while every
+    retrieved source for that query was life-insurance/general content with
+    zero motor material in it at all — there was no motor chunk for
+    anything to leak FROM.
+
+    Merges _TYPE_GIVEAWAY_TERMS with get_active_vocab()'s keyword lists
+    (covers all core + promoted open-vocab types, not just the 6 curated
+    here) so this gate has real coverage across all policy types, not just
+    the ones _TYPE_GIVEAWAY_TERMS happens to enumerate. Two safety filters,
+    both drawn from this file's own bare-word false-positive history
+    (project_motor_bareword_giveaway_generalization,
+    project_compound_word_joiner_bug):
+      - multi-word phrases only — a bare single word (even one already
+        vetted for the leakage check above, e.g. motor's "vehicle") is
+        excluded here, since this gate's drop condition (context has NO
+        support at all) is a different risk profile than the leakage
+        check's (context DOES support it).
+      - any phrase shared by 2+ types (e.g. "third party liability" in both
+        motor and liability, "accidental death" in both life and
+        personal_accident) is dropped from every type's list — a shared
+        phrase can't safely attribute one type over another.
+
+    Recomputed per call rather than cached at import time: get_active_vocab()
+    can change at runtime (candidate-type promotion), and this is cheap
+    (short-string set operations over a few hundred keywords, no ML/IO) —
+    same reasoning _get_type_assertion_vocab's siblings elsewhere in this
+    file already apply to per-request get_active_vocab() calls.
+    """
+    raw: dict = {}
+    for _type_name, _terms in _TYPE_GIVEAWAY_TERMS.items():
+        raw.setdefault(_type_name, set()).update(
+            t.lower() for t in _terms if " " in t or "-" in t
+        )
+    for _type_name, _info in get_active_vocab().items():
+        for kw in (_info.get("keywords") or []):
+            kw_l = kw.lower().strip()
+            if " " in kw_l or "-" in kw_l:
+                raw.setdefault(_type_name, set()).add(kw_l)
+    counts: dict = {}
+    for _terms in raw.values():
+        for _t in _terms:
+            counts[_t] = counts.get(_t, 0) + 1
+    return {
+        _type_name: sorted(t for t in _terms if counts[t] == 1)
+        for _type_name, _terms in raw.items()
+    }
+
+
+# Phase 2 (plan_claim_answer_correctness.md): claim-intent detector, kept as
+# one named, importable constant rather than inlined so it can't drift out
+# of sync with the corpus/tests that need to recognize the same shape.
+# Requires BOTH claim vocabulary AND a procedural question shape — "claim"
+# alone would also fire on a coverage question ("does my policy cover a
+# claim for water damage?"), which isn't asking about claim PROCEDURE and
+# shouldn't get the extra retrieval weighting below. The procedural-shape
+# alternation covers all three canonical phrasings this plan's Phase 0
+# corpus uses ("how do I claim...", "what is the ... claim process", "walk
+# me through claiming on a ... policy") plus common variants.
+_CLAIM_INTENT_VOCAB_RE = re.compile(r"\b(claim|claiming|claims|settl\w*|reimburs\w*)\b", re.IGNORECASE)
+_CLAIM_INTENT_PROCEDURAL_RE = re.compile(
+    r"^\s*(?:how|what|walk me|explain|tell me)\b|\b(?:process|procedure|steps?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_claim_intent_query(query: str) -> bool:
+    query = query or ""
+    return bool(_CLAIM_INTENT_VOCAB_RE.search(query) and _CLAIM_INTENT_PROCEDURAL_RE.search(query))
+
 
 # Curated, closed list of named claim/policy documents and instruments this
 # KB actually discusses. Used by the artifact-grounding check in the
@@ -4298,7 +4392,7 @@ def _is_insurance_related(question: str) -> bool:
 
 from langchain_core.documents import Document
 from rag import RAGPipeline
-from router import get_insurance_llm
+from router import get_insurance_llm, VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
 from video_store import VideoVectorStore
 from webpage_store import WebpageVectorStore
 from calculator import compute_insurance_benefits, _is_calculation_question
@@ -4331,10 +4425,96 @@ from rag import LLM_CONTEXT_WINDOW_CHARS
 # 3585 real input tokens + 512 requested output = 4097, just over the
 # model's 4096-token ceiling. Using 3 chars/token (instead of 4) builds
 # in that margin everywhere this ratio is used for a token estimate.
+#
+# Phase C0 (2026-08-04, plan_shallow_answers_context_budget.md): this ratio
+# is doing two jobs with OPPOSITE safety directions. For estimating PROMPT
+# cost (below), a low ratio over-counts tokens — conservative, but wastes
+# real context budget. For converting the leftover budget back to chars
+# (ask_stream's `_context_budget = _context_token_budget * _CHARS_PER_TOKEN`,
+# where the overflow above was actually measured), a low ratio under-fills
+# — that one stays untouched at 3. Confirmed live 2026-08-04: the real
+# Qwen2.5-7B-Instruct-AWQ tokenizer counts DETAILED_GROUNDED_PROMPT at 2,523
+# tokens, not the 3,735 this char/3 estimate gave — a ~1,200-token phantom
+# cost, repeated on every single request, that was starving the actual
+# retrieved-context budget down to a 300-token floor regardless of how much
+# real content was retrieved (see the plan for the full chain: 300 tok ->
+# 900 chars -> compressor fragments every chunk into ~112-char slivers ->
+# generic filler is the only thing writable from that). The prompt text is
+# STATIC and known at import time, so it doesn't need a heuristic at all —
+# it can just be measured.
 _CHARS_PER_TOKEN = 3
-_STRICT_PROMPT_TOKENS_EST = len(STRICT_GROUNDED_PROMPT) // _CHARS_PER_TOKEN
-_DETAILED_PROMPT_TOKENS_EST = len(DETAILED_GROUNDED_PROMPT) // _CHARS_PER_TOKEN
-_CONVERSATIONAL_PROMPT_TOKENS_EST = len(CONVERSATIONAL_RAG_PROMPT) // _CHARS_PER_TOKEN
+
+
+def _measure_prompt_tokens(prompt: str) -> int:
+    """Real token count via vLLM's own /tokenize endpoint (note: lives
+    directly under VLLM_HOST, NOT under /v1/ — confirmed live 2026-08-04).
+    Falls back to the char/_CHARS_PER_TOKEN heuristic on ANY failure so a
+    transient hiccup at container boot (vLLM not up yet, a network blip)
+    degrades to exactly today's behavior rather than crashing import or
+    silently under-budgeting every request for the process's lifetime.
+    Calling out to the vLLM host here isn't a NEW failure mode — this app
+    already hard-depends on that same host for every single request.
+    Computed once at import time and cached in the module-level constants
+    below, never re-measured per request. Deliberately NOT hardcoding the
+    measured numbers as literals: that's the exact staleness bug that
+    caused the prior 700-token-constant production crash this whole
+    dynamic-budget mechanism exists to prevent (see the comment above) —
+    if a prompt template's size changes, the next process boot re-measures
+    it automatically.
+    """
+    if not VLLM_HOST:
+        return len(prompt) // _CHARS_PER_TOKEN
+    try:
+        import json as _json_tok
+        import urllib.request as _urlreq_tok
+        body = _json_tok.dumps({"model": _resolve_vllm_model(), "prompt": prompt}).encode()
+        req = _urlreq_tok.Request(
+            f"{VLLM_HOST}/tokenize", data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"},
+            method="POST",
+        )
+        with _urlreq_tok.urlopen(req, timeout=15) as resp:
+            return _json_tok.loads(resp.read())["count"]
+    except Exception as exc:
+        logger.warning(
+            "[token-budget] /tokenize measurement failed, falling back to "
+            "char/%d estimate for this prompt: %s", _CHARS_PER_TOKEN, exc,
+        )
+        return len(prompt) // _CHARS_PER_TOKEN
+
+
+_STRICT_PROMPT_TOKENS_EST = _measure_prompt_tokens(STRICT_GROUNDED_PROMPT)
+_DETAILED_PROMPT_TOKENS_EST = _measure_prompt_tokens(DETAILED_GROUNDED_PROMPT)
+_CONVERSATIONAL_PROMPT_TOKENS_EST = _measure_prompt_tokens(CONVERSATIONAL_RAG_PROMPT)
+logger.info(
+    "[token-budget] real prompt token counts — strict=%d detailed=%d conversational=%d "
+    "(vs. char/%d estimates: %d/%d/%d)",
+    _STRICT_PROMPT_TOKENS_EST, _DETAILED_PROMPT_TOKENS_EST, _CONVERSATIONAL_PROMPT_TOKENS_EST,
+    _CHARS_PER_TOKEN,
+    len(STRICT_GROUNDED_PROMPT) // _CHARS_PER_TOKEN,
+    len(DETAILED_GROUNDED_PROMPT) // _CHARS_PER_TOKEN,
+    len(CONVERSATIONAL_RAG_PROMPT) // _CHARS_PER_TOKEN,
+)
+
+# Phase C3 (2026-08-04, plan_shallow_answers_context_budget.md): the actual
+# completion request's own "max_tokens" value — read ONCE here and reused
+# both for the request itself (ask_stream's payload, ~line 7060) and for
+# _output_reserve (ask_stream, ~line 6580). Before this fix those were two
+# independently-hardcoded numbers that had drifted apart: _output_reserve
+# reserved 1500 tokens "just in case," while the completion request itself
+# was actually capped at VLLM_MAX_TOKENS (deployed value: 512, not even the
+# 900 code default) — reserving 3x more than could ever actually be
+# requested, wasting ~988 tokens of the 3900-token budget on every single
+# detailed-mode request for nothing. _output_reserve's whole job is to
+# guarantee prompt_tokens + max_tokens never exceeds the model's ceiling
+# (that exact overflow already crashed production once — see the
+# _CHARS_PER_TOKEN comment above) — it can only be correct if it reserves
+# EXACTLY what the request will ask for, no more and no less. A single
+# shared constant makes the two structurally incapable of drifting apart
+# again, the same principle _measure_prompt_tokens uses above.
+_VLLM_MAX_TOKENS_DETAILED = int(os.getenv("VLLM_MAX_TOKENS", "900"))
+_VLLM_MAX_TOKENS_BRIEF = int(os.getenv("VLLM_MAX_TOKENS_BRIEF", "300"))
+
 
 class MultiSourceRAG:
     def __init__(self, doc_pipeline: Optional[RAGPipeline] = None):
@@ -5736,7 +5916,25 @@ class MultiSourceRAG:
         # generated answer (see [[project_always_false_claim_corrections]]).
         # video/webpage chunks are exempt (source_type check below) since
         # they aren't covered by the hard pre-filter either.
-        _TYPE_MISMATCH_DISCOUNT = 0.5
+        #
+        # Phase 2 (plan_claim_answer_correctness.md): strengthened to 0.3x
+        # for claim-process queries with a confident specific type. Claims
+        # content is structurally the worst case for this discount's
+        # rationale — the claims chapters mix all policy types' procedures
+        # inside "general"-tagged narrative prose (confirmed via
+        # policy_type_audit.py --claims-scope: 29 of 50 genuine claims-body
+        # chunks in the KB's multi-topic reference docs are general-tagged,
+        # not a tagging error but real type-agnostic regulatory/procedural
+        # content), so a wrong-type-flavored general chunk is more likely to
+        # win the reranker's top slots here than for a typical query. Scoped
+        # narrowly (claim-intent AND a confident non-"general" query type)
+        # rather than lowering the discount globally, since 0.3x is
+        # otherwise untested outside this specific, confirmed-worst-case
+        # population — general queries keep the original, already-tuned 0.5x.
+        _TYPE_MISMATCH_DISCOUNT = (
+            0.3 if (_is_claim_intent_query(retrieval_query) and _query_policy_type != "general")
+            else 0.5
+        )
 
         # Mutated by the Mode-B fallback further down, read by
         # _effective_sort_score — a chunk that only made it into the pool
@@ -6398,7 +6596,7 @@ class MultiSourceRAG:
             _PROMPT_TEMPLATE_TOKENS = _DETAILED_PROMPT_TOKENS_EST
         else:
             _PROMPT_TEMPLATE_TOKENS = _CONVERSATIONAL_PROMPT_TOKENS_EST
-        _output_reserve = 1500 if detailed else 300
+        _output_reserve = _VLLM_MAX_TOKENS_DETAILED if detailed else _VLLM_MAX_TOKENS_BRIEF
         _history_tokens_est = len(history) // _CHARS_PER_TOKEN if history else 0
 
         # If template + history + output_reserve alone already leave no
@@ -6768,17 +6966,50 @@ class MultiSourceRAG:
 
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
-                llm = get_insurance_llm(temperature=0)
             elif detailed:
                 prompt = DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
-                llm = get_insurance_llm(temperature=0)
             else:
                 prompt = CONVERSATIONAL_RAG_PROMPT.format(
                     history=history,
                     context=full_context,
                     question=prompt_question,
                 )
-                llm = get_insurance_llm(temperature=0)
+
+            # Safety valve (2026-08-04, plan_shallow_answers_context_budget.md
+            # — found live, NOT part of the original plan): _context_budget
+            # (chars, computed far above from a CHAR estimate of what would
+            # go into `context=`) does not account for everything that ends
+            # up in the ASSEMBLED `prompt` string above — per-chunk
+            # "[Document: file (Page N)]\n" labels, _rerank_windows()
+            # potentially returning a different span than what
+            # compress_to_budget trimmed to, the "[Related prior answers]"
+            # block, etc. Confirmed live: this real gap produced an actual
+            # vLLM 400 ("3797 input tokens" against a 300-token output
+            # request, 4097 total) on a genuinely fresh, single-turn,
+            # brief-mode query — the exact production crash the whole
+            # dynamic-budget mechanism exists to prevent, reappearing
+            # because Phases C0/C3 removed the phantom prompt/output-reserve
+            # slack that had been silently absorbing this gap the whole
+            # time. Rather than trying to account for every source of
+            # char-vs-token slop in the estimate (fragile, will drift again
+            # the next time any of those pieces changes), measure the REAL
+            # token count of the fully-assembled prompt right before
+            # sending and cap max_tokens so the total structurally cannot
+            # exceed the model's ceiling — correct regardless of WHERE the
+            # gap comes from. 50-token buffer, not 196 (the char-heuristic's
+            # margin): this is a real measurement, not an estimate, so it
+            # needs far less slack.
+            _desired_max_tokens = _VLLM_MAX_TOKENS_DETAILED if detailed else _VLLM_MAX_TOKENS_BRIEF
+            _real_prompt_tokens_final = _measure_prompt_tokens(prompt)
+            _safe_max_tokens = max(50, min(_desired_max_tokens, 4096 - _real_prompt_tokens_final - 50))
+            if _safe_max_tokens < _desired_max_tokens:
+                logger.warning(
+                    "[ask_stream] context-budget gap: real prompt tokens=%d left only %d/%d "
+                    "of the intended output budget — some source of char-vs-token slop between "
+                    "the estimate and the assembled prompt is larger than accounted for",
+                    _real_prompt_tokens_final, _safe_max_tokens, _desired_max_tokens,
+                )
+            llm = get_insurance_llm(temperature=0, max_tokens=_safe_max_tokens)
 
         # ── Stream LLM tokens directly via HTTP SSE ───────────────────────────
         # LangChain's astream() buffers the full response before yielding.
@@ -6872,7 +7103,7 @@ class MultiSourceRAG:
                 # markdown bolding/bullets the model sometimes adds, which
                 # left little headroom. Confirmed live: a fire-insurance
                 # "explain in detail" answer was cut after ~2 points.
-                "max_tokens": int(__import__("os").getenv("VLLM_MAX_TOKENS", "900") if detailed else __import__("os").getenv("VLLM_MAX_TOKENS_BRIEF", "300")),
+                "max_tokens": _safe_max_tokens,
                 "stream": True,
             }
             headers = _stream_headers
@@ -6928,6 +7159,20 @@ class MultiSourceRAG:
                             if done:
                                 break
                 streamed_ok = True
+                # Phase C3 prep (plan_shallow_answers_context_budget.md):
+                # finish_reason was only ever logged for brief-mode's own
+                # truncation-mitigation path below — detailed mode had zero
+                # visibility into whether it was hitting its max_tokens
+                # ceiling mid-generation. Needed to safely right-size
+                # _output_reserve (which must reserve at least as much as
+                # detailed mode's real completion length, or genuinely
+                # truncate answers) — kept as a permanent log line since
+                # it's cheap and useful going forward, not a one-off probe.
+                if _keyword_detailed:
+                    logger.info(
+                        "[ask_stream] detailed completion finish_reason=%r len(chars)=%d",
+                        _finish_reason, len(_kv_reply),
+                    )
             except Exception as exc:
                 logger.warning("[ask_stream] direct %s streaming failed, falling back: %s", _active, exc)
 
@@ -7512,6 +7757,69 @@ class MultiSourceRAG:
                     )
             except Exception as _contam_exc:
                 logger.debug("[ask_stream] cross-topic contamination filter skipped: %s", _contam_exc)
+
+        # ── Ungrounded foreign-type assertion gate (Phase 1, ─────────────────
+        # plan_claim_answer_correctness.md) ──────────────────────────────────
+        # Complementary to the cross-topic-contamination filter directly
+        # above, not a duplicate of it — see _get_type_assertion_vocab's
+        # docstring for the leakage-vs-hallucination distinction. This is
+        # what actually generalizes today's hand-patched fix (the
+        # third-party/motor-accident check added to
+        # _fc_line_is_always_false_claim) from "motor asserted in a life
+        # answer" to any foreign type asserted in any answer with zero
+        # supporting evidence in what was retrieved.
+        if _keyword_detailed and _query_policy_type != "general":
+            try:
+                _ta_vocab = _get_type_assertion_vocab()
+                _ta_src = (_corrected_text or _reply_stripped).strip()
+                _ta_opener, _ta_points, _ta_closer = _split_numbered_points(_ta_src)
+                _ta_ctx_norm = _normalize_word_forms(_full_context_uncompressed)
+
+                def _ta_unit_is_ungrounded_foreign_type(unit: str) -> bool:
+                    unit_norm = _normalize_word_forms(unit)
+                    for _type_name, _terms in _ta_vocab.items():
+                        if _type_name == _query_policy_type:
+                            continue
+                        for _term in _terms:
+                            _term_norm = _normalize_word_forms(_term)
+                            if not _term_norm:
+                                continue
+                            _pat = r"\b" + re.escape(_term_norm) + r"\b"
+                            if re.search(_pat, unit_norm) and not re.search(_pat, _ta_ctx_norm):
+                                return True
+                    return False
+
+                _ta_kept = [p for p in _ta_points if not _ta_unit_is_ungrounded_foreign_type(p)]
+                if len(_ta_kept) < len(_ta_points):
+                    if _ta_kept:
+                        _ta_rebuilt = _rebuild_from_points(_ta_opener, _ta_kept, _ta_closer)
+                        _ta_rebuilt = re.sub(r"\n{3,}", "\n\n", _ta_rebuilt).strip()
+                        _corrected_text = _ta_rebuilt
+                        _kv_reply = _ta_rebuilt
+                        logger.info(
+                            "[ask_stream] dropped %d ungrounded foreign-type point(s) "
+                            "(Phase 1 type-attribution gate)",
+                            len(_ta_points) - len(_ta_kept),
+                        )
+                    else:
+                        # Same discard-and-refuse fallback as every other
+                        # whole-reply-contaminated block in this file — a
+                        # fragment built from zero surviving points is worse
+                        # than a clean refusal.
+                        _ta_refusal = (
+                            "Hmm, I don't have that specific information in my knowledge base "
+                            "right now. Let me get one of our agents on it, they'll be able to "
+                            "help you better! 😊"
+                        )
+                        _reply_stripped = _ta_refusal
+                        _kv_reply = _ta_refusal
+                        _corrected_text = _ta_refusal
+                        logger.info(
+                            "[ask_stream] discarded whole answer: every point asserted an "
+                            "ungrounded foreign-type claim (Phase 1 type-attribution gate)"
+                        )
+            except Exception as _ta_exc:
+                logger.debug("[ask_stream] type-attribution gate skipped: %s", _ta_exc)
 
         # ── Semantic per-point topic-relevance gate (Phase 2, plan.md) ─────────
         # LOG-ONLY by default (POINT_RELEVANCE_GATE_ACTIVE unset) — this is
@@ -8867,6 +9175,99 @@ class MultiSourceRAG:
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
+        # ── Relation-anchored grounding (Phase 3, plan_claim_answer_ ──────────
+        # correctness.md) — LOG-ONLY diagnostic, does NOT modify the answer ───
+        # Generalizes the two Class-B bugs hand-patched into
+        # _fc_line_is_always_false_claim today (stolen-vehicle-transfer
+        # inversion, life-claim 30-day-trigger swap): word-level grounding
+        # ("is '30 days' in context?", "is 'transfer' in context?") passes
+        # both, even though both are false — every word is real, just
+        # RECOMBINED into a false relationship. This checks whether a
+        # (relation, anchor) pair extracted from the generated text actually
+        # co-occurs in the retrieved context, not just whether each word
+        # does independently. Self-contained (its own context/window logic,
+        # not reusing _dewrapped_ctx/_source_window from the block above) so
+        # it can never be affected by whether that block's try succeeded.
+        # Started log-only per this plan's explicit rollout discipline (same
+        # discipline the point-relevance gate's original log-only period
+        # used) — count would-drops against the Phase 0 corpus before this
+        # is ever allowed to touch an answer.
+        try:
+            _RA_TEMPORAL_RE = re.compile(
+                r"\b(\d{1,3})\s*(day|month|year)s?\b[^.]{0,40}?\b(?:from|of|after)\b\s+"
+                r"([a-z][a-z '-]{5,60}?)(?=[.,;]|\s+and\b|$)",
+                re.IGNORECASE,
+            )
+            _RA_TRANSFER_RE = re.compile(
+                r"\b(\w+(?:\s+\w+){0,4})\s+(?:is|are|must be|shall be|will be)?\s*"
+                r"(transferr?ed|assign(?:ed)?|paid)\s+(?:to|in the name of)\s+"
+                r"([a-z][a-z '-]{3,50}?)(?=[.,;]|\s+and\b|$)",
+                re.IGNORECASE,
+            )
+
+            def _ra_stem(word: str) -> str:
+                w = word.lower()
+                for suf in ("red", "ed", "ing", "s"):
+                    if w.endswith(suf) and len(w) - len(suf) >= 3:
+                        return w[: -len(suf)]
+                return w
+
+            def _ra_windows_around(ctx_lower: str, relation_stem: str, radius: int = 200) -> list:
+                # Search by STEM + up to 4 trailing letters so
+                # transfer/transferred/transferring all match without
+                # needing every inflection spelled out — confirmed necessary
+                # live: the bad unit says "transferred", the real source
+                # text says "transfer" (base form), an exact-string search
+                # would have missed the very case this exists to catch.
+                windows = []
+                for m in re.finditer(r"\b" + re.escape(relation_stem) + r"\w{0,4}\b", ctx_lower):
+                    windows.append(ctx_lower[max(0, m.start() - radius): m.end() + radius])
+                return windows
+
+            def _ra_pair_ungrounded(ctx_lower: str, relation_text: str, anchor_text: str) -> bool:
+                _stem = _ra_stem(relation_text.split()[-1] if " " in relation_text else relation_text)
+                _windows = _ra_windows_around(ctx_lower, _stem)
+                if not _windows:
+                    # Relation phrase itself isn't in context at all — a
+                    # word-level grounding check upstream (currency/
+                    # artifact-noun) already owns that failure mode; this
+                    # check only judges RELATION distortion when the
+                    # relation word does have real support somewhere.
+                    return False
+                _anchor_words = [w for w in re.findall(r"[a-z]+", anchor_text.lower()) if len(w) > 3]
+                if not _anchor_words:
+                    return False
+                # ALL substantial anchor words must co-occur in the SAME
+                # window, not just any one — confirmed necessary live: "date"
+                # alone appears near "30 days" in both the wrong anchor
+                # ("date of the incident") and the correct one ("date of
+                # receipt of papers"), so requiring only one shared word let
+                # the wrong anchor pass as if it were grounded.
+                return not any(all(aw in w for aw in _anchor_words) for w in _windows)
+
+            _ra_src = (_corrected_text or _reply_stripped).strip()
+            _ra_ctx_lower = (_full_context_uncompressed or "").lower()
+            _ra_would_drop = []
+            for _m in _RA_TEMPORAL_RE.finditer(_ra_src):
+                _rel = f"{_m.group(1)} {_m.group(2)}"
+                _anchor = _m.group(3)
+                if _ra_pair_ungrounded(_ra_ctx_lower, _rel, _anchor):
+                    _ra_would_drop.append({"kind": "temporal", "relation": _rel, "anchor": _anchor.strip()})
+            for _m in _RA_TRANSFER_RE.finditer(_ra_src):
+                _rel = _m.group(2)
+                _anchor = _m.group(3)
+                if _ra_pair_ungrounded(_ra_ctx_lower, _rel, _anchor):
+                    _ra_would_drop.append({"kind": "transfer", "relation": _rel, "anchor": _anchor.strip()})
+
+            if _ra_would_drop:
+                logger.info(
+                    "[ask_stream] Phase 3 relation-anchored grounding (LOG-ONLY, not enforced): "
+                    "would flag %d ungrounded relation(s): %s",
+                    len(_ra_would_drop), _ra_would_drop,
+                )
+        except Exception as _ra_exc:
+            logger.debug("[ask_stream] relation-anchored grounding diagnostic skipped: %s", _ra_exc)
+
         # Set unconditionally for the same reason as _dropped_num above — the
         # hollow-answer detector needs to check this even if the try block
         # below never runs.
@@ -9446,6 +9847,68 @@ class MultiSourceRAG:
                 re.IGNORECASE,
             )
 
+            # On a total-loss theft claim the insurer asks the Registering
+            # Authority NOT to transfer the stolen vehicle's registration/
+            # ownership to anyone — precisely to stop the thief disposing of
+            # it (m4-3f.pdf p14: "...request them not to transfer the
+            # ownership of the vehicle to any one. This will prevent the
+            # thief from disposing of the stolen vehicle."). Confirmed
+            # reproduced live, and it survives the correction pipeline
+            # unchanged: "The registration certificate of the stolen vehicle
+            # must be transferred in the name of the insured after approval"
+            # — an inversion of the source, not a vague paraphrase. Same
+            # drop-don't-rewrite reasoning as the fines/average-clause checks
+            # above. Deliberately order-independent (just three concept-word
+            # hits in the same line/point, not a fixed sequence) — the actual
+            # bad phrasing puts "registration" before "stolen" before
+            # "transferred", the source puts "transfer" before "ownership"
+            # before "stolen"; a line is short enough (one bullet point) that
+            # proximity is already implied without pinning word order. Only
+            # drop when no negation word is nearby, so a correctly-phrased
+            # "must NOT be transferred" line is left alone.
+            _SV_STOLEN_RE = re.compile(r"\b(?:stolen|theft)\b", re.IGNORECASE)
+            _SV_REG_OWNERSHIP_RE = re.compile(
+                r"\b(?:registration|ownership|r\.?c\.?\s*(?:book|certificate)?)\b", re.IGNORECASE
+            )
+            _SV_TRANSFER_RE = re.compile(r"\btransfer\w*\b", re.IGNORECASE)
+            _SV_NEGATION_RE = re.compile(
+                r"\b(not|n't|never|avoid\w*|without|prevent\w*|no\s+transfer)\b", re.IGNORECASE
+            )
+
+            # IRDA (Protection of Policyholders Interests) Regulations 2002,
+            # Reg. 8(3) (9.3 INSURANCE LAW AND PRACTICE.pdf p173-174): a life
+            # claim must be paid or disputed within 30 days from the DATE OF
+            # RECEIPT OF ALL RELEVANT PAPERS AND CLARIFICATIONS — not from
+            # the date of the incident/accident/death itself. Confirmed
+            # reproduced across 3 independent fresh generations (2 logged as
+            # genuine "KV cache stored", not "hit") of "how to claim life
+            # insurance" in various phrasings: "The claim process must be
+            # completed within 30 days from the date of the incident." This
+            # sets a false customer expectation — the 30-day clock doesn't
+            # even start until documentation is complete, which can itself
+            # take much longer than 30 days after the incident. Drop rather
+            # than rewrite (no single safe substitution — surrounding wording
+            # varies), same as the other checks in this block. A correctly-
+            # phrased line naming the real trigger (papers/documents/
+            # clarifications) is left alone.
+            _30DAY_TRIGGER_RE = re.compile(
+                r"\b30\s*days\b[^.]{0,120}?\b(?:date|time)\s+of\s+the\s+(?:incident|accident|loss|death)\b"
+                r"|\b(?:date|time)\s+of\s+the\s+(?:incident|accident|loss|death)\b[^.]{0,120}?\b30\s*days\b",
+                re.IGNORECASE,
+            )
+            _30DAY_CORRECT_ANCHOR_RE = re.compile(
+                r"\b(?:papers?|documents?|documentation|clarifications?|requirements?)\b", re.IGNORECASE
+            )
+
+            # Third-party/car-accident-in-life check REMOVED here 2026-08-04
+            # (Phase 6, plan_claim_answer_correctness.md) — superseded by
+            # Phase 1's ungrounded-foreign-type-assertion gate (see that
+            # block's own comment for why: same "no supporting context"
+            # condition, now applied generically instead of to this one
+            # type pair). See the comment inside _fc_line_is_always_false_claim
+            # below, at the point this used to be checked, for the full
+            # removal rationale.
+
             def _fc_line_is_always_false_claim(_ln: str) -> bool:
                 if _FINES_CLAIM_RE.search(_ln) and not _FINES_NEGATION_RE.search(_ln):
                     return True
@@ -9453,6 +9916,32 @@ class MultiSourceRAG:
                     return True
                 if _PREMIUM_MARKET_VALUE_RE.search(_ln):
                     return True
+                if (
+                    _SV_STOLEN_RE.search(_ln)
+                    and _SV_REG_OWNERSHIP_RE.search(_ln)
+                    and _SV_TRANSFER_RE.search(_ln)
+                    and not _SV_NEGATION_RE.search(_ln)
+                ):
+                    return True
+                if _30DAY_TRIGGER_RE.search(_ln) and not _30DAY_CORRECT_ANCHOR_RE.search(_ln):
+                    return True
+                # _TP_MOTOR_ACCIDENT_RE/_TP_VEHICLE_ACCIDENT_RE (the third-
+                # party/car-accident-in-life check) REMOVED here 2026-08-04
+                # (Phase 6, plan_claim_answer_correctness.md) — it was a
+                # Class A (wrong-type import) check, and Phase 1's
+                # ungrounded-foreign-type-assertion gate now covers the same
+                # case generically: "car accident" was added to
+                # _TYPE_GIVEAWAY_TERMS["motor"], which feeds
+                # _get_type_assertion_vocab(), so Phase 1 drops it with the
+                # same "no supporting context" condition this hand-rolled
+                # check used. Re-verified via the claims_factual_repro
+                # regression-lock corpus after removal: still 0% (see
+                # /tmp/claims_factual_phase6.json). The stolen-vehicle and
+                # 30-day checks directly above stay — those are Class B
+                # (factual inversion / relation distortion), and Phase 3
+                # (the mechanism that generalizes them) is still LOG-ONLY,
+                # not enforcing, so this is still the only active guard for
+                # those two cases.
                 return False
 
             if any(_fc_line_is_always_false_claim(_ln) for _ln in _false_claim_fixed.split("\n")):
@@ -9481,7 +9970,8 @@ class MultiSourceRAG:
                     _false_claim_fixed = re.sub(r"\n{3,}", "\n\n", "\n".join(_fc_renumbered))
                     logger.info(
                         "[ask_stream] dropped sentence/point containing an always-false claim "
-                        "(fines coverage or a condition-of-average misdefinition)"
+                        "(fines coverage, condition-of-average misdefinition, premium/market-value "
+                        "timing, stolen-vehicle transfer, or life-claim 30-day trigger)"
                     )
                 else:
                     # A single-sentence brief-mode reply with no line breaks
@@ -9545,7 +10035,13 @@ class MultiSourceRAG:
                                 _cl_next_n += 1
                             else:
                                 _cl_renumbered.append(_u)
-                        _cl_rebuilt = "\n".join(_cl_renumbered).strip()
+                        # Dropping a unit removes only its text; the blank
+                        # line that separated it from its neighbours
+                        # survives and stacks up ("2. ...\n\n\n\n3. ...").
+                        # Same fix already applied to the always-false-claims
+                        # block above — this block had the identical gap,
+                        # just never noticed since citation leaks are rarer.
+                        _cl_rebuilt = _re8.sub(r"\n{3,}", "\n\n", "\n".join(_cl_renumbered)).strip()
                     else:
                         _cl_rebuilt = " ".join(_cl_kept).strip()
                         if _cl_rebuilt and _cl_rebuilt[-1] not in ".!?":
@@ -9558,6 +10054,80 @@ class MultiSourceRAG:
                     )
         except Exception as _cl_exc:
             logger.debug("[ask_stream] citation-leak strip skipped: %s", _cl_exc)
+
+        # ── Third-party brand strip: a competitor's own portal/app name ────────
+        # STRICT_GROUNDED_PROMPT/DETAILED_GROUNDED_PROMPT/CONVERSATIONAL_RAG_PROMPT
+        # all now tell the model not to repeat this — same
+        # [[project_dont_trust_buried_disclosure_instructions]] gap as the
+        # citation-leak strip above, so it needs the same deterministic
+        # backstop. Confirmed live: 5e9acf857576_travelinsuranceguide.pdf in
+        # the KB is itself published by a DIFFERENT insurance company ("If"),
+        # not us, and names its own customer portal/app verbatim — asked
+        # "How to claim the travel insurance?", a detailed answer said "You
+        # can file a claim on My Pages or via If Mobile" and "select If
+        # Travel Insurance and then choose Digital travel insurance card",
+        # directing the user to a competitor's own systems as if they were
+        # ours. Kept deliberately as a small, specific term list (same
+        # discipline as the always-false-claims block above) rather than a
+        # generic company-name detector, which would be far too prone to
+        # false positives on ordinary insurer names actually relevant to the
+        # KB. Drop the whole unit (point/sentence) containing the leaked
+        # brand rather than trying to surgically rewrite "My Pages" into
+        # generic language and risk a grammatically broken remainder.
+        try:
+            import re as _re9
+            _THIRD_PARTY_BRAND_RE = _re9.compile(
+                r'\bMy\s+Pages\b|\bIf\s+Mobile\b|\bIf\s+Travel\s+Insurance\b|'
+                r'\bIf\s+travel\s+assistance\b|\bIf\s+P\s*&\s*C\b',
+                _re9.IGNORECASE,
+            )
+            _tpb_src = (_corrected_text or _reply_stripped).strip()
+            if _THIRD_PARTY_BRAND_RE.search(_tpb_src):
+                _tpb_has_points = bool(_re9.search(r'(?:^|\n)\s*\d+\.\s', _tpb_src))
+                if _tpb_has_points:
+                    _tpb_units = _re9.split(r'\n(?=\s*\d+\.\s)', _tpb_src)
+                else:
+                    _tpb_units = _re9.split(r'(?<=[.!?])(?<!\d\.)\s+', _tpb_src)
+
+                _tpb_kept = [u for u in _tpb_units if not _THIRD_PARTY_BRAND_RE.search(u)]
+                if len(_tpb_kept) < len(_tpb_units) and _tpb_kept:
+                    if _tpb_has_points:
+                        _tpb_point_re = _re9.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re9.DOTALL)
+                        _tpb_renumbered, _tpb_next_n = [], 1
+                        for _u in _tpb_kept:
+                            _m = _tpb_point_re.match(_u)
+                            if _m:
+                                _tpb_renumbered.append(f"{_m.group(1)}{_tpb_next_n}{_m.group(3)}{_m.group(4)}")
+                                _tpb_next_n += 1
+                            else:
+                                _tpb_renumbered.append(_u)
+                        _tpb_rebuilt = _re9.sub(r"\n{3,}", "\n\n", "\n".join(_tpb_renumbered)).strip()
+                    else:
+                        _tpb_rebuilt = " ".join(_tpb_kept).strip()
+                        if _tpb_rebuilt and _tpb_rebuilt[-1] not in ".!?":
+                            _tpb_rebuilt += "."
+                    _corrected_text = _tpb_rebuilt
+                    _kv_reply = _tpb_rebuilt
+                    logger.info(
+                        "[ask_stream] dropped %d unit(s) leaking a third-party insurer's own brand name",
+                        len(_tpb_units) - len(_tpb_kept),
+                    )
+                elif not _tpb_kept:
+                    # Every unit contained the branded reference — the whole
+                    # reply is built around it, same as other contamination
+                    # checks that discard the whole reply rather than leave
+                    # nothing.
+                    _tpb_rebuilt = (
+                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                    )
+                    _corrected_text = _tpb_rebuilt
+                    _kv_reply = _tpb_rebuilt
+                    logger.info(
+                        "[ask_stream] discarded whole reply — every unit leaked a third-party insurer's brand name"
+                    )
+        except Exception as _tpb_exc:
+            logger.debug("[ask_stream] third-party brand strip skipped: %s", _tpb_exc)
 
         # ── Buffered-path single yield (after all corrections) ────────────────
         # The non-streaming (buffered) path above stored the raw answer in

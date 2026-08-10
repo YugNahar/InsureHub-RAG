@@ -151,8 +151,27 @@ def _read_trace_record() -> dict:
 
 
 def _ask(query: str, session_id: str, timeout: int = 120) -> str:
-    """POST to /ask-stream, return the answer text (the streamed body
-    with the trailing '\\n\\n{"sources": ...}' metadata blob stripped).
+    """POST to /ask-stream, return the FINAL answer text the user actually
+    sees — not the raw streamed body.
+
+    BUG FIXED 2026-08-04 (found while running the Phase 0 claims sub-corpus,
+    plan_claim_answer_correctness.md): this previously returned everything
+    before the trailing '\\n\\n{"sources": ...}' metadata blob, i.e. the raw
+    PRE-correction stream. ask_stream's post-generation correction pipeline
+    (third-party brand strip, always-false-claim drops, citation-leak strip,
+    etc.) only ever produces a SEPARATE trailing `corrected_text` field in
+    that same JSON blob — the streamed tokens the user watches live are
+    generated and sent before any of those corrections can run, and can
+    never be un-sent. Grading contamination against the pre-correction text
+    made every post-generation-guard fix look permanently broken to this
+    runner regardless of whether it actually worked (confirmed: a fresh run
+    of claims-factual-travel-brandleak-01 read 33% contaminated from the raw
+    stream's "My Pages"/"If Mobile" while curl-verified corrected_text for
+    the same query has been clean since the fix landed). Falls back to the
+    pre-JSON text only when `corrected_text` is genuinely absent (no
+    correction fired this turn, or the response isn't the expected shape) —
+    that fallback is still directionally useful, just less precise, not
+    silently wrong.
     """
     body = json.dumps({"question": query, "session_id": session_id}).encode()
     req = urllib.request.Request(
@@ -161,7 +180,17 @@ def _ask(query: str, session_id: str, timeout: int = 120) -> str:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     idx = raw.rfind('\n\n{"sources"')
-    return raw[:idx] if idx != -1 else raw
+    if idx == -1:
+        return raw
+    pre_correction = raw[:idx]
+    try:
+        trailer = json.loads(raw[idx:].strip())
+        corrected = trailer.get("corrected_text")
+        if isinstance(corrected, str) and corrected.strip():
+            return corrected
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return pre_correction
 
 
 def _turns(query: str) -> list:
@@ -173,6 +202,19 @@ def _turns(query: str) -> list:
     if "->" in query:
         return [t.strip() for t in query.split("->") if t.strip()]
     return [query]
+
+
+# Added 2026-08-04 after a real live incident (plan_shallow_answers_context_
+# budget.md): a genuine vLLM 400 (prompt+max_tokens exceeded the model's
+# context window) surfaces to the user as a plain error string, not an
+# exception this script would see — _ask() just returns it as regular
+# answer text (no '\n\n{"sources"' trailer to split on). Without this check
+# a crash and a real clean answer look IDENTICAL to _find_forbidden (neither
+# contains a forbidden phrase), so a crash was silently graded "clean" —
+# exactly the blind spot that let a real regression through undetected
+# until manual spot-checking caught it. This mirrors the api.py-side
+# message verbatim, not a substring guess.
+_CRASH_TEXT = "Could not generate an answer due to an internal error"
 
 
 def _find_forbidden(answer: str, case: dict) -> list:
@@ -206,6 +248,7 @@ def run_case(case: dict, repeats: int) -> dict:
                 answer = _ask(turn, session)
             trace = _read_trace_record()
             hits = _find_forbidden(answer, case)
+            crashed = _CRASH_TEXT in answer
             point_scores = [
                 p.get("relevance_score")
                 for p in trace.get("points", [])
@@ -233,6 +276,7 @@ def run_case(case: dict, repeats: int) -> dict:
             demoted = trace.get("point_relevance_demoted") or []
             results.append({
                 "run": r,
+                "crashed": crashed,
                 "contaminated": bool(hits),
                 "forbidden_hits": hits,
                 "point_count": len(trace.get("points", [])),
@@ -249,6 +293,7 @@ def run_case(case: dict, repeats: int) -> dict:
         # Small gap so we never hammer the single-worker backend.
         time.sleep(1)
     contaminated_runs = sum(1 for x in results if x.get("contaminated"))
+    crashed_runs = sum(1 for x in results if x.get("crashed"))
     return {
         "id": case["id"],
         "category": case["category"],
@@ -257,6 +302,8 @@ def run_case(case: dict, repeats: int) -> dict:
         "repeats": repeats,
         "contaminated_runs": contaminated_runs,
         "any_contaminated": contaminated_runs > 0,
+        "crashed_runs": crashed_runs,
+        "any_crashed": crashed_runs > 0,
         "runs": results,
     }
 
@@ -289,18 +336,32 @@ def main() -> None:
         print(f"[{i}/{len(cases)}] {case['id']} ({case['category']}) ...", flush=True)
         cr = run_case(case, args.repeats)
         case_results.append(cr)
+        if cr.get("any_crashed"):
+            for run in cr["runs"]:
+                if run.get("crashed"):
+                    print(f"    *** CRASHED (run {run['run']}): internal error, not a real answer ***")
         if cr["any_contaminated"]:
             for run in cr["runs"]:
                 if run.get("contaminated"):
                     print(f"    CONTAMINATED (run {run['run']}): {run['forbidden_hits']}")
                     print(f"      -> {run['answer_preview'][:160]}")
-        else:
+        if not cr.get("any_crashed") and not cr["any_contaminated"]:
             print("    clean")
 
     # ── Aggregate ──────────────────────────────────────────────────────
     repro = [c for c in case_results if c["category"] == "known_contamination_repro"]
     controls = [c for c in case_results if c["category"] in ("clean_control", "exemption_control")]
     narrative = [c for c in case_results if c["category"] == "narrative_structure_repro"]
+    # Phase 0 of plan_claim_answer_correctness.md: claims-specific sub-
+    # corpus, built by build_claims_corpus.py. claims_cross_type is the
+    # exploratory baseline (12 types x 3 phrasings, forbidden_phrases =
+    # every OTHER type's distinctive vocabulary) that Phases 1-3 are
+    # measured against. claims_factual is the regression lock for the
+    # three specific bad phrasings confirmed live and fixed on 2026-08-04
+    # (travel brand leak, motor stolen-vehicle inversion, life 30-day/
+    # third-party) — this one should already read 0% before Phase 1 exists.
+    claims_cross_type = [c for c in case_results if c["category"] == "claims_cross_type_repro"]
+    claims_factual = [c for c in case_results if c["category"] == "claims_factual_repro"]
 
     def _rate(group):
         if not group:
@@ -312,6 +373,23 @@ def main() -> None:
     all_rate, all_c, all_t = _rate(case_results)
     repro_rate, repro_c, repro_t = _rate(repro)
     ctrl_rate, ctrl_c, ctrl_t = _rate(controls)
+    claims_cross_rate, claims_cross_c, claims_cross_t = _rate(claims_cross_type)
+    claims_factual_rate, claims_factual_c, claims_factual_t = _rate(claims_factual)
+
+    # Crash rate — added 2026-08-04 after a real vLLM-400 incident
+    # (plan_shallow_answers_context_budget.md) that _find_forbidden alone
+    # would have silently graded "clean" (an error string contains no
+    # forbidden phrase). Tracked across the WHOLE corpus, not per-category —
+    # a crash is a crash regardless of which case triggered it.
+    def _crash_rate(group):
+        if not group:
+            return 0.0, 0, 0
+        total_runs = sum(c["repeats"] for c in group)
+        crashed_runs = sum(c.get("crashed_runs", 0) for c in group)
+        return (100.0 * crashed_runs / total_runs if total_runs else 0.0), crashed_runs, total_runs
+
+    crash_rate, crash_c, crash_t = _crash_rate(case_results)
+    crashed_cases = [c["id"] for c in case_results if c.get("any_crashed")]
 
     # Points-dropped audit. IMPORTANT — as of the 2026-07-23 guarded gate,
     # this number is NOT attributable to the Phase-2 point-relevance gate;
@@ -386,12 +464,22 @@ def main() -> None:
     print("\n" + "=" * 66)
     print("CONTAMINATION BASELINE")
     print("=" * 66)
+    print(f"Overall CRASH rate:                 {crash_rate:.1f}%  ({crash_c}/{crash_t} runs)   <- MUST be 0")
+    if crashed_cases:
+        print(f"  *** {len(crashed_cases)} case(s) crashed (real internal error, not a real answer): "
+              f"{crashed_cases} ***")
     print(f"Overall contamination rate:        {all_rate:.1f}%  ({all_c}/{all_t} runs)")
     print(f"  known_contamination_repro:       {repro_rate:.1f}%  ({repro_c}/{repro_t} runs)")
     print(f"  clean+exemption controls:        {ctrl_rate:.1f}%  ({ctrl_c}/{ctrl_t} runs)   <- MUST stay ~0")
     if narrative:
         n_rate, n_c, n_t = _rate(narrative)
         print(f"  narrative_structure_repro:       {n_rate:.1f}%  ({n_c}/{n_t} runs)")
+    if claims_cross_type:
+        print(f"  claims_cross_type_repro:         {claims_cross_rate:.1f}%  ({claims_cross_c}/{claims_cross_t} runs)  "
+              f"<- Phase 0 baseline (plan_claim_answer_correctness.md), target for Phases 1-3")
+    if claims_factual:
+        print(f"  claims_factual_repro:            {claims_factual_rate:.1f}%  ({claims_factual_c}/{claims_factual_t} runs)  "
+              f"<- 2026-08-04 fixes' regression lock, should already read 0%")
     print()
     print(f"Total point-count reduction on clean+exemption controls: {len(control_drops)}  "
           f"(NOT necessarily the Phase-2 gate — see point_relevance_demoted below for that)")
@@ -425,9 +513,13 @@ def main() -> None:
         "api_url": API_URL,
         "case_count": len(case_results),
         "repeats": args.repeats,
+        "crash_rate_pct": round(crash_rate, 2),
+        "crashed_case_ids": crashed_cases,
         "overall_rate_pct": round(all_rate, 2),
         "repro_rate_pct": round(repro_rate, 2),
         "control_rate_pct": round(ctrl_rate, 2),
+        "claims_cross_type_rate_pct": round(claims_cross_rate, 2),
+        "claims_factual_rate_pct": round(claims_factual_rate, 2),
         "control_point_drops": control_drops,
         "repro_point_drops": repro_drops,
         "control_point_demotes": control_demotes,
@@ -447,10 +539,13 @@ def main() -> None:
     # guessed). Non-zero exit lets this gate a deploy, not just print
     # numbers for a human to eyeball each time.
     _REPRO_WARN_RATE_PCT = 8.5  # ~2x the last known-good baseline (~4.17%)
-    _hard_fail = ctrl_rate > 0.0
+    _hard_fail = ctrl_rate > 0.0 or crash_rate > 0.0
     _warn = repro_rate > _REPRO_WARN_RATE_PCT
     print()
-    if _hard_fail:
+    if crash_rate > 0.0:
+        print(f"*** FAIL — {crash_c} real crash(es) ({crash_rate:.1f}% of all runs) — a crash is never "
+              f"acceptable regardless of what else passed ***")
+    elif _hard_fail:
         print(f"*** FAIL — contamination on a clean/exemption control ({ctrl_rate:.1f}%, must be 0) ***")
     elif _warn:
         print(f"*** WARN — repro rate {repro_rate:.1f}% is more than 2x the ~4.17% known-good baseline ***")
