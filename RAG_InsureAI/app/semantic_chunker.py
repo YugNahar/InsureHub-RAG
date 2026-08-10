@@ -109,16 +109,27 @@ def _split_paragraphs(text: str) -> List[str]:
 # structurally, rather than trying to patch it after the fact with
 # reranking/classification workarounds.
 #
-# Heading candidates are short, ALL-CAPS, multi-word lines. The hard part
-# is separating genuine section titles from repeating page furniture
-# (running headers/footers, "Learning Objectives" boilerplate that
-# appears on every lesson page) — confirmed empirically against this
+# Heading candidates are short, ALL-CAPS OR Title Case, multi-word lines.
+# The hard part is separating genuine section titles from repeating page
+# furniture (running headers/footers, "Learning Objectives" boilerplate
+# that appears on every lesson page) — confirmed empirically against this
 # project's real KB: boilerplate lines like "LEARNING OBJECTIVES" repeat
 # 12+ times across one source document, while genuine headings like
 # "MOTOR INSURANCE" or "THIRD PARTY ADMINISTRATORS-HEALTH" appear exactly
 # once. A frequency filter (appears <=2 times in the document) reliably
 # separates the two without needing a fixed boilerplate word list that
 # would only work for this one KB's specific documents.
+#
+# ALL-CAPS-only was too narrow: confirmed live 2026-08-10 (off-vocab test,
+# a synthetic drone-insurance PDF) that a real, common heading style this
+# never matched at all -- Title Case ("1. What Drone Insurance Covers",
+# "1.1 Hull Cover") -- meaning heading detection (and everything that
+# depends on it: doc_prior, regex_first_pass_policy_type's strongest
+# branch, Phase 3's page-header fallback) had zero signal to work with
+# for a document that literally states its own topic in its own title.
+# ALL-CAPS is this KB's scanned-textbook convention, not a general
+# property of real-world PDFs (Word exports, typeset guides, etc.
+# overwhelmingly use Title Case instead) -- see _is_title_case below.
 _HEADING_BOILERPLATE = {
     "learning objectives", "lesson outline", "lesson round-up", "lesson round up",
     "self-test questions", "self test questions", "professional programme",
@@ -132,12 +143,50 @@ _HEADING_PAGE_MARKER_RE = re.compile(r"^[A-Z][A-Z0-9&.\-]{1,12}\s+\d+$")
 # any line ending in a bare page number after real words.
 _HEADING_TOC_RE = re.compile(r"(\.{2,}|…)|\s\d+$")
 
+# Small connector words don't count toward the Title Case capitalization
+# check below -- a genuine heading like "Third-Party Liability Cover"
+# or "Who Can Buy This Policy" is still Title Case even though a real
+# style guide would lowercase "of"/"the"/"and" inside it.
+_TITLE_CASE_SKIP_WORDS = {
+    "a", "an", "the", "of", "in", "on", "to", "for", "and", "or", "is",
+    "are", "with", "by", "at", "from", "as", "vs", "vs.",
+}
+
+
+def _is_title_case(line: str) -> bool:
+    """Heading-shaped Title Case: almost every significant word starts
+    with a capital letter, and the line doesn't end in sentence-
+    terminating punctuation -- a genuine heading is a short label, not a
+    sentence. Confirmed against real prose (this module's own docstrings
+    and this KB's chunk text): a sentence starting with a capitalized
+    phrase drops to mostly-lowercase within a few words, so the >=80%
+    bar cleanly separates "Third-Party Liability Cover" (heading) from
+    "Third-Party Liability Cover responds when the drone causes bodily
+    injury..." (sentence, same opening words) without needing NLP."""
+    if line[-1:] in ".?!,;:":
+        return False
+    words = line.split()
+    # Numeric section prefixes ("1.1", "2.") and bare punctuation ("—")
+    # have no case at all -- counting them as "not capitalized" against
+    # the ratio wrongly penalizes numbered headings like "4. Premium
+    # Factors" (confirmed live 2026-08-10: dropped the ratio to 0.67 on
+    # short numbered headings, just under the 0.8 bar). Excluded from
+    # the denominator entirely rather than counted as a miss.
+    significant = [
+        w for w in words
+        if any(c.isalpha() for c in w) and w.lower().strip(".,()") not in _TITLE_CASE_SKIP_WORDS
+    ]
+    if not significant:
+        return False
+    capitalized = sum(1 for w in significant if w[:1].isupper())
+    return capitalized / len(significant) >= 0.8
+
 
 def _is_heading_candidate(line: str) -> bool:
     line = line.strip()
     if not (3 <= len(line) < 70):
         return False
-    if not line.isupper():
+    if not (line.isupper() or _is_title_case(line)):
         return False
     if len(line.split()) < 2:
         return False

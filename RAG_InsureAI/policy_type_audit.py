@@ -170,12 +170,18 @@ def print_claims_scope_report(result: dict) -> None:
 # "insurance hb 1101.pdf") — those genuinely span many types and a
 # document-topic check would itself be wrong for them.
 SINGLE_TOPIC_DOCS: dict[str, str] = {
-    "5e9acf857576_travelinsuranceguide.pdf": "travel",
+    "801b5f761448_travel_insurance_guide.pdf": "travel",
     "ea22bdd3a9bf_m4-5f.pdf": "health",
     "df12091601c0_m3-f2.pdf": "life",
     "5a1c9b6aaef2_m4-7f.pdf": "liability",
     "b9cc853485a4_m4-3f.pdf": "motor",
-    "015ed1fc1d47_Pet_Insurance_Guide.pdf": "health",
+    # Was "health" -- stale from before pet_insurance existed as its own
+    # open-vocab type (project_open_vocab_promotion_wired). This document
+    # IS about pet insurance; "health" was never the right expectation
+    # for it, just the closest type available at the time this table was
+    # written. Confirmed live 2026-08-10: 12/12 chunks consistently tagged
+    # pet_insurance, which is correct, not contamination.
+    "015ed1fc1d47_Pet_Insurance_Guide.pdf": "pet_insurance",
 }
 
 

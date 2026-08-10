@@ -1441,7 +1441,20 @@ about cyber insurance even if it never says the words "cyber insurance").
 - If the text genuinely discusses multiple different types with no single
   dominant one, or truly can't be pinned to any specific type, put "general"
   in IDENTIFIED_TYPE — that is a correct, expected answer here, not a
-  failure to identify something."""
+  failure to identify something.
+- SAME ANSWER — "general" — when the text IS confidently, singularly about
+  ONE clear, coherent insurance product, but that product is genuinely
+  DIFFERENT from every type listed below (e.g. drone/UAV insurance, wedding
+  insurance, event-cancellation insurance — real, specific products that
+  just aren't in this particular list). This is a DIFFERENT reason for
+  "general" than the multi-topic/can't-pin-down case above, but the same
+  correct answer here: "general" is also how you flag "this needs its own
+  type that isn't in my list" so a separate step can identify what that new
+  type actually is. Do NOT force-fit it into whichever listed type sounds
+  closest just because it shares some surface vocabulary (e.g. a drone
+  crashing is NOT motor insurance just because "collision" and "crash" also
+  appear in motor policies) — that vocabulary overlap is real but shallow;
+  the actual product, its triggers, and what it pays for are unrelated."""
         reply_fields = "IDENTIFIED_TYPE=<the single policy type that clearly applies, or \"general\" if none does>"
         confidence_desc = "how confident you are in this identification"
     else:
@@ -1450,7 +1463,15 @@ about cyber insurance even if it never says the words "cyber insurance").
 primarily discuss "{assigned_type}" insurance?
 - If yes, confirm it.
 - If no, state the ONE type it actually discusses instead — or "general" if it
-  genuinely discusses multiple different types with no single dominant one."""
+  genuinely discusses multiple different types with no single dominant one.
+- Also answer "general" (not a guess at the closest listed type) if the text
+  is confidently about ONE clear, coherent insurance product that is simply
+  DIFFERENT from every type in the label list below — e.g. drone/UAV
+  insurance, wedding insurance, event-cancellation insurance. The
+  provisional "{assigned_type}" tag came from a keyword match, not a real
+  read of the content, so don't let it anchor you toward confirming a
+  closest-sounding type that shares surface vocabulary (e.g. "collision" or
+  "crash" appearing) without actually being that product."""
         reply_fields = ("VERIFIED=<yes/no>\n"
                          "CORRECTED_TYPE=<the correct type if VERIFIED=no, otherwise write \"same\">")
         confidence_desc = "how confident you are in this verification"
