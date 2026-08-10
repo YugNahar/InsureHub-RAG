@@ -1,0 +1,492 @@
+[
+  {
+    "id": "c554d904-261f-4ebf-8956-3071adefe8cb",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "70b8776e-0873-4204-b84b-e86cd5bba6ec",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "cc1fd01d-6d83-44a7-b07f-078be3ad14b4",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "51e3615e-b79c-4979-8aa6-17f852c128d4",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "44e18aab-f8b9-4cae-8bd6-7ac20b9bfe60",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "28bb3f4d-7710-4330-92b3-f9bcc4a7a56d",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "db9986e3-ba60-4d43-bf42-d203fbe07494",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "05ec3348-c932-4608-a465-7be2dfc422fd",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "82aa2d85-47de-4bad-9d62-98c398950237",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "eedde2bc-5e12-4018-a02e-f0b725b0d4dc",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "e012c621-f927-4d88-af8d-86a6a0a17aca",
+    "gold_type": "life",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "ec9bc730-a0ea-4750-b803-6094d16a7ecb",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "7c27681c-9aff-4772-87dd-4253e7a36792",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "ad270917-7ed8-4a3b-ba58-b4835143893d",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "8cf268fe-45f9-4825-9ae6-9d1a4b217988",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "9da2008f-5c5b-46db-8cca-7c4f860ba256",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "8cd8bbf1-1c31-4c68-8824-09171c123eb7",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "d2b8b52d-70a8-468e-91f2-d51469751386",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "1fbabf3f-3df2-4214-95f1-422267bd0a35",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "5cada56f-3104-457e-9522-455d81637134",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "d44ee998-6dc3-4c5b-bc23-12ffce1d1217",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "d82e3e93-30a5-4263-9bd3-23bef82006ca",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "6408c1cc-df71-4883-9d70-299ca556b5ff",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0f543565-44a7-4c2f-9946-70cbba8c2c66",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "452088ee-2435-4adf-b5de-be1211f77f81",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "64552a99-1026-4c0c-91aa-60a00f54e375",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "a9178dd9-f6f0-4382-bbb6-c746ea1508bb",
+    "gold_type": "health",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "b439ec4d-41fc-4dff-92d3-ef881dd5422e",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "e8a162e1-90d7-4ba8-a1f4-a500bd89aa48",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "65fe64ad-eb29-403e-8acf-7f9946346c84",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0feb0b3e-8ce3-4b0c-949b-a86c16ee70ef",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "e722e3fe-53b8-465b-b9a6-998dd75c6910",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "22b4820c-3e9e-47cb-83e6-932c4acb26ce",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "810da12a-c5dc-4434-b9e3-aa208752f093",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "c1e812b4-e15d-43b6-8ad6-c39ad0177406",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "a1f5b7ef-c1cb-4d9c-be57-dc82d129476d",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "b784c28e-6bc1-447c-9118-4221464d9e61",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "f4c08d9c-a4d3-47ca-ba86-baffdfcb2b5f",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "50aef22b-42f3-4871-b0a5-4a80225381f3",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "61ff43ca-2f58-4fe2-a151-3d3cde286d0f",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "7bba7062-4bff-46b2-8f2d-9955d7fedb9f",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "b6d0db21-ee81-4d84-ba30-49022cb6860d",
+    "gold_type": "motor",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "b0707d7b-8a08-4a77-8cd9-43f0e603afa3",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0535db24-79fa-47c7-9fc7-13fb737874f7",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0c0097d1-c9b1-4cc2-a2a8-65250aec6a67",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "16ab5184-12c8-4ed0-8a44-54f04b80ebd6",
+    "gold_type": "general",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "5c9140c8-6531-43eb-97a6-128fbaf93290",
+    "gold_type": "general",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "4680ccdc-ded0-4e7a-9a7c-acfaba01e498",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "26803e6d-fcbc-4d3a-b102-853ed8be5762",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "2dbda056-8544-437b-b515-52bd80bcb250",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "248a4f99-15ff-4714-aeaf-aa44d5169dff",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "80e1af26-3aca-4bd5-82e4-2418733478ec",
+    "gold_type": "liability",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "67d57f0f-9a2d-48c2-a35d-76c30be84b63",
+    "gold_type": "general",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "889e22c0-632d-4b96-9423-469527e12c86",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0ed32696-a240-4c7f-b534-89f21eb936b0",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0651d002-84c8-4b94-b11e-c38dc482d853",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "416c3356-9df8-49fa-a773-0a16b6947aaf",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "350102e3-4afd-43b2-8750-eb37caeb2ee9",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "0abc9e21-e6d4-4a30-a035-e361e03696e7",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "56bc8b82-c35c-42cb-93ab-bdf50e621112",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "7c1aca8e-a4ed-4139-9923-2a2560c030d4",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "88ae5da2-46be-4c6b-a25d-b0478f09e2cd",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "8d870f58-2901-4c7c-a65e-11cc6b8d8464",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "e687a829-59b8-4198-9a20-00596ef6853b",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "5a0944cd-b3b7-4000-b88a-11ccd1f6066b",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "584cbe22-a633-4e25-85bd-732c7ce949b5",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "74c15f3a-70b7-4d42-a056-a5b3f6282909",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "21d9962b-25e7-4b50-812d-cb44433d288f",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "46334feb-5ab4-4fed-a5fc-823e17c30891",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "39226de6-2034-4b5d-9151-59f8ef9a48c1",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "2aa56893-bd3d-4cf6-a728-fd63a1132ab5",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "91d530fa-f047-4d03-834f-ed206c2082d9",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "dd789f24-dc2e-4ce3-8d1c-e34e69f556c2",
+    "gold_type": "travel",
+    "basis": "doc-topic-heuristic (trusted, non-outlier)"
+  },
+  {
+    "id": "bf8db0c3-987e-4481-a687-7d8fb65fabd5",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "ba3aa727-0f8f-4212-84cb-655471ebfda7",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "b545fc65-599e-4cee-becd-0059509e8ab1",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "664823d3-5830-4a9f-a72b-761d8a0c95f0",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "c8d755f6-5802-4ff6-9574-8e78c630a007",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "15f41c20-191e-40c2-84a1-3dd9e38bb846",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "a1db532c-c59e-4b83-8cd9-4d6314f02d27",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "0dc9b62a-4cdc-45df-be33-028bfc3ba39b",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "58a90fa2-635a-47be-83c3-3e2b31488359",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "d7b74151-8cb2-45c3-834b-41a0139ccbbe",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "a264d62c-2171-4fcf-ad95-fdbe1394c3c0",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "15dd47a4-0db2-43f1-af75-f191f5cb1cc7",
+    "gold_type": "pet_insurance",
+    "basis": "corrected 2026-08-07: originally labeled health/general before pet_insurance existed as a recognized type; every chunk in this document explicitly discusses pet insurance by name (confirmed by direct text read of all 12 entries)"
+  },
+  {
+    "id": "406372d2-be38-448d-a14a-025d41a6d9e3",
+    "gold_type": "life",
+    "basis": "manual: life-proposal health questionnaire, footer=Practice of Life Insurance"
+  },
+  {
+    "id": "b997532d-7175-439a-a2a7-0cc661c383c8",
+    "gold_type": "health",
+    "basis": "manual: page header explicitly reads Health Insurance"
+  },
+  {
+    "id": "9aa92227-bdd0-43be-a06f-474492cd4c22",
+    "gold_type": "health",
+    "basis": "manual: page header explicitly reads Health Insurance"
+  },
+  {
+    "id": "d8d4f439-210d-402d-b69a-8b492d5ba87d",
+    "gold_type": "liability",
+    "basis": "manual: footer=Liability Insurance & Documents in General Insurance, fire is a passing cross-reference"
+  },
+  {
+    "id": "6d4707c0-aeb0-46e8-8c92-445af3abec7a",
+    "gold_type": "travel",
+    "basis": "manual: travel-guide own exclusion clause, motor mentioned only as an excluded item"
+  },
+  {
+    "id": "8b5c211a-d398-45f3-8ec8-b11603d1348f",
+    "gold_type": "general",
+    "basis": "manual: table of contents spanning many types (NAIS, crop, burglary, cash-in-safe, jewellery)"
+  },
+  {
+    "id": "5e1a6623-18ef-48fd-9782-87b5f801e32c",
+    "gold_type": "general",
+    "basis": "manual: generic claims-settlement procedure (repair/replacement), not health-specific"
+  },
+  {
+    "id": "8014561e-eb7d-49bc-9192-3407f911bda0",
+    "gold_type": "general",
+    "basis": "manual: regulatory-oversight passage; health debate is plain English, not health insurance"
+  },
+  {
+    "id": "47b3b018-5e25-4b84-b738-f8ab78c98702",
+    "gold_type": "general",
+    "basis": "manual: regulatory/investment passage; (Health Insurance) Regulations is a named-Act cross-reference, not substantive content -- fresh=life is ALSO not clearly right, gold=general"
+  },
+  {
+    "id": "3570cc17-c2d3-4ed3-82aa-4b28785d6e90",
+    "gold_type": "general",
+    "basis": "manual: AMBIGUOUS -- table of contents, entries are all marine-topic but structurally an index not explanatory content; accepting general as the safer call"
+  },
+  {
+    "id": "a4716754-85d9-47f6-9377-206b37199497",
+    "gold_type": "general",
+    "basis": "manual: list comparing disclosure requirements ACROSS multiple types (personal accident + burglary), not personal_accident alone"
+  },
+  {
+    "id": "6c7705c4-0c9e-42cf-8cd3-5cba2820d82d",
+    "gold_type": "crop",
+    "basis": "manual: KNOWN REGRESSION CASE -- genuinely substantive PMFBY/crop-scheme content, fresh reclassifies to general which under-calls it; old tag was correct"
+  },
+  {
+    "id": "ec931f81-93d2-440b-a69c-fd9ce004faf6",
+    "gold_type": "general",
+    "basis": "manual: KNOWN IMPERFECT CASE -- generic claims-evidence procedure from a fire-insurance section; old=fire is defensible, fresh=health is clearly wrong (no health content visible); gold=general as the least-wrong single answer"
+  }
+]

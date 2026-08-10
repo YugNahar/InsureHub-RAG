@@ -1,0 +1,2390 @@
+{
+  "meta_path": "/app/app/turbovec_data/documents/insurance_docs_meta.ndjson",
+  "total_chunks_in_file": 397,
+  "chunks_classified": 397,
+  "limited": false,
+  "decisions": [
+    {
+      "id": "1902eebc-0ab3-477e-bc70-ffd913923d18",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e5180f2f-55c4-4f64-b7ea-e0dd2a35d889",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "7221eb29-7d08-47a3-b331-3f0162bdbc74",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "1adcc2b8-9524-4672-b8db-aa557858dab7",
+      "source": "insurance hb 1101.pdf",
+      "old": "marine",
+      "new": "general"
+    },
+    {
+      "id": "00945f64-31b4-4e95-a76b-53c26c3e4b75",
+      "source": "insurance hb 1101.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "b8882556-fe9c-496e-b253-a0c5c53f9321",
+      "source": "insurance hb 1101.pdf",
+      "old": "fire",
+      "new": "fire"
+    },
+    {
+      "id": "28c78727-e16a-4e2e-aa11-32aee9169a1b",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "c186cb60-a3c6-4bf8-b64e-2f87e0c661ed",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "aed64894-7b12-4f9b-9f44-476a038e6d8a",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c1c404fc-a43f-4564-9352-c213fc0a0e55",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "0d176e2e-11fe-4825-a625-eb7770452580",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "a519a145-2d54-4d5c-b789-aa134b4a7a33",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "a0cb2e71-e7ff-43db-a9ff-3bfb814216a9",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "1bde8570-0ccc-4691-87cc-467504d672ca",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "fd403632-409b-4055-968f-e9ea504a8f07",
+      "source": "insurance hb 1101.pdf",
+      "old": "fire",
+      "new": "fire"
+    },
+    {
+      "id": "d2c284a8-67ed-4a9b-bb8c-95d757571c5e",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "2cc4b07d-85e9-4959-8de9-01411dda138a",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "1779f69e-d2ea-492c-91cb-49c3df8ff37c",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c7a292cc-2a69-424e-9fbc-3304a728814b",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "978c9628-ee9b-4e67-bf54-005b4329fbea",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "62b48317-7722-4d72-9630-a30102e942be",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "5e016681-1ca9-42b4-879c-0c3ff83c8448",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "1f87aecc-8b37-4e16-8f51-47463d7904c7",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "cea3c42a-7c34-4e45-8ebb-9a1a08af7fe4",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "2b1c1715-c435-4141-9733-adc27ca64836",
+      "source": "insurance hb 1101.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "c235badd-1a23-40ae-9d2b-3fa913569ab0",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "health"
+    },
+    {
+      "id": "e010621f-f099-4076-9476-0220734602a0",
+      "source": "insurance hb 1101.pdf",
+      "old": "health",
+      "new": "motor"
+    },
+    {
+      "id": "262fca31-5aa2-4ae0-a0b4-e32a7e0f177a",
+      "source": "insurance hb 1101.pdf",
+      "old": "travel",
+      "new": "travel"
+    },
+    {
+      "id": "15cd5909-0c79-4890-a6ba-876b88dafeb0",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b921dba7-7ee8-45f6-811b-018b0954b284",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "micro_insurance"
+    },
+    {
+      "id": "2407b2aa-6cad-44d5-bad1-5a0549e48224",
+      "source": "insurance hb 1101.pdf",
+      "old": "crop",
+      "new": "life"
+    },
+    {
+      "id": "fce4b85d-022d-4841-88b2-b1f76fa3866c",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "micro_insurance"
+    },
+    {
+      "id": "01718399-3d77-4e35-99c1-99da9c236ad2",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e026099c-c863-4371-8617-7ce2d7ae5d0d",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "2c0a57a7-c9e7-4fab-a1f7-f3212885f63f",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "6ee4c83c-9c7d-4521-83ef-f3c215efd02f",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4a2b6c11-4786-4347-921e-143db3b30a0c",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "179557b2-8689-4101-b1d2-e0c3aa78cb96",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "f9d35c4c-6560-4722-92a4-f5133104eef8",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "ee362921-16c8-4eb4-8f24-f3df07548352",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "25247443-127f-4f75-8e5d-0d558dc8ebff",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "d51b5a1e-2930-422d-8cb7-e75e857d93c9",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "2ff96c13-2bd3-445c-bea1-dd0aeb9e0358",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "5b352228-365a-4908-b4c2-2101e5d5199a",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b4fb2e77-14a8-4271-96d3-77b955a6a986",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a14d4c8e-678b-4be0-a974-e00c7329c67d",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "76731432-fd7d-4459-8fbe-82cac77cb57c",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0b621c6d-eb7e-49fb-ad0b-441fbb33a237",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a00b23db-cdc8-48e9-aed4-2c33de12bc8b",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "7ce01933-5588-4f72-8132-5cc1b0cdfc66",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "17117c64-3291-437a-8a96-61d0e0f2d2a5",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "07a8ca5c-b1d4-4cd0-9578-3e55e5968960",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "d781c9d1-52ec-449e-a069-8a1123ae5a3a",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "d7856c1d-60d5-478d-aae4-7f9f4b976c60",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "bd1c8e36-353d-494a-8a32-0378ba8e8f91",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "c1264a32-ac77-4e91-9f88-4bb6f8e3c2d2",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "f419b032-5873-474e-98ab-1a15545fe11d",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "fb91e47a-ec15-4d77-8cae-16326223197f",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "eef1ade8-1970-4782-89ea-e31a56315e20",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c5d79a95-a22c-48b3-99d4-c9bb9ca8d01f",
+      "source": "insurance hb 1101.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "f9e9c992-bc97-4663-ac4a-17124ab24b83",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "9699fc2b-fda1-43d5-805a-ca04d8eaa416",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e56d1c14-0261-4b0f-a55c-cee3a8067380",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "eec2110c-ad20-4859-bafe-c820165ecf6e",
+      "source": "insurance hb 1101.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "db0bf18a-75d5-4dcc-8681-4e89dcbabb24",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4bf34dac-1ce0-4a09-af0e-c28a428c8c91",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "2be09bdd-b8b7-4c07-bac5-f0e4723054f3",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "df9e4ad5-bc3f-488b-9d50-3fb5f5262f89",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b1d703e1-30ee-449b-abf0-8f974f6a6a30",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "393db964-3023-47e4-8e08-606a540aa347",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3e67ad70-632d-43a4-b4a8-b6a8f576fc4e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "975962a9-6369-4adb-9715-87699f62ea70",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3570cc17-c2d3-4ed3-82aa-4b28785d6e90",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "liability"
+    },
+    {
+      "id": "66041ee2-863b-4a11-a9e6-2843ccbb2c62",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c925b4a2-dd2b-479c-874d-454af747ff1a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "d6459f92-b28c-4392-ac08-adeef11f31de",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "4b5b1602-ba4c-4e74-b4b2-a6f8cdfa7795",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "8b5c211a-d398-45f3-8ec8-b11603d1348f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "crop",
+      "new": "general"
+    },
+    {
+      "id": "4dbd49d1-2ecb-4a7c-9b53-47cf9a752714",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "403d03cb-1036-45de-be5e-9c9ab3ef9562",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "2bfb3d2d-272e-4d41-9273-59745263aab0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "00c917ca-3828-48da-8126-4669ce68eec6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "home"
+    },
+    {
+      "id": "0f859e40-738b-44aa-abb8-b76768219331",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "general"
+    },
+    {
+      "id": "9ad256dd-fa71-4f8f-8806-30ce104c6f33",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "8a0e299f-0e95-4ca0-b49f-a316fcea8853",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e1f6e56c-815e-43d7-be3c-841e9d8a252a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "27b8e708-48c8-41d2-8ff5-db4d4034ab55",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "962cc1bf-cad3-4840-9e7b-f84b801a153f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "980bb5af-03f3-4320-aed7-17f6d081a0f0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b73b4007-bd11-469d-9493-07b383821d68",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "4e16eecb-947a-404c-8239-a3ad1456d017",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "d39e432b-e33b-47a7-b7a1-b33eab321219",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "fed72eaa-f30f-4a40-a28b-31f32d81914d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ddddf0db-b51c-4de2-8fa3-69e1e39b2415",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "97a1735f-6a2d-4c21-9b8f-e409d10444fd",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "93f22b43-dc9a-4cfa-a4bd-ed60b961013d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ea44a2b8-1fd7-43a0-b2b2-3e803a510463",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "6b80c8a6-62db-4b73-8da8-5f3ea9194616",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "201ce743-9d00-4ef3-8e52-08fc83795691",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a4716754-85d9-47f6-9377-206b37199497",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "personal_accident",
+      "new": "general"
+    },
+    {
+      "id": "9d5021f6-ca81-41cd-814f-80cbaa590ee2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4bc281e5-9382-4c16-9262-3dd39064164a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "general"
+    },
+    {
+      "id": "f92d0e83-d0b6-4360-a3b9-9d6826de6c5e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "7e3386f1-6b50-469b-aae4-7a831e2e2220",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "9f136eba-76c9-4c19-9b4a-b50b23bbff35",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c5c1de2b-bc8e-4cb4-be6e-40c4f32e4043",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3470b40c-5c7f-4ecc-ba84-e466d17a8a44",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e73fd3a9-a75a-46b1-9a33-85434ed90120",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "general"
+    },
+    {
+      "id": "1e773d54-7b3c-4e3f-a355-43a9cef6feeb",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "0cf78838-712a-49d2-8367-6fdd802c7611",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3bd2dcff-8f8d-427d-9164-182a5f8ef43e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c5f62b58-4d87-478c-865e-46b2d27b55c2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "micro_insurance"
+    },
+    {
+      "id": "79bb553d-250c-4731-8351-e5f85eaf7d95",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "26ffe48b-a0ba-4d13-a9ec-c701cd6d8d72",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "47d54502-abff-4de6-8573-d9447370e3b6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c571f1ae-a25e-456e-bfa4-a6ad0e1130d9",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "362a665b-188a-4902-a8ec-969f3cb73c50",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "25ff8ac1-4268-4eb5-b5e3-2001e04c8535",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "9faa0f19-e736-4f15-b919-02a74ae67576",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "787f8cc6-f0b9-434d-8e17-e021593bf5b5",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "dd133ce3-d91a-4639-b76b-8feb7d8c9469",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "10ba10f6-dc97-44f0-8bfe-783f5e436954",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "20bac065-3774-4baa-986d-24ab01ff1be3",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "marine"
+    },
+    {
+      "id": "4470ba77-6636-417c-8690-14bce124353f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "5e400d9d-16de-4db0-89a8-66aa8cac2670",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "ca54afe6-9acb-4129-9c51-55f58223b3a0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "c7b39d4a-d473-45a7-b25d-11ef9128aa1c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b3ae1e66-52ac-4e1a-85b4-9dc34145408d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "5eae4fe2-0f0c-4c9b-be8e-a46176daa0a6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "722303f0-dd35-4034-b6c2-a5762e0cfc35",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4f3469f4-ea3d-469b-8e2a-0bb0275fc6b1",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "89160021-2c89-4b4b-b659-da4d65f2379e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "f8609603-c145-4de2-8e73-39fce1ba3425",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "26588fa2-2854-428f-b8c1-1652ece32b25",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "9795457c-43b6-46a8-a434-a901957bd542",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a45e7024-b2dc-4f59-b00e-d36484c7aabd",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "fc41b0cc-0074-4b7e-a6aa-84ce473ad2bc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "18352c94-69ee-4be7-95a6-888d228bae7d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "bf314cf4-b54d-48ca-94d5-398d9f5a2eec",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "fdb29788-dc02-4ebd-8fb8-709c28ad51fc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "46457a3c-eb75-447b-bdee-53d660b1e27a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "164a3c89-af28-429a-bc04-a8a37796933c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "6332fee4-0d67-488a-afcf-903fd36d1036",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "6fdabada-2ab2-4e64-b99d-78317bb4d542",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "e884aab7-bf58-4f50-b5c5-0a991c065e0e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "79c298a4-83ff-4254-b27f-3eadb97250cc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "7d50aa82-db31-43ce-93d2-ae59e69f5850",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "77d54151-e4ad-46be-80a9-1f3ed84d1d8b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "47b3b018-5e25-4b84-b738-f8ab78c98702",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "life"
+    },
+    {
+      "id": "0c5f2528-0bf2-46cc-b49d-c0c40d1c8149",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "43c877f3-d590-49a0-823b-36d72c7dfbd4",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a97b3e03-1331-41f5-bcac-5c19d23e6dff",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c6e20b3c-7ed1-4057-9ae7-35bfd34a2e0b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "a37c42b9-21c2-40fd-8058-8d82ef35da12",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "df223a8c-60b0-496e-914a-b8bae6ff3ad1",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "e80453ee-45a8-4697-a690-2f7cfabda1a3",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b826af6f-a007-451c-8940-e90f3cdcd943",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b17edb4f-998a-413c-be48-387146f9e3c6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "81e29c32-ac6b-4f8a-9177-4d75cb482195",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "micro_insurance"
+    },
+    {
+      "id": "d3c6975f-f1c7-4e05-b9a9-b6e8b113d458",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "05dc2388-3739-4251-8cc7-e9ad20cd0c35",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "259fd9ca-44ae-44c8-89b9-39d2c1a303c9",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4ace4b0b-b389-4b9d-ac93-b7e403d5b981",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "22b10aeb-acf7-4972-8f14-295c60ea40a8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "7d553ce8-c7cf-4a37-8f53-cf518facf12d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e2596cd3-740f-4de5-84e1-05aebd8d1160",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "8031dd90-edd8-496c-988a-1de4d170cf1b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "f1db329f-cb5d-4048-9004-590c64e9269e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a79ac030-ee00-4be1-b095-3727c22f70bd",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "liability"
+    },
+    {
+      "id": "58b84d25-2eda-4d56-bf2e-6b6910fe8d3d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "43798729-a01c-4aaf-b12d-5ddf031ab6de",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "marine"
+    },
+    {
+      "id": "ce2aec2c-f34a-410a-b953-9720fedcb310",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0a44c8a1-6495-4dcf-bac8-7bd622078a2c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "marine"
+    },
+    {
+      "id": "bb94c3f9-c87a-4cce-8f7b-81d81f69be52",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "general"
+    },
+    {
+      "id": "7eb2748c-d844-42ac-93fb-aa033592bf76",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "99e1efa1-bd9c-46cc-808a-6dca9a31ab59",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "5aec3dfb-ecc9-4606-844e-1d65825bd34a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "commercial",
+      "new": "liability"
+    },
+    {
+      "id": "9697f7ab-7303-4784-9fc4-3ed1cf502c2d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "f0b48431-b682-40e6-8a79-efac368b8adc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0a223cb0-3d00-45ab-8d49-d5469c36bc93",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a0cf3627-8ef6-484b-a6cd-2af715a77a97",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "106b16f7-05dc-44e8-b54b-f62819fda00f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "559ec656-85eb-4add-b95f-612c5efd4533",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ed4b37eb-4ff7-48e5-b542-bdeb443271f8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0fce0f28-52aa-4d0e-b21b-5a009431dba2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3490fe84-db22-4513-b171-510b074cd660",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "56954b3b-7ec6-41b7-a2c6-c9a5a4cb37e2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "934edd7c-7724-421c-9133-2eb61b5ea9a2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "9a517a6f-da3a-475e-a9c9-7364061d32ec",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "67748a1a-d0f2-49b0-b65c-aa06e8a417fc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "420d1763-a79e-47ad-86da-ed0ccb2a33c4",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ceb74ccd-3d85-49c6-a0c8-25fcb4c25443",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ea496dd2-a057-4133-880d-0c26c373d5cf",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "8014561e-eb7d-49bc-9192-3407f911bda0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "2c05730f-b1b2-444e-9209-c672aaff278e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "06e3e534-f7a4-4201-a4fd-b1b2d7914523",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3ab11afe-f462-4370-bb1e-2a6951ec659f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "41dce521-15e9-45f6-af51-8bc7191be53b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "1f2e7f70-1549-4760-b472-650c3a59ba66",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "87537807-1466-44df-b258-61a5cf1c366b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "621e8f2b-067c-4b7a-a04a-10696bb344cb",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0036ca5e-bda2-4db4-b891-be6c5c52f363",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "044e333c-172c-4528-b6a1-addc792bde3e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c07b753c-734e-4b92-aa96-b79e2e6f0b2a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "fa26e07a-443a-42e3-8407-6f220acca35f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "02e91a1f-4561-4a3f-a2ad-ac9b8c03b56a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e5ced75a-bbb5-4a63-a718-9bbe46fe5eda",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4deda23b-9db2-4c47-b232-93cb60f44218",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "cbf35f0c-9386-4a49-93ba-2b0a5f488cef",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3642647d-75ee-4597-a672-b8bda355bc98",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e7d88797-a249-4a3b-b742-746ba05bc8eb",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "f6aadd8d-5a37-47a7-a97a-0b42a04bdfae",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ab6034b2-7f83-4931-a5fc-ef3477740c4b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b99ee0b1-a611-4848-bfe6-3472d8930bea",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "97c86b1f-8072-47f2-8c81-303ae1b4ff9a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "edcb1556-67f4-489a-b1d6-6058b97fe374",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "6c3447ec-c543-44ea-a1c2-29dcdd6d43e6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "fc9fdde1-76d5-42a9-a1be-eceaf89b4438",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "21b5112f-76ac-47be-89ce-f95c850ad008",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "e71420dc-1974-4933-af30-2deb922f8eb3",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "6d161183-ce5f-4834-8896-47b92b313083",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "98364f28-9ab0-46de-83b6-a2e616b23db0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "81ea03e8-90ca-4db4-a5bb-d9d30fba56a7",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "5feb00a0-81ed-4daa-8da6-7d0281440b45",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "18d7e97e-0993-457d-a75a-2a6acffde551",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "f288e25e-8a23-4244-a8e1-50ed764af5f7",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "b54d2370-55f9-409a-b8a2-062777292065",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "991f7e7d-db63-435c-ae85-ef0d52522023",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "cd8afc0a-a973-4228-8a57-c66a91f892eb",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "4ccdc90e-6fae-46c3-acc7-edae5b90b874",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "536b9baf-a68d-4523-80b9-d8126d13e13f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "3dd8600d-d98a-4eca-9f8f-a6159b7f1dfc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "fcc61ef6-de45-46f2-aab8-a2c992f0e804",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "0bdd7389-23c8-4a93-9524-81c20c2074e8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "health"
+    },
+    {
+      "id": "aaa7afe8-1053-42cd-ac64-4114231d67a1",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "0ac64746-ccc0-4e53-bb2c-3da23a2d79a4",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "52242783-6550-4d69-8745-a392aeec752c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "a7ef226d-07d5-4b5e-b1e1-094be705efb0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "6856b58f-664a-4f4c-a66f-4aaaffb9d4b5",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "c5268456-a283-4afe-aa59-cdaa8a621a34",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "31a63431-324f-4b6b-b778-24b7ac4df292",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "d435a2fe-8b15-4c01-acab-cfb8909ae187",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "8a61fee0-8f92-4b39-82e5-958327673ec8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "09809d80-8e5d-400f-94de-a314cc6cf4a9",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "f0c140df-c3fd-4b64-b851-3ef4e4dac888",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ec931f81-93d2-440b-a69c-fd9ce004faf6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "fire",
+      "new": "health"
+    },
+    {
+      "id": "5e1a6623-18ef-48fd-9782-87b5f801e32c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "2ab824d1-ec9b-42aa-b72e-90760391421a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "aafe581c-0231-4e39-a6ce-c2251769658c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "health"
+    },
+    {
+      "id": "d83612ff-f615-4d5c-8edb-6af5995e0562",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "fire",
+      "new": "marine"
+    },
+    {
+      "id": "2042ccda-513b-4f88-a05c-7b67457dfd4b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "general"
+    },
+    {
+      "id": "a715ed48-5696-4c18-b20c-4e0be0b7b1cc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e581915e-b7d9-4294-8a70-285b31d58eba",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "68b66658-8b7f-404e-977d-de98706faf16",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e8aa4457-83d5-4898-a048-f68ca156cb74",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ab1fc51b-d86e-4700-aab3-4b8623f4f582",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "69d1bbf9-127d-4d9f-b598-ee12be962338",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "marine"
+    },
+    {
+      "id": "682dbef0-fd9e-4eb2-a618-2aeff2387cd2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3e0433e4-f983-4c68-8a94-eb7ae4108450",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "677c1d59-e4a1-40de-a6a7-c7d7e797c056",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0092046b-16e2-43dc-8f3a-76c78e9a5547",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "home",
+      "new": "general"
+    },
+    {
+      "id": "e42f81c1-c2cd-4359-8660-58135e868ee4",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b38b2984-bc0c-4170-9b29-0c3307dfba53",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "marine"
+    },
+    {
+      "id": "60a685c0-e9ef-4e84-addf-738c91ba0ada",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "marine"
+    },
+    {
+      "id": "b72a18f3-b55a-414f-bb49-962bb1c77bd9",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "cd04f088-84f2-4c8e-bf47-4bf7f20037a8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "home",
+      "new": "marine"
+    },
+    {
+      "id": "c56cb25e-c8ce-43c1-9e67-af313fcfb6df",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "fire",
+      "new": "fire"
+    },
+    {
+      "id": "1571db27-61d5-4824-b9f4-a968d964f4b6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "marine"
+    },
+    {
+      "id": "769a2321-fffa-40d5-aeb5-846d1f872a44",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "marine"
+    },
+    {
+      "id": "10731b9e-e9ba-40ff-a725-83c033fd3b89",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "marine"
+    },
+    {
+      "id": "f64714fe-73a9-456b-96f4-1205fd4c51be",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "marine"
+    },
+    {
+      "id": "5ddbde2b-5fd2-4f54-b792-6e78066739e2",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "marine",
+      "new": "marine"
+    },
+    {
+      "id": "5635ea5e-7881-48b7-a072-8a48fb6fd798",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "7dfd1e3a-89ba-4722-9995-e6030bc031bb",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "31e506cd-9b13-4518-b247-7eebc6b2e236",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "60303e13-b91f-4a09-829a-864251ea833a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "e666fe00-dffa-4ada-b696-45a6b947571c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "4eeed719-7ce4-4a09-b8fa-a7493dc89b89",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "ec9b7a15-b73f-4464-8e9d-6be415c42dc1",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "35869846-c3cb-4a00-be99-3e2ce53f4b9d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "1de424ee-1df4-47a8-8950-5944b6d2d977",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "travel",
+      "new": "travel"
+    },
+    {
+      "id": "e1b1d7f9-3b69-41be-9996-23022ab04ee0",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "crop",
+      "new": "crop"
+    },
+    {
+      "id": "f6682163-478b-4c09-afcb-173ace2ed25b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "crop",
+      "new": "crop"
+    },
+    {
+      "id": "34e629ab-073d-42e0-8edd-d02afc5aed66",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "9f6ef9d6-348b-476b-a856-f06445f1a8f9",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "bdbe38f6-c830-45f6-b1db-e95816110da8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "home",
+      "new": "jewellery_insurance"
+    },
+    {
+      "id": "5e10e208-681e-4f98-8809-fd07d1c1449c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "liability",
+      "new": "general"
+    },
+    {
+      "id": "6c7705c4-0c9e-42cf-8cd3-5cba2820d82d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "crop",
+      "new": "general"
+    },
+    {
+      "id": "700a3866-09ba-4ed4-9f46-3ecbbbc00346",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "c4f42b89-ca09-453e-838f-75499fa3e753",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0414fbaa-54e3-400b-abe9-99bf0f9ae99f",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "d538b3db-1904-42da-9bab-1d1b9ed9ebcc",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "ef93a870-ccbf-46a4-9ecc-c88eb82c111e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "b4525e3a-573a-46a4-8ae3-a1f7914c557e",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "852a7062-fe5d-4a0e-b8cc-464d4e070c53",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "0c79d355-e39f-47bc-857c-20416ca50941",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "a669d03e-db99-4b57-8024-007cd61c7323",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "62a18ed3-e162-44a9-89c6-8c4074ccd7ca",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3e3ebf54-e7ef-43d2-9cd1-eb2800151ac4",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "41312d7f-88cd-4fed-836e-6ce4d501058d",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "3e9d4b85-0872-45e6-a434-7efb6c0d9276",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "life"
+    },
+    {
+      "id": "4c4c2dd5-b437-4fea-bb52-37e396c79154",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "985b9c8c-c116-4650-9c73-3a7e0b056c26",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "health"
+    },
+    {
+      "id": "b5a5b600-defc-483a-91b2-78c842b7c548",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "7620c656-c148-4d30-9c3b-c67befa61024",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "923553b3-a650-4849-b914-69c734c31a9c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "d13ce526-c970-421a-b527-2a2559ff0ce1",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "b22f2fd9-5e03-472f-8c5c-baab07887bde",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "life",
+      "new": "general"
+    },
+    {
+      "id": "da8c1d10-8891-4aaa-9c59-78a2e86d135c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "53a8230c-412f-4602-9df1-fdd1844025b6",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "ba719ff4-b87f-422b-88fb-50ec6bead1c5",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e4242ba9-a094-4e8a-b304-bfff516bff7a",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "525445f2-8bcf-4fe8-b2cf-5c5b02130ed4",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "e31ab290-b4dd-46f7-b322-6861c443d801",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "de21e3f9-be7c-42e3-92d0-47752c80c46b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "4fc101c1-1274-4e2e-b8be-d8f59481974b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "00bee9e6-dc7a-4027-8091-7e5b087bc279",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "fa2343af-5724-4f8b-983b-077c7dfd318c",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "general",
+      "new": "health"
+    },
+    {
+      "id": "1fa64143-60f7-4026-b241-0bea50d8a1c8",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "c554d904-261f-4ebf-8956-3071adefe8cb",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "70b8776e-0873-4204-b84b-e86cd5bba6ec",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "406372d2-be38-448d-a14a-025d41a6d9e3",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "health",
+      "new": "life"
+    },
+    {
+      "id": "cc1fd01d-6d83-44a7-b07f-078be3ad14b4",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "51e3615e-b79c-4979-8aa6-17f852c128d4",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "44e18aab-f8b9-4cae-8bd6-7ac20b9bfe60",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "28bb3f4d-7710-4330-92b3-f9bcc4a7a56d",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "db9986e3-ba60-4d43-bf42-d203fbe07494",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "05ec3348-c932-4608-a465-7be2dfc422fd",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "82aa2d85-47de-4bad-9d62-98c398950237",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "eedde2bc-5e12-4018-a02e-f0b725b0d4dc",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "e012c621-f927-4d88-af8d-86a6a0a17aca",
+      "source": "df12091601c0_m3-f2.pdf",
+      "old": "life",
+      "new": "life"
+    },
+    {
+      "id": "ec9bc730-a0ea-4750-b803-6094d16a7ecb",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "7c27681c-9aff-4772-87dd-4253e7a36792",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "ad270917-7ed8-4a3b-ba58-b4835143893d",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "8cf268fe-45f9-4825-9ae6-9d1a4b217988",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "9da2008f-5c5b-46db-8cca-7c4f860ba256",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "8cd8bbf1-1c31-4c68-8824-09171c123eb7",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "d2b8b52d-70a8-468e-91f2-d51469751386",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "1fbabf3f-3df2-4214-95f1-422267bd0a35",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "5cada56f-3104-457e-9522-455d81637134",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "d44ee998-6dc3-4c5b-bc23-12ffce1d1217",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "b997532d-7175-439a-a2a7-0cc661c383c8",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "travel",
+      "new": "health"
+    },
+    {
+      "id": "d82e3e93-30a5-4263-9bd3-23bef82006ca",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "6408c1cc-df71-4883-9d70-299ca556b5ff",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "0f543565-44a7-4c2f-9946-70cbba8c2c66",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "9aa92227-bdd0-43be-a06f-474492cd4c22",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "travel",
+      "new": "health"
+    },
+    {
+      "id": "452088ee-2435-4adf-b5de-be1211f77f81",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "64552a99-1026-4c0c-91aa-60a00f54e375",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "a9178dd9-f6f0-4382-bbb6-c746ea1508bb",
+      "source": "ea22bdd3a9bf_m4-5f.pdf",
+      "old": "health",
+      "new": "health"
+    },
+    {
+      "id": "b439ec4d-41fc-4dff-92d3-ef881dd5422e",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "e8a162e1-90d7-4ba8-a1f4-a500bd89aa48",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "65fe64ad-eb29-403e-8acf-7f9946346c84",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "0feb0b3e-8ce3-4b0c-949b-a86c16ee70ef",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "e722e3fe-53b8-465b-b9a6-998dd75c6910",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "22b4820c-3e9e-47cb-83e6-932c4acb26ce",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "810da12a-c5dc-4434-b9e3-aa208752f093",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "c1e812b4-e15d-43b6-8ad6-c39ad0177406",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "a1f5b7ef-c1cb-4d9c-be57-dc82d129476d",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "b784c28e-6bc1-447c-9118-4221464d9e61",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "f4c08d9c-a4d3-47ca-ba86-baffdfcb2b5f",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "50aef22b-42f3-4871-b0a5-4a80225381f3",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "61ff43ca-2f58-4fe2-a151-3d3cde286d0f",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "7bba7062-4bff-46b2-8f2d-9955d7fedb9f",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "b6d0db21-ee81-4d84-ba30-49022cb6860d",
+      "source": "b9cc853485a4_m4-3f.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "b0707d7b-8a08-4a77-8cd9-43f0e603afa3",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "0535db24-79fa-47c7-9fc7-13fb737874f7",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "0c0097d1-c9b1-4cc2-a2a8-65250aec6a67",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "16ab5184-12c8-4ed0-8a44-54f04b80ebd6",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "general",
+      "new": "liability"
+    },
+    {
+      "id": "5c9140c8-6531-43eb-97a6-128fbaf93290",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "general",
+      "new": "liability"
+    },
+    {
+      "id": "4680ccdc-ded0-4e7a-9a7c-acfaba01e498",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "26803e6d-fcbc-4d3a-b102-853ed8be5762",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "2dbda056-8544-437b-b515-52bd80bcb250",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "248a4f99-15ff-4714-aeaf-aa44d5169dff",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "d8d4f439-210d-402d-b69a-8b492d5ba87d",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "fire",
+      "new": "liability"
+    },
+    {
+      "id": "80e1af26-3aca-4bd5-82e4-2418733478ec",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "liability",
+      "new": "liability"
+    },
+    {
+      "id": "67d57f0f-9a2d-48c2-a35d-76c30be84b63",
+      "source": "5a1c9b6aaef2_m4-7f.pdf",
+      "old": "general",
+      "new": "liability"
+    },
+    {
+      "id": "536986b2-2dbd-41aa-a828-1641eaf50def",
+      "source": "2793245cfe4f_InsuranceFundamentals.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "05cad0f9-0ea6-4ddf-aae8-a4b06d70f381",
+      "source": "2793245cfe4f_InsuranceFundamentals.pdf",
+      "old": "health",
+      "new": "general"
+    },
+    {
+      "id": "afd0ed79-21de-4652-9bed-0c5124fcaf07",
+      "source": "9374469e4c52_Major Insurance Brokers in the GCC 1.pdf",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "9261f0ea-0455-4833-8f7c-68fb05762683",
+      "source": "9374469e4c52_Major Insurance Brokers in the GCC 1.pdf",
+      "old": "commercial",
+      "new": "general"
+    },
+    {
+      "id": "bf8db0c3-987e-4481-a687-7d8fb65fabd5",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "general",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "ba3aa727-0f8f-4212-84cb-655471ebfda7",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "b545fc65-599e-4cee-becd-0059509e8ab1",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "664823d3-5830-4a9f-a72b-761d8a0c95f0",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "c8d755f6-5802-4ff6-9574-8e78c630a007",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "15f41c20-191e-40c2-84a1-3dd9e38bb846",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "a1db532c-c59e-4b83-8cd9-4d6314f02d27",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "0dc9b62a-4cdc-45df-be33-028bfc3ba39b",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "58a90fa2-635a-47be-83c3-3e2b31488359",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "general",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "d7b74151-8cb2-45c3-834b-41a0139ccbbe",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "a264d62c-2171-4fcf-ad95-fdbe1394c3c0",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "health",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "15dd47a4-0db2-43f1-af75-f191f5cb1cc7",
+      "source": "015ed1fc1d47_Pet_Insurance_Guide.pdf",
+      "old": "general",
+      "new": "pet_insurance"
+    },
+    {
+      "id": "7c41c5b4-e8a2-4fc4-8def-6fe5bd48d44b",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "motor",
+      "new": "motor"
+    },
+    {
+      "id": "dec9d774-9039-46df-a715-4c161e3ddb93",
+      "source": "1f2e36d3fb97_9.3 INSURANCE LAW AND PRACTICE.pdf",
+      "old": "fire",
+      "new": "marine"
+    },
+    {
+      "id": "d3f91966-813e-409a-80e2-0d03ca75c0c0",
+      "source": "801b5f761448_travel_insurance_guide.pdf",
+      "old": "travel",
+      "new": "travel"
+    },
+    {
+      "id": "301e51b8-9b4b-475d-bda4-df5601af7fb2",
+      "source": "801b5f761448_travel_insurance_guide.pdf",
+      "old": "travel",
+      "new": "travel"
+    },
+    {
+      "id": "050acf82-0ad5-4973-a178-e1fa831c4019",
+      "source": "801b5f761448_travel_insurance_guide.pdf",
+      "old": "travel",
+      "new": "travel"
+    }
+  ]
+}
