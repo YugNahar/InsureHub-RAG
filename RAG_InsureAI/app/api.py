@@ -946,13 +946,13 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     # project_live_upload_metadata_pipeline_test).
     def _reclassify_chunks_with_llm() -> None:
         try:
-            from router import get_insurance_llm
+            from router import get_classification_llm
             from metadata_tagger import (
                 verify_and_enrich_section_metadata,
                 classify_candidate_type,
                 derive_document_topic_prior,
             )
-            reclass_llm = get_insurance_llm(temperature=0)
+            reclass_llm = get_classification_llm(temperature=0)
             tvec = pipeline.vector_store._store
 
             sections: dict = {}
@@ -1168,7 +1168,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
     try:
         from document_loader import load_url
         from metadata_tagger import tag_document
-        from router import get_insurance_llm
+        from router import get_classification_llm
 
         docs = await asyncio.to_thread(load_url, url)
         if not docs or not any(d.page_content.strip() for d in docs):
@@ -1179,7 +1179,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
         # Classify insurer / policy_type so filters work on video chunks
         llm = None
         try:
-            llm = get_insurance_llm(temperature=0)
+            llm = get_classification_llm(temperature=0)
         except Exception as llm_exc:
             logger.warning("[upload-video] LLM unavailable — falling back to regex classification: %s", llm_exc)
 
@@ -1239,11 +1239,11 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
         # webpage chunks participate in query-time metadata filtering just like
         # PDF/DOCX chunks do.
         from metadata_tagger import tag_document
-        from router import get_insurance_llm
+        from router import get_classification_llm
 
         llm = None
         try:
-            llm = get_insurance_llm(temperature=0)
+            llm = get_classification_llm(temperature=0)
         except Exception as llm_exc:
             logger.warning("[upload-webpage] LLM unavailable — falling back to regex classification: %s", llm_exc)
 

@@ -32,7 +32,7 @@ from metadata_tagger import (
     derive_document_topic_prior,
 )
 from validator import detect_conflict, validate_grounding
-from router import get_insurance_llm, get_general_llm, VLLM_HOST
+from router import get_insurance_llm, get_general_llm, get_classification_llm, VLLM_HOST
 from prompt_template import (
     GENERAL_PROMPT,
     RAG_PROMPT,
@@ -660,9 +660,15 @@ class RAGPipeline:
 
     # ── Shared LLM accessor (lazy, temperature=0) ──────────────────────────
     def _get_llm(self):
-        """Return a zero-temperature LLM for metadata classification tasks."""
+        """Return a zero-temperature LLM for metadata classification tasks
+        (policy_type, doc_type, query-type-for-retrieval-routing, section
+        verify/enrich) -- via get_classification_llm(), which prefers Groq
+        independently of Layla's live-answer backend setting. See that
+        function's docstring for why this is safe here specifically (a
+        background/non-latency-critical classification task) when Groq was
+        already tried and rejected for live RAG answer generation."""
         try:
-            return get_insurance_llm(temperature=0)
+            return get_classification_llm(temperature=0)
         except Exception as exc:
             logger.warning("[RAG] Could not get LLM for metadata classification: %s", exc)
             return None

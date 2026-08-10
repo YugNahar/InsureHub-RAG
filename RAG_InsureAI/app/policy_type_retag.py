@@ -91,7 +91,7 @@ def cmd_classify(args) -> int:
     pipe = RAGPipeline()
     llm = pipe._get_llm()
     if llm is None:
-        print("ERROR: no LLM available (get_insurance_llm failed) — refusing to run "
+        print("ERROR: no LLM available (get_classification_llm failed) — refusing to run "
               "regex-only re-tag, that would reintroduce the exact bug this fixes.")
         return 1
 

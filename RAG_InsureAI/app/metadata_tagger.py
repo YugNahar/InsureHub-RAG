@@ -1717,6 +1717,19 @@ _CANDIDATE_STOPWORDS = frozenset({
     # dominance bars for those documents. See policy_type_retag.py's
     # 2026-08-06 dry-run for the full regression this caused.
     "premium", "premiums", "risk", "risks",
+    # Confirmed live (2026-08-10, off-vocab regression test): a real
+    # candidate entry ("subrogation" -- itself a legal doctrine, not a
+    # product, since removed from candidate_vocab.json) had accumulated
+    # exactly this same class of universal insurance-domain words as its
+    # stored keywords, and a genuinely unrelated synthetic drone-insurance
+    # chunk cheap-matched it purely on 2+ of them co-occurring, well
+    # before match_candidate_vocab()'s LLM step ever ran. "loss" and
+    # "compensation" are the basis of every insurance claim regardless of
+    # product; "indemnity", "principle", and "cause" are equally generic
+    # legal/theoretical vocabulary (principle of indemnity, proximate
+    # cause) rather than anything distinctive of one specific product.
+    "loss", "losses", "compensation", "indemnity", "principle", "principles",
+    "cause", "causes",
 })
 
 # General-English function/filler words, on top of the domain list above.
@@ -1874,14 +1887,22 @@ def classify_candidate_type(
 
     try:
         prompt = f"""This text is an insurance-related passage. Read it and decide: does it
-describe a SPECIFIC, NAMEABLE insurance product or coverage type — one you
-can name in 1-3 words (e.g. "pet insurance", "aviation insurance",
-"directors and officers liability")?
+describe a SPECIFIC, NAMEABLE insurance PRODUCT — something a customer
+could actually go buy a policy for — in 1-3 words (e.g. "pet insurance",
+"aviation insurance", "directors and officers liability")?
 
 - If yes, reply with ONLY that name, lowercase, 1-3 words, nothing else.
 - If the text is genuinely generic, covers multiple unrelated types, or
   isn't about one specific insurance product at all, reply with exactly:
   general
+- Also reply "general" (not a guess) if the text is about a LEGAL DOCTRINE,
+  insurance MECHANISM/CONCEPT, RISK-MANAGEMENT THEORY, or REGULATORY TOPIC
+  that applies ACROSS many different products rather than naming one
+  specific product itself — e.g. subrogation, coinsurance, total loss,
+  indemnity, licensing/regulatory compliance, pure vs. speculative risk.
+  These describe how insurance works or is regulated in general, not a
+  product a customer buys, even though they're genuinely insurance-related
+  and may be the clear main subject of the passage.
 
 TEXT:
 {text[:2000]}

@@ -330,5 +330,46 @@ def get_insurance_llm(temperature: float = 0, max_tokens: int = 0):
     )
 
 
+# ── Classification-only Groq route (metadata_tagger.py's policy_type/
+# doc_type/query_type calls, never Layla's live RAG answer generation) ──────
+# Deliberately INDEPENDENT of _active_backend()/_runtime_mode above, which
+# governs the live-answer backend the Super Admin panel toggles — Groq was
+# tried there four separate times and made grounding quality worse each
+# time (open-ended synthesis with strict citation/formatting rules is a
+# different task than closed classification, and that finding does not
+# transfer here). Confirmed live 2026-08-10: a synthetic off-vocab test
+# (drone insurance, outside all 16 known types) had the local vLLM model
+# confidently (85%) force-fit the content into "motor" on every retry,
+# while llama-3.3-70b-versatile correctly and consistently answered
+# "general" (3/3) -- and still correctly identified real motor/health/
+# liability content as those same types (6/6), i.e. it isn't just
+# defaulting to "general" indiscriminately. Classification/tagging is a
+# background, non-latency-critical task (already async at ingestion —
+# see api.py's _reclassify_chunks_with_llm), so the extra network hop to
+# Groq costs nothing a user would notice, unlike a live answer stream.
+def get_classification_llm(temperature: float = 0, max_tokens: int = 0):
+    """Dedicated LLM for metadata_tagger.py's classification tasks
+    (policy_type, doc_type, candidate_type, query-type-for-retrieval-
+    routing) — prefers Groq whenever GROQ_API_KEY is configured,
+    regardless of what get_insurance_llm()'s live-answer backend is set
+    to. Falls back to get_insurance_llm() when Groq isn't configured, so
+    this still works in any environment without it."""
+    if GROQ_API_KEY:
+        from langchain_openai import ChatOpenAI
+
+        _mt = max_tokens if max_tokens > 0 else 500
+        logger.debug("[LLM] Classification via Groq model=%s max_tokens=%d", GROQ_MODEL, _mt)
+        return ChatOpenAI(
+            model=GROQ_MODEL,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY,
+            temperature=temperature,
+            max_tokens=_mt,
+            timeout=60,
+            max_retries=1,
+        )
+    return get_insurance_llm(temperature=temperature, max_tokens=max_tokens)
+
+
 def get_general_llm(temperature: float = 0.3):
     return get_insurance_llm(temperature=temperature)
