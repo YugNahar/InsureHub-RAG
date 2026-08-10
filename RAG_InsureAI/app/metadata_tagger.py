@@ -1043,6 +1043,21 @@ STEP 2 — decide:
 - Only if the text is consistently about ONE type throughout (synonyms, examples, and
   elaboration of that same type are fine — that's still one type) → answer that
   specific type's label.
+- WATCH FOR EXCLUSIONS AND CROSS-REFERENCES: a type mentioned only to say the text does
+  NOT cover it ("does not cover", "excluded", "not covered", "unless"), or mentioned only
+  as a comparison point to a DIFFERENT product ("as in X insurance", "unlike X", "whereas
+  in X insurance..."), is evidence AGAINST that type, never for it — the words are
+  present, but the sentence is denying or comparing, not describing the text's own
+  subject. The type a text is ABOUT is the one whose own rules, benefits, or claims
+  procedure it actually states.
+  Example: "Exclusions in luggage insurance ... does not cover ... motorised vehicles ...
+  electric vehicles for which motor liability insurance is required." is TRAVEL insurance
+  (a real KB chunk once mistagged "motor" for exactly this reason) — "motor" appears
+  purely to name what luggage cover excludes.
+  Example: "...in General Insurance the cover is granted normally for one year and in
+  Fire Insurance the preamble states..." is LIABILITY insurance, not fire (another real
+  KB chunk mistagged this way) — a passing cross-reference used only to illustrate a
+  general point about renewal notices, not the text's actual subject.
 
 Reply with ONLY the policy type label (one word from: {all_labels}).
 No explanation. No punctuation. Just the label.
@@ -1515,7 +1530,22 @@ primarily discuss "{assigned_type}" insurance?
   cover...", "irrelevant here in a way it would matter for a scheme built
   around X...") is telling you it is NOT that other type — the other type's
   vocabulary appearing in a sentence like that is evidence AGAINST that type,
-  not for it, even though the literal words are present.{doc_context}
+  not for it, even though the literal words are present.
+- WATCH FOR EXCLUSIONS: the same applies to a type mentioned only to say the
+  text does NOT cover it ("does not cover", "excluded", "not covered",
+  "unless") — that is also evidence AGAINST that type, not for it. The type
+  a text is ABOUT is the one whose own rules, benefits, or claims procedure
+  it actually states, not any type it names while denying or comparing.
+  Example: "Exclusions in luggage insurance ... does not cover ... motorised
+  vehicles ... electric vehicles for which motor liability insurance is
+  required." is TRAVEL insurance (a real KB chunk once mistagged "motor" for
+  exactly this reason) — "motor" appears purely to name what luggage cover
+  excludes.
+  Example: "...in General Insurance the cover is granted normally for one
+  year and in Fire Insurance the preamble states..." is LIABILITY insurance,
+  not fire (another real KB chunk mistagged this way) — a passing
+  cross-reference used only to illustrate a general point about renewal
+  notices, not the text's actual subject.{doc_context}
 
 STEP 2 — EXTRACT (from the text only — never guess or invent a value): for each
 field below, give the value ONLY if it is explicitly stated in the text,

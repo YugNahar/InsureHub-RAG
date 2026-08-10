@@ -1,8 +1,41 @@
 # Plan: fix persistent `policy_type` chunk mislabelling
 
-**Status:** diagnosis complete, implementation not started.
+**Status (2026-08-10):**
+- Phase 0 (audit harness + gold set) — DONE: `policy_type_audit.py`, `policy_type_gold.json`.
+- Phase 1 (document-level topic prior) — DONE: `derive_document_topic_prior()` in
+  `metadata_tagger.py`, threaded into `verify_and_enrich_section_metadata()` and used as the
+  `assigned_type` anchor at all three live call sites (`rag.py`'s `SectionChunker`, `api.py`'s
+  live-upload path, `policy_type_retag.py`) — confirmed via `grep -rn "doc_prior if doc_prior"`.
+- Phase 2 (exclusion/cross-reference prompt rule) — DONE: added to both
+  `_build_policy_type_prompt` and `_build_verify_and_enrich_prompt`, using the plan's own two
+  real examples (the travel-guide "motor" exclusion mistag, the liability-module "fire"
+  cross-reference mistag) verbatim.
+- Phase 3 (page-header/footer topic mining) — DONE: `_mine_page_header_topic()` in
+  `semantic_chunker.py`, verified live against the real `m4-7f.pdf` liability-module text —
+  correctly mines "Liability Insurance & Documents in General Insurance", the exact RC-4
+  example. Feeds `regex_first_pass_policy_type()` as `section_heading` only when no genuine
+  heading was detected; does not affect `section_id` grouping. Stripped from chunk text before
+  storage.
+- Phase 4 (section-aware path actually executing) — DIAGNOSED, not a code bug: real heading
+  detection genuinely never fires on the LIVE KB (0/397 chunks have `section_heading` set,
+  confirmed live), matching the original diagnosis. But re-running the CURRENT chunker against
+  real source text produces `section_heading` on 20/20 chunks (mix of genuine headings like
+  "7.0 INTRODUCTION" and Phase 3's mined fallback) — the code executes correctly; the live KB
+  is simply stale relative to it, same pattern `policy_type_retag.py` already documents for
+  `policy_type` itself. A full corpus RE-INGEST (re-chunk + re-embed, not just a metadata
+  retag) would be needed to actually populate this on the live KB — a bigger, separate
+  decision than this plan's scope, not done here.
+- Phase 5 (re-tag and verify) — classify-only dry-run in progress; `--apply` not run.
+- Phase 6 (guardrails) — item 1 (stale document-level `policy_type_confidence`/
+  `all_policy_types` never gating chunk-level logic) is already substantially enforced via
+  `_CHUNK_SKIP_FIELDS` in `rag.py` (both upload paths) and documented as a hard rule in
+  `policy_type_audit_baseline.py`; a physical field rename was judged not worth the added
+  call-site risk given that guardrail already works. Item 2 (standing check) already satisfied
+  — `policy_type_audit.py` has the same PASS/FAIL exit-code contract as
+  `contamination_corpus_runner.py`; this repo has no CI harness to wire either into beyond that.
+
 **Audience:** implementing agent (Sonnet). Investigation done 2026-07-31 against the live
-KB (414 chunks, `app/turbovec_data/documents/insurance_docs_meta.ndjson`).
+KB (414 chunks — 397 as of 2026-08-10, `app/turbovec_data/documents/insurance_docs_meta.ndjson`).
 
 ---
 

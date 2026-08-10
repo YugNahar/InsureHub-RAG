@@ -29,7 +29,7 @@ from typing import Any, List
 import numpy as np
 from langchain_core.documents import Document
 
-from metadata_tagger import _regex_policy_score
+from metadata_tagger import _regex_policy_score, classify_query_policy_type
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +186,40 @@ def _extract_sections(text: str) -> List[tuple]:
     if len([s for s in sections if s[0]]) < 2:
         return [("", text)]
     return sections
+
+
+# ── Page-header/footer topic mining (plan_policy_type_tagging.md RC-4) ──────────
+# _extract_sections above deliberately EXCLUDES a frequently-repeating line
+# (freq > 2) from genuine-heading detection, treating it as boilerplate noise
+# ("LEARNING OBJECTIVES" repeats 12+ times on purpose). But when that
+# repeating line itself NAMES a specific insurance type -- "Practice of Life
+# Insurance", "Liability Insurance & Documents in General Insurance", "Health
+# Insurance" -- it is real, printed, ground-truth per-document topic signal
+# sitting unused in chunk text, not noise (RC-4). This matters most for
+# exactly the documents Phase 1's doc_prior correctly refuses to anchor: a
+# genuinely multi-topic reference textbook (e.g. "9.3 INSURANCE LAW AND
+# PRACTICE.pdf") has doc_prior="general" by design, but its own chapters
+# still print a distinct running header per chapter -- this is the signal
+# that resolves THOSE sections correctly, complementary to doc_prior rather
+# than redundant with it.
+def _mine_page_header_topic(text: str) -> str:
+    """Find a line that repeats >=3 times in *text* (a stricter bar than
+    _extract_sections' >2-excludes cutoff, to avoid mining a two-page
+    coincidence) AND itself resolves to a specific policy type via
+    classify_query_policy_type() -- a repeating line that's just page
+    furniture (a bare page code, "LEARNING OBJECTIVES") classifies
+    "general" and is correctly skipped rather than mined as a false label.
+    Returns "" when no such line exists."""
+    freq: dict[str, int] = {}
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if 3 <= len(stripped) < 90:
+            freq[stripped] = freq.get(stripped, 0) + 1
+    repeating = [line for line, count in freq.items() if count >= 3]
+    for line in sorted(repeating, key=lambda l: freq[l], reverse=True):
+        if classify_query_policy_type(line) != "general":
+            return line
+    return ""
 
 
 # ── Page-merge helper ────────────────────────────────────────────────────────────
@@ -519,6 +553,10 @@ class SemanticChunker:
             )
             pieces_raw, overlap_sizes, headings = self.split_text(doc.page_content)
             doc_source = doc.metadata.get("source") or doc.metadata.get("filename") or "doc"
+            # Once per document (see _mine_page_header_topic above) -- a
+            # fallback signal for chunks with no genuine detected heading,
+            # not a replacement for one that already exists.
+            page_header_topic = _mine_page_header_topic(doc.page_content)
             for idx, (piece, ov_size, heading) in enumerate(zip(pieces_raw, overlap_sizes, headings)):
                 markers = _PAGE_MARKER_RE.findall(piece)
                 recovered_page = page_value
@@ -529,6 +567,32 @@ class SemanticChunker:
                     except (ValueError, TypeError):
                         recovered_page = markers[0]
                     piece = _PAGE_MARKER_RE.sub("", piece).strip()
+
+                # Strip a verbatim occurrence of the mined running
+                # header/footer line from this chunk's own text before it's
+                # stored — otherwise it competes with the chunk's real
+                # content as ordinary prose during body-keyword scoring
+                # instead of acting as the label it actually is (Phase 3,
+                # plan_policy_type_tagging.md RC-4). Applies whenever the
+                # line is present, not only when it's about to stand in as
+                # the fallback heading below — it's boilerplate either way.
+                if page_header_topic and page_header_topic in piece:
+                    piece = "\n".join(
+                        line for line in piece.split("\n")
+                        if line.strip() != page_header_topic
+                    ).strip()
+
+                # A mined page-header topic (see _mine_page_header_topic
+                # above) stands in for section_heading ONLY when no genuine
+                # heading was detected for this chunk — it never overrides
+                # a real one, and deliberately does NOT affect section_id
+                # grouping below, which stays keyed on the genuine heading
+                # exactly as before. This just revives
+                # regex_first_pass_policy_type()'s heading-check branch
+                # (the strongest one, RC-1) for documents whose own
+                # printed page furniture already states the topic, without
+                # changing how chunks get grouped into sections.
+                effective_heading = heading or page_header_topic
 
                 # Count overlap words after marker stripping so the value is
                 # accurate for the stored (marker-free) text. section_id
@@ -550,7 +614,7 @@ class SemanticChunker:
                         "chunk_index":         idx,
                         "chunking_method":     "semantic",
                         "overlap_prefix_words": ov_size,
-                        "section_heading":     heading,
+                        "section_heading":     effective_heading,
                         "section_id":          f"{doc_source}::{heading}" if heading else f"{doc_source}::chunk{idx}",
                     },
                 ))
