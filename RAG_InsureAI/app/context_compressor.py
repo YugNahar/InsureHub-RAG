@@ -33,6 +33,17 @@ logger = logging.getLogger(__name__)
 # Sentence must have at least this many chars to be embedded / kept.
 _MIN_SENT_CHARS = 25
 
+# Phase D (2026-08-04, plan_shallow_answers_context_budget.md): the smallest
+# per-chunk allocation still worth keeping as a real chunk rather than
+# dropping it. Calibrated well above _MIN_SENT_CHARS (25) — that floor is
+# "still embeddable as a sentence fragment," not "still useful to an LLM
+# trying to answer from it." 220 chars is roughly one full sentence of this
+# KB's typical prose (see the ~112-char fragments this fix replaces —
+# confirmed live those were routinely mid-word/mid-clause, not complete
+# thoughts). See compress_to_budget's docstring for the failure mode this
+# closes.
+_MIN_VIABLE_CHUNK_CHARS = 220
+
 
 def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
     """
@@ -144,18 +155,22 @@ class ContextCompressor:
         exceeds the LLM's context window.
 
         Steps:
-          1. Give every chunk a fair-share allocation (max_total_chars / N)
-             up front; any share left unused by a chunk smaller than its
-             allocation rolls over to chunks that need more, highest-
-             relevance-first (caller's pre-sort order).
+          0. If fair-share would fall below a per-chunk viability floor
+             (_MIN_VIABLE_CHUNK_CHARS), drop the lowest-ranked (tail)
+             chunks first rather than spreading an unusably thin
+             allocation across all of them — see the Phase D note below.
+          1. Give every SURVIVING chunk a fair-share allocation
+             (max_total_chars / N) up front; any share left unused by a
+             chunk smaller than its allocation rolls over to chunks that
+             need more, highest-relevance-first (caller's pre-sort order).
           2. For a chunk that fits within its final allocation, include it
              as-is.
           3. For a chunk that exceeds its allocation, keep only the most
              query-relevant sentences from it that still fit.
           4. As a last resort, hard-truncate at a sentence boundary.
 
-        Fair-share replaces a strict "fill in rank order until the budget
-        runs out" pass — confirmed live: 10 chunks competing for a
+        Fair-share (step 1) replaces a strict "fill in rank order until the
+        budget runs out" pass — confirmed live: 10 chunks competing for a
         6000-char budget left the 4th chunk with 20 characters and chunks
         5-10 with none at all, discarding entire retrieved sources outright
         even though they'd been relevant enough to be retrieved in the
@@ -168,6 +183,28 @@ class ContextCompressor:
         redistribution step still lets top-ranked chunks grow to their
         full size first, exactly as before, once every chunk's minimum is
         covered.
+
+        Phase D (2026-08-04, plan_shallow_answers_context_budget.md): fair
+        share has its OWN failure mode at the low end, opposite to the one
+        it was built to fix above — it spends the whole budget fragmenting
+        EVERY chunk into a sliver, rather than keeping SOME chunks
+        genuinely usable. Confirmed live: an 8-chunk, 900-char budget gave
+        every chunk ~112 chars — well under one real sentence — so every
+        chunk took the hard_truncate path (step 4) and the model received
+        8 mid-sentence fragments instead of coherent context, which is
+        exactly what upstream context-budget fixes (Phases A/C0/C3) were
+        needed for in the first place. Step 0 only engages BELOW the
+        viability floor — above it this is a no-op, and step 1's behavior
+        for the case it was built for (see the paragraph above) is
+        unchanged, byte-for-byte. `chunks` arrives here already sorted by
+        relevance (`_sort_and_truncate` runs before this call in
+        multi_source_rag.py), so dropping from the end is well-defined:
+        it drops the least-relevant survivors, not an arbitrary subset.
+        A dropped chunk is absent from the RETURNED (compressed) list, but
+        callers keep `_full_context_uncompressed` built from the ORIGINAL
+        retrieved set for the post-generation grounding checks — those are
+        unaffected by anything this method drops or fragments, by design
+        (see multi_source_rag.py's own comment on that variable).
         """
         total = sum(len(d.page_content) for d in chunks)
         if total <= max_total_chars:
@@ -179,12 +216,26 @@ class ContextCompressor:
             total, len(chunks), max_total_chars,
         )
 
+        n = len(chunks)
+        _dropped_for_viability = 0
+        while n > 1 and max_total_chars // n < _MIN_VIABLE_CHUNK_CHARS:
+            chunks = chunks[:-1]
+            n -= 1
+            _dropped_for_viability += 1
+        if _dropped_for_viability:
+            logger.info(
+                "[Compressor] dropped %d lowest-ranked chunk(s) rather than fragment all "
+                "%d below the %d-char viability floor (%d chars ÷ %d chunks = %d/chunk)",
+                _dropped_for_viability, n + _dropped_for_viability, _MIN_VIABLE_CHUNK_CHARS,
+                max_total_chars, n + _dropped_for_viability,
+                max_total_chars // (n + _dropped_for_viability),
+            )
+
         query_emb: np.ndarray = self._model.encode(
             [query], normalize_embeddings=True, show_progress_bar=False
         )[0]
 
         sizes = [len(d.page_content) for d in chunks]
-        n = len(chunks)
         fair_share = max_total_chars // n
         allocations = [min(s, fair_share) for s in sizes]
         leftover = max_total_chars - sum(allocations)
