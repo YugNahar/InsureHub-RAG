@@ -34,12 +34,16 @@ class AgentDefinition:
     averaged into one centroid) so a short, distinctive example doesn't
     get diluted — see embeddings.py."""
 
-    invoke: Optional[Callable[[str, str], Awaitable[str]]] = None
-    """async (session_id, message) -> reply text. The actual dispatch
-    target — today an in-process call into the agent's own handler
-    (e.g. travel_bot's chat_endpoint); a future out-of-process agent's
-    invoke would be a small async function making a real MCP client call
-    instead, with the exact same signature."""
+    invoke: Optional[Callable[[str, str], Awaitable[dict]]] = None
+    """async (session_id, message) -> {"text": str, "ui": dict | None,
+    "collected_fields": dict | None}. "ui" is an out-of-band signal for the
+    frontend (e.g. {"type": "ava_form", ...} to open a structured intake
+    form instead of rendering "text" as a plain reply) — None for an
+    ordinary conversational turn. The actual dispatch target — today an
+    in-process call into the agent's own handler (e.g. travel_bot's
+    chat_endpoint); a future out-of-process agent's invoke would be a
+    small async function making a real MCP client call instead, with the
+    exact same signature."""
 
     enabled: bool = True
 

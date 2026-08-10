@@ -18,22 +18,59 @@ from __future__ import annotations
 import asyncio
 
 from travel_bot.core.database import SessionLocal as _AvaSessionLocal
-from travel_bot.routers.chat import chat_endpoint as _ava_chat_endpoint
+from travel_bot.routers.chat import (
+    chat_endpoint as _ava_chat_endpoint,
+    get_or_create_session as _ava_get_or_create_session,
+    FIELD_OPTIONS_MAP as _AVA_FIELD_OPTIONS_MAP,
+)
 from travel_bot.schemas.chat import ChatRequest as _AvaChatRequest
+from travel_bot.schemas.travel import COVERAGE_TYPE_LOCKS as _AVA_COVERAGE_TYPE_LOCKS
+from travel_bot.models.message import Message as _AvaMessage
 
 from ..registry import AgentDefinition, register_agent
 
+_INTAKE_FORM_WELCOME = (
+    "Sure — let's get you a quote. Fill in your details below, or upload a "
+    "document and I'll pre-fill what I can."
+)
 
-def _call_sync(session_id: str, message: str) -> str:
+
+def _call_sync(session_id: str, message: str) -> dict:
     db = _AvaSessionLocal()
     try:
+        # api.py calls invoke(session_id, "") exactly once, right when a
+        # handoff is accepted, to produce Ava's opening turn — the
+        # established convention for "this is the start of the
+        # conversation" (see api.py's _handoff_yes_gen). Short-circuit
+        # chat_endpoint's own QUOTING-phase question-asking here rather
+        # than teaching the phase machine itself about a "first turn"
+        # special case: this is the one feature this whole change exists
+        # to replace, so it's scoped to this one bridge function, not
+        # chat_endpoint (which every other turn — including a user who
+        # free-types instead of using the form — still goes through
+        # completely unmodified).
+        if message == "":
+            db_session = _ava_get_or_create_session(db, session_id)
+            state = db_session.extracted_data or {}
+            db.add(_AvaMessage(session_id=session_id, role="assistant", content=_INTAKE_FORM_WELCOME))
+            db.commit()
+            return {
+                "text": _INTAKE_FORM_WELCOME,
+                "ui": {
+                    "type": "ava_form",
+                    "field_options": _AVA_FIELD_OPTIONS_MAP,
+                    "coverage_type_locks": _AVA_COVERAGE_TYPE_LOCKS,
+                },
+                "collected_fields": state,
+            }
+
         resp = _ava_chat_endpoint(_AvaChatRequest(session_id=session_id, message=message), db)
-        return resp.response
+        return {"text": resp.response, "ui": resp.ui, "collected_fields": resp.collected_fields}
     finally:
         db.close()
 
 
-async def _invoke(session_id: str, message: str) -> str:
+async def _invoke(session_id: str, message: str) -> dict:
     # chat_endpoint is sync (def, not async def) — offload it so an Ava
     # turn's DB + LLM latency doesn't block the whole event loop for
     # every other concurrent user, unlike the old inline call it replaces.
