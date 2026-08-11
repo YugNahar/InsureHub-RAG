@@ -309,28 +309,36 @@ from travel_bot.models.extracted_value import ExtractedValue as _TravelExtracted
 _travel_base.metadata.create_all(bind=_travel_engine)
 app.include_router(_travel_chat_router)
 
-# Voice agent integration (2026-08-05) — outbound reactivation calls (Riya,
-# via osvi) for a DIFFERENT product line (Generali Central life insurance
-# quotations on a separate azure-hosted website) than everything else in
-# this file. Mounted the same way travel_bot is directly above: its own DB,
-# its own router, no shared state with Layla/Ava. See
-# voice_agent/osvi_client.py's module docstring — the osvi API call itself
-# is not yet usable (OSVI_INITIATE_CALL_URL/AGENT_UUID/API_TOKEN unset in
-# .env) until the real API Integration Guide confirms the endpoint
-# contract; the scheduling/cancellation logic (the part that guarantees a
-# completed-payment session is never called) works and is testable now.
-from voice_agent.routers.webhook import router as _voice_agent_router
-from voice_agent.core.database import Base as _voice_agent_base, engine as _voice_agent_engine, SessionLocal as _voice_agent_session_local
-from voice_agent.scheduler import scheduler_loop as _voice_agent_scheduler_loop
-_voice_agent_base.metadata.create_all(bind=_voice_agent_engine)
-app.include_router(_voice_agent_router)
-
-
-@app.on_event("startup")
-async def _start_voice_agent_scheduler():
-    app.state.voice_agent_scheduler_task = asyncio.create_task(
-        _voice_agent_scheduler_loop(_voice_agent_session_local)
-    )
+# Voice agent integration — DISABLED 2026-08-10. Riya (outbound
+# reactivation calls via osvi, for Generali Central life-insurance
+# quotations) was extracted out of this repo into its own fully
+# independent project on 2026-08-05/06 (separate repo, separate deploy,
+# separate credentials, separate DB — see the real code at
+# ~/Downloads/riya-voice-agent, github.com/Lavishdevpura/riya-voice-agent,
+# running in its own `riya_voice_agent` container). The app/voice_agent/
+# package still sitting in this repo's tree is a leftover pre-extraction
+# copy — confirmed dormant (checked its own DB: zero real calls fired
+# from it since the Aug 6 extraction, only pre-extraction test rows and
+# this session's own safely-cancelled test rows). Mounting it here was a
+# pure residual risk with no upside: it shares the same live osvi
+# credentials as the real deployment, so anything that ever POSTed to
+# THIS container's /api/voice-agent/quotation-event could still fire a
+# real, billed outbound call. Router mount, DB table creation, and the
+# background scheduler task are all disabled below; the voice_agent/
+# package files are left in place for reference, not deleted.
+#
+# from voice_agent.routers.webhook import router as _voice_agent_router
+# from voice_agent.core.database import Base as _voice_agent_base, engine as _voice_agent_engine, SessionLocal as _voice_agent_session_local
+# from voice_agent.scheduler import scheduler_loop as _voice_agent_scheduler_loop
+# _voice_agent_base.metadata.create_all(bind=_voice_agent_engine)
+# app.include_router(_voice_agent_router)
+#
+#
+# @app.on_event("startup")
+# async def _start_voice_agent_scheduler():
+#     app.state.voice_agent_scheduler_task = asyncio.create_task(
+#         _voice_agent_scheduler_loop(_voice_agent_session_local)
+#     )
 
 import re as _bot_re
 
@@ -952,6 +960,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 classify_candidate_type,
                 derive_document_topic_prior,
             )
+            from candidate_vocab import upsert_candidate
             reclass_llm = get_classification_llm(temperature=0)
             tvec = pipeline.vector_store._store
 
@@ -977,6 +986,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             )
 
             updated = 0
+            _section_pass1 = []
             for section_items in sections.values():
                 section_text = "\n\n".join(c.page_content for _, c in section_items)
                 # The synchronous step above already ran the free heading-
@@ -1012,6 +1022,62 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                     section_candidate_type = classify_candidate_type(
                         section_text, llm=reclass_llm, source=filename, source_type="chunk",
                     )
+                _section_pass1.append((section_items, section_text, fresh, section_candidate_type, enriched))
+
+            # Pass 2 — in-document open-vocabulary anchor correction.
+            # derive_document_topic_prior() only scores the CLOSED 12-type
+            # vocabulary, so a genuinely single-topic but OFF-VOCAB document
+            # (e.g. drone or livestock insurance) always gets doc_prior=
+            # "general" — which means the DOCUMENT CONTEXT anchor in
+            # _build_verify_and_enrich_prompt never fires, and every section
+            # is classified from its own isolated text with zero visibility
+            # into what its sibling sections already decided. Confirmed live
+            # 2026-08-10: a 9-section livestock-insurance test document
+            # force-fit 5/9 administrative/procedural sections into "crop"
+            # (the bare word "farmer" alone was enough for a 90%-confidence
+            # classification in total isolation) and 1/9 into "life", while
+            # 2/9 correctly landed on general + candidate="livestock_
+            # insurance" — those 2 confirmed sections are real in-document
+            # evidence the other 6 never got to see. If >=2 sections of THIS
+            # SAME document independently converge on the same open-
+            # vocabulary candidate label, that's the same shape of evidence
+            # derive_document_topic_prior's own docstring relies on for the
+            # closed-vocabulary case (raw signal summed across the whole
+            # document, not judged per-chunk in isolation) — just sourced
+            # from Mode-A guesses instead of regex hits. Feed it back as
+            # doc_prior (same DOCUMENT CONTEXT prompt mechanism used above)
+            # for any sibling section that landed on a DIFFERENT official
+            # type, and let the model re-judge with that context instead of
+            # in a vacuum. Threshold is 2, not 1 — a single section's guess
+            # could be a fluke; two independent sections agreeing within one
+            # document is a real, replicated signal.
+            _candidate_tally: dict = {}
+            for _, _, _p1_fresh, _p1_cand, _ in _section_pass1:
+                if _p1_fresh == "general" and _p1_cand:
+                    _candidate_tally[_p1_cand] = _candidate_tally.get(_p1_cand, 0) + 1
+            _doc_candidate_anchor = max(_candidate_tally, key=_candidate_tally.get) if _candidate_tally else None
+            if _doc_candidate_anchor and _candidate_tally[_doc_candidate_anchor] < 2:
+                _doc_candidate_anchor = None
+
+            _final_sections = []
+            for section_items, section_text, fresh, section_candidate_type, enriched in _section_pass1:
+                if _doc_candidate_anchor and fresh != "general" and section_candidate_type != _doc_candidate_anchor:
+                    enriched2 = verify_and_enrich_section_metadata(
+                        section_text, fresh, llm=reclass_llm, doc_prior=_doc_candidate_anchor,
+                    )
+                    fresh2 = enriched2["policy_type"]
+                    if fresh2 != fresh:
+                        logger.info(
+                            "[background reclassify] '%s': in-document candidate anchor %r corrected a section from %r to %r",
+                            filename, _doc_candidate_anchor, fresh, fresh2,
+                        )
+                        fresh, enriched = fresh2, enriched2
+                        if fresh == "general":
+                            section_candidate_type = _doc_candidate_anchor
+                            upsert_candidate(_doc_candidate_anchor, [], filename, "chunk")
+                _final_sections.append((section_items, fresh, section_candidate_type, enriched))
+
+            for section_items, fresh, section_candidate_type, enriched in _final_sections:
                 for cid, _ in section_items:
                     meta = tvec._metadatas.get(cid)
                     if meta is None:
@@ -1021,6 +1087,22 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                         updated += 1
                     if section_candidate_type:
                         meta["candidate_policy_type"] = section_candidate_type
+                    elif fresh != "general" and meta.get("candidate_policy_type"):
+                        # Confirmed live 2026-08-10: without this, a chunk
+                        # whose synchronous (regex-only) pass landed on
+                        # "general" -- and so got a candidate_policy_type
+                        # guess attached -- but whose background LLM pass
+                        # then corrects policy_type to a real, specific
+                        # type keeps the now-stale candidate guess sitting
+                        # alongside it (e.g. policy_type="crop" WITH
+                        # candidate_policy_type="wedding_insurance" on the
+                        # same chunk, from an unrelated earlier guess).
+                        # section_candidate_type is only ever computed when
+                        # fresh == "general" above, so it can't itself
+                        # signal "clear this" -- this branch does that
+                        # explicitly instead.
+                        meta.pop("candidate_policy_type", None)
+                        updated += 1
                     for field in ("language", "jurisdiction", "document_version", "effective_date", "coverage_category"):
                         if enriched.get(field, "unknown") != "unknown":
                             meta[field] = enriched[field]
