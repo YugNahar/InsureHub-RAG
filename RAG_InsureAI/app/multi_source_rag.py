@@ -2722,8 +2722,19 @@ async def _classify_query_candidate_type_llm(query: str) -> Optional[str]:
         upsert_candidate(hit, [], query, "query")
         return hit
 
-    try:
-        prompt = f"""This is a short insurance-related question. If it names or clearly
+    # Backend failure (timeout, connection error, empty completion) is
+    # deliberately allowed to propagate here rather than being swallowed
+    # into a `return None` — the caller (ask_stream) uses None from THIS
+    # function as "confirmed general, no specific candidate topic," which
+    # licenses _candidate_mismatch to drop every candidate-tagged chunk
+    # that disagrees. A classification that never actually ran (backend
+    # down/busy) is not evidence the query is general — it's no evidence
+    # at all. Confirmed live: under concurrent load this call failed
+    # outright for "Is loss of milk yield covered under livestock
+    # insurance?", and the resulting None silently dropped the correctly
+    # candidate-tagged livestock chunk that contained the answer, even
+    # though the query literally names "livestock insurance."
+    prompt = f"""This is a short insurance-related question. If it names or clearly
 implies ONE specific insurance product or coverage type — even an unusual
 or unfamiliar-sounding one — extract that name in 1-3 words. If the
 question itself already uses a specific term for the coverage (even a term
@@ -2737,12 +2748,27 @@ rather than judging whether it "sounds like" a real product.
 QUESTION: {query}
 
 ANSWER:"""
-        raw = await _backend_completion(prompt, max_tokens=10, timeout=3)
-        if not raw:
-            return None
+    # Classification-only route (get_classification_llm — prefers Groq,
+    # see router.py), not _backend_completion's shared vLLM-by-default
+    # path. Confirmed live 2026-08-10: for the exact query above, vLLM
+    # answered "general" despite the prompt's own explicit instruction to
+    # use the query's stated term — a genuine instruction-following miss,
+    # not a backend failure (raw='general', a real, well-formed reply).
+    # The same query via get_classification_llm() correctly answered
+    # "livestock insurance". This is the same fix already applied to the
+    # ingestion-side classification calls in api.py/metadata_tagger.py
+    # this session, for the identical reason: a short, single-label
+    # extraction judgment, not full answer generation — the class of task
+    # Groq has been shown to help with here, distinct from the generation
+    # role it was tried and reverted for three times (see .env's own
+    # history on that).
+    try:
+        _completion = await get_classification_llm(temperature=0, max_tokens=10).ainvoke(prompt)
+        raw = _completion.content if hasattr(_completion, "content") else str(_completion)
     except Exception as exc:
-        logger.debug("[CANDIDATE_TYPE] query open-ended LLM call failed: %s", exc)
-        return None
+        raise RuntimeError(f"query candidate-type classification call failed: {exc}") from exc
+    if not raw:
+        raise RuntimeError("empty completion from backend for query candidate-type classification")
 
     label = normalize_candidate_label(raw)
     if label is None:
@@ -4392,7 +4418,7 @@ def _is_insurance_related(question: str) -> bool:
 
 from langchain_core.documents import Document
 from rag import RAGPipeline
-from router import get_insurance_llm, VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
+from router import get_insurance_llm, get_classification_llm, VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model
 from video_store import VideoVectorStore
 from webpage_store import WebpageVectorStore
 from calculator import compute_insurance_benefits, _is_calculation_question
@@ -5952,11 +5978,13 @@ class MultiSourceRAG:
         # so this avoids paying an LLM call on every single query for a
         # comparison that usually can't matter.
         _query_candidate_type: Optional[str] = None
+        _query_candidate_classification_failed = False
         if any(c.metadata.get("candidate_policy_type") for c in all_chunks):
             try:
                 _query_candidate_type = await _classify_query_candidate_type_llm(retrieval_query)
             except Exception as exc:
                 logger.debug("[CANDIDATE_TYPE] query-side gate failed: %s", exc)
+                _query_candidate_classification_failed = True
 
         def _type_mismatched(c):
             _chunk_type = str(c.metadata.get("policy_type", "general")).lower()
@@ -5985,6 +6013,12 @@ class MultiSourceRAG:
             # leaking "just like visiting a vet for your pet" into a home-
             # insurance answer. Query's own candidate is checked (not just
             # "unset") so a real matching novel-type case is never dropped.
+            if _query_candidate_classification_failed:
+                # No signal either way — fail safe by not dropping, rather
+                # than treating an unrun classification as "confirmed not
+                # this type." See the raise-on-failure comment in
+                # _classify_query_candidate_type_llm.
+                return False
             return bool(
                 str(c.metadata.get("source_type", "document")).lower() == "document"
                 and c.metadata.get("candidate_policy_type")
