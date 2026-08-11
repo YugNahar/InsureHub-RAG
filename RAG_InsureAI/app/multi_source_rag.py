@@ -1288,6 +1288,40 @@ _TYPE_ATTRIBUTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Catches a distinct failure mode from _TYPE_GIVEAWAY_TERMS below: the
+# model stating a country/region-level legal or regulatory insurance
+# requirement (a Schengen visa's minimum-coverage condition, a country
+# "requiring" health insurance for expats, etc.) that it knows from its own
+# training data, not from anything actually retrieved — STRICT_GROUNDED_
+# PROMPT's "never use external knowledge" instruction doesn't reliably stop
+# this for well-known real-world facts. Confirmed live, 3 of 5 destination-
+# insurance queries: "is health insurance required for a europe trip"
+# fabricated an entirely unrelated "the UAE requires expats to have some
+# form of health insurance" claim (sourced from a YouTube transcript with
+# no such content) alongside a repeated Schengen-visa claim; "should i buy
+# health insurance before travelling to germany" fabricated "Germany
+# requires health insurance for certain visa categories" plus a specific
+# dollar figure. All three answers' own retrieved context never contained
+# the word "visa" at all (confirmed directly against the source text) —
+# by contrast, "i am going to france"/"...to japan" with no legal-
+# requirement claim in context came back correctly generic, and the one
+# query using the literal string "schengen visa" correctly refused rather
+# than hallucinate. A real, grounded requirement claim needs its own
+# supporting language (visa/legal/mandatory) to exist somewhere in what
+# was actually retrieved — if the answer asserts the claim but the context
+# has none of that language anywhere, it's very likely training-data
+# leakage, not retrieval.
+_LEGAL_REQUIREMENT_CLAIM_RE = re.compile(
+    r"\b(legal(?:ly)?\s+requir\w*|mandator\w+\s+(?:to\s+have\s+)?(?:some\s+form\s+of\s+)?"
+    r"(?:health\s+)?insurance|insurance\s+is\s+(?:often\s+)?(?:a\s+)?legal\s+requirement|"
+    r"requir\w*\s+(?:you\s+to\s+have\s+|expats?\s+to\s+have\s+)?(?:some\s+form\s+of\s+)?"
+    r"(?:health\s+)?insurance|visa\s+requir\w*)\b",
+    re.IGNORECASE,
+)
+_LEGAL_REQUIREMENT_SUPPORT_RE = re.compile(
+    r"\bvisa\b|\blegal(?:ly)?\s+requir\w*|\bmandator\w+\b", re.IGNORECASE,
+)
+
 # Module-level (not request-scoped) so both the detailed-mode point filter
 # and the brief-mode whole-reply check below can share one definition rather
 # than drifting out of sync. Catches jargon/content from a RETRIEVED chunk
@@ -8247,6 +8281,35 @@ class MultiSourceRAG:
                     )
             except Exception as _retr_contam_exc:
                 logger.debug("[ask_stream] retrieval-contamination filter skipped: %s", _retr_contam_exc)
+
+        # ── Ungrounded legal/regulatory requirement claim (training-data leak) ─
+        # Runs regardless of mode/policy_type — see _LEGAL_REQUIREMENT_CLAIM_RE's
+        # own module-level docstring for the confirmed failure this catches.
+        # Not scoped to _retrieval_contamination_detected's own guard
+        # (detailed mode, general policy_type, follow-ups) since this
+        # specific hallucination isn't limited to any of those.
+        if not _retrieval_contamination_detected:
+            try:
+                _legal_ans_src = (_corrected_text or _reply_stripped)
+                if (
+                    _legal_ans_src
+                    and _LEGAL_REQUIREMENT_CLAIM_RE.search(_legal_ans_src)
+                    and not _LEGAL_REQUIREMENT_SUPPORT_RE.search(_full_context_uncompressed or "")
+                ):
+                    _legal_refusal_text = (
+                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                    )
+                    _reply_stripped = _legal_refusal_text
+                    _kv_reply = _legal_refusal_text
+                    _corrected_text = _legal_refusal_text
+                    logger.info(
+                        "[ask_stream] discarded answer: stated a legal/mandatory insurance "
+                        "requirement with no visa/legal/mandatory language anywhere in the "
+                        "retrieved context — likely training-data leakage, not grounded content"
+                    )
+            except Exception as _legal_contam_exc:
+                logger.debug("[ask_stream] legal-requirement-claim filter skipped: %s", _legal_contam_exc)
 
         # ── Strip stray numbered-list markers (brief / conversational mode) ───
         # CONVERSATIONAL_RAG_PROMPT explicitly forbids numbered lists ("No
