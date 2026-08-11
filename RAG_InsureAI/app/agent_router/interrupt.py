@@ -52,8 +52,26 @@ _CONTACT_INFO_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}|\+?\d[\d\s-]{7,}\d", 
 # refer to the ACTIVE specialist conversation (e.g. "what's my premium
 # going to be" mid-quote), so those stay on the LLM fallback path rather
 # than a blanket deterministic interrupt.
+#
+# WH-word is NOT anchored to the start of the message — confirmed live: a
+# user mid-Ava-offer (pending confirmation to connect to Ava for a Europe
+# travel quote) sent "I am going to travel to europe so should i take the
+# health insurance" and got stuck re-asking the same yes/no offer twice in
+# a row. The anchored version only matches when the WH-word is literally
+# the first word, so a real preamble before the actual question ("I am
+# going to Europe, so should I...") fell through to the LLM fallback,
+# which — for this exact case, at temperature=0 so consistently wrong both
+# times — read it as continuing the Europe-travel offer rather than a
+# distinct general question, likely because the topic (Europe travel)
+# genuinely overlaps with what the pending offer itself is about, unlike
+# the clearly-unrelated "What is motor insurance?" case this regex was
+# originally built for. _LIKELY_CONTINUATION_RE and _CONTACT_INFO_RE above
+# already short-circuit every known genuine continuation shape (numbers,
+# yes/no, quote-flow commands, contact info) before this check ever runs,
+# so dropping the start-anchor doesn't reopen that risk — it only widens
+# which phrasing of an actual WH-question this deterministic path catches.
 _GENERAL_QUESTION_RE = re.compile(
-    r"^\s*(?:what|how|does|do|is|are|can|could|would|should|why|when|where|who|which)\b"
+    r"\b(?:what|how|does|do|is|are|can|could|would|should|why|when|where|who|which)\b"
     r"[^.!]*\b(?:insurance|polic(?:y|ies)|claims?|cover(?:s|age|ed)?)\b",
     re.IGNORECASE,
 )
