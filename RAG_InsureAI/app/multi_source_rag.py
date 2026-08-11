@@ -6019,8 +6019,26 @@ class MultiSourceRAG:
                 # this type." See the raise-on-failure comment in
                 # _classify_query_candidate_type_llm.
                 return False
+            # A candidate_policy_type is only meaningful negative evidence
+            # when the chunk's own REAL policy_type is "general" — i.e. the
+            # closed-vocabulary classifier itself couldn't confidently place
+            # it, and candidate_policy_type is the best guess standing in.
+            # Confirmed live: travel_insurance_guide.pdf's chunks carry
+            # policy_type="travel" (a confident, correct closed-vocab tag)
+            # AND a stray candidate_policy_type="micro_insurance" (a wrong
+            # ingestion-time guess) left over alongside it — this function's
+            # own docstring above assumes candidate_policy_type only ever
+            # sits on a chunk whose real type is unknown, but nothing
+            # enforced that, so a confidently-typed chunk with a bogus
+            # candidate label got silently dropped from EVERY query whose
+            # own candidate guess didn't happen to also say
+            # "micro_insurance" — including "should I buy travel insurance
+            # for Europe", which has no relation to micro-insurance at all.
+            # A chunk's own confident, real type is authoritative; a stale
+            # candidate guess must never override it.
             return bool(
                 str(c.metadata.get("source_type", "document")).lower() == "document"
+                and str(c.metadata.get("policy_type", "general")).lower() == "general"
                 and c.metadata.get("candidate_policy_type")
                 and c.metadata.get("candidate_policy_type") != _query_candidate_type
             )
