@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Demo Quotation Site — Abandonment Trigger Test</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; }
+  h1 { font-size: 20px; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 20px; margin-top: 16px; }
+  label { display: block; margin-top: 12px; font-size: 13px; color: #555; }
+  input { width: 100%; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+  button { margin-top: 16px; padding: 10px 18px; border: none; border-radius: 6px; background: #16213e; color: white; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #999; cursor: not-allowed; }
+  .status { margin-top: 16px; padding: 12px; border-radius: 6px; font-size: 14px; }
+  .status.fail { background: #fdecea; color: #a33; }
+  .status.wait { background: #fff8e1; color: #8a6d00; }
+  .status.sent { background: #e6f4ea; color: #1e7a34; }
+  #countdown { font-weight: bold; }
+  #log { margin-top: 16px; font-size: 12px; color: #666; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <h1>Demo Quotation Site — abandonment trigger test</h1>
+  <p style="font-size:13px;color:#666">Simulates the real azure-one website's job: collect the customer, detect a payment failure, then notify the voice-agent backend if the customer goes inactive for 60s. This page has no relation to the real production site — it exists only to test the auto-trigger end to end.</p>
+
+  <div class="card">
+    <label>Name</label>
+    <input id="name" value="Lavish">
+    <label>Phone (digits only, no country code)</label>
+    <input id="phone" value="8829968373">
+    <label>Policy Type</label>
+    <input id="policyType" value="travel">
+    <label>Session ID</label>
+    <input id="session" readonly>
+    <button id="payBtn" onclick="simulatePaymentFailure()">Pay Now (will fail)</button>
+  </div>
+
+  <div id="statusBox"></div>
+  <div id="log"></div>
+
+<script>
+const API_BASE = "http://localhost:8501";
+document.getElementById('session').value = 'demo-site-' + Date.now();
+
+let inactivityTimer = null;
+let countdownInterval = null;
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+}
+
+function setStatus(html, cls) {
+  document.getElementById('statusBox').innerHTML = `<div class="status ${cls}">${html}</div>`;
+}
+
+function simulatePaymentFailure() {
+  document.getElementById('payBtn').disabled = true;
+  setStatus('Payment failed — card declined by bank.', 'fail');
+  log('Payment simulated as FAILED (card declined).');
+  startInactivityCountdown(60);
+}
+
+function startInactivityCountdown(seconds) {
+  let remaining = seconds;
+  setStatus(`Payment failed — card declined by bank.<br>No retry detected. Notifying support in <span id="countdown">${remaining}</span>s if you stay inactive...`, 'wait');
+  countdownInterval = setInterval(() => {
+    remaining -= 1;
+    const el = document.getElementById('countdown');
+    if (el) el.textContent = remaining;
+    if (remaining <= 0) {
+      clearInterval(countdownInterval);
+    }
+  }, 1000);
+
+  inactivityTimer = setTimeout(fireAbandonmentEvent, seconds * 1000);
+  log(`Started ${seconds}s inactivity timer. If no retry happens, will POST quotation_abandoned automatically.`);
+}
+
+async function fireAbandonmentEvent() {
+  const name = document.getElementById('name').value;
+  const phone = document.getElementById('phone').value;
+  const session = document.getElementById('session').value;
+  const policyType = document.getElementById('policyType').value;
+
+  log('60s inactivity elapsed — firing POST /api/voice-agent/quotation-event ...');
+  try {
+    const resp = await fetch(`${API_BASE}/api/voice-agent/quotation-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event_type: 'quotation_abandoned',
+        session_id: session,
+        phone_number: phone,
+        country_code: 'IN',
+        drop_off_stage: 'payment_initiated_not_completed',
+        quotation_count: 2,
+        person_name: name,
+        policy_type: policyType
+      })
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      setStatus(`Abandonment event sent successfully.<br>Reactivation call scheduled: <b>${data.detail}</b><br>Watch your phone — it should ring shortly.`, 'sent');
+      log('Backend accepted the event: ' + JSON.stringify(data));
+    } else {
+      setStatus('Backend rejected the event — see log.', 'fail');
+      log('Backend error: ' + JSON.stringify(data));
+    }
+  } catch (err) {
+    setStatus('Could not reach the backend — see log.', 'fail');
+    log('Fetch failed: ' + err.message);
+  }
+}
+</script>
+</body>
+</html>
