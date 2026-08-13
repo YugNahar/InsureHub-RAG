@@ -31,6 +31,24 @@ from travel_bot.schemas.travel import (
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 llm_service = LLMService()
 
+
+def delete_session_data(db: DBSession, session_id: str) -> bool:
+    """Delete every row tied to `session_id` across all 5 tables this
+    module writes to (session_id and request_id are the same value
+    throughout — see Request's own docstring). Called by api.py's 24h-
+    inactivity session reaper so an abandoned Ava conversation's PII
+    (name/email/phone, quotes) doesn't sit in travel_bot.db forever after
+    the parent session is purged everywhere else. Returns True if a
+    ChatSession row existed for this id (there was anything to delete)."""
+    existed = db.query(ChatSession).filter(ChatSession.session_id == session_id).first() is not None
+    db.query(Message).filter(Message.session_id == session_id).delete()
+    db.query(ChatSession).filter(ChatSession.session_id == session_id).delete()
+    db.query(Request).filter(Request.request_id == session_id).delete()
+    db.query(FieldExtractionLog).filter(FieldExtractionLog.session_id == session_id).delete()
+    db.query(ExtractedValue).filter(ExtractedValue.request_id == session_id).delete()
+    db.commit()
+    return existed
+
 # Deliberately permissive (accepts business/personal/education addresses
 # alike, not a strict RFC 5322 pattern) but requires a real-looking TLD —
 # used both for the intake-form backstop and the email-quote endpoint.

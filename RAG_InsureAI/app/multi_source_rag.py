@@ -5,6 +5,7 @@ Supports document filtering with substring matching.
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from typing import List, Tuple, Optional
@@ -20,7 +21,7 @@ from rapidfuzz import fuzz, process
 from turbovec_store import _rerank_windows, _get_shared_reranker
 from metadata_tagger import (
     classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
-    _is_duplicate_of_existing_type,
+    _is_duplicate_of_existing_type, _regex_policy_score,
 )
 import contamination_trace
 
@@ -804,6 +805,125 @@ _COMPARISON_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Warm lead-in (shared by both fallback sites below) ─────────────────────
+# Used to rotate through several candidates ("So,", "Good question,",
+# "Right,", "Sure thing,") — user feedback (2026-08-13, two rounds) flagged
+# the VARIETY itself as the problem, not just "So," specifically ("these
+# 'So' and 'Right' are not looking [good]... just say 'Sure Thing'").
+# Locked to a single fixed phrase instead — explicitly chosen by the user
+# over the no-lead-in-at-all alternative. _pick_lead_in kept as a function
+# (not inlined at both call sites) so a future change is one edit, not two.
+_LEAD_IN = "Sure thing,"
+
+
+def _pick_lead_in(check_text: str) -> str:
+    return _LEAD_IN
+
+# ── "Type of X" query-shape disambiguation (2026-08-13) ────────────────
+# _TYPES_OF_QUERY_RE fires on the bare phrase "type(s) of X" regardless of
+# grammatical shape, but two completely different question shapes share
+# that surface phrase: a genuine ENUMERATION request ("what types of
+# motor insurance are there") that legitimately wants a full list, versus
+# a DECISION/RECOMMENDATION request ("what type of insurance should I buy
+# if my house is on fire") that wants ONE specific answer plus a brief
+# reason — not an inventory of every peril a policy happens to cover.
+# prompt_template.py's TYPES/KINDS QUESTIONS rule has no way to tell these
+# apart from the raw question text alone, because the model reads that
+# static rule text against whatever the actual question says. Confirmed
+# live: "if my house is on fire then what type of insurance should i buy"
+# got a 7-point numbered list padded with home insurance's OTHER covered
+# perils (lightning, explosion, storm, flood, theft) — none of which the
+# user asked about — because the model read "what type of insurance" as
+# matching the enumeration rule's trigger phrase. Same lesson as every
+# other prompt-compliance gap fixed this session: rewording the static
+# rule and hoping the model reads it right every time isn't durable —
+# resolve the ambiguity in code first (regex fast path, LLM fallback for
+# genuinely ambiguous phrasing, same two-tier shape as
+# _resolve_modifier_intent above), then tell the model explicitly which
+# shape this specific question is.
+_TYPE_DECISION_RE = re.compile(
+    r"\bshould\s+i\b|\bshould\s+you\b|\bdo\s+i\s+need\b|\bdoes\s+one\s+need\b|"
+    r"\bwhich\s+(?:one\s+)?(?:should|do)\s+i\b|"
+    r"\bneed\s+to\s+(?:buy|get|purchase|choose|take|pick)\b|"
+    r"\bwant\s+to\s+(?:buy|get|purchase)\b|"
+    r"\brecommend\b|\bbest\s+(?:type|option|policy|insurance)\b",
+    re.IGNORECASE,
+)
+_TYPE_ENUMERATION_RE = re.compile(
+    r"\b(?:are\s+there|exist|available)\b|\ball\s+the\s+(?:types?|kinds?)\b|"
+    r"\blist\s+(?:all\s+)?(?:the\s+)?(?:types?|kinds?)\b",
+    re.IGNORECASE,
+)
+
+_TYPE_SHAPE_PROMPT = """\
+Read the user's question to an insurance chatbot. It contains the phrase \
+"type of" or "types of" (or "kind(s) of"). Decide which of these two shapes \
+it actually is:
+
+ENUMERATION = the user wants a LIST of every type/kind of X that exists \
+("what types of motor insurance are there", "what kinds of health plans \
+does the company offer", "list all the types of X").
+
+DECISION = the user describes their OWN situation, need, or a specific \
+event, and wants a RECOMMENDATION of the ONE type of insurance that fits \
+it — not a list of every type that exists ("if my house catches fire what \
+type of insurance should I buy", "what kind of insurance do I need for my \
+car", "which type of policy is best if I travel a lot").
+
+Output EXACTLY one word: ENUMERATION or DECISION.
+
+Question: "What are the types of motor insurance policies?"
+ENUMERATION
+
+Question: "If my house is on fire then what type of insurance should i buy"
+DECISION
+
+Question: "What kinds of health insurance plans are there?"
+ENUMERATION
+
+Question: "My car got stolen, what type of insurance covers that?"
+DECISION
+
+Question: {question}
+"""
+
+
+async def _classify_type_query_shape_llm(question: str) -> bool:
+    """LLM fallback for the ENUMERATION-vs-DECISION shape of a "type(s)
+    of X" question — only called when neither fast regex above found a
+    confident signal either way. Returns True for DECISION (suppress the
+    enumeration format), False for ENUMERATION or on any error/timeout —
+    the safer default, since ENUMERATION is this codebase's pre-existing
+    behavior for this phrase and an unresolved case should degrade to
+    that rather than to an unproven new behavior.
+    """
+    try:
+        prompt = _TYPE_SHAPE_PROMPT.format(question=question)
+        raw = await _backend_completion(prompt, max_tokens=6, timeout=4)
+        if not raw:
+            return False
+        return raw.strip().upper().startswith("DECISION")
+    except Exception:
+        return False
+
+
+async def _is_type_decision_query(question: str) -> bool:
+    """True when a "type(s)/kind(s) of X" question is asking for a
+    recommendation of ONE type for the user's own situation, not a
+    request to enumerate every type that exists — see _TYPE_DECISION_RE
+    above for why this distinction matters. Only meaningful after the
+    caller has already confirmed _TYPES_OF_QUERY_RE matched; a question
+    without that phrase never needs this check.
+    """
+    q = question.lower()
+    if _TYPE_DECISION_RE.search(q):
+        return True
+    if _TYPE_ENUMERATION_RE.search(q):
+        return False
+    # Neither fast pattern matched — genuinely ambiguous phrasing worth
+    # the small LLM round trip rather than silently defaulting either way.
+    return await _classify_type_query_shape_llm(question)
+
 
 def _needs_detailed_answer(question: str) -> bool:
     """True when the question expects a comprehensive, multi-part, or procedural answer."""
@@ -1321,6 +1441,95 @@ _LEGAL_REQUIREMENT_CLAIM_RE = re.compile(
 _LEGAL_REQUIREMENT_SUPPORT_RE = re.compile(
     r"\bvisa\b|\blegal(?:ly)?\s+requir\w*|\bmandator\w+\b", re.IGNORECASE,
 )
+
+# Confirmed live 2026-08-12 while investigating a "detailed answers feel
+# padded/generic" report that turned out to affect every policy type, not
+# just motor: a large share of "general"-tagged chunks from at least one
+# KB source (9.3 INSURANCE LAW AND PRACTICE.pdf, an academic textbook) are
+# not generic-but-real insurance content at all — they're literal table-
+# of-contents lines ("Loss Control … 11 Loss prevention … 11"), textbook
+# section-structure markers ("LESSON ROUND UP", "SELF TEST QUESTIONS",
+# "Learning Objectives"), the issuing institute's own front-matter/office-
+# hours/contact info, or cover-page word-repeat OCR garbling
+# ("INSURANCE LAW INSURANCE LAW INSURANCE LAW... AND AND AND AND"). None
+# of this is ever a genuine answer to any question, regardless of the
+# query's own policy type — this almost certainly explains this session's
+# earlier, previously-unresolved "at the end of this lesson..." textbook-
+# leak finding (textbook lesson-scaffolding text leaking straight into a
+# generated answer). The EXISTING _TYPE_MISMATCH_DISCOUNT/_sort_and_
+# truncate softly discounts "general"-tagged chunks but still lets them
+# backfill a chunk_limit slot when on-topic content is thin — appropriate
+# for genuinely useful generic content, but this specific noise category
+# is never useful at any discount, so it's excluded outright here instead
+# of just discounted, same "deterministic exclusion over a discount or a
+# prompt rule" approach already proven for regulatory boilerplate (see
+# [[project_prioritize_topic_chunks_density_risk]]).
+_TOC_PAGENUM_RE = re.compile(r"(?:\.{3,}|…)\s*\d{1,4}\b")
+_TEXTBOOK_STRUCTURE_MARKER_RE = re.compile(
+    r"\b(?:LESSON\s+ROUND\s+UP|SELF\s+TEST\s+QUESTIONS|PRACTICE\s+TEST\s+PAPER|Learning\s+Objectives)\b",
+    re.IGNORECASE,
+)
+_WORD_REPEAT_GARBLE_RE = re.compile(r"\b(\w{3,})\b(?:\s+\1\b){2,}", re.IGNORECASE)
+# Added after live-verifying the fix above: a DIFFERENT phrasing of the
+# same underlying problem slipped through the first pass — "In India,
+# this lesson helps you understand buying methods of health insurance
+# policies, settle claims, and comprehend the practice of health
+# insurance" (a lesson's own introduction sentence, not a TOC entry, so
+# none of the three signals above catch it). This is the textbook talking
+# about ITSELF ("this lesson"/"this chapter" teaches X) rather than
+# stating a fact about insurance — never a genuine answer to anything,
+# same reasoning as DETAILED_GROUNDED_PROMPT's own rule 9 banning the
+# MODEL from saying "the guide mentions" — this is the same self-
+# reference pattern, just originating in the source text instead of the
+# model's own phrasing.
+_LESSON_SELF_REFERENCE_RE = re.compile(
+    r"\bthis\s+(?:lesson|chapter|module)\s+(?:helps?|covers?|explains?|discusses?|teaches?|will\s+help)\b"
+    r"|\byou\s+will\s+(?:learn|be\s+able\s+to)\b"
+    r"|\bin\s+this\s+(?:lesson|chapter|module)\b",
+    re.IGNORECASE,
+)
+# Added 2026-08-13 after a live "explain health insurance in detail" answer
+# leaked "The correct option for the statements is d. Statement 1 is false
+# but statement 2 is true" as if it were a real fact — traced to a
+# different textbook source (not the 9.3 INSURANCE LAW AND PRACTICE one)
+# whose end-of-module self-test uses an assertion-reason MCQ format:
+# "a. Both statements are false b. Both statements are true c. Statement
+# 1 true but statement 2 is false d. Statement 1 is false but statement 2
+# is true". Same category as the three signals above (textbook self-
+# reference content, never a genuine answer) but a distinct phrasing this
+# corpus's OTHER quiz sources also use, so it's checked independent of
+# source file. "correct option" alone is a near-zero-false-positive
+# signal (real insurance prose never uses this phrase); "Statement 1 ...
+# Statement 2" within a short span catches the options list itself even
+# when "correct option" isn't in the same chunk.
+_MCQ_ANSWER_KEY_RE = re.compile(
+    r"\bcorrect\s+option\b"
+    r"|\bstatement\s*1\b.{0,150}\bstatement\s*2\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_textbook_structural_noise(text: str) -> bool:
+    """True for table-of-contents lines, textbook section-marker
+    boilerplate, cover-page word-repeat OCR garbling, a lesson/chapter
+    talking about itself, or an MCQ self-test answer key — never a real
+    answer to anything, independent of the query's own policy type or
+    which source file it came from. Five independent signals, any one is
+    sufficient: (1) 3+ "….123" style page-number references (real prose
+    essentially never contains even one of these), (2) a fixed textbook
+    structural marker phrase, (3) the same word repeated 3+ times
+    consecutively (a cover-page OCR/rendering artifact, not real sentence
+    structure), (4) the text describing what "this lesson"/"this chapter"
+    itself teaches, rather than stating an actual insurance fact, (5) an
+    assertion-reason MCQ answer key ("correct option is d" / "Statement
+    1 ... Statement 2 ...")."""
+    return bool(
+        len(_TOC_PAGENUM_RE.findall(text)) >= 3
+        or _TEXTBOOK_STRUCTURE_MARKER_RE.search(text)
+        or _WORD_REPEAT_GARBLE_RE.search(text)
+        or _LESSON_SELF_REFERENCE_RE.search(text)
+        or _MCQ_ANSWER_KEY_RE.search(text)
+    )
 
 # Module-level (not request-scoped) so both the detailed-mode point filter
 # and the brief-mode whole-reply check below can share one definition rather
@@ -2737,6 +2946,68 @@ Reply with ONLY the label word, nothing else."""
         return "general"
 
 
+async def _classify_query_policy_types_multi_llm(query: str) -> list[str]:
+    """Multi-label sibling of _classify_query_policy_type_llm() — used
+    ONLY at the primary retrieval-filter call site, when regex named a
+    type on the weakest evidence it trusts (a single hit). NOT a
+    replacement for _classify_query_policy_type_llm() itself — that
+    function's own "regex says general" fallback path is unchanged and
+    untouched; this is an additive, separate consultation for a different
+    failure mode.
+
+    A single query can genuinely span two insurance types where only one
+    is named/matched by a regex phrase — forcing a single label onto that
+    hard-excludes the OTHER type's chunks from the retrieval filter
+    entirely, no matter how relevant they are. Confirmed live: "I am going
+    to travel to europe so should i take the health insurance" classified
+    single-label as "health" (regex: exactly one hit, no tie) — the
+    resulting filter never let travel_insurance_guide.pdf's chunks reach
+    the reranker at all, even though that document scored 0.9981 against
+    this exact question with NO filter applied — the single highest
+    rerank score in the entire KB — versus 0.9197 for the best chunk the
+    health-only filter allowed through. The model then filled the
+    Europe/Schengen gap from its own training data instead of the real
+    retrieved answer.
+
+    Validated against the same queries the existing single-label
+    classifier already gets right, confirming this doesn't widen
+    spuriously: a genuinely single-topic query (e.g. "what is not covered
+    if my car is stolen") still returns exactly one label; a query that
+    only NAMES one type but substantively concerns a second (the Europe/
+    health case above) returns both. Returns [] on any failure or empty
+    result — the caller must treat that as "no additional signal," never
+    as license to drop the primary type it already has.
+    """
+    try:
+        label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in get_active_vocab().items())
+        prompt = f"""Which insurance policy types does this question involve? Usually exactly ONE.
+Only name a SECOND type if the question genuinely involves both (e.g. it asks about one
+type of cover in the context of a situation another type specifically covers).
+
+Available types:
+{label_list}
+
+QUESTION: {query}
+
+Reply with the label word(s), comma-separated, nothing else."""
+        raw = await _backend_completion(prompt, max_tokens=15, timeout=4)
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.strip().lower().split(",") if p.strip()]
+        labels: list[str] = []
+        for p in parts:
+            label = _normalize_policy_type(re.split(r"[\s\n.:;()]", p)[0])
+            if label in _valid_policy_types() and label not in labels:
+                labels.append(label)
+            if len(labels) == 2:
+                break
+        logger.debug("[QUERY_POLICY_TYPE] multi-label LLM: %r -> %s", query, labels)
+        return labels
+    except Exception as exc:
+        logger.debug("[QUERY_POLICY_TYPE] multi-label LLM failed (%s) — no additional signal", exc)
+        return []
+
+
 async def _classify_query_candidate_type_llm(query: str) -> Optional[str]:
     """
     Open-vocabulary sibling of _classify_query_policy_type_llm() — no list
@@ -3731,23 +4002,52 @@ def _has_numbered_list_format(text: str) -> bool:
     return len(_NUMBERED_LINE_RE.findall(text)) >= 2
 
 
-async def _enforce_numbered_list_format(query: str, answer_text: str) -> Optional[str]:
+async def _enforce_numbered_list_format(
+    query: str, answer_text: str, is_type_decision: bool = False,
+) -> Optional[str]:
     """
-    When `query` is a TYPES/KINDS or COMPARISON question (see
-    _TYPES_OF_QUERY_RE / _COMPARISON_QUERY_RE) and `answer_text` came back as
-    prose instead of the required numbered list, makes ONE narrow,
-    temperature=0 LLM call whose only job is to RESTRUCTURE the existing
-    text into numbered lines — never to add, remove, or reword any fact.
-    Purely a formatting pass, not a regeneration.
+    When `query` is a TYPES/KINDS question (see _TYPES_OF_QUERY_RE) and
+    `answer_text` came back as prose instead of the required numbered
+    list, makes ONE narrow, temperature=0 LLM call whose only job is to
+    RESTRUCTURE the existing text into numbered lines — never to add,
+    remove, or reword any fact. Purely a formatting pass, not a
+    regeneration.
+
+    COMPARISON questions (_COMPARISON_QUERY_RE) used to trigger this too,
+    reformatting into a numbered list — moved to
+    _enforce_comparison_table_format below instead (2026-08-13, user
+    feedback: a numbered list reads badly for a two-item comparison,
+    wants a real table), which produces a genuine HTML <table> via the
+    same ui-marker mechanism travel_bot's format_compare_quotes already
+    proved out, not markdown table syntax (the chat bubble's renderMarkdown
+    has no pipe-table support — confirmed by that exact same comment in
+    format_compare_quotes). Comparison queries are EXCLUDED here rather
+    than left to also match, to avoid two back-to-back reformat LLM calls
+    on the same answer (list, then table) for one query.
+
+    is_type_decision: the caller's already-resolved _is_type_decision_query()
+    result (see that function and _TYPE_DECISION_RE's block comment) —
+    reused rather than re-derived here to avoid a second LLM round trip
+    reaching a possibly different conclusion. _TYPES_OF_QUERY_RE alone
+    can't tell a genuine "what types of X are there" enumeration apart
+    from "what type of X should I buy" naming the user's own situation;
+    without this, this reformatter would turn a short, correct,
+    already-generated recommendation answer BACK into a numbered list
+    of unrelated coverage details, undoing the whole point of the
+    decision-vs-enumeration prompt override upstream.
 
     Returns None (no correction, safe to keep the original prose) when: the
-    query isn't one of these two shapes, the answer already has numbered
+    query isn't a TYPES/KINDS enumeration (or is a TYPES/KINDS decision
+    question, not a real enumeration), the answer already has numbered
     lines, the answer is a refusal message, the answer is too short to
     plausibly hold 2+ distinct points, or the reformat call fails, times
     out, or produces something that fails a basic length-sanity check
     (guards against a truncated or hallucinated rewrite slipping through).
     """
-    if not (_TYPES_OF_QUERY_RE.search(query) or _COMPARISON_QUERY_RE.search(query)):
+    _is_types_query = bool(_TYPES_OF_QUERY_RE.search(query))
+    if _is_types_query and is_type_decision:
+        return None
+    if not _is_types_query:
         return None
     if _has_numbered_list_format(answer_text):
         return None
@@ -3853,7 +4153,7 @@ REFORMATTED:"""
 # matching _sentence_chars_mentioning does downstream — it only needs to
 # recognize which sentences are about which name, not reproduce the exact
 # phrase.
-_PHRASE = r"(?!(?:how|why|what|where|when|does|do|did|is|are|can|will|would|should|could|shall)\b)(?:the\s+)?[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,1}"
+_PHRASE = r"(?!(?:how|why|what|where|when|does|do|did|is|are|can|will|would|should|could|shall)\b)(?:the\s+|an?\s+)?[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,1}"
 
 # Patterns tried against the QUERY, in order — these are all genuine
 # comparison-intent phrasings ("compare X and Y", "what are X and Y",
@@ -3879,15 +4179,444 @@ _NAMED_PAIR_ANSWER_PATTERN = re.compile(
 )
 
 
+_LEADING_ARTICLE_RE = re.compile(r"^(?:the|an?)\s+", re.IGNORECASE)
+
+# Term names from insurance_terms_glossary.pdf ([[project_insurance_glossary_and_pipeline_check]]),
+# restricted to entries that _PHRASE can actually capture (1-2 whitespace
+# words — a hyphenated word like "co-payment" or "free-look" counts as
+# one). Used ONLY to decide whether a general/general named-pair query
+# ("deductible" vs "premium") is safe to split-retrieve like a
+# cross-type comparison already does — see the retrieval-split block
+# below for why this needs to be a real, content-backed list rather than
+# a shape-based guess.
+_GENERAL_VOCAB_TERMS = frozenset({
+    "premium", "deductible", "co-payment", "copayment", "co-pay", "copay",
+    "grace period", "lapse", "policy lapse", "sum insured", "idv",
+    "cash value", "surrender value", "rider", "endorsement", "exclusion",
+    "policyholder", "insurer", "insured", "beneficiary", "nominee",
+    "underwriter", "actuary", "tpa", "claim", "indemnity", "subrogation",
+    "ncb", "no-claim bonus", "waiting period", "pre-existing condition",
+    "proposal form", "policy term", "renewal", "free-look period",
+    "moral hazard", "reinsurance", "third-party insurance",
+})
+
+
 def _extract_named_pair(text: str, patterns: List[re.Pattern]) -> Optional[Tuple[str, str]]:
     for pat in patterns:
         m = pat.search(text)
         if not m:
             continue
-        a, b = m.group(1).strip(), m.group(2).strip()
+        # _PHRASE's leading "(?:the\s+|an?\s+)?" is nested INSIDE this
+        # capturing group, not excluded by it — a non-capturing group only
+        # means "no separate group reference," it doesn't remove the text
+        # from an outer group that wraps it. So a query like "difference
+        # between a deductible and a premium" was capturing "a deductible"
+        # verbatim, article included, which then leaked straight into
+        # comparison-table column headers. Strip it here instead of
+        # reworking the shared regex, since every caller wants the bare
+        # noun phrase.
+        a = _LEADING_ARTICLE_RE.sub("", m.group(1).strip())
+        b = _LEADING_ARTICLE_RE.sub("", m.group(2).strip())
         if a and b and a.lower() != b.lower():
             return a, b
     return None
+
+
+# ── Comparison-table format (2026-08-13, user feedback) ────────────────────
+# _enforce_numbered_list_format used to reformat comparison answers into a
+# numbered list, same as TYPES/KINDS answers — but a numbered list reads
+# badly for a two-item comparison ("1. deductible is X, 2. premium is Y"
+# doesn't read as a comparison at all). Redirected here instead: produces
+# a genuine HTML <table> via the SAME structured-ui mechanism travel_bot's
+# format_compare_quotes.py already proved end-to-end (ChatResponse.ui,
+# ui.type == "comparison_table", frontend's buildComparisonTable()) rather
+# than embedding markdown table syntax in the answer text — the chat
+# bubble's renderMarkdown has no pipe-table support (confirmed live by
+# that exact same comment in format_compare_quotes.py: a plain-text pipe
+# table used to show up as literal '|'/'---' characters). Reuses
+# _extract_named_pair/_NAMED_PAIR_QUERY_PATTERNS/_NAMED_PAIR_ANSWER_PATTERN
+# above (same named-item extraction _enforce_named_pair_depth already
+# relies on) for the table's column headers, rather than re-deriving or
+# asking the LLM to guess the two names.
+# Confirmed live: the model's first output row is sometimes its OWN prompt
+# template line echoed back as if it were real data — "attribute label |
+# value for deductible | value for premium" — despite the prompt saying
+# "no header row". _TABLE_VALUE_ECHO_RE below catches this independent of
+# the label wording (the literal "value for" substring only ever appears
+# in the template itself, never in genuine restructured content), which is
+# a more robust signal than trying to enumerate every header-ish label the
+# model might echo.
+_TABLE_ROW_SKIP_LABEL_RE = re.compile(
+    # "^step\s*\d*$" confirmed live: adding a Definition-row instruction to
+    # the prompt once caused the model to echo "Step 1"/"Step 2" literally
+    # as row labels, with the row's real label/values shifted into the
+    # wrong slots — the same template-echo failure mode as the other
+    # entries here, just triggered by the word "step" instead of a
+    # placeholder token.
+    r"^-{2,}$|^attribute(\s+label)?$|^point$|^criteria$|^comparison$|^colou?r$|^step\s*\d*$",
+    re.IGNORECASE,
+)
+_TABLE_VALUE_ECHO_RE = re.compile(
+    r"\bvalue\s+for\b|\bthe\s+fact\s+about\b|\bshort\s+attribute\s+name\b|"
+    # Confirmed live: the prompt's non-insurance "apples and oranges" shape
+    # illustration ("Color | Red or green | Orange") leaked verbatim into a
+    # real deductible/premium table — no insurance policy attribute is
+    # ever legitimately "Red or green" or "Orange", so these are safe,
+    # unambiguous echo signals, same idea as "value for" above.
+    r"\bred\s+or\s+green\b|^orange$",
+    re.IGNORECASE,
+)
+# Confirmed live: a row can echo just ONE side's name rather than both
+# (e.g. "Cost | Deductible | Out-of-pocket before insurance helps" — the
+# deductible column is just the bare word "Deductible", not a real fact,
+# while the premium column holds a real sentence). The two-sided
+# _is_name_echo_row check in the parsing loop only catches the case where
+# BOTH sides are bare names; this catches EITHER side alone.
+_TABLE_ROW_DIGIT_RE = re.compile(r"\d[\d,]*")
+# Deliberate, scoped exception to the general "no currency/payment figures
+# unless the query says 'example'" policy (see ask_stream's own
+# _is_example_request block, and [[feedback_numbers_only_in_examples]]) —
+# user feedback (2026-08-13): a comparison table specifically benefits
+# from a concrete example figure regardless of whether the user's
+# question used the word "example", since it helps the reader picture
+# the comparison concretely. If the ANSWER already has a real example
+# figure, the reformat prompt below uses it; if not, the model is
+# explicitly permitted to invent one plausible illustrative figure per
+# side FOR THIS ONE ROW ONLY — every other row still must come from facts
+# actually stated in the ANSWER. This is the one place in this file that
+# deliberately allows non-grounded content into a response; everything
+# else stays under GROUNDING's normal no-hallucination rules. Only
+# applies to _enforce_comparison_table_format — the general prose policy
+# for every other query shape is unchanged.
+
+
+async def _enforce_comparison_table_format(query: str, answer_text: str) -> Optional[Tuple[str, dict]]:
+    """
+    When `query` is a COMPARISON question (_COMPARISON_QUERY_RE) naming two
+    specific things, converts `answer_text` into
+    {"columns": [name_a, name_b], "rows": [{"label": attribute, "values":
+    [val_a, val_b]}, ...]} via ONE narrow, temperature=0 LLM call whose
+    only job is to RESTRUCTURE existing facts into rows — never to add,
+    remove, or invent one. Purely a formatting pass, not a regeneration,
+    same discipline as _enforce_numbered_list_format.
+
+    Returns (intro_text, table) on success — intro_text is the only text
+    that replaces answer_text in the chat bubble; the caller attaches
+    table separately via the ui trailer (mirrors travel_bot's own
+    (intro_text, table) return shape from format_compare_quotes). Returns
+    None (keep answer_text unchanged) when: the query isn't a comparison
+    question, no two named items can be extracted from it or the answer,
+    the answer is a refusal message, too short to plausibly hold 2+
+    comparison points, or the reformat call fails, times out, or produces
+    fewer than 2 usable rows (guards against a truncated or hallucinated
+    table slipping through — no length-ratio check here, unlike the
+    numbered-list formatter, since collapsing prose into short row values
+    is expected to shrink the character count substantially even when
+    every fact survives).
+    """
+    if not _COMPARISON_QUERY_RE.search(query):
+        return None
+    pair = (
+        _extract_named_pair(query, _NAMED_PAIR_QUERY_PATTERNS)
+        or _extract_named_pair(answer_text, [_NAMED_PAIR_ANSWER_PATTERN])
+    )
+    if not pair:
+        return None
+    # Title-cased for display — the query itself is whatever case the user
+    # typed ("difference between a deductible and a premium"), and that
+    # verbatim casing was flowing straight into the table's column headers.
+    # Every downstream comparison against name_a/name_b is already
+    # case-insensitive (.lower() on both sides), so this is display-only.
+    name_a, name_b = pair[0].strip().title(), pair[1].strip().title()
+    if answer_text.strip().lower().startswith("hmm, i don't have"):
+        return None
+    if len(answer_text) < 80:
+        return None
+
+    prompt = f"""Convert the ANSWER below, which compares "{name_a}" and "{name_b}", into a
+comparison table. Do this in two separate steps, both required.
+
+STEP 1 — restructure real facts, definition row first. Every row you write in this step —
+INCLUDING the Definition row described below — must follow this shape: one label, then BOTH
+items' values side by side on the SAME line. Never write a row whose LABEL is {name_a} or
+{name_b} themselves — that produces one row per ITEM instead of one row per shared POINT,
+which is wrong even for the Definition row. Wrong shape (never do this, for any row,
+including Definition):
+{name_a} | <something about {name_a}> | Not specified
+{name_b} | Not specified | <something about {name_b}>
+Right shape, illustrated with a completely unrelated, non-insurance example so it can never
+be confused with real content (comparing apples and oranges — notice the LABEL is the shared
+point, never the item's own name, and BOTH items get a value on the SAME row; never reuse
+this wording or these facts, it is only to show the shape):
+Color | Red or green | Orange
+
+With that shape in mind: before any other row, add ONE row labeled "Definition" (literally
+that word — never {name_a} or {name_b}) that states, in one short plain sentence per side,
+what {name_a} actually is and what {name_b} actually is — enough that someone who has never
+heard either term before understands what each one even IS, not just how they differ. Most
+of these ANSWERs already open by explaining each term (e.g. "A deductible is...", "Life
+insurance provides...") — take the definition from there, only lightly reworded to fit one
+row; never invent a definition that contradicts the ANSWER. This Definition row is mandatory
+and must come first, even if the rest of the ANSWER only discusses differences afterward.
+
+After the Definition row, find each distinct attribute or point of comparison the
+ANSWER makes about {name_a} and {name_b}, one row per shared attribute (such as cost,
+duration, who it covers, when it applies), following the same right shape shown above —
+using an attribute name of your own choosing and real facts from the ANSWER, not the word
+"Color" and not that illustration's words. Do NOT add, remove, or invent any fact in this
+step — only restructure what the ANSWER already says, about {name_a} and {name_b}
+specifically and no other product. Never invent a number or amount in this step either —
+every figure in a STEP 1 row must appear in the ANSWER text verbatim; if you want to state an
+amount that isn't in the ANSWER, that only belongs in the Example row from STEP 2, never
+here. If you notice yourself about to write a fact about some other insurance type, stop —
+it does not belong in this table. If the ANSWER only states
+a fact for one side of a real attribute, use "Not specified" for the other side's value on
+that row rather than guessing — but never label the row with {name_a} or {name_b} themselves,
+always with the shared attribute.
+
+Before writing each row, double check which item the fact you're about to write is actually
+about — the FIRST value column is always {name_a}, the SECOND is always {name_b}, in that
+order, every row. A fact that the ANSWER states about {name_a} must go in the {name_a} column,
+never the {name_b} column, even if the ANSWER's sentence about {name_a} happens to come later
+in the text than the sentence about {name_b}. Putting a true fact in the wrong column states
+something false about both items — re-read the ANSWER sentence you're restructuring and
+confirm which of the two names it names before placing the value.
+
+STEP 2 — add one example row, always, no exceptions. After ALL of the STEP 1 rows (not
+after each one — exactly one Example row total for the whole table, no matter how many
+STEP 1 rows you wrote), add exactly one more row, labeled "Example", giving a short,
+concrete illustrative figure for EACH side — a plain number/amount plus a few words of
+context (e.g. "$500 hospital bill"), not a full sentence. Unlike STEP 1, this row does NOT
+need to come from the ANSWER text — if the ANSWER already states a real example figure for
+both sides, use that; otherwise invent one plausible, representative figure for each side,
+specifically about {name_a} and {name_b} (it only needs to help the reader picture the
+comparison, not be a real quoted rate). This step is mandatory even if STEP 1 produced no
+rows at all. Never leave either side of the Example row as "Not specified" or blank.
+
+Output ONLY the rows from both steps — no header row, no markdown, no numbering, no extra
+commentary before or after.
+
+ANSWER:
+{answer_text}
+
+TABLE:"""
+
+    try:
+        # Same timeout/token-budget reasoning as _enforce_numbered_list_format
+        # above — this backend's normal generation latency (7-38s observed)
+        # means a short timeout would just silently no-op the whole feature.
+        # Confirmed live: the mandatory Definition row (added same day)
+        # makes every table systematically longer — a 4-attribute-row
+        # table with full-sentence Definition/Cost/Coverage values ran up
+        # against the old 500-token ceiling and got cut off mid-value in
+        # its last row ("$1," instead of a full figure). Raised to 700.
+        raw = await _backend_completion(
+            prompt, max_tokens=min(700, max(150, len(answer_text) // 3 + 150)),
+            timeout=35, temperature=0,
+        )
+    except Exception as exc:
+        logger.debug("[ask_stream] comparison-table reformat call failed: %s", exc)
+        return None
+    if not raw:
+        return None
+
+    # Digit tokens (commas stripped) that genuinely appear in the ANSWER —
+    # used below to catch a STEP 1 row inventing a number ($X, $500, etc.)
+    # that was never actually stated, which STEP 1's own instructions
+    # explicitly forbid (only the Example row may invent a figure).
+    _answer_digit_tokens = {d.replace(",", "") for d in _TABLE_ROW_DIGIT_RE.findall(answer_text)}
+
+    # Confirmed live: adding the mandatory Definition row (below) made the
+    # reformat call, when asked to state "what {name_a}/{name_b} actually
+    # is" as a standalone sentence, sometimes reach for a generic
+    # memorized definition instead of the ANSWER's own — once producing
+    # "Life insurance provides coverage based on regular payments made by
+    # the policyholder" as the DEFINITION OF PREMIUM in a deductible-vs-
+    # premium table, the exact cross-topic-contamination failure mode this
+    # codebase has hit many times in the main answer path (same
+    # [[project_cross_topic_contamination]] class), just newly reachable
+    # here via the reformat call's own hallucination rather than
+    # retrieval/generation.
+    #
+    # Two more precise approaches were tried and rejected before this one:
+    # (1) raw _ANCHOR_TYPE_RE word matching false-flagged genuine "health
+    # insurance" rows just for saying "medical" (a synonym the regex
+    # groups with "health" for matching, but a plain word-vs-word set
+    # comparison doesn't know is the same type); (2) reusing
+    # classify_query_policy_type (the main retrieval path's own
+    # query-length classifier) false-flagged short generic row cells —
+    # confirmed live, classify_query_policy_type("Policyholder") alone
+    # returns "livestock_insurance" from incidental keyword overlap, since
+    # that classifier is tuned for 5-10-word QUERIES, not 1-3-word table
+    # cells. Landed on requiring the STRONG, explicit "<Type> insurance"
+    # phrase shape specifically — _ANCHOR_TYPE_RE's own optional trailing
+    # "(\s+insurance)?" group, only counted when it actually matched. This
+    # is exactly the shape the real contamination bug took ("Life
+    # insurance provides...") and neither false-positive case above ever
+    # produces that shape, so requiring it trades a little recall (a
+    # contaminated row phrased without the word "insurance" would slip
+    # through) for much higher precision (never wrongly drops a good row)
+    # — the right tradeoff, since a missed row just leaves the table
+    # slightly less complete while a false positive actively throws away
+    # good content.
+    def _anchor_types_in(text: str) -> set:
+        return {m[0].lower() for m in _ANCHOR_TYPE_RE.findall(text or "")}
+    def _strong_anchor_types_in(text: str) -> set:
+        return {m.group(1).lower() for m in _ANCHOR_TYPE_RE.finditer(text or "") if m.group(2)}
+    _expected_anchor_types = _anchor_types_in(name_a) | _anchor_types_in(name_b)
+
+    rows = []
+    for line in raw.strip().split("\n"):
+        line = line.strip().lstrip("-*").strip()
+        if line.count("|") < 2:
+            continue
+        parts = [p.strip().strip("-").strip() for p in line.split("|")]
+        if len(parts) < 3:
+            continue
+        label, val_a, val_b = parts[0], parts[1], parts[2]
+        # Confirmed live (twice, independently): a row whose values are
+        # just the two item names restated verbatim ("Label | Deductible |
+        # Premium", "Coverage scope | Fire insurance | Home insurance") —
+        # the model treating the column headers themselves as a row rather
+        # than a real point of comparison. Not wrong, just content-free;
+        # drop it the same way _TABLE_VALUE_ECHO_RE drops template echo.
+        _is_name_echo_row = (
+            val_a.strip().lower() == name_a.strip().lower()
+            and val_b.strip().lower() == name_b.strip().lower()
+        )
+        # Confirmed live: a row where BOTH sides literally say "Not
+        # specified" — the model attempting a row neither side of the
+        # ANSWER actually supports. (not val_a and not val_b) below only
+        # catches genuinely empty strings; this catches the placeholder
+        # text itself, which is just as uninformative as a blank row.
+        _is_blank_row = (
+            val_a.strip().lower() == "not specified"
+            and val_b.strip().lower() == "not specified"
+        )
+        # Confirmed live: without a shape example the model sometimes
+        # degenerates into one row PER ITEM instead of one row per shared
+        # attribute — label == the item's own name, with that item's real
+        # content on its own side and "Not specified" on the other. Two such
+        # rows (one per item) look superficially like a real comparison but
+        # never let a reader see both items' values for the same attribute
+        # side by side, defeating the table's whole purpose. Drop rather
+        # than try to salvage — the fact still exists in the ANSWER's prose
+        # even if this reformat call didn't manage to pair it up correctly.
+        _is_item_name_label_row = label.strip().lower() in (name_a.strip().lower(), name_b.strip().lower())
+        # Confirmed live: a row can echo just ONE side's name rather than
+        # both — e.g. "Cost | Deductible | Out-of-pocket before insurance
+        # helps" (val_a is the bare item name, not a real fact, while val_b
+        # holds real content). _is_name_echo_row above only catches BOTH
+        # sides being bare names; this catches either side alone. Also
+        # checks each value against the OTHER side's name (cross-column) —
+        # confirmed live: "Uncontrollable Factors | Livestock Insurance |
+        # Not specified" in a crop-vs-livestock table put the LIVESTOCK
+        # item's own name in the CROP column as if it were a fact about
+        # crop insurance. A same-column check alone (val_a vs name_a,
+        # val_b vs name_b) never catches this, since the echoed name is on
+        # the wrong side.
+        _is_partial_name_echo = (
+            val_a.strip().lower() in (name_a.strip().lower(), name_b.strip().lower())
+            or val_b.strip().lower() in (name_a.strip().lower(), name_b.strip().lower())
+        )
+        # Confirmed live: a STEP 1 row inventing a figure ("$X"/"$Y", or a
+        # real-looking amount) that never appears in the ANSWER — the
+        # prompt explicitly limits invented numbers to the Example row.
+        # Drop the whole row rather than just the number, since a row that
+        # invented one fact can't be trusted to have restructured the rest
+        # of itself correctly either.
+        _is_hallucinated_figure_row = label.strip().lower() != "example" and any(
+            d.replace(",", "") not in _answer_digit_tokens
+            for d in _TABLE_ROW_DIGIT_RE.findall(val_a) + _TABLE_ROW_DIGIT_RE.findall(val_b)
+        )
+        # Confirmed live: with a richer, multi-attribute ANSWER (more
+        # source material after the retrieval-balance fix in
+        # [[project_named_pair_retrieval_filter_gap]]), the model
+        # sometimes repeats STEP 2's "add an Example row" after EVERY
+        # STEP 1 row instead of once at the end — 4 separate rows all
+        # labeled "Example" instead of the single row the prompt asks
+        # for. Keep only the first; the STEP 2 instruction is explicit
+        # that this should never happen more than once.
+        _is_duplicate_example = (
+            label.strip().lower() == "example"
+            and any(r["label"].strip().lower() == "example" for r in rows)
+        )
+        # Confirmed live: the Example row is explicitly allowed to invent a
+        # generic illustrative scenario ("$1,000 medical bill") that isn't
+        # drawn from the ANSWER — exempted for the same reason the
+        # hallucination-figure check above exempts it (STEP 2's content
+        # isn't required to come from — or be scoped to — the ANSWER).
+        _is_cross_topic_contaminated = label.strip().lower() != "example" and bool(
+            (_strong_anchor_types_in(val_a) | _strong_anchor_types_in(val_b)) - _expected_anchor_types
+        )
+        if (
+            not label
+            or _TABLE_ROW_SKIP_LABEL_RE.match(label)
+            or (not val_a and not val_b)
+            or _TABLE_VALUE_ECHO_RE.search(val_a) or _TABLE_VALUE_ECHO_RE.search(val_b)
+            or _is_name_echo_row
+            or _is_blank_row
+            or _is_item_name_label_row
+            or _is_partial_name_echo
+            or _is_hallucinated_figure_row
+            or _is_duplicate_example
+            or _is_cross_topic_contaminated
+        ):
+            continue
+        rows.append({"label": label, "values": [val_a or "Not specified", val_b or "Not specified"]})
+
+    # STEP 1 asks for the Definition row first, but prompt-only compliance
+    # on row ORDER (as opposed to row presence) has proven unreliable
+    # elsewhere in this function — cheap and safe to just move it to the
+    # front here rather than trust generation order.
+    _def_idx = next((i for i, r in enumerate(rows) if r["label"].strip().lower() == "definition"), None)
+    if _def_idx is not None and _def_idx != 0:
+        rows.insert(0, rows.pop(_def_idx))
+
+    if len(rows) < 2:
+        logger.debug(
+            "[ask_stream] comparison-table reformat produced %d usable row(s), keeping prose", len(rows)
+        )
+        return None
+
+    # Confirmed live, two different shapes of the same underlying failure:
+    # (1) the reformat call collapses an ENTIRE column — every non-Example
+    # row says "Not specified" on the SAME side; (2) subtler, seen after
+    # the retrieval-balance fix in [[project_named_pair_retrieval_filter_gap]]
+    # gave the model richer material about BOTH items — one-sidedness that
+    # ALTERNATES per row ("Starting Line": {name_a} filled/{name_b} blank,
+    # "Safety Net": {name_b} filled/{name_a} blank), which looks
+    # superficially balanced in aggregate (each item gets a row) but still
+    # never lets a reader compare both items on the SAME attribute in a
+    # single row — the exact defect the round-2 row-per-item fix targeted,
+    # just with metaphor labels instead of the item's own name, so
+    # _is_item_name_label_row never catches it. Individual rows pass every
+    # per-row check above since each one is internally well-formed; only
+    # visible in aggregate. Confirmed this is a failure mode and not
+    # genuine asymmetry by observing the SAME model correctly balance both
+    # columns for the exact same two items in other calls — so treat 100%
+    # of non-Example rows being one-sided (regardless of WHICH side, or
+    # whether it's the same side every time) as an unreliable reformat and
+    # fall back to prose, same as the too-few-rows case above. A MINORITY
+    # of one-sided rows mixed with genuinely balanced ones is left alone —
+    # that's a normal, honest reflection of an attribute only one side has
+    # a stated fact for, not a failure.
+    _non_example_rows = [r for r in rows if r["label"].strip().lower() != "example"]
+    _one_sided_rows = sum(
+        1 for r in _non_example_rows
+        if r["values"][0] == "Not specified" or r["values"][1] == "Not specified"
+    )
+    if _non_example_rows and _one_sided_rows == len(_non_example_rows):
+        logger.debug(
+            "[ask_stream] comparison-table reformat produced %d/%d one-sided non-Example "
+            "row(s) (every row missing one side), keeping prose",
+            _one_sided_rows, len(_non_example_rows),
+        )
+        return None
+
+    intro = f"Here's how {name_a} and {name_b} compare:"
+    table = {"columns": [name_a, name_b], "rows": rows}
+    return intro, table
 
 
 # Confirmed live: the model sometimes hedges rather than actually
@@ -5610,11 +6339,37 @@ class MultiSourceRAG:
         # that retry exists to attempt — it needs a clean, unfiltered
         # shot at the raw question, not the primary attempt's filter.
         _filter_meta_no_policy_type = filter_meta
+        _regex_policy_scores = _regex_policy_score(retrieval_query)
         _query_policy_type = classify_query_policy_type(retrieval_query)
+        _query_policy_type_from_weak_regex = (
+            _query_policy_type != "general" and _regex_policy_scores.get(_query_policy_type, 0) <= 1
+        )
         if _query_policy_type == "general":
             _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
         if _query_policy_type != "general":
             _policy_types_for_filter = {_query_policy_type}
+            # A single regex hit is the weakest evidence classify_query_
+            # policy_type trusts on its own (see that function's own
+            # docstring) — confirmed live this misses a genuine second type
+            # the question also involves: "I am going to travel to europe
+            # so should i take the health insurance" classified single-
+            # label as "health" (regex: exactly one hit), and the resulting
+            # hard filter excluded travel_insurance_guide.pdf entirely —
+            # the single highest-scoring chunk in the whole KB for this
+            # exact question (rerank 0.9981 unfiltered vs. 0.9197 for the
+            # best chunk the health-only filter allowed through). The model
+            # then filled the gap with an ungrounded claim from its own
+            # training data instead of the real retrieved answer. See
+            # _classify_query_policy_types_multi_llm's own docstring for
+            # the validated fix. Deliberately gated on <=1, not >=2 — a
+            # >=2-hit regex match (e.g. "are all types of illness covered
+            # under health insurance") is already strong, specific evidence
+            # this function's own docstring already relies on staying
+            # trusted without a second LLM round-trip; only ever WIDENS the
+            # filter, so a genuinely single-topic query is unaffected.
+            if _query_policy_type_from_weak_regex:
+                _multi_policy_types = await _classify_query_policy_types_multi_llm(retrieval_query)
+                _policy_types_for_filter |= set(_multi_policy_types)
             # Comparison/named-pair questions ("difference between motor
             # and marine insurance") name TWO distinct types, but the
             # single-type classification above only ever returns ONE of
@@ -5726,7 +6481,27 @@ class MultiSourceRAG:
                 # measurement that motivated this; this was the actual
                 # mechanism behind a stale answer's phrasing bleeding into
                 # fresh generations for a genuinely different question.
-                if _kv_hit is None:
+                #
+                # Skipped entirely for comparison queries (2026-08-13):
+                # confirmed live — "difference between a deductible and a
+                # premium" produced a raw answer with a redundant, near-
+                # duplicate restatement tacked on at the end ("Premium is
+                # the cost the policyholder pays..." appearing a second
+                # time in different words), traced to a "related" cache hit
+                # injecting an earlier cached answer about the SAME term.
+                # This mechanism exists for genuinely different-but-related
+                # follow-ups; a comparison query about two well-known named
+                # items is the shape LEAST likely to need it (the
+                # retrieval-balance fix in
+                # [[project_named_pair_retrieval_filter_gap]] already gives
+                # each side dedicated, fresh retrieval) and MOST likely to
+                # trigger it spuriously — repeatedly asking the same or a
+                # near-identical comparison (both from real users and from
+                # this session's own heavy testing) populates the cache
+                # with many close variants of the exact same core answer,
+                # making a "related, not identical" match especially
+                # likely to just be the same fact restated.
+                if _kv_hit is None and not _COMPARISON_QUERY_RE.search(question):
                     _related = _kv.semantic_get_related(
                         _kv_q_emb,
                         lower_threshold=0.80,
@@ -5908,8 +6683,28 @@ class MultiSourceRAG:
             # trigger the split when classify_query_policy_type gives two
             # DIFFERENT non-general answers — the exact shape of the
             # confirmed bug, nothing broader.
+            #
+            # Second trigger added 2026-08-13: confirmed live that
+            # "difference between a deductible and a premium" never hit
+            # the branch above at all — both sides classify as "general"
+            # (they're cross-cutting vocabulary, not policy types), so the
+            # single combined retrieval ran instead, and "premium" (a term
+            # discussed across nearly every policy-type guide) crowded out
+            # "deductible" (much more narrowly discussed) in the shared
+            # rerank — most rows in the resulting table came back "Not
+            # specified" on the deductible side. The "Form A"/"Form B" risk
+            # above doesn't apply to genuine general-vocabulary terms —
+            # unlike "Form A", "deductible" is independently retrievable on
+            # its own. Rather than guess that from the phrase's shape
+            # (fragile — see [[project_fragile_signal_lists]]), check both
+            # sides against _GENERAL_VOCAB_TERMS, the actual term list from
+            # insurance_terms_glossary.pdf — a precise, content-backed
+            # allowlist rather than a heuristic, so "Form A"/"Form B" (not
+            # in the glossary) still correctly falls through to the single
+            # combined retrieval unchanged.
             _np_pair_for_retrieval = _extract_named_pair(retrieval_query, _NAMED_PAIR_QUERY_PATTERNS)
             _np_split_types = None
+            _np_split_general_terms = None
             if _np_pair_for_retrieval:
                 _np_a, _np_b = _np_pair_for_retrieval
                 _np_query_a = _np_a if re.search(r'\binsurance\b', _np_a, re.IGNORECASE) else f"{_np_a} insurance"
@@ -5918,22 +6713,31 @@ class MultiSourceRAG:
                 _np_type_b = classify_query_policy_type(_np_query_b)
                 if _np_type_a != "general" and _np_type_b != "general" and _np_type_a != _np_type_b:
                     _np_split_types = (_np_type_a, _np_type_b)
-            if _np_split_types:
+                elif _np_a.strip().lower() in _GENERAL_VOCAB_TERMS and _np_b.strip().lower() in _GENERAL_VOCAB_TERMS:
+                    _np_split_general_terms = (_np_a, _np_b)
+            if _np_split_types or _np_split_general_terms:
                 _np_per_side_limit = max(2, -(-_chunk_limit // 2))  # ceil(chunk_limit / 2)
+                # General-vocab terms are searched bare (matches how the
+                # glossary itself headers each term — "Deductible", not
+                # "Deductible insurance"); the type-split path still needs
+                # the "+insurance" phrasing since that's what
+                # classify_query_policy_type was run against above.
+                _np_retrieval_a = _np_query_a if _np_split_types else _np_a
+                _np_retrieval_b = _np_query_b if _np_split_types else _np_b
                 _chunks_a, _chunks_b = await asyncio.gather(
                     self._retrieve_all_sources_combined(
-                        _expand_abbreviations(_np_query_a), filter_meta, doc_top_k=_doc_top_k,
+                        _expand_abbreviations(_np_retrieval_a), filter_meta, doc_top_k=_doc_top_k,
                         summary_top_k=3, media_top_k=_media_top_k, chunk_limit=_np_per_side_limit,
                     ),
                     self._retrieve_all_sources_combined(
-                        _expand_abbreviations(_np_query_b), filter_meta, doc_top_k=_doc_top_k,
+                        _expand_abbreviations(_np_retrieval_b), filter_meta, doc_top_k=_doc_top_k,
                         summary_top_k=3, media_top_k=_media_top_k, chunk_limit=_np_per_side_limit,
                     ),
                 )
                 logger.info(
                     "[ask_stream] named-pair split retrieval: %r(%s, %d chunks) + %r(%s, %d chunks)",
-                    _np_query_a, _np_type_a, len(_chunks_a),
-                    _np_query_b, _np_type_b, len(_chunks_b),
+                    _np_retrieval_a, _np_type_a if _np_split_types else "general-vocab", len(_chunks_a),
+                    _np_retrieval_b, _np_type_b if _np_split_types else "general-vocab", len(_chunks_b),
                 )
                 all_chunks = self._merge_chunks(_chunks_a + _chunks_b)
             else:
@@ -6138,6 +6942,14 @@ class MultiSourceRAG:
                 reverse=True,
             )
             return chunks[:_chunk_limit]
+
+        _structural_noise_dropped = [c for c in all_chunks if _is_textbook_structural_noise(c.page_content)]
+        if _structural_noise_dropped:
+            logger.info(
+                "[ask_stream] textbook-structural-noise: dropping %s",
+                [c.metadata.get("source", "") for c in _structural_noise_dropped],
+            )
+            all_chunks = [c for c in all_chunks if c not in _structural_noise_dropped]
 
         _candidate_dropped = [c for c in all_chunks if _candidate_mismatch(c)]
         if _candidate_dropped:
@@ -6382,11 +7194,54 @@ class MultiSourceRAG:
         # enough evidence on its own; a tokenization artifact in the third,
         # admittedly-weaker proxy signal shouldn't be able to override both.
         _semantic_high_confidence_bypass = _semantically_grounded and _top_rerank >= 0.9
+        # Confirmed live (2026-08-13): "What is the difference between crop
+        # and livestock insurance?" scored top_rerank=0.9999 (as close to
+        # certain as this system gets) on EVERY run, with dedicated
+        # crop_insurance_guide.pdf and livestock_insurance_guide.pdf chunks
+        # always present via the named-pair split retrieval in
+        # [[project_named_pair_retrieval_filter_gap]] — yet lex_ok and
+        # semantically_grounded (both small-model judgment calls) each
+        # independently flipped to False on roughly half of otherwise
+        # byte-identical repeat runs, refusing a comparison the KB clearly,
+        # richly covers. Same run-to-run judgment-call flakiness this
+        # project's small vLLM model has shown before (see
+        # [[project_vllm_nondeterministic_quality_glitches]]) — just never
+        # previously observed on a query whose OTHER signal (retrieval) is
+        # this unambiguous. Re-derives the same named-pair-split shape test
+        # used at retrieval time (not trusted from an earlier variable —
+        # a future retrieval change shouldn't silently break this) as an
+        # independent, non-LLM confidence signal: if this is a genuine
+        # two-item comparison eligible for dual per-side retrieval AND the
+        # merged pool's best score is still near-certain, that's strong
+        # enough evidence on its own, without needing either flaky signal
+        # to agree.
+        _cq_pair = None if document_filter else _extract_named_pair(retrieval_query, _NAMED_PAIR_QUERY_PATTERNS)
+        _cq_is_split_shape = False
+        if _cq_pair:
+            _cq_a, _cq_b = _cq_pair
+            _cq_type_a = classify_query_policy_type(
+                _cq_a if re.search(r"\binsurance\b", _cq_a, re.IGNORECASE) else f"{_cq_a} insurance"
+            )
+            _cq_type_b = classify_query_policy_type(
+                _cq_b if re.search(r"\binsurance\b", _cq_b, re.IGNORECASE) else f"{_cq_b} insurance"
+            )
+            _cq_is_split_shape = (
+                (_cq_type_a != "general" and _cq_type_b != "general" and _cq_type_a != _cq_type_b)
+                or (_cq_a.strip().lower() in _GENERAL_VOCAB_TERMS and _cq_b.strip().lower() in _GENERAL_VOCAB_TERMS)
+            )
+        _retrieval_split_bypass = _cq_is_split_shape and _top_rerank >= 0.9
         ctx_covered = (
             _grounding_bypass
             or _semantic_high_confidence_bypass
             or (_lex_ok and _semantically_grounded)
+            or _retrieval_split_bypass
         )
+        if _retrieval_split_bypass and not (_lex_ok and _semantically_grounded):
+            logger.info(
+                "[ask_stream] retrieval-split bypass: top_rerank=%.3f >= 0.9, comparison "
+                "query eligible for dual retrieval — overriding lex_ok=%s/semantically_grounded=%s",
+                _top_rerank, _lex_ok, _semantically_grounded,
+            )
         if _grounding_bypass and not _semantically_grounded:
             logger.info(
                 "[ask_stream] grounding bypass: top_rerank=%.3f >= 0.9, lex_ok=True — "
@@ -7050,6 +7905,36 @@ class MultiSourceRAG:
                     "Please include a concrete real-life example to illustrate this concept clearly."
                 )
 
+            # ── Type-of-X decision-vs-enumeration override ─────────────────
+            # See _TYPE_DECISION_RE's block comment above for the full case.
+            # Checked against `question` (the user's actual literal wording),
+            # not prompt_question, which may have been rewritten above (a
+            # follow-up's retrieval_query, a point-reference quote, etc.) and
+            # would no longer reliably contain "type of" even when the
+            # user's real question did. _is_type_decision (not re-derived) is
+            # reused below at _enforce_numbered_list_format's call site — that
+            # deterministic reformatter is ALSO gated on _TYPES_OF_QUERY_RE
+            # and, without this, would still turn this prompt fix's own
+            # short, correct prose answer BACK into a numbered list, since it
+            # has no way to know this question isn't a real enumeration
+            # request. One classification, reused, not two independent LLM
+            # round trips reaching different conclusions.
+            _is_type_decision = bool(_TYPES_OF_QUERY_RE.search(question)) and await _is_type_decision_query(question)
+            if _is_type_decision:
+                prompt_question = (
+                    f"{prompt_question.rstrip(' .?')}. This question describes the "
+                    "user's own situation or need and asks which ONE type of "
+                    "insurance fits it — it is NOT asking you to list or enumerate "
+                    "every type that exists. Give a short, direct answer naming the "
+                    "single most relevant type and a brief reason why, in plain "
+                    "prose. Do NOT produce a numbered list of unrelated coverage "
+                    "details or other perils the policy happens to cover."
+                )
+                logger.info(
+                    "[ask_stream] type-of-X decision query detected, suppressing enumeration format: %r",
+                    question[:80],
+                )
+
             if document_filter:
                 prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
             elif detailed:
@@ -7088,6 +7973,43 @@ class MultiSourceRAG:
             _desired_max_tokens = _VLLM_MAX_TOKENS_DETAILED if detailed else _VLLM_MAX_TOKENS_BRIEF
             _real_prompt_tokens_final = _measure_prompt_tokens(prompt)
             _safe_max_tokens = max(50, min(_desired_max_tokens, 4096 - _real_prompt_tokens_final - 50))
+
+            # Confirmed live (2026-08-13): for a query whose retrieval pulls
+            # several dense, jargon-heavy chunks at once (comparison queries
+            # are the worst case — "difference between a deductible and a
+            # premium" pulled 5 separate source docs), the char/3 slop this
+            # safety valve exists to catch can be MUCH larger than the
+            # 50-token buffer above assumes — real tokens came in at 5200
+            # against a 4096-token model, driving _safe_max_tokens all the
+            # way down to its 50-token floor. The valve still did its job
+            # (no crash), but 50 tokens is enough to cut a real answer off
+            # mid-sentence ("...you cover the"), which reads as broken to a
+            # user even though nothing errored. Rather than accept a
+            # near-empty answer, trim full_context and rebuild the prompt
+            # once, aiming for enough room that the output is still usable.
+            _MIN_USABLE_OUTPUT_TOKENS = 150
+            if full_context and _safe_max_tokens < min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens):
+                _target_floor = min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens)
+                _tokens_over = (_real_prompt_tokens_final + 50 + _target_floor) - 4096
+                # 2x margin — the same char/3 slop that caused the overshoot
+                # in the first place means a 1x cut based on the estimate
+                # would likely still come up short after re-measuring.
+                _chars_to_cut = max(300, _tokens_over * _CHARS_PER_TOKEN * 2)
+                full_context = full_context[:max(0, len(full_context) - _chars_to_cut)]
+                if document_filter:
+                    prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                elif detailed:
+                    prompt = DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                else:
+                    prompt = CONVERSATIONAL_RAG_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                _real_prompt_tokens_final = _measure_prompt_tokens(prompt)
+                _safe_max_tokens = max(50, min(_desired_max_tokens, 4096 - _real_prompt_tokens_final - 50))
+                logger.warning(
+                    "[ask_stream] context-budget gap: trimmed full_context by %d chars to recover "
+                    "output room — real prompt tokens now=%d, safe_max_tokens now=%d/%d",
+                    _chars_to_cut, _real_prompt_tokens_final, _safe_max_tokens, _desired_max_tokens,
+                )
+
             if _safe_max_tokens < _desired_max_tokens:
                 logger.warning(
                     "[ask_stream] context-budget gap: real prompt tokens=%d left only %d/%d "
@@ -7451,7 +8373,7 @@ class MultiSourceRAG:
 
         try:
             _list_formatted_text = await _enforce_numbered_list_format(
-                question, _corrected_text or _reply_stripped
+                question, _corrected_text or _reply_stripped, is_type_decision=_is_type_decision
             )
             if _list_formatted_text:
                 logger.info("[ask_stream] reformatted prose answer into a numbered list")
@@ -7459,6 +8381,27 @@ class MultiSourceRAG:
                 _kv_reply = _list_formatted_text
         except Exception as _list_exc:
             logger.debug("[ask_stream] numbered-list format enforcement skipped: %s", _list_exc)
+
+        # Comparison questions get a real table instead (see
+        # _enforce_comparison_table_format's own docstring for why this
+        # moved off the numbered-list formatter above, which no longer
+        # matches _COMPARISON_QUERY_RE at all). _comparison_table (attached
+        # to _final_payload further down) is what api.py forwards to the
+        # frontend as ui.table — a numbered-list-formatted comparison
+        # answer restructures just as cleanly into table rows as prose
+        # would, so this runs regardless of whether the block above fired.
+        _comparison_table: Optional[dict] = None
+        try:
+            _table_result = await _enforce_comparison_table_format(
+                question, _corrected_text or _reply_stripped
+            )
+            if _table_result:
+                _table_intro, _comparison_table = _table_result
+                logger.info("[ask_stream] reformatted comparison answer into a table")
+                _corrected_text = _table_intro
+                _kv_reply = _table_intro
+        except Exception as _table_exc:
+            logger.debug("[ask_stream] comparison-table format enforcement skipped: %s", _table_exc)
 
         # Mode-agnostic (not gated on _keyword_detailed — same precedent as
         # the source-self-reference/rider-misattribution block above):
@@ -8451,25 +9394,20 @@ class MultiSourceRAG:
                 _LEAD_IN_RE = _lead_re.compile(
                     r'^(so|good question|sure thing|right|ah)[,.!]', _lead_re.IGNORECASE,
                 )
-                # Ordered by preference; skip a candidate if its own word
-                # already appears as a natural mid-sentence transition near
-                # the start of the model's own text (confirmed live: forcing
-                # "So," in front of a reply whose 2nd sentence already opens
-                # with "So, if someone gets injured..." produced an awkward
-                # back-to-back "So, ... So, ..." — pick a non-colliding
-                # lead-in instead of always defaulting to the first one).
-                _LEAD_IN_CANDIDATES = ("So,", "Good question,", "Right,", "Sure thing,")
+                # Skip a candidate if its own word already appears as a
+                # natural mid-sentence transition near the start of the
+                # model's own text (confirmed live: forcing "So," in front
+                # of a reply whose 2nd sentence already opens with "So, if
+                # someone gets injured..." produced an awkward back-to-back
+                # "So, ... So, ..."). Selection itself is _pick_lead_in()
+                # (module-level, shared with the currency-strip re-check
+                # below) — rotates its start point per call instead of
+                # always trying "So," first, see that function's comment.
                 if _lead_src:
                     _lead_lower = _lead_src.lower()
                     _has_natural_start = any(_lead_lower.startswith(p) for p in _KNOWN_NATURAL_STARTS)
                     if not _has_natural_start and not _LEAD_IN_RE.match(_lead_src):
-                        _check_window = _lead_src[:200].lower()
-                        _chosen_lead = _LEAD_IN_CANDIDATES[0]
-                        for _cand in _LEAD_IN_CANDIDATES:
-                            _cand_word = _cand.rstrip(",").lower()
-                            if not _lead_re.search(r'\b' + _lead_re.escape(_cand_word) + r'\b,', _check_window):
-                                _chosen_lead = _cand
-                                break
+                        _chosen_lead = _pick_lead_in(_lead_src)
                         # The model's own text was written to stand as the
                         # FIRST sentence, so it's capitalized accordingly
                         # ("Totally get why that's confusing."). Prepending a
@@ -9277,14 +10215,7 @@ class MultiSourceRAG:
                         r'^(so|good question|sure thing|right|ah)[,.!]', _re5.IGNORECASE,
                     )
                     if _rl_src and not any(_rl_src.lower().startswith(p) for p in _rl_natural_starts) and not _rl_lead_re.match(_rl_src):
-                        _rl_candidates = ("So,", "Good question,", "Right,", "Sure thing,")
-                        _rl_window = _rl_src[:200].lower()
-                        _rl_chosen = _rl_candidates[0]
-                        for _rl_cand in _rl_candidates:
-                            _rl_word = _rl_cand.rstrip(",").lower()
-                            if not _re5.search(r'\b' + _re5.escape(_rl_word) + r'\b,', _rl_window):
-                                _rl_chosen = _rl_cand
-                                break
+                        _rl_chosen = _pick_lead_in(_rl_src)
                         _corrected_text = f"{_rl_chosen} {_rl_src}"
                         _kv_reply = _corrected_text
         except Exception as _num_exc:
@@ -10274,7 +11205,17 @@ class MultiSourceRAG:
             "don't have that right now",
             "i don't have that right now",
         )
-        if _kv_reply and unique_sources and not any(p in _kv_reply.lower() for p in _handoff_phrases) and not _disable_query_cache:
+        # _comparison_table is never cached alongside _kv_reply — a cache
+        # hit only ever replays the plain "answer" string (see semantic_get
+        # below), so caching just the table's short intro line would mean
+        # a repeated comparison question loses its table entirely on the
+        # next hit. Comparisons are a small fraction of total query volume,
+        # so skipping the cache for them is a much smaller cost than
+        # extending the cache schema to carry structured table data too.
+        if (
+            _kv_reply and unique_sources and _comparison_table is None
+            and not any(p in _kv_reply.lower() for p in _handoff_phrases) and not _disable_query_cache
+        ):
             try:
                 _kv.put(
                     _kv_key,
@@ -10340,6 +11281,37 @@ class MultiSourceRAG:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
+        # Confirmed live: a LATER-stage discard (Rule4/hollow-answer/
+        # contamination detection, all checked above — or a downstream
+        # phrase match, same _handoff_phrases the KV-cache-write guard
+        # already checks) can overwrite _corrected_text with a refusal/
+        # handoff message AFTER _comparison_table was already built
+        # earlier in the pipeline. _comparison_table is a separate
+        # variable from _corrected_text, so that overwrite alone doesn't
+        # clear it — without this check, the response would show a
+        # refusal ("I don't have that information...") next to a fully
+        # populated table, reading as hallucinated content contradicting
+        # the refusal in the same breath. Re-check right here, at the
+        # last possible point before the table is attached, rather than
+        # trusting that every discard path upstream remembered to clear
+        # it — a new discard path added later without this in mind would
+        # otherwise silently reopen the same bug.
+        _final_text_for_table_check = (_final_payload.get("corrected_text") or "").strip().lower()
+        if _comparison_table and (
+            _final_payload.get("needs_human")
+            or any(p in _final_text_for_table_check for p in _handoff_phrases)
+        ):
+            logger.info("[ask_stream] dropped comparison table — final answer became a refusal/handoff message")
+            _comparison_table = None
+        if _comparison_table:
+            # Same ui-marker shape travel_bot's format_compare_quotes
+            # already sends (ui.type == "comparison_table", ui.table ==
+            # {columns, rows}) — api.py forwards this straight through to
+            # the frontend, which already knows how to render it (see
+            # frontend/public/app.js's buildComparisonTable / evt.ui
+            # handling); no frontend change needed for Layla's own
+            # comparison answers to get a real <table> too.
+            _final_payload["ui"] = {"type": "comparison_table", "table": _comparison_table}
         yield "\n\n" + _json.dumps(_final_payload)
 
     # Management methods (keep as before)

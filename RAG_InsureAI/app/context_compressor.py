@@ -26,8 +26,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from langchain_core.documents import Document
 
-from turbovec_store import _rerank_metadata_prefix
-
 logger = logging.getLogger(__name__)
 
 # Sentence must have at least this many chars to be embedded / kept.
@@ -43,6 +41,13 @@ _MIN_SENT_CHARS = 25
 # thoughts). See compress_to_budget's docstring for the failure mode this
 # closes.
 _MIN_VIABLE_CHUNK_CHARS = 220
+
+# Same reasoning as _MIN_VIABLE_CHUNK_CHARS, one level deeper: the
+# smallest per-WINDOW allocation (see the fair-share-across-windows
+# packing in compress_to_budget) still worth keeping as a real fragment
+# rather than starving it out entirely. Lower than the chunk floor since
+# a window is a sub-unit of a chunk, not a whole chunk on its own.
+_MIN_VIABLE_WINDOW_CHARS = 80
 
 
 def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
@@ -87,6 +92,19 @@ def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
     return punct_sentences if punct_sentences else [text]
 
 
+def _window_bounds(n: int, window: int) -> List[tuple]:
+    """Non-overlapping (start, end) index ranges covering all n sentences,
+    each up to `window` sentences wide, in original document order.
+    window=1 reproduces the original per-sentence behavior exactly
+    (n windows of size 1); window >= n collapses to one window covering
+    everything — both fall out of the same range() formula, no special
+    case needed."""
+    if n <= 0:
+        return []
+    w = max(1, window)
+    return [(s, min(s + w, n)) for s in range(0, n, w)]
+
+
 class ContextCompressor:
     """
     Compress retrieved chunks to query-relevant sentences.
@@ -115,12 +133,36 @@ class ContextCompressor:
         min_sentences: int = 2,
         max_sentences: int = 10,
         max_chars_per_chunk: int = 600,
+        window_size: int = 5,
     ):
         self._model = embed_model
         self._threshold = similarity_threshold
         self._min_sents = min_sentences
         self._max_sents = max_sentences
         self._skip_below = max_chars_per_chunk
+        # Score each sentence by the similarity of the WINDOW of
+        # window_size consecutive sentences it belongs to, not the
+        # sentence alone (2026-08-13) — confirmed live an isolated
+        # sentence often lacks enough surface vocabulary to score well
+        # against the query even when it states the one fact that
+        # answers it: "Form B which is also known as Comprehensive
+        # Policy is an optional cover" scored 0.4684 alone (rank 26 of
+        # 28 sentences in its chunk) against "Explain motor insurance in
+        # detail", but the same text grouped with its 4 neighboring
+        # sentences scored 0.7111 (rank 2 of 6) — because the window as
+        # a whole shares more of the query's vocabulary ("motor
+        # insurance", "types of policies") than the isolated sentence
+        # does on its own. Tested for the opposite failure mode too
+        # (windowing diluting a genuinely important standalone
+        # sentence by averaging it with irrelevant neighbors) with a
+        # sentence echoing this module's own documented "broken hand"
+        # exclusion case, surrounded by up to 4 unrelated filler
+        # sentences — windowing still scored HIGHER than scoring it
+        # alone in every case tried, never lower. window_size=1
+        # reproduces the original per-sentence behavior exactly (see
+        # _window_bounds), so this is a strict generalization, not a
+        # different mechanism bolted on.
+        self._window = window_size
         # KB chunk text is static (sourced from ingested documents), so the
         # same chunk's sentences were being re-split and re-embedded from
         # scratch on every request that retrieved it — measured live at
@@ -249,14 +291,20 @@ class ContextCompressor:
 
         # Pass 1: classify each chunk without touching the model yet. For a
         # chunk needing sentence-level ranking, reuse its cached
-        # (sentences, embeddings) if this exact chunk text was compressed
-        # before — the KB itself doesn't change between requests, only the
-        # query does, so cache hits are the common case after warm-up.
-        # Only genuine cache misses get queued for the model; those are
-        # still batched into one encode() call rather than one per chunk.
+        # (sentences, window_bounds, window_embs) if this exact chunk text
+        # was compressed before — the KB itself doesn't change between
+        # requests, only the query does, so cache hits are the common case
+        # after warm-up. Only genuine cache misses get queued for the
+        # model; those are still batched into one encode() call rather
+        # than one per chunk. Cached by WINDOW rather than by individual
+        # sentence (2026-08-13) — see self._window's own docstring in
+        # __init__ for why scoring moved from per-sentence to per-window;
+        # window_bounds lets each sentence still get its own slot in the
+        # final packing step below, just scored via its window instead of
+        # itself alone.
         _slots: List[Optional[Dict[str, Any]]] = [None] * n
-        _all_sentences: List[str] = []
-        _offsets: List[tuple] = []  # (slot_index, start, end) into _all_sentences
+        _all_windows: List[str] = []
+        _offsets: List[tuple] = []  # (slot_index, start, end) into _all_windows
         # Real production hit rate was unmeasured — the three plausible causes
         # of "still slow despite caching" (cold-start on a wide/low-overlap
         # retrieval pattern, cache size churning against a bigger corpus, or
@@ -283,18 +331,18 @@ class ContextCompressor:
                 or "youtube" in str(doc.metadata.get("source_type", "")).lower()
                 or "whisper" in str(doc.metadata.get("source_type", "")).lower()
             )
-            _cache_key = (text, is_yt)
+            _cache_key = (text, is_yt, self._window)
             _cached = self._sent_cache.get(_cache_key)
             if _cached is not None:
                 _cache_hits += 1
-                sentences, sent_embs = _cached
+                sentences, window_bounds, window_embs = _cached
                 if len(sentences) <= 1:
                     truncated = text[:alloc].rsplit('. ', 1)[0] + '…'
                     _slots[i] = {"kind": "hard_truncate", "doc": doc, "text": truncated}
                     continue
                 _slots[i] = {
                     "kind": "rank", "doc": doc, "alloc": alloc,
-                    "sentences": sentences, "sent_embs": sent_embs,
+                    "sentences": sentences, "window_bounds": window_bounds, "window_embs": window_embs,
                 }
                 continue
 
@@ -310,54 +358,63 @@ class ContextCompressor:
                     "doc": doc,
                     "text": truncated,
                 }
-                self._sent_cache[_cache_key] = (sentences, None)
+                self._sent_cache[_cache_key] = (sentences, [], None)
                 continue
 
-            # Embed an enriched version of each sentence (metadata prefix
-            # only, never returned) so the embedding model has a chance to
-            # know this sentence's policy_type/section — the same fix as
-            # _rerank_metadata_prefix's docstring describes for the
-            # cross-encoder reranker, applied here to the compressor's own
-            # separate embedding-similarity sentence selection. Confirmed
-            # live this same "broken hand" query dropped the one sentence
-            # that actually answered it (a pre-existing-injury exclusion
-            # clause) during compression even though the chunk containing
-            # it had already survived retrieval and reranking — the raw
-            # sentence's wording alone doesn't say "this is an exclusion,"
-            # so it lost out to other sentences in the same chunk that
-            # happened to share more surface vocabulary with the query.
-            # `sentences` (unenriched) is what actually gets returned in
-            # the final compressed text — only the embedding INPUT changes.
-            _prefix = _rerank_metadata_prefix(doc.metadata)
-            start = len(_all_sentences)
-            _all_sentences.extend(_prefix + s for s in sentences)
-            end = len(_all_sentences)
+            # Deliberately NOT prepending _rerank_metadata_prefix() here
+            # (2026-08-13, reverted — see git history for the earlier
+            # attempt). It's a proven win for the cross-encoder reranker,
+            # which compares candidates ACROSS different chunks/sources —
+            # there, a chunk's policy_type/section tells the reranker
+            # something a differently-tagged competing chunk lacks. This
+            # loop is different: every window here belongs to the SAME
+            # chunk, `alloc` was already fixed per-chunk by the outer
+            # fair-share pass above, and windows are only ever ranked
+            # against OTHER WINDOWS OF THIS SAME CHUNK — which all share
+            # identical metadata. A prefix constant across every candidate
+            # in a ranking can't add discriminating signal there; it can
+            # only distort it, and confirmed live it does: this chunk's
+            # metadata says "Section: Principles", but the chunk's own
+            # text actually spans two headings ("BASIC PRINCIPLES OF MOTOR
+            # INSURANCE" and, later, "TYPES OF MOTOR INSURANCE POLICIES").
+            # Prepending "[Section: Principles]" to every window pulled
+            # the later, correctly-on-topic "Form A / Form B" window's
+            # score down from rank 3 of 10 to rank 7 of 10 relative to
+            # its chunk-mates, purely because that window is about a
+            # DIFFERENT section than the one label covering the whole
+            # chunk — dropping it out of the packer's budget entirely.
+            window_bounds = _window_bounds(len(sentences), self._window)
+            window_texts = [" ".join(sentences[s:e]) for s, e in window_bounds]
+            start = len(_all_windows)
+            _all_windows.extend(window_texts)
+            end = len(_all_windows)
             _offsets.append((i, start, end))
             _slots[i] = {
                 "kind": "rank",
                 "doc": doc,
                 "alloc": alloc,
                 "sentences": sentences,
+                "window_bounds": window_bounds,
                 "cache_key": _cache_key,
             }
 
-        # Pass 2: one batched encode() call for every cache-miss sentence
+        # Pass 2: one batched encode() call for every cache-miss window
         # collected above.
-        if _all_sentences:
-            _all_sent_embs = self._model.encode(
-                _all_sentences, normalize_embeddings=True, batch_size=32, show_progress_bar=False
+        if _all_windows:
+            _all_window_embs = self._model.encode(
+                _all_windows, normalize_embeddings=True, batch_size=32, show_progress_bar=False
             )
         else:
-            _all_sent_embs = None
+            _all_window_embs = None
 
         for slot_idx, start, end in _offsets:
             slot = _slots[slot_idx]
-            sent_embs = _all_sent_embs[start:end]
-            slot["sent_embs"] = sent_embs
+            window_embs = _all_window_embs[start:end]
+            slot["window_embs"] = window_embs
             _cache_key = slot.pop("cache_key")
             if len(self._sent_cache) >= self._sent_cache_max:
                 self._sent_cache.pop(next(iter(self._sent_cache)))
-            self._sent_cache[_cache_key] = (slot["sentences"], sent_embs)
+            self._sent_cache[_cache_key] = (slot["sentences"], slot["window_bounds"], window_embs)
 
         for i, slot in enumerate(_slots):
             if slot is None or slot["kind"] != "rank":
@@ -365,42 +422,100 @@ class ContextCompressor:
             doc = slot["doc"]
             alloc = slot["alloc"]
             sentences = slot["sentences"]
-            sent_embs = slot["sent_embs"]
-            scores = np.dot(sent_embs, query_emb)
-            ranked = np.argsort(scores)[::-1]
+            window_bounds = slot["window_bounds"]
+            window_embs = slot["window_embs"]
+            window_scores = np.dot(window_embs, query_emb)
+            # Broadcast each window's score onto every sentence it covers —
+            # this IS the mechanism described in self._window's docstring:
+            # a sentence's relevance score comes from the window of
+            # surrounding context it belongs to, not itself in isolation.
+            scores = np.empty(len(sentences))
+            for (s, e), wscore in zip(window_bounds, window_scores):
+                scores[s:e] = wscore
+            # Pack WHOLE windows only — never split one into a partial
+            # slice (2026-08-13). Windows exist precisely because a lone
+            # sentence's embedding is too noisy to rank reliably (see the
+            # class docstring); an earlier version of this fix sliced an
+            # over-budget window down to its "best" individual sentences,
+            # which reintroduces that exact noise one level down. Confirmed
+            # live: both the real "Form A / Form B" case and a synthetic
+            # "one highly specific on-topic sentence surrounded by generic
+            # filler" case lost the specific sentence to per-sentence
+            # re-ranking even though their WINDOW correctly scored highest
+            # — the specific sentence alone still reads as low-relevance
+            # in isolation, which is the exact problem windowing exists to
+            # avoid. Keeping every window atomic avoids ever needing that
+            # unreliable per-sentence judgment call again.
+            n_windows = len(window_bounds)
+            window_sizes = [
+                sum(len(sentences[j]) + 2 for j in range(s, e))
+                for s, e in window_bounds
+            ]
 
-            # Guarantee the single highest-scoring sentence a slot before
-            # the greedy walk below runs — a plain greedy walk in score
-            # order skips any sentence that doesn't fit the REMAINING
-            # budget and moves on, so an oversized #1 sentence can lose out
-            # to several shorter, lower-relevance ones that happen to fit,
-            # even though it individually outscores every one of them.
-            # Confirmed live: a 760-char sentence containing the only
-            # clause that actually answered "can I get insurance for my
-            # broken hand" (a pre-existing-injury exclusion) scored highest
-            # among its chunk's sentences but was silently dropped this
-            # way, while several shorter, less relevant sentences from the
-            # same chunk filled the budget instead — the generated answer
-            # was never grounded in the one fact that mattered. If the top
-            # sentence alone exceeds the whole allocation, it still wins:
-            # hard-truncated, it's used as this chunk's entire compressed
-            # result rather than being dropped for lesser complete ones.
-            top_idx = int(ranked[0])
-            top_sentence = sentences[top_idx]
-            if len(top_sentence) + 2 > alloc:
-                truncated = top_sentence[:alloc].rsplit(' ', 1)[0] + '…'
-                _slots[i] = {"kind": "hard_truncate", "doc": doc, "text": truncated}
-                continue
+            # Drop windows too small to matter even if nothing else
+            # competed for the budget, same floor as _MIN_VIABLE_CHUNK_CHARS
+            # one level deeper — an empty/near-empty window isn't a useful
+            # unit to place at all.
+            active = [idx for idx in range(n_windows) if window_sizes[idx] >= _MIN_VIABLE_WINDOW_CHARS]
+            if not active:
+                active = list(range(n_windows))
 
-            kept_indices: set = {top_idx}
-            used = len(top_sentence) + 2
-            for idx in ranked[1:]:
-                s = sentences[int(idx)]
-                if used + len(s) + 2 <= alloc:
-                    kept_indices.add(int(idx))
-                    used += len(s) + 2
-                if used >= alloc:
-                    break
+            # Greedy-WITH-SKIP across windows in score order (2026-08-13)
+            # — the reason a plain greedy walk starved out the Form A/B
+            # window even after windowing fixed its ranking: a handful of
+            # big, high-scoring windows can consume the ENTIRE per-chunk
+            # allocation before a smaller, lower-but-still-relevant window
+            # is ever tried. Stopping at the first window that doesn't fit
+            # (a "break") reproduces that starvation; skipping it and
+            # continuing to try smaller, lower-scored windows against
+            # whatever budget remains is what lets a short but genuinely
+            # relevant window claim leftover space the bigger ones left
+            # behind, without ever fragmenting any window.
+            ranked_active = sorted(active, key=lambda idx: window_scores[idx], reverse=True)
+            kept_indices: set = set()
+            remaining = alloc
+            skipped: list = []
+            for idx in ranked_active:
+                s, e = window_bounds[idx]
+                size = window_sizes[idx]
+                if size <= remaining:
+                    kept_indices.update(range(s, e))
+                    remaining -= size
+                else:
+                    skipped.append(idx)
+
+            # Leftover budget too small for any whole skipped window to
+            # fit — rather than wasting it, take as much of the single
+            # highest-scoring skipped window as fits, sentence by sentence
+            # in document order (not re-ranked — this is filling genuine
+            # leftover scraps, a secondary best-effort step, not the
+            # primary per-window decision that needed reliable scoring).
+            if skipped and remaining >= _MIN_VIABLE_WINDOW_CHARS:
+                best_skipped = max(skipped, key=lambda idx: window_scores[idx])
+                s, e = window_bounds[best_skipped]
+                used = 0
+                for j in range(s, e):
+                    L = len(sentences[j]) + 2
+                    if used + L <= remaining:
+                        kept_indices.add(j)
+                        used += L
+                    else:
+                        break
+
+            if not kept_indices:
+                # Degenerate case (alloc smaller than any single kept
+                # sentence) — fall back to the single highest-scoring
+                # sentence, hard-truncated if it alone still doesn't fit,
+                # rather than returning nothing for this chunk. Mirrors
+                # the pre-fair-share "guarantee the top sentence a slot"
+                # safety net this replaces.
+                top_idx = int(np.argmax(scores))
+                top_sentence = sentences[top_idx]
+                if len(top_sentence) + 2 > alloc:
+                    truncated = top_sentence[:alloc].rsplit(' ', 1)[0] + '…'
+                    _slots[i] = {"kind": "hard_truncate", "doc": doc, "text": truncated}
+                    continue
+                kept_indices = {top_idx}
 
             # Re-assemble in original document order (not relevance order)
             # so the LLM reads coherent prose, not a jumbled ranking.

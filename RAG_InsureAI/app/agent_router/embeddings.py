@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from typing import Optional
 
 import numpy as np
 
@@ -66,6 +67,13 @@ async def warm_agent_embeddings(force: bool = False) -> None:
         )
 
 
+async def _query_vector(query: str) -> np.ndarray:
+    model = _get_shared_embed_model(EMBED_MODEL_NAME)
+    return await asyncio.to_thread(
+        lambda: model.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
+    )
+
+
 async def best_agent_similarity(query: str) -> list[tuple[str, float]]:
     """
     [(agent_name, max_cosine_similarity_over_its_docs), ...] sorted
@@ -79,13 +87,30 @@ async def best_agent_similarity(query: str) -> list[tuple[str, float]]:
         await warm_agent_embeddings()
     if not _AGENT_DOC_VECTORS:
         return []
-    model = _get_shared_embed_model(EMBED_MODEL_NAME)
-    query_vec = await asyncio.to_thread(
-        lambda: model.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
-    )
+    query_vec = await _query_vector(query)
     scores: list[tuple[str, float]] = []
     for agent_name, (_docs, doc_vectors) in _AGENT_DOC_VECTORS.items():
         sims = doc_vectors @ query_vec  # normalized vectors -> dot product == cosine similarity
         scores.append((agent_name, float(sims.max())))
     scores.sort(key=lambda pair: pair[1], reverse=True)
     return scores
+
+
+async def agent_similarity(query: str, agent_name: str) -> Optional[float]:
+    """Max cosine similarity of `query` against ONE specific agent's own
+    (description + example_queries) docs — the single-agent counterpart
+    to best_agent_similarity's across-all-agents scan. Built for
+    interrupt.is_interruption(): deciding whether a message mid-specialist-
+    conversation is still plausibly relevant to THAT agent doesn't need
+    (and shouldn't be diluted by) comparing against every OTHER agent's
+    docs too. Returns None if the agent isn't registered or has no
+    embedded docs (caller falls back to the LLM/default path)."""
+    if not _WARMED:
+        await warm_agent_embeddings()
+    entry = _AGENT_DOC_VECTORS.get(agent_name)
+    if entry is None:
+        return None
+    _docs, doc_vectors = entry
+    query_vec = await _query_vector(query)
+    sims = doc_vectors @ query_vec
+    return float(sims.max())
