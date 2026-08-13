@@ -39,6 +39,7 @@ from auth import create_login_endpoint, require_auth, verify_access_token
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agent_hub import hub as _agent_hub
+import redis_client
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 import json as _json
@@ -160,24 +161,6 @@ def _normalize_history(raw_turns: object) -> list[dict]:
     return history[-_MAX_HISTORY_TURNS * 2 :]
 
 
-def _load_conversations() -> dict[str, list[dict]]:
-    payload = _load_json_state(_CONVERSATIONS_PATH, "conversation")
-    return {
-        str(session_id): history
-        for session_id, turns in payload.items()
-        if (history := _normalize_history(turns))
-    }
-
-
-def _load_agent_sessions() -> dict[str, dict]:
-    payload = _load_json_state(_AGENT_SESSIONS_PATH, "conversation agent")
-    return {
-        str(session_id): dict(session)
-        for session_id, session in payload.items()
-        if isinstance(session, dict)
-    }
-
-
 def _normalize_job(raw_job: object) -> dict | None:
     if not isinstance(raw_job, dict):
         return None
@@ -226,18 +209,63 @@ def _load_jobs() -> dict[str, dict]:
     return jobs
 
 
-# Conversation memory: session_id -> list of {"role": "user/assistant", "content": "..."}
-_conversations: dict[str, list[dict]] = _load_conversations()
-_agent_sessions: dict[str, dict] = _load_agent_sessions()
+# Conversation memory (session_id -> list of {"role": "user/assistant",
+# "content": "..."}) now lives directly in Redis, per session_id key —
+# see _get_conversation_history/_save_conversation_history/
+# _delete_conversation_history below. No module-level dict to eagerly
+# load here anymore: that used to mean deserializing the ENTIRE
+# conversations.json (5.5MB+ across ~875 sessions) at import time and
+# rewriting all of it on every single save; a Redis GET/SET touches only
+# the one session that actually changed. The one-time legacy-file
+# migration (first boot only, Redis starts empty) is async and runs from
+# api.py's startup hook instead — see _migrate_legacy_conversations_if_needed.
+#
+# _agent_sessions (ConversationAgent's discovery/refinement state — a
+# LOW-usage, mostly-legacy path, unlike the two stores above) keeps its
+# existing whole-dict restore_sessions()/export_sessions() shape rather
+# than moving to per-session keys: it's populated once from a single
+# Redis blob key at startup (_load_agent_sessions_from_redis) and written
+# back as one blob on every change, exactly the same round-trip
+# conversation_agent_sessions.json did, just relocated off disk.
+_agent_sessions: dict[str, dict] = {}
 _jobs: dict[str, dict] = _load_jobs()
 
+_AGENT_SESSIONS_KEY = "convagent:blob"
+_CONV_KEY_PREFIX = "conv:"
+# Same backstop-only rationale as agent_hub.py's _BACKSTOP_TTL_SECONDS —
+# the session reaper (_purge_inactive_sessions) is the mechanism actually
+# meant to delete this key on schedule; the TTL just guarantees it can't
+# outlive that by more than a comfortable margin if the reaper were ever
+# down.
+_CONV_TTL_SECONDS = int(os.getenv("SESSION_INACTIVITY_HOURS", "24")) * 3 * 3600
 
-def _persist_conversations_locked() -> None:
-    _atomic_write_json(_CONVERSATIONS_PATH, _conversations)
+
+def _conv_key(session_id: str) -> str:
+    return f"{_CONV_KEY_PREFIX}{session_id}"
 
 
-def _persist_agent_sessions_locked() -> None:
-    _atomic_write_json(_AGENT_SESSIONS_PATH, _agent_sessions)
+async def _persist_agent_sessions_locked() -> None:
+    await redis_client.set_json(_AGENT_SESSIONS_KEY, _agent_sessions)
+
+
+async def _load_agent_sessions_from_redis() -> None:
+    """Populate _agent_sessions at startup. One-time migration: if Redis
+    has no blob yet AND the legacy conversation_agent_sessions.json still
+    exists, import it and write the blob once; every boot after that
+    finds the blob already there and skips straight to loading it."""
+    data = await redis_client.get_json(_AGENT_SESSIONS_KEY)
+    if data is None:
+        payload = _load_json_state(_AGENT_SESSIONS_PATH, "conversation agent")
+        data = {
+            str(session_id): dict(session)
+            for session_id, session in payload.items()
+            if isinstance(session, dict)
+        }
+        if data:
+            await redis_client.set_json(_AGENT_SESSIONS_KEY, data)
+            logger.info("Migrated %d conversation-agent session(s) from legacy file into Redis.", len(data))
+    _agent_sessions.clear()
+    _agent_sessions.update(data or {})
 
 
 def _persist_jobs_locked() -> None:
@@ -245,35 +273,54 @@ def _persist_jobs_locked() -> None:
 
 
 async def _get_conversation_history(session_id: str) -> list[dict]:
-    async with _get_async_lock():
-        return [dict(turn) for turn in _conversations.get(session_id, [])]
+    data = await redis_client.get_json(_conv_key(session_id))
+    return data if isinstance(data, list) else []
 
 
 async def _save_conversation_history(session_id: str, history: list[dict]) -> None:
-    async with _get_async_lock():
-        _conversations[session_id] = history[-_MAX_HISTORY_TURNS * 2 :]
-        _persist_conversations_locked()
+    trimmed = history[-_MAX_HISTORY_TURNS * 2 :]
+    await redis_client.set_json(_conv_key(session_id), trimmed, _CONV_TTL_SECONDS)
 
 
 async def _delete_conversation_history(session_id: str) -> None:
-    async with _get_async_lock():
-        if session_id in _conversations:
-            del _conversations[session_id]
-            _persist_conversations_locked()
+    await redis_client.delete_key(_conv_key(session_id))
+
+
+async def _migrate_legacy_conversations_if_needed() -> None:
+    """One-time import from the old conversations.json into Redis — only
+    does anything on the very first boot after this store moved off the
+    file (Redis has zero conv:* keys); every boot after that finds
+    existing keys and returns immediately. Mirrors agent_hub.startup()'s
+    own migration for the exact same reason: real conversation history
+    already exists in the file and shouldn't be silently dropped by
+    switching storage backends."""
+    existing = await redis_client.scan_keys(f"{_CONV_KEY_PREFIX}*")
+    if existing:
+        return
+    payload = _load_json_state(_CONVERSATIONS_PATH, "conversation")
+    migrated = 0
+    for session_id, turns in payload.items():
+        history = _normalize_history(turns)
+        if not history:
+            continue
+        await redis_client.set_json(_conv_key(str(session_id)), history, _CONV_TTL_SECONDS)
+        migrated += 1
+    if migrated:
+        logger.info("Migrated %d conversation(s) from legacy conversations.json into Redis.", migrated)
 
 
 async def _save_agent_sessions(sessions: dict[str, dict]) -> None:
     async with _get_async_lock():
         _agent_sessions.clear()
         _agent_sessions.update({str(key): dict(value) for key, value in sessions.items()})
-        _persist_agent_sessions_locked()
+        await _persist_agent_sessions_locked()
 
 
 async def _delete_agent_session(session_id: str) -> None:
     async with _get_async_lock():
         if session_id in _agent_sessions:
             del _agent_sessions[session_id]
-            _persist_agent_sessions_locked()
+            await _persist_agent_sessions_locked()
 
 
 async def _set_job(job_id: str, job: dict) -> None:
@@ -301,6 +348,7 @@ create_login_endpoint(app)
 # module for the full quote/bind/issue conversation flow.
 from travel_bot.routers.chat import router as _travel_chat_router
 from travel_bot.routers.chat import is_ava_process_question as _is_ava_process_question
+from travel_bot.routers.chat import delete_session_data as _delete_travel_bot_session
 from travel_bot.core.database import Base as _travel_base, engine as _travel_engine, SessionLocal as _travel_session_local
 import travel_bot.models.field_definition as _travel_field_definition  # noqa: F401 — registers the table below; only written by seed_field_definitions.py, never read by the live chat flow
 from travel_bot.models.session import ChatSession as _TravelChatSession
@@ -356,6 +404,28 @@ from agent_router import registry as _agent_registry, core as _agent_router_core
 
 _CONFIRM_YES_RE = _bot_re.compile(r"\b(yes|yeah|yep|sure|ok(ay)?|please do|go ahead|connect me)\b")
 _CONFIRM_NO_RE  = _bot_re.compile(r"\b(no|nope|nah|not now|don'?t|skip)\b")
+
+# Explicit request for a HUMAN agent (2026-08-12) — deliberately separate
+# from _CONFIRM_YES_RE's own "connect me" (which means "yes, connect me
+# to the SPECIALIST BOT I was just offered", a different intent entirely).
+# Checked BEFORE the multi-bot routing block below so it wins over a
+# pending Ava-confirmation or an active Ava conversation — asking for a
+# human is a strong, universal override regardless of what else is going
+# on in the session. Deliberately a fast regex, no LLM fallback: this is
+# a narrow, common-phrasing intent (unlike agent_router/interrupt.py's
+# harder general-vs-specialist-continuation problem), and a rare missed
+# phrasing just means the user has to ask again, not a real failure mode.
+_HUMAN_AGENT_REQUEST_RE = _bot_re.compile(
+    r"\b(?:connect|transfer|put)\b[^.!?]{0,25}\b(?:me|us)\b[^.!?]{0,20}\b(?:with|to)\b[^.!?]{0,15}"
+    r"\b(?:a\s+)?(?:human|real|live|actual)?\b[^.!?]{0,12}\b(?:agent|person|rep(?:resentative)?|someone)\b"
+    r"|\b(?:speak|talk|chat)\b[^.!?]{0,15}\b(?:with|to)\b[^.!?]{0,12}\b(?:a\s+)?(?:human|real|live|actual|"
+    r"agent|person|rep(?:resentative)?|someone)\b"
+    r"|\b(?:human|live)\s+agent\b"
+    r"|\b(?:can|could|may)\s+i\s+(?:talk|speak|chat)\s+(?:to|with)\s+(?:a\s+)?(?:human|person|someone|agent|representative)\b"
+    r"|\bi\s+(?:want|need)\s+(?:to\s+(?:talk|speak)\s+to\s+)?(?:a\s+)?(?:human|real\s+person|live\s+agent|representative)\b"
+    r"|\bis\s+there\s+a\s+(?:human|real\s+person|representative)\b",
+    re.IGNORECASE,
+)
 
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -587,7 +657,7 @@ async def ws_super_admin(websocket: WebSocket):
 @app.post("/session/create")
 async def session_create():
     """Create a monitored chat session for human handoff tracking."""
-    sid = _agent_hub.create_session()
+    sid = await _agent_hub.create_session()
     return {"session_id": sid}
 
 
@@ -601,6 +671,8 @@ async def agents_status():
 async def delete_session_endpoint(session_id: str):
     """Delete a session (triggered from agent dashboard)."""
     deleted = await _agent_hub.delete_session(session_id)
+    if deleted:
+        await _purge_session_side_stores(session_id)
     return {"deleted": deleted}
 
 
@@ -715,7 +787,7 @@ async def ws_user_endpoint(websocket: WebSocket, session_id: str):
     Handoff is triggered explicitly by the client sending {"type":"request_handoff"},
     not automatically on connect.
     """
-    session = _agent_hub.get_or_create_session(session_id)
+    session = await _agent_hub.get_or_create_session(session_id)
     await websocket.accept()
     session.user_ws = websocket
 
@@ -787,6 +859,21 @@ async def _init_async_lock():
 
 
 @app.on_event("startup")
+async def _load_redis_backed_stores():
+    """Populate every Redis-backed session/conversation store before the
+    app starts accepting requests — agent_hub's self._sessions cache,
+    the one-time conversations.json migration, and the conversation-agent
+    blob. Registered early (right after the lock) and awaited in order
+    since _get_conversation_agent()'s lazy singleton reads _agent_sessions
+    synchronously on first real request; by running here, it's always
+    already populated by then, matching the guarantee the old
+    load-at-import-time file reads gave for free."""
+    await _agent_hub.startup()
+    await _migrate_legacy_conversations_if_needed()
+    await _load_agent_sessions_from_redis()
+
+
+@app.on_event("startup")
 async def _start_job_pruner():
     """Periodically prune stale jobs from memory (every 5 minutes)."""
     async def _prune_loop():
@@ -797,6 +884,73 @@ async def _start_job_pruner():
             except Exception:
                 logger.exception("Periodic job pruner failed")
     app.state.job_pruner_task = asyncio.create_task(_prune_loop())
+
+
+_SESSION_INACTIVITY_HOURS = _int_env("SESSION_INACTIVITY_HOURS", 24)
+
+
+def _purge_travel_bot_sessions_sync(session_ids: list[str]) -> None:
+    db = _travel_session_local()
+    try:
+        for sid in session_ids:
+            _delete_travel_bot_session(db, sid)
+    finally:
+        db.close()
+
+
+async def _purge_session_side_stores(session_id: str) -> None:
+    """The other 3 session_id-keyed stores a full purge needs beyond
+    agent_hub itself — split out so both the automatic inactivity reaper
+    and the manual DELETE /session/{id} endpoint get the same complete
+    cleanup instead of the manual path only ever clearing agent_hub."""
+    await _delete_conversation_history(session_id)
+    await _delete_agent_session(session_id)
+    await asyncio.to_thread(_purge_travel_bot_sessions_sync, [session_id])
+
+
+async def _purge_inactive_sessions() -> None:
+    """Storage-growth control: a session nobody has touched in
+    SESSION_INACTIVITY_HOURS (24h default) has its chat history removed
+    from every session_id-keyed store this app writes to — agent_hub's
+    sessions_data.json (the dashboard/handoff history), conversations.json
+    (the actual multi-turn memory /ask-stream reads for context),
+    conversation_agent_sessions.json, and travel_bot.db (Ava's intake/quote
+    state plus its own messages table, including PII — name/email/phone).
+    Without this all four grow forever, since nothing else ever removes a
+    session that was simply abandoned (as opposed to explicitly cleared via
+    DELETE /session/{id}). agent_hub is the source of truth for "when was
+    this session last active": every entry point — the main chat, and Ava
+    once agent_router hands off to it — shares one session_id that always
+    starts with POST /session/create → agent_hub.create_session(), so its
+    per-message timestamps see every turn regardless of which agent
+    answered.
+    """
+    stale_ids = await _agent_hub.delete_inactive_sessions(_SESSION_INACTIVITY_HOURS)
+    if not stale_ids:
+        return
+    for sid in stale_ids:
+        await _purge_session_side_stores(sid)
+    logger.info(
+        "Session reaper: purged %d session(s) inactive >%gh: %s",
+        len(stale_ids), _SESSION_INACTIVITY_HOURS, stale_ids,
+    )
+
+
+@app.on_event("startup")
+async def _start_session_reaper():
+    """Periodically purge sessions inactive for >SESSION_INACTIVITY_HOURS
+    (checked hourly) — see _purge_inactive_sessions for what gets removed
+    and why."""
+    async def _reap_loop():
+        while True:
+            await asyncio.sleep(3600)  # check hourly
+            try:
+                await _purge_inactive_sessions()
+            except Exception:
+                logger.exception("Periodic session reaper failed")
+    app.state.session_reaper_task = asyncio.create_task(_reap_loop())
+
+
 @app.on_event("startup")
 async def _warmup_pipeline():
     """Pre-load embedding model and vector store at startup so first request is fast."""
@@ -1535,7 +1689,7 @@ async def ask(req: AskRequest):
 
         # ── Log to agent hub + trigger handoff if needed ─────────────────────
         if req.session_id and req.session_id.strip():
-            _agent_hub.get_or_create_session(req.session_id)
+            await _agent_hub.get_or_create_session(req.session_id)
             agents_online = _agent_hub.online_count() > 0
             offline_escalated = needs_human and not agents_online
 
@@ -1927,9 +2081,54 @@ async def ask_stream(req: AskRequest):
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
             )
 
+    # ── Explicit request for a human agent (2026-08-12) ──────────────────────
+    # Checked before multi-bot routing below so it overrides a pending Ava
+    # confirmation or an active Ava conversation — see
+    # _HUMAN_AGENT_REQUEST_RE's own comment for why. Bypasses the RAG
+    # pipeline entirely (this isn't a question about insurance content) and
+    # reuses the EXACT same request_handoff()/trigger_offline_escalation()
+    # machinery the automatic on-refusal path already calls further below
+    # (~needs_human/offline_escalated) — the frontend's existing
+    # evt.needsHuman / evt.offlineEscalated handling (app.js) already
+    # renders the agent-dashboard popup, the "finding a human agent"
+    # notice, and the "no agents available, emailed support" notice
+    # correctly, with zero frontend changes needed. The answer text itself
+    # deliberately doesn't distinguish online/offline — same as the
+    # existing refusal-path prompt line ("I can get a human agent to walk
+    # you through it properly!") — the actual outcome is communicated by
+    # the system-pill notice that follows, not this line.
+    if req.session_id and req.session_id != "default" and _HUMAN_AGENT_REQUEST_RE.search(req.question):
+        _sid = req.session_id
+        _q = req.question
+        await _agent_hub.get_or_create_session(_sid)
+        _agents_online = _agent_hub.online_count() > 0
+        _ack_text = "Sure, let me get a human agent for you right away! 😊"
+
+        async def _human_request_gen():
+            if not _agents_online:
+                await _agent_hub.log_message(_sid, "user", _q)
+                await _agent_hub.log_message(_sid, "ai", _ack_text)
+                asyncio.create_task(_agent_hub.trigger_offline_escalation(_sid, _q))
+            else:
+                asyncio.create_task(_agent_hub.log_message(_sid, "user", _q))
+                asyncio.create_task(_agent_hub.log_message(_sid, "ai", _ack_text))
+                await _agent_hub.request_handoff(_sid, _q)
+            yield _ack_text
+            yield "\n\n" + _json.dumps({
+                "sources": [], "done": True,
+                "needs_human": _agents_online,
+                "offline_escalated": not _agents_online,
+            })
+
+        return StreamingResponse(
+            _human_request_gen(),
+            media_type="text/plain",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
+        )
+
     # ── Multi-bot routing: pending confirmation or already handed off ───────
     if req.session_id and req.session_id != "default":
-        _bot_sess = _agent_hub.get_or_create_session(req.session_id)
+        _bot_sess = await _agent_hub.get_or_create_session(req.session_id)
 
         if _bot_sess.awaiting_agent_confirmation:
             _target = _bot_sess.awaiting_agent_confirmation
@@ -1977,7 +2176,7 @@ async def ask_stream(req: AskRequest):
                 # happened. Only an ambiguous non-answer (not confidently a
                 # new question) still gets the safe re-ask fallback.
                 _is_interruption = await _agent_router_interrupt.is_interruption(
-                    req.question, _target_def.display_name if _target_def else _target
+                    req.question, _target
                 )
                 if not _is_interruption:
                     _reask = f"Just to confirm — would you like me to connect you with {_target_def.display_name if _target_def else _target}? (yes/no)"
@@ -2126,7 +2325,7 @@ async def ask_stream(req: AskRequest):
             yield "\n\n" + _json.dumps({"sources": [], "done": True})
             # Log to hub so agents can see greeting exchanges too
             if _sid and _sid != "default":
-                _agent_hub.get_or_create_session(_sid)
+                await _agent_hub.get_or_create_session(_sid)
                 asyncio.create_task(_agent_hub.log_message(_sid, "user", req.question))
                 asyncio.create_task(_agent_hub.log_message(_sid, "ai", greeting_reply))
         return StreamingResponse(
@@ -2222,7 +2421,7 @@ async def ask_stream(req: AskRequest):
                     final_data["offline_escalated"] = offline_escalated
                     # Log to hub — auto-create session if missing (handles backend restarts)
                     if req.session_id and req.session_id != "default":
-                        _agent_hub.get_or_create_session(req.session_id)
+                        await _agent_hub.get_or_create_session(req.session_id)
                         if offline_escalated:
                             # Must await so history is fully written before PDF is generated
                             await _agent_hub.log_message(req.session_id, "user", req.question)

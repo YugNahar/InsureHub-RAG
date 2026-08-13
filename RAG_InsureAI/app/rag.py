@@ -633,18 +633,17 @@ class RAGPipeline:
             embed_model=self._vector_store.embed_model,
             max_chars_per_chunk=LLM_CONTEXT_WINDOW_CHARS,
         )
-        _cache_path = os.path.join(
-            os.getenv("INSUREHUB_DATA_DIR", os.path.expanduser("~/.insurehub")),
-            "cache",
-            "query_kv_cache.json",
-        )
+        # Same REDIS_URL env var / default as redis_client.py (agent_hub.py's
+        # session store) — one Redis instance, different key prefixes
+        # ("kv:" here vs "session:"/"conv:" there) keep the stores apart.
+        _redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
         self._cache = QueryKVCache(
-            cache_path=_cache_path,
+            redis_url=_redis_url,
             ttl_seconds=int(os.getenv("KV_CACHE_TTL", "3600")),
             max_entries=int(os.getenv("KV_CACHE_MAX_ENTRIES", "500")),
             sem_threshold=float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92")),
         )
-        logger.info("[RAGPipeline] KV cache ready — path=%s", _cache_path)
+        logger.info("[RAGPipeline] KV cache ready — redis=%s", _redis_url)
 
     @property
     def vector_store(self):

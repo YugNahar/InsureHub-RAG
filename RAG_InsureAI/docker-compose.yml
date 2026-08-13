@@ -39,6 +39,10 @@ x-common: &common
     # confirmed reachable — `docker run --rm --gpus all nvidia/cuda:...
     # nvidia-smi` is the check.
     MODEL_DEVICE: ${MODEL_DEVICE:-cpu}
+    # redis_client.py's default already matches this ("redis" resolves via
+    # Docker DNS to the service below on the shared compose network) — set
+    # explicitly here anyway so it's visible without reading the code.
+    REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   volumes:
     - insurehub_data:/root/.insurehub
     - insurehub_tmp:/root/.insurehub_tmp
@@ -48,12 +52,31 @@ x-common: &common
 
 services:
 
+  # ── Session/conversation store (agent_hub.py, conversations.json's
+  # replacement) — appendonly persistence so session/chat history survives a
+  # redis restart, matching the durability the JSON files gave before this.
+  redis:
+    image: redis:7-alpine
+    container_name: insurehub_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # ── Production chat API (conversation intelligence, /ask, /upload, etc.) ────
   api:
     <<: *common
     container_name: insurehub_api
     working_dir: /app/app
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8501", "--ws-per-message-deflate", "False"]
+    depends_on:
+      redis:
+        condition: service_healthy
     ports:
       - "8501:8501"
     volumes:
@@ -98,3 +121,4 @@ volumes:
   insurehub_tmp:
   hf_cache:
   whisper_cache:
+  redis_data:

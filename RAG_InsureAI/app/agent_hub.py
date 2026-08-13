@@ -2,8 +2,28 @@
 Human-agent handoff hub — manages chat sessions and WebSocket connections
 for live agent monitoring and real-time conversation takeover.
 
-Sessions are persisted to sessions_data.json (mounted volume) so history
-survives backend restarts and agent logouts.
+Sessions live in Redis (session:{id} keys, see redis_client.py) so history
+survives backend restarts and agent logouts, with self._sessions kept as
+an in-memory write-through cache — every read stays synchronous exactly
+as before (get_session, list_sessions, the WS handoff state machine),
+only the persistence call at the end of each mutation is now `await
+self._save_session(sid)` (one Redis key) instead of the old
+_save_sessions() (rewrite the ENTIRE sessions_data.json, every session,
+on every single message — the actual thing being fixed here). On first
+boot after this change (Redis genuinely empty), startup() migrates
+whatever was in the old sessions_data.json once; every boot after that
+is a no-op since Redis already has session keys.
+
+Session deletion (delete_session, delete_inactive_sessions) is still the
+authoritative expiry mechanism, not Redis TTL — a session's Redis key
+also carries a generous backstop TTL (_BACKSTOP_TTL_SECONDS) purely so an
+abandoned key can't outlive the JSON file it replaced even if the
+reaper task in api.py were ever down for an extended period, but under
+normal operation the reaper always fires first. Relying on Redis TTL as
+the PRIMARY mechanism was considered and rejected: self._sessions has no
+way to notice a key silently expiring in Redis between reads, so it
+would either drift out of sync with what's actually persisted or need
+its own reconciliation pass — no simpler than just keeping the reaper.
 """
 import asyncio
 import json
@@ -12,16 +32,64 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Set
 
 logger = logging.getLogger(__name__)
 
 from fastapi import WebSocket
 
+import redis_client
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SESSIONS_FILE = os.path.join(_HERE, "sessions_data.json")
+_SESSIONS_FILE = os.path.join(_HERE, "sessions_data.json")  # legacy — read only, one-time migration
 _AGENT_ACTIVITY_FILE = os.path.join(_HERE, "agent_activity.json")
+
+_SESSION_KEY_PREFIX = "session:"
+# 3x the inactivity-purge threshold (api.py's SESSION_INACTIVITY_HOURS,
+# default 24h) — a safety net only; delete_inactive_sessions() is the
+# mechanism that's actually supposed to fire first. See module docstring.
+_BACKSTOP_TTL_SECONDS = int(os.getenv("SESSION_INACTIVITY_HOURS", "24")) * 3 * 3600
+
+
+def _session_key(session_id: str) -> str:
+    return f"{_SESSION_KEY_PREFIX}{session_id}"
+
+
+def _session_to_dict(session: "ChatSession") -> dict:
+    return {
+        "created_at": session.created_at,
+        "tone": session.tone,
+        "handoff_exhausted": session.handoff_exhausted,
+        "email_sent": session.email_sent,
+        "active_agent": session.active_agent,
+        "awaiting_agent_confirmation": session.awaiting_agent_confirmation,
+        "history": [
+            {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta}
+            for m in session.history
+        ],
+    }
+
+
+def _session_from_dict(session_id: str, data: dict) -> "ChatSession":
+    session = ChatSession(
+        session_id=session_id,
+        status="ai",  # always "ai" on load; no agents connected yet
+        created_at=data.get("created_at", _now_full()),
+        tone=data.get("tone", "neutral"),
+        handoff_exhausted=data.get("handoff_exhausted", False),
+        email_sent=data.get("email_sent", False),
+        active_agent=data.get("active_agent", "layla"),
+        awaiting_agent_confirmation=data.get("awaiting_agent_confirmation", ""),
+    )
+    for m in data.get("history", []):
+        session.history.append(ChatMessage(
+            role=m["role"],
+            content=m["content"],
+            timestamp=m.get("timestamp", ""),
+            meta=m.get("meta", {}),
+        ))
+    return session
 
 
 def _now() -> str:
@@ -36,6 +104,27 @@ def _now() -> str:
 
 def _now_full() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _last_activity(session: "ChatSession") -> datetime:
+    """Timestamp of the most recent thing that happened in *session* — the
+    last message if there is one, else its creation time. Used by the
+    inactivity reaper below; parse failures return "now" (never stale) so
+    a malformed/legacy timestamp can never cause a session to be purged.
+    Message timestamps are full ISO 8601 with a UTC offset (_now());
+    created_at is the older "%Y-%m-%d %H:%M" UTC-naive format (_now_full())
+    — both are handled here since sessions loaded from disk may predate
+    either format change."""
+    raw = session.history[-1].timestamp if session.history else session.created_at
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.now(timezone.utc)
 
 
 _ABUSE_WORDS = frozenset({
@@ -149,59 +238,83 @@ class AgentHub:
         self._agent_records: Dict[str, dict] = {}   # name → persistent activity record
         self._super_admin_ws: List[WebSocket] = []  # connected super-admin sockets
         self._super_admin_tokens: set = set()       # valid super-admin session tokens
-        self._load_sessions()
+        # Per-session write lock (see _save_session) — several call sites
+        # fire off two log_message() calls back-to-back via
+        # asyncio.create_task (e.g. "user" then "ai") without awaiting
+        # either. That was harmless under the old sync file write (no
+        # await point inside it, so whichever task started first always
+        # finished first, in order). A real Redis round-trip DOES have a
+        # suspension point, so without this lock the two SETs to the same
+        # key can complete out of order — confirmed live: the "user"-only
+        # write occasionally landed AFTER the "ai" write and silently
+        # erased the AI reply from the session's persisted history. The
+        # lock only serializes the SET itself; _session_to_dict() still
+        # reads self._sessions[sid].history fresh at write time, so the
+        # second writer under the lock always captures whatever the first
+        # writer already appended.
+        self._session_locks: Dict[str, asyncio.Lock] = {}
         self._load_agent_records()
+        # self._sessions is populated by startup() (async — Redis needs an
+        # await), called from api.py's FastAPI startup hook. Left empty
+        # here rather than blocking __init__, since `hub = AgentHub()`
+        # below runs at import time, before any event loop exists to await
+        # on.
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def _load_sessions(self):
-        if not os.path.exists(_SESSIONS_FILE):
+    async def startup(self) -> None:
+        """Load every session from Redis into self._sessions. One-time
+        migration: if Redis has zero session keys (first boot after this
+        store moved off sessions_data.json) AND that legacy file still
+        exists with data, import it into Redis and memory instead of
+        starting empty — every boot after this one finds session keys
+        already in Redis and this branch never runs again."""
+        keys = await redis_client.scan_keys(f"{_SESSION_KEY_PREFIX}*")
+        if not keys:
+            migrated = self._load_sessions_from_legacy_file()
+            if migrated:
+                for sid, session in migrated.items():
+                    self._sessions[sid] = session
+                    await redis_client.set_json(
+                        _session_key(sid), _session_to_dict(session), _BACKSTOP_TTL_SECONDS
+                    )
+                logger.info("Migrated %d session(s) from legacy sessions_data.json into Redis.", len(migrated))
             return
+        for key in keys:
+            data = await redis_client.get_json(key)
+            if not data:
+                continue
+            sid = key[len(_SESSION_KEY_PREFIX):]
+            self._sessions[sid] = _session_from_dict(sid, data)
+        logger.info("Loaded %d session(s) from Redis.", len(self._sessions))
+
+    @staticmethod
+    def _load_sessions_from_legacy_file() -> Dict[str, "ChatSession"]:
+        if not os.path.exists(_SESSIONS_FILE):
+            return {}
         try:
             with open(_SESSIONS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for sid, s in data.items():
-                session = ChatSession(
-                    session_id=sid,
-                    status="ai",  # always "ai" on load; no agents connected yet
-                    created_at=s.get("created_at", _now_full()),
-                    tone=s.get("tone", "neutral"),
-                    handoff_exhausted=s.get("handoff_exhausted", False),
-                    email_sent=s.get("email_sent", False),
-                    active_agent=s.get("active_agent", "layla"),
-                    awaiting_agent_confirmation=s.get("awaiting_agent_confirmation", ""),
-                )
-                for m in s.get("history", []):
-                    session.history.append(ChatMessage(
-                        role=m["role"],
-                        content=m["content"],
-                        timestamp=m.get("timestamp", ""),
-                        meta=m.get("meta", {}),
-                    ))
-                self._sessions[sid] = session
+            return {sid: _session_from_dict(sid, s) for sid, s in data.items()}
         except Exception:
-            pass
+            logger.exception("Could not read legacy sessions_data.json for migration")
+            return {}
 
-    def _save_sessions(self):
-        try:
-            data = {}
-            for sid, s in self._sessions.items():
-                data[sid] = {
-                    "created_at": s.created_at,
-                    "tone": s.tone,
-                    "handoff_exhausted": s.handoff_exhausted,
-                    "email_sent": s.email_sent,
-                    "active_agent": s.active_agent,
-                    "awaiting_agent_confirmation": s.awaiting_agent_confirmation,
-                    "history": [
-                        {"role": m.role, "content": m.content, "timestamp": m.timestamp, "meta": m.meta}
-                        for m in s.history
-                    ],
-                }
-            with open(_SESSIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    async def _save_session(self, session_id: str) -> None:
+        """Persist ONE session to Redis — replaces the old _save_sessions(),
+        which rewrote every session in the store on every single message.
+        No-op if the session isn't in memory (e.g. already deleted).
+        Serialized per-session (see self._session_locks) so two writes to
+        the same key from concurrent fire-and-forget log_message() calls
+        can't complete out of order and silently drop one of them."""
+        if session_id not in self._sessions:
+            return
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            await redis_client.set_json(_session_key(session_id), _session_to_dict(session), _BACKSTOP_TTL_SECONDS)
 
     # ── Agent-activity persistence ────────────────────────────────────────────
 
@@ -235,10 +348,10 @@ class AgentHub:
 
     # ── Sessions ──────────────────────────────────────────────────────────────
 
-    def create_session(self) -> str:
+    async def create_session(self) -> str:
         sid = uuid.uuid4().hex[:8]
         self._sessions[sid] = ChatSession(session_id=sid)
-        self._save_sessions()
+        await self._save_session(sid)
         return sid
 
     async def delete_session(self, session_id: str) -> bool:
@@ -256,7 +369,8 @@ class AgentHub:
             except Exception:
                 pass
         del self._sessions[session_id]
-        self._save_sessions()
+        self._session_locks.pop(session_id, None)
+        await redis_client.delete_key(_session_key(session_id))
         # Also prune this session from every agent's persistent chat-history log
         # (_agent_records[name]["chats"]) — that log survives independently of
         # self._sessions and used to be untouched by delete, so a deleted
@@ -289,14 +403,39 @@ class AgentHub:
         await self._broadcast_sessions_update()
         return True
 
+    async def delete_inactive_sessions(self, hours: float = 24) -> List[str]:
+        """Purge every session whose last activity is older than *hours*
+        (storage-growth control — Redis's own backstop TTL is a safety net
+        only, this is the mechanism actually meant to fire first; see the
+        module docstring). Skips a session with a live
+        user_ws even if its last logged message is stale, so an open tab
+        idling past the cutoff is never pulled out from under a connected
+        user. Reuses delete_session() for each one, so a purged session
+        gets the exact same cleanup (agent-record pruning, connected-agent
+        notification, super-admin broadcast) a manual admin delete gets.
+        Returns the ids actually deleted, so callers can purge the same
+        ids from every OTHER session_id-keyed store (conversations.json,
+        conversation_agent_sessions.json, travel_bot's DB) — this method
+        only owns its own store."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        stale_ids = [
+            sid for sid, s in list(self._sessions.items())
+            if s.user_ws is None and _last_activity(s) < cutoff
+        ]
+        deleted = []
+        for sid in stale_ids:
+            if await self.delete_session(sid):
+                deleted.append(sid)
+        return deleted
+
     def get_session(self, session_id: str) -> Optional[ChatSession]:
         return self._sessions.get(session_id)
 
-    def get_or_create_session(self, session_id: str) -> "ChatSession":
+    async def get_or_create_session(self, session_id: str) -> "ChatSession":
         """Return existing session or create one on the fly (handles backend restarts)."""
         if session_id not in self._sessions:
             self._sessions[session_id] = ChatSession(session_id=session_id)
-            self._save_sessions()
+            await self._save_session(session_id)
         return self._sessions[session_id]
 
     def list_sessions(self) -> List[dict]:
@@ -338,7 +477,7 @@ class AgentHub:
         session.history.append(msg)
         if role == "ai":
             session.handoff_exhausted = False  # fresh AI turn — allow handoff again if needed
-        self._save_sessions()
+        await self._save_session(session_id)
         await self._broadcast_new_message(session_id, msg)
         await self._broadcast_sessions_update()
         if role == "user":
@@ -372,7 +511,7 @@ class AgentHub:
                 session.status = "ai"
                 session.agent_id = None
                 session.tone_from_red = False
-                self._save_sessions()
+                await self._save_session(agent.active_session)
                 if session.user_ws:
                     try:
                         await session.user_ws.send_json({
@@ -446,7 +585,7 @@ class AgentHub:
             return False  # caller sends email
 
         session.status = "waiting"
-        self._save_sessions()
+        await self._save_session(session_id)
 
         # Prefer the caller-supplied question; fall back to last user message in history
         unanswerable = question or next(
@@ -498,7 +637,7 @@ class AgentHub:
         session.status = "ai"
         session.handoff_exhausted = True
         session.email_sent = True
-        self._save_sessions()
+        await self._save_session(session_id)
         unanswerable = next(
             (m.content for m in reversed(session.history) if m.role == "user"), ""
         )
@@ -540,7 +679,7 @@ class AgentHub:
                 pass
         if not delivered:
             session.pending_ws_message = _timeout_msg
-        self._save_sessions()
+        await self._save_session(session_id)
         if escalated_index is not None:
             await self._broadcast_message_meta_update(session_id, escalated_index, session.history[escalated_index].meta)
         import asyncio as _aio
@@ -628,7 +767,7 @@ class AgentHub:
                 pass
         if not delivered:
             session.pending_ws_message = _decline_msg
-        self._save_sessions()
+        await self._save_session(session_id)
         if escalated_index is not None:
             await self._broadcast_message_meta_update(session_id, escalated_index, session.history[escalated_index].meta)
 
@@ -654,7 +793,7 @@ class AgentHub:
                     session.history[i].meta["escalation_sent"] = True
                     escalated_index = i
                     break
-            self._save_sessions()
+            await self._save_session(session_id)
         history_snapshot = list(session.history) if session else []
         await _aio.to_thread(_send_email_sync, session_id, history_snapshot, unanswerable_query)
         if session and escalated_index is not None:
@@ -668,7 +807,7 @@ class AgentHub:
             if old_session and old_session.agent_id == agent.agent_id:
                 old_session.status = "ai"
                 old_session.agent_id = None
-                self._save_sessions()
+                await self._save_session(agent.active_session)
                 if old_session.user_ws:
                     try:
                         await old_session.user_ws.send_json({
@@ -685,7 +824,7 @@ class AgentHub:
             session.tone_from_red = True
         agent.active_session = session.session_id
         agent.monitoring.add(session.session_id)
-        self._save_sessions()
+        await self._save_session(session.session_id)
         # Open or reopen a chat record in agent activity.
         # Deduplicate: if a record already exists for this session_id, reopen it
         # instead of creating a new one — prevents duplicate entries on re-login.
@@ -778,7 +917,7 @@ class AgentHub:
             if old:
                 old.status = "ai"
                 old.agent_id = None
-                self._save_sessions()
+                await self._save_session(agent.active_session)
                 if old.user_ws:
                     try:
                         await old.user_ws.send_json({
@@ -800,7 +939,7 @@ class AgentHub:
             session.agent_id = None
             session.tone = "neutral"
             session.tone_from_red = False
-            self._save_sessions()
+            await self._save_session(released_sid)
             if session.user_ws:
                 try:
                     await session.user_ws.send_json({
@@ -838,7 +977,7 @@ class AgentHub:
             return
         msg = ChatMessage(role="agent", content=content)
         session.history.append(msg)
-        self._save_sessions()
+        await self._save_session(session_id)
         # Record the reply in agent activity
         rec = self._agent_records.get(agent.name)
         if rec:
@@ -892,7 +1031,7 @@ class AgentHub:
             m.role == "user" and m.meta.get("escalation_sent") and not m.meta.get("escalation_resolved")
             for m in session.history
         )
-        self._save_sessions()
+        await self._save_session(session_id)
 
         rec = self._ensure_agent_record(agent.name)
         rec["total_queries_answered"] = rec.get("total_queries_answered", 0) + 1
@@ -929,7 +1068,7 @@ class AgentHub:
             return
         msg = ChatMessage(role="user", content=content)
         session.history.append(msg)
-        self._save_sessions()
+        await self._save_session(session_id)
         # Append user message to the active agent's chat record
         if session.agent_id:
             agent = self._agents.get(session.agent_id)
@@ -1157,7 +1296,7 @@ class AgentHub:
             return False
         session.active_agent = agent_name
         session.awaiting_agent_confirmation = ""
-        self._save_sessions()
+        await self._save_session(session_id)
         await self._broadcast_sessions_update()
         return True
 
@@ -1169,7 +1308,7 @@ class AgentHub:
         if not session:
             return False
         session.awaiting_agent_confirmation = agent_name
-        self._save_sessions()
+        await self._save_session(session_id)
         await self._broadcast_sessions_update()
         return True
 
@@ -1180,7 +1319,7 @@ class AgentHub:
         if not session:
             return False
         session.awaiting_agent_confirmation = ""
-        self._save_sessions()
+        await self._save_session(session_id)
         await self._broadcast_sessions_update()
         return True
 

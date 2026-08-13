@@ -1,5 +1,5 @@
 """
-Disk-persisted KV cache for RAG query results with semantic similarity lookup.
+Redis-persisted KV cache for RAG query results with semantic similarity lookup.
 
 Two lookup modes
 ----------------
@@ -17,7 +17,26 @@ Two lookup modes
 Cache key still includes the sorted source list so adding a new document
 automatically invalidates all cached answers for the same query.
 
-TTL: configurable, default 3600 s (1 hour).
+The similarity search itself stays in-process numpy (self._emb_matrix, an
+(N, D) matrix of every live entry's query embedding, matmul'd against the
+incoming query on every semantic_get/semantic_get_related call) rather than
+moving to Redis-side vector search (RediSearch) — at this cache's real size
+(max_entries defaults to 500, one 768-dim float32 vector each) an in-memory
+matmul is already sub-millisecond, and RediSearch would mean a different
+Redis image/module plus a whole new query API for zero measurable benefit
+at this scale. Redis here is PERSISTENCE only: self._data/self._emb_matrix
+are an in-memory mirror hydrated from Redis at startup (_load) and kept in
+sync on every write, same "in-memory read/compute path + Redis persists
+each individual write" split already used for agent_hub.py's ChatSession —
+each put() now touches exactly the one key that changed instead of
+rewriting every cached entry (including every entry's 768-float embedding
+list) to one JSON file on every single cache write.
+
+TTL: configurable, default 3600 s (1 hour) — set as each key's native Redis
+TTL (a real backstop: an entry can't outlive it even if this process never
+restarts) AND still re-checked in-process on every read exactly as before,
+since Redis expiring a key doesn't retroactively evict it from the
+in-memory mirror the moment it happens.
 Eviction: lazy on read + LRU when max_entries is reached.
 """
 import hashlib
@@ -28,8 +47,11 @@ import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import redis as _redis_sync
 
 logger = logging.getLogger(__name__)
+
+_KEY_PREFIX = "kv:"
 
 _CACHE_VERSION = 2          # bumped because entry schema changed (added query_embedding)
 # Raised 0.92 -> 0.94 (2026-07-13, explicit user request after a stale
@@ -47,11 +69,13 @@ _SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.94"
 
 class QueryKVCache:
     """
-    Disk-persisted semantic KV cache.
+    Redis-persisted semantic KV cache — see module docstring for why the
+    similarity search itself stays in-process numpy rather than moving to
+    Redis-side vector search.
 
     Parameters
     ----------
-    cache_path    : absolute path to the JSON file.
+    redis_url     : Redis connection URL (redis://host:port/db).
     ttl_seconds   : entry lifetime (default 3600 s).
     max_entries   : LRU eviction threshold (default 500).
     sem_threshold : cosine similarity threshold for semantic hits (0–1).
@@ -59,12 +83,21 @@ class QueryKVCache:
 
     def __init__(
         self,
-        cache_path: str,
+        redis_url: str,
         ttl_seconds: int = 3600,
         max_entries: int = 500,
         sem_threshold: float = _SEMANTIC_THRESHOLD_DEFAULT,
     ):
-        self._path = cache_path
+        # Synchronous client, not redis.asyncio — every call site in
+        # multi_source_rag.py/rag.py calls get()/put()/semantic_get() etc.
+        # as plain sync calls today (this class predates any async
+        # persistence in this codebase), and threading async through
+        # RAGPipeline's construction + every ask_stream() cache touchpoint
+        # would be a much bigger refactor for no real benefit — a local
+        # Redis round-trip is sub-millisecond, same order of magnitude as
+        # the blocking file I/O it replaces, which this same code path
+        # already did synchronously with no complaint.
+        self._redis = _redis_sync.from_url(redis_url, decode_responses=True)
         self._ttl  = ttl_seconds
         self._max  = max_entries
         self._sem_threshold = sem_threshold
@@ -151,7 +184,7 @@ class QueryKVCache:
             entry["query_embedding"] = query_embedding.tolist()
         self._data[key] = entry
         self._emb_dirty = True
-        self._save()
+        self._save_entry(key, entry)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API — semantic
@@ -271,24 +304,26 @@ class QueryKVCache:
     def invalidate(self, key: str) -> None:
         self._data.pop(key, None)
         self._emb_dirty = True
-        self._save()
+        self._delete_entries([key])
 
     def flush(self) -> int:
         now = time.time()
         before = len(self._data)
+        expired_keys = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
         self._data = {k: v for k, v in self._data.items() if now - v["ts"] <= self._ttl}
         removed = before - len(self._data)
         if removed:
             self._emb_dirty = True
-            self._save()
+            self._delete_entries(expired_keys)
         return removed
 
     def clear(self) -> None:
+        keys = list(self._data.keys())
         self._data.clear()
         self._emb_matrix = None
         self._emb_keys   = []
         self._emb_dirty  = False
-        self._save()
+        self._delete_entries(keys)
 
     def stats(self) -> Dict[str, Any]:
         now = time.time()
@@ -305,7 +340,7 @@ class QueryKVCache:
             "ttl_seconds":      self._ttl,
             "max_entries":      self._max,
             "sem_threshold":    self._sem_threshold,
-            "cache_path":       self._path,
+            "backend":          "redis",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -342,50 +377,78 @@ class QueryKVCache:
         expired = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
         for k in expired:
             del self._data[k]
+        if expired:
+            self._delete_entries(expired)
         if len(self._data) < self._max:
             self._emb_dirty = True
             return
         oldest = min(self._data, key=lambda k: self._data[k].get("ts_last_hit", self._data[k]["ts"]))
         del self._data[oldest]
+        self._delete_entries([oldest])
         self._emb_dirty = True
 
-    def _save(self) -> None:
-        tmp = self._path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(self._path), exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"version": _CACHE_VERSION, "entries": self._data}, f)
-            os.replace(tmp, self._path)
-        except Exception as exc:
-            logger.warning("[KVCache] save failed: %s", exc)
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+    def _redis_key(self, key: str) -> str:
+        return f"{_KEY_PREFIX}{key}"
 
-    def _load(self) -> None:
-        if not os.path.exists(self._path):
+    def _save_entry(self, key: str, entry: Dict[str, Any]) -> None:
+        try:
+            payload = dict(entry)
+            payload["_v"] = _CACHE_VERSION
+            self._redis.set(self._redis_key(key), json.dumps(payload), ex=self._ttl)
+        except Exception as exc:
+            logger.warning("[KVCache] Redis save failed for key=%s...: %s", key[:12], exc)
+
+    def _delete_entries(self, keys: List[str]) -> None:
+        if not keys:
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if d.get("version") != _CACHE_VERSION:
-                logger.info("[KVCache] schema version changed — starting fresh")
-                return
-            self._data = d.get("entries", {})
-            self._emb_dirty = True
-            logger.info("[KVCache] loaded %d entries from %s", len(self._data), self._path)
-            # Prune expired entries immediately on load so stale answers from
-            # previous sessions are never served after a container restart.
-            now = time.time()
-            expired_keys = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
-            if expired_keys:
-                for k in expired_keys:
-                    del self._data[k]
-                self._emb_dirty = True
-                self._save()
-                logger.info("[KVCache] pruned %d expired entries on startup", len(expired_keys))
+            self._redis.delete(*[self._redis_key(k) for k in keys])
         except Exception as exc:
-            logger.warning("[KVCache] load failed (%s) — starting fresh", exc)
+            logger.warning("[KVCache] Redis delete failed for %d key(s): %s", len(keys), exc)
+
+    def _load(self) -> None:
+        """Hydrate self._data from every kv:* key in Redis at startup —
+        Redis's own TTL means most staleness is already handled server-side
+        (an entry whose TTL fired simply won't exist to SCAN), but the
+        version + ts checks below stay as a backstop the exact same way
+        the old file-based _load() checked schema version and pruned
+        expired entries on load, in case TTL and ttl_seconds have drifted
+        (e.g. this process's KV_CACHE_TTL was shortened since the entry
+        was written, so Redis hasn't expired it yet but this process
+        should still treat it as stale)."""
+        try:
+            keys = list(self._redis.scan_iter(match=f"{_KEY_PREFIX}*"))
+        except Exception as exc:
+            logger.warning("[KVCache] Redis scan failed (%s) — starting empty", exc)
+            return
+        if not keys:
+            return
+        try:
+            raw_values = self._redis.mget(keys)
+        except Exception as exc:
+            logger.warning("[KVCache] Redis mget failed (%s) — starting empty", exc)
+            return
+
+        now = time.time()
+        loaded, stale = 0, []
+        for redis_key, raw in zip(keys, raw_values):
+            if raw is None:
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if entry.pop("_v", None) != _CACHE_VERSION:
+                stale.append(redis_key[len(_KEY_PREFIX):])
+                continue
+            if now - entry.get("ts", 0) > self._ttl:
+                stale.append(redis_key[len(_KEY_PREFIX):])
+                continue
+            self._data[redis_key[len(_KEY_PREFIX):]] = entry
+            loaded += 1
+
+        self._emb_dirty = True
+        logger.info("[KVCache] loaded %d entries from Redis", loaded)
+        if stale:
+            self._delete_entries(stale)
+            logger.info("[KVCache] pruned %d stale entry(ies) on startup", len(stale))
