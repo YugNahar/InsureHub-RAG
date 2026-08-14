@@ -4181,6 +4181,15 @@ _NAMED_PAIR_ANSWER_PATTERN = re.compile(
 
 _LEADING_ARTICLE_RE = re.compile(r"^(?:the|an?)\s+", re.IGNORECASE)
 
+# English elides a shared trailing word off every item but the last: "crop
+# and livestock insurance" means "crop insurance and livestock insurance",
+# but _PHRASE only ever captures what's literally there, so group 1 comes
+# back as bare "crop" while group 2 keeps "livestock insurance" — an
+# asymmetric pair that then leaks straight into comparison-table column
+# headers ("Crop" next to "Livestock Insurance"). Confirmed live. Reconstruct
+# the elided word onto whichever side is missing it.
+_ELIDED_SUFFIX_RE = re.compile(r"\s+(insurance|policy|policies|coverage)$", re.IGNORECASE)
+
 # Term names from insurance_terms_glossary.pdf ([[project_insurance_glossary_and_pipeline_check]]),
 # restricted to entries that _PHRASE can actually capture (1-2 whitespace
 # words — a hyphenated word like "co-payment" or "free-look" counts as
@@ -4217,6 +4226,11 @@ def _extract_named_pair(text: str, patterns: List[re.Pattern]) -> Optional[Tuple
         # noun phrase.
         a = _LEADING_ARTICLE_RE.sub("", m.group(1).strip())
         b = _LEADING_ARTICLE_RE.sub("", m.group(2).strip())
+        a_suffix, b_suffix = _ELIDED_SUFFIX_RE.search(a), _ELIDED_SUFFIX_RE.search(b)
+        if b_suffix and not a_suffix:
+            a += b_suffix.group(0)
+        elif a_suffix and not b_suffix:
+            b += a_suffix.group(0)
         if a and b and a.lower() != b.lower():
             return a, b
     return None
@@ -4384,11 +4398,16 @@ confirm which of the two names it names before placing the value.
 
 STEP 2 — add one example row, always, no exceptions. After ALL of the STEP 1 rows (not
 after each one — exactly one Example row total for the whole table, no matter how many
-STEP 1 rows you wrote), add exactly one more row, labeled "Example", giving a short,
-concrete illustrative figure for EACH side — a plain number/amount plus a few words of
-context (e.g. "$500 hospital bill"), not a full sentence. Unlike STEP 1, this row does NOT
-need to come from the ANSWER text — if the ANSWER already states a real example figure for
-both sides, use that; otherwise invent one plausible, representative figure for each side,
+STEP 1 rows you wrote), add exactly one more row, labeled "Example", giving one short,
+concrete real-world SCENARIO sentence for EACH side — a brief situation a reader can
+picture, with a specific figure worked naturally into it, not a bare fragment like "$500
+hospital bill" or "$30,000 car value" (confirmed live: users found bare fragments
+unhelpfully terse next to how this app explains examples everywhere else; the target
+shape is one full sentence like "A driver causes a minor collision and their motor
+insurance covers the $2,000 repair after their $500 deductible" — a person/situation in
+it, not just a number). Unlike STEP 1, this row does NOT need to come from the ANSWER
+text — if the ANSWER already states a real example scenario for both sides, adapt it into
+one sentence each; otherwise invent one plausible, representative scenario for each side,
 specifically about {name_a} and {name_b} (it only needs to help the reader picture the
 comparison, not be a real quoted rate). This step is mandatory even if STEP 1 produced no
 rows at all. Never leave either side of the Example row as "Not specified" or blank.
