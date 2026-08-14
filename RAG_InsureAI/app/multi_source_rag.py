@@ -899,7 +899,7 @@ async def _classify_type_query_shape_llm(question: str) -> bool:
     """
     try:
         prompt = _TYPE_SHAPE_PROMPT.format(question=question)
-        raw = await _backend_completion(prompt, max_tokens=6, timeout=4)
+        raw = await _backend_completion(prompt, max_tokens=6, timeout=10)
         if not raw:
             return False
         return raw.strip().upper().startswith("DECISION")
@@ -1043,7 +1043,7 @@ async def _classify_modifier_intent_llm(question: str) -> tuple[bool, bool, bool
     """
     try:
         prompt = _MODIFIER_INTENT_PROMPT.format(question=question)
-        raw = await _backend_completion(prompt, max_tokens=20, timeout=4)
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=10)
         if not raw:
             return (False, False, False)
         raw_l = raw.lower()
@@ -1155,6 +1155,25 @@ _FOLLOWUP_KEYWORDS = frozenset({
 })
 
 
+# The vLLM backend is shared, slow (~7-8 tok/s, confirmed live), and a
+# single ask_stream request already makes many sequential calls to it
+# (query classification, topic extraction, contextualization, the main
+# answer, then — for comparison queries — depth-balancing, list
+# formatting, and table reformatting on top). Confirmed live 2026-08-14:
+# a burst of back-to-back test requests produced 3x more backend timeout
+# warnings than the same window under normal light use — extra concurrent
+# requests were queueing on top of each other on this one backend, and
+# the tightest per-call timeouts (sized for near-instant response) had no
+# slack left once a request had to wait its turn. Capping how many
+# requests THIS PROCESS sends to vLLM at once means the (N+1)th request
+# waits here, in an asyncio queue, instead of piling up unbounded on the
+# backend and timing out. Does not apply to Groq/manual — those are
+# different services without this shared-capacity constraint.
+_VLLM_CONCURRENCY_LIMIT = int(os.getenv("VLLM_CONCURRENCY_LIMIT", "4"))
+_vllm_semaphore = asyncio.Semaphore(_VLLM_CONCURRENCY_LIMIT)
+_unlimited_semaphore = asyncio.Semaphore(1000)
+
+
 async def _backend_completion(
     prompt: str, max_tokens: int, timeout: float, temperature: float = 0,
     backend_override: Optional[str] = None,
@@ -1215,30 +1234,32 @@ async def _backend_completion(
         "temperature": temperature,
         "stream": False,
     }
+    sem = _vllm_semaphore if backend == "vllm" else _unlimited_semaphore
     try:
-        async with _ah.ClientSession() as session:
-            async with session.post(
-                url, json=payload, headers=headers,
-                timeout=_ah.ClientTimeout(total=timeout),
-            ) as resp:
-                if resp.status != 200:
-                    # Silently returning None here (as before) is indistinguishable
-                    # from a network blip or timeout in logs — every caller treats
-                    # it as "the model said no" and refuses, so a sustained
-                    # condition (e.g. a rate/quota limit) looks identical to
-                    # ordinary occasional flakiness with no way to tell them apart
-                    # short of manually replaying the exact request outside the
-                    # app. Logging status + body once per failure costs nothing
-                    # on the happy path and turns "everything is mysteriously
-                    # refusing" into an immediately diagnosable log line.
-                    body = await resp.text()
-                    logger.warning(
-                        "[_backend_completion] %s returned status=%s (backend=%s model=%s): %s",
-                        url, resp.status, backend, model, body[:300],
-                    )
-                    return None
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
+        async with sem:
+            async with _ah.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, headers=headers,
+                    timeout=_ah.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        # Silently returning None here (as before) is indistinguishable
+                        # from a network blip or timeout in logs — every caller treats
+                        # it as "the model said no" and refuses, so a sustained
+                        # condition (e.g. a rate/quota limit) looks identical to
+                        # ordinary occasional flakiness with no way to tell them apart
+                        # short of manually replaying the exact request outside the
+                        # app. Logging status + body once per failure costs nothing
+                        # on the happy path and turns "everything is mysteriously
+                        # refusing" into an immediately diagnosable log line.
+                        body = await resp.text()
+                        logger.warning(
+                            "[_backend_completion] %s returned status=%s (backend=%s model=%s): %s",
+                            url, resp.status, backend, model, body[:300],
+                        )
+                        return None
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"].strip()
     except Exception as exc:
         logger.warning("[_backend_completion] request to %s failed (backend=%s): %s", url, backend, exc)
         return None
@@ -2694,7 +2715,7 @@ Conversation:
 
 Follow-up: {question}
 Search query:"""
-    reformulated = await _backend_completion(prompt, max_tokens=30, timeout=4)
+    reformulated = await _backend_completion(prompt, max_tokens=30, timeout=10)
     if reformulated:
         reformulated = reformulated.strip().strip('"\'')
         if len(reformulated) >= 3:
@@ -2848,7 +2869,7 @@ async def _extract_intent_topics(question: str) -> set[str]:
     """
     try:
         prompt = _INTENT_PROMPT.format(question=question)
-        raw = await _backend_completion(prompt, max_tokens=60, timeout=5)
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=15)
         if not raw:
             return set()
 
@@ -2933,7 +2954,7 @@ Use the EXACT label word above (e.g. "motor", not "car" or "auto"; "home", not "
 QUESTION: {query}
 
 Reply with ONLY the label word, nothing else."""
-        raw = await _backend_completion(prompt, max_tokens=10, timeout=3)
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=10)
         if not raw:
             return "general"
         label = re.split(r"[\s\n,.:;()]", raw.strip().lower())[0]
@@ -2990,7 +3011,7 @@ Available types:
 QUESTION: {query}
 
 Reply with the label word(s), comma-separated, nothing else."""
-        raw = await _backend_completion(prompt, max_tokens=15, timeout=4)
+        raw = await _backend_completion(prompt, max_tokens=15, timeout=10)
         if not raw:
             return []
         parts = [p.strip() for p in raw.strip().lower().split(",") if p.strip()]
@@ -3251,7 +3272,7 @@ async def _verify_grounding(question: str, context: str, backend_override: Optio
         "Answer with a single word: YES or NO."
     )
     try:
-        raw = await _backend_completion(prompt, max_tokens=10, timeout=4.0, backend_override=backend_override)
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=10.0, backend_override=backend_override)
         if not raw:
             return False
         cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
@@ -3354,7 +3375,7 @@ async def _contextualize_query(question: str, history: str) -> str:
         "nothing else."
     )
     try:
-        raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=15.0)
         if not raw or not raw.strip():
             return question
         return raw.strip()
@@ -3389,7 +3410,7 @@ async def _extract_pasted_followup(question: str) -> Tuple[Optional[str], str]:
         "no pasted block, respond with exactly: NONE"
     )
     try:
-        raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=15.0)
     except Exception:
         return None, question
     if not raw or not raw.strip():
@@ -4382,7 +4403,14 @@ step — only restructure what the ANSWER already says, about {name_a} and {name
 specifically and no other product. Never invent a number or amount in this step either —
 every figure in a STEP 1 row must appear in the ANSWER text verbatim; if you want to state an
 amount that isn't in the ANSWER, that only belongs in the Example row from STEP 2, never
-here. If you notice yourself about to write a fact about some other insurance type, stop —
+here. The same rule applies to LISTS, not just numbers: if a row restates something the
+ANSWER enumerates — which methods, types, categories, or items something covers or
+involves — include only the items the ANSWER itself names, never an extra item of your
+own on top, even one that would obviously belong on that kind of list in general (confirmed
+live: a "modes of transport" row correctly carried over the ANSWER's own list, then added
+two more transport methods that were never in the ANSWER at all — invented because they're
+common real-world examples of the category, not because the source said so). If you notice
+yourself about to write a fact about some other insurance type, stop —
 it does not belong in this table. If the ANSWER only states
 a fact for one side of a real attribute, use "Not specified" for the other side's value on
 that row rather than guessing — but never label the row with {name_a} or {name_b} themselves,
@@ -4399,13 +4427,15 @@ confirm which of the two names it names before placing the value.
 STEP 2 — add one example row, always, no exceptions. After ALL of the STEP 1 rows (not
 after each one — exactly one Example row total for the whole table, no matter how many
 STEP 1 rows you wrote), add exactly one more row, labeled "Example", giving one short,
-concrete real-world SCENARIO sentence for EACH side — a brief situation a reader can
-picture, with a specific figure worked naturally into it, not a bare fragment like "$500
-hospital bill" or "$30,000 car value" (confirmed live: users found bare fragments
-unhelpfully terse next to how this app explains examples everywhere else; the target
-shape is one full sentence like "A driver causes a minor collision and their motor
-insurance covers the $2,000 repair after their $500 deductible" — a person/situation in
-it, not just a number). Unlike STEP 1, this row does NOT need to come from the ANSWER
+concrete real-world SCENARIO sentence for EACH side, each with its OWN specific invented
+figure worked in naturally. Neither a bare fragment like "$500 hospital bill" nor a
+scenario with no number at all is acceptable — every Example value needs both a
+situation AND a figure, always, for both sides. Right shape (never reuse this wording or
+the $15, it is a deliberately unrelated non-insurance example only to show the shape —
+one that names a real insurance type gets copied verbatim into real answers about that
+same type instead of prompting the model to invent its own, confirmed live): "A
+commuter's train is delayed by two hours and the rail operator refunds $15 of their
+ticket." Unlike STEP 1, this row does NOT need to come from the ANSWER
 text — if the ANSWER already states a real example scenario for both sides, adapt it into
 one sentence each; otherwise invent one plausible, representative scenario for each side,
 specifically about {name_a} and {name_b} (it only needs to help the reader picture the
@@ -5011,7 +5041,7 @@ async def _split_compound_question(question: str) -> Optional[tuple[str, str]]:
         "each question stands alone with no other context needed.\n"
         "Output only the two questions, one per line, no numbering, no labels, no explanation:"
     )
-    raw = await _backend_completion(prompt, max_tokens=60, timeout=4.0)
+    raw = await _backend_completion(prompt, max_tokens=60, timeout=15.0)
     if not raw:
         return None
     lines = [ln.strip().strip('"') for ln in raw.strip().split("\n") if ln.strip()]
@@ -7486,7 +7516,7 @@ class MultiSourceRAG:
                     f"definition. You can use your own general knowledge; this word doesn't need "
                     f"to come from any document."
                 )
-                _meaning_answer = await _backend_completion(_meaning_prompt, max_tokens=120, timeout=10.0)
+                _meaning_answer = await _backend_completion(_meaning_prompt, max_tokens=120, timeout=20.0)
                 if _meaning_answer and _meaning_answer.strip():
                     yield _meaning_answer.strip()
                     yield "\n\n" + _json_s.dumps({"sources": [], "done": True, "needs_human": False})
