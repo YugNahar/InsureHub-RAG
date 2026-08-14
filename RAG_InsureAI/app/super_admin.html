@@ -175,7 +175,7 @@
   .settings-card h3{font-size:.95rem;font-weight:700;margin-bottom:16px;color:var(--text)}
   .settings-card label{font-size:.8rem;font-weight:600;color:var(--text);display:block;margin-bottom:4px}
   .settings-card .field-group{margin-top:12px}
-  .settings-card input[type="text"],.settings-card input[type="password"]{background:var(--bg);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text);padding:10px 14px;font-size:.9rem;outline:none;width:100%;margin-top:4px;box-sizing:border-box;transition:border-color .15s,box-shadow .15s}
+  .settings-card input[type="text"],.settings-card input[type="password"],.settings-card input[type="email"]{background:var(--bg);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text);padding:10px 14px;font-size:.9rem;outline:none;width:100%;margin-top:4px;box-sizing:border-box;transition:border-color .15s,box-shadow .15s}
   .settings-card input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-light)}
   .settings-card .radio-group{display:flex;gap:18px;flex-wrap:wrap;margin-top:8px}
   .settings-card .radio-group label{display:flex;align-items:center;gap:6px;font-size:.85rem;font-weight:400;color:var(--text);cursor:pointer}
@@ -190,6 +190,24 @@
   .settings-card .save-result.error{color:var(--red);display:block}
   .settings-card .btn-save{background:var(--accent);color:#fff;border:none;border-radius:var(--radius-sm);padding:10px 24px;font-size:.85rem;font-weight:600;cursor:pointer;margin-top:18px;transition:background .15s}
   .settings-card .btn-save:hover{background:var(--accent2)}
+  .settings-card .btn-save:disabled{opacity:.55;cursor:not-allowed}
+
+  /* Agent-emails (escalation recipients) card */
+  .settings-card .hint{font-size:.8rem;color:var(--muted);margin-bottom:14px;line-height:1.4}
+  #ae-list{display:flex;flex-direction:column;gap:6px;margin-bottom:16px;max-height:220px;overflow-y:auto}
+  .ae-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)}
+  .ae-row .ae-info{display:flex;flex-direction:column;gap:1px;overflow:hidden;min-width:0}
+  .ae-row .ae-name{font-size:.85rem;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ae-row .ae-email{font-size:.75rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ae-row .ae-del{background:none;border:none;color:var(--red);cursor:pointer;font-size:.76rem;font-weight:600;padding:5px 9px;border-radius:6px;flex-shrink:0}
+  .ae-row .ae-del:hover{background:var(--red-light)}
+  .ae-empty{font-size:.83rem;color:var(--muted);padding:6px 0}
+  .ae-add-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .ae-add-row .field-group{flex:1;min-width:140px;margin-top:0}
+  .ae-add-row .btn-save{margin-top:0;flex-shrink:0}
+  .ae-upload-section{border-top:1px solid var(--border);margin-top:18px;padding-top:16px}
+  .ae-upload-row{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
+  .ae-upload-row input[type="file"]{font-size:.8rem;color:var(--text)}
 
   /* =====================================================================
      Responsive — sidebar becomes an off-canvas drawer below 860px, same
@@ -286,6 +304,68 @@
           <div class="active-backend" id="bs-active-backend">Currently active: <strong id="bs-active-label">—</strong></div>
           <button class="btn-save" id="bs-save-btn">Save</button>
           <div class="save-result" id="bs-result"></div>
+        </div>
+
+        <div class="settings-card" id="email-sender-card">
+          <h3>Escalation Email Sender</h3>
+          <p class="hint">This is the mailbox escalation and quotation emails actually send FROM. If it ever starts rejecting the current credentials, update it here — it takes effect on the very next email, no server restart needed. Both providers are kept available since either might end up sending.</p>
+
+          <label>Email provider</label>
+          <div class="radio-group" id="es-provider">
+            <label><input type="radio" name="es-provider" value="gmail" /> Gmail</label>
+            <label><input type="radio" name="es-provider" value="outlook" /> Microsoft Outlook / Office 365</label>
+          </div>
+
+          <div class="field-group">
+            <label for="es-sender">Sender email address</label>
+            <input type="email" id="es-sender" placeholder="you@example.com" />
+          </div>
+
+          <div class="field-group">
+            <label for="es-app-password">App Password</label>
+            <input type="password" id="es-app-password" placeholder="leave blank to keep current" autocomplete="new-password" />
+            <div id="es-app-password-set" class="api-key-set" style="display:none">✓ App Password is set</div>
+            <p class="hint" id="es-hint-gmail" style="margin:8px 0 0">
+              This is <strong>not</strong> the sender's normal Gmail login password — Gmail refuses that for this kind of sign-in. It's a separate 16-character code Google generates just for apps like this one.
+              To get one: open <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">myaccount.google.com/apppasswords</a> while signed into the sender's Gmail account (2-Step Verification must already be turned on — Google won't offer this option otherwise), create a password for "Mail", and paste the 16 characters it shows you here. Spaces don't matter. Google only shows it once, so copy it right away.
+            </p>
+            <p class="hint" id="es-hint-outlook" style="margin:8px 0 0;display:none">
+              This is <strong>not</strong> the sender's normal Outlook password either — it's a separate App Password Microsoft generates the same way, once 2-step verification is turned on. Personal (outlook.com/hotmail) accounts: generate one at <a href="https://account.live.com/proofs/AppPassword" target="_blank" rel="noopener noreferrer">account.live.com/proofs/AppPassword</a>. Work/school (Microsoft 365) accounts: ask whoever manages that — some organizations also need SMTP AUTH turned on for this specific mailbox in the Microsoft 365 admin center, separately from the App Password, or the login will keep failing even with the right password.
+            </p>
+          </div>
+
+          <div class="active-backend" id="es-active-sender">Currently sending from: <strong id="es-active-label">—</strong> <span id="es-active-provider"></span></div>
+          <button class="btn-save" id="es-save-btn">Save</button>
+          <div class="save-result" id="es-result"></div>
+        </div>
+
+        <div class="settings-card" id="agent-emails-card">
+          <h3>Escalation Email Recipients</h3>
+          <p class="hint">Whenever a question can't be answered and no agent is online, an email goes out to everyone in this list — add as many agents as you need, there's no limit.</p>
+
+          <div id="ae-list"></div>
+
+          <div class="ae-add-row">
+            <div class="field-group">
+              <label for="ae-name">Name (optional)</label>
+              <input type="text" id="ae-name" placeholder="e.g. Priya Shah" />
+            </div>
+            <div class="field-group">
+              <label for="ae-email">Email</label>
+              <input type="email" id="ae-email" placeholder="agent@example.com" />
+            </div>
+            <button class="btn-save" id="ae-add-btn">Add agent</button>
+          </div>
+
+          <div class="ae-upload-section">
+            <label for="ae-file-input">Or upload a document (.csv or .xlsx) — needs an "email" column, a "name" column is optional</label>
+            <div class="ae-upload-row">
+              <input type="file" id="ae-file-input" accept=".csv,.xlsx" />
+              <button class="btn-save" id="ae-upload-btn">Upload</button>
+            </div>
+          </div>
+
+          <div class="save-result" id="ae-result"></div>
         </div>
       </div>
     </div>
@@ -394,9 +474,11 @@ function switchSidebarMode(mode) {
   if (mode === 'sessions') {
     renderSidebarSessions();
   } else if (mode === 'settings') {
-    document.getElementById('main-title').textContent = 'Backend Settings';
+    document.getElementById('main-title').textContent = 'Settings';
     document.getElementById('backend-settings').style.display = '';
     loadBackendSettings();
+    loadEmailSenderSettings();
+    loadAgentEmails();
   } else {
     document.getElementById('main-title').textContent = 'Overview';
     document.getElementById('welcome-view').style.display = '';
@@ -1130,6 +1212,263 @@ document.getElementById('bs-save-btn').onclick = async () => {
     resultEl.className = 'save-result error';
     resultEl.textContent = 'Failed to save: ' + ex.message;
     resultEl.style.display = 'block';
+  }
+};
+
+// ── Escalation Email Sender ──────────────────────────────────────────────────
+const _ES_PROVIDER_LABELS = { gmail: 'Gmail', outlook: 'Outlook / Office 365' };
+
+function _esApplyProvider(provider) {
+  document.querySelectorAll('#es-provider input[type="radio"]').forEach(el => {
+    el.checked = el.value === provider;
+  });
+  document.getElementById('es-hint-gmail').style.display = provider === 'gmail' ? '' : 'none';
+  document.getElementById('es-hint-outlook').style.display = provider === 'outlook' ? '' : 'none';
+}
+
+// Radio toggle — show/hide the matching App Password guidance immediately,
+// same UX as Backend Settings' manual-fields toggle, even before saving.
+document.getElementById('es-provider').addEventListener('change', e => {
+  _esApplyProvider(e.target.value);
+});
+
+async function loadEmailSenderSettings() {
+  const resultEl = document.getElementById('es-result');
+  resultEl.style.display = 'none';
+  try {
+    const r = await fetch('/super-admin/email-settings', {
+      headers: { 'X-Super-Admin-Token': token },
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.className = 'save-result error';
+      resultEl.textContent = data.detail || 'Failed to load sender settings';
+      resultEl.style.display = 'block';
+      return;
+    }
+    _esApplyProvider(data.provider || 'gmail');
+    document.getElementById('es-sender').value = data.sender || '';
+    document.getElementById('es-app-password').value = '';
+    document.getElementById('es-app-password-set').style.display = data.app_password_set ? '' : 'none';
+    document.getElementById('es-active-label').textContent = data.sender || '—';
+    document.getElementById('es-active-provider').textContent = data.sender
+      ? `(${_ES_PROVIDER_LABELS[data.provider] || data.provider})` : '';
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to load sender settings: ' + ex.message;
+    resultEl.style.display = 'block';
+  }
+}
+
+document.getElementById('es-save-btn').onclick = async () => {
+  const resultEl = document.getElementById('es-result');
+  const btn = document.getElementById('es-save-btn');
+  resultEl.style.display = 'none';
+  let provider = 'gmail';
+  document.querySelectorAll('#es-provider input[type="radio"]').forEach(el => {
+    if (el.checked) provider = el.value;
+  });
+  const sender = document.getElementById('es-sender').value.trim();
+  const appPassword = document.getElementById('es-app-password').value.trim();
+  btn.disabled = true;
+  try {
+    const r = await fetch('/super-admin/email-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Super-Admin-Token': token },
+      body: JSON.stringify({ provider, sender, app_password: appPassword }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.className = 'save-result error';
+      resultEl.textContent = data.detail || 'Failed to save';
+      resultEl.style.display = 'block';
+      return;
+    }
+    _esApplyProvider(data.provider || 'gmail');
+    document.getElementById('es-sender').value = data.sender || '';
+    document.getElementById('es-app-password').value = '';
+    document.getElementById('es-app-password-set').style.display = data.app_password_set ? '' : 'none';
+    document.getElementById('es-active-label').textContent = data.sender || '—';
+    document.getElementById('es-active-provider').textContent = data.sender
+      ? `(${_ES_PROVIDER_LABELS[data.provider] || data.provider})` : '';
+    resultEl.className = 'save-result success';
+    resultEl.textContent = 'Saved ✓ Takes effect on the next email, right away.';
+    resultEl.style.display = 'block';
+    setTimeout(() => { resultEl.style.display = 'none'; }, 4000);
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to save: ' + ex.message;
+    resultEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// ── Agent Emails (escalation recipients) ────────────────────────────────────
+async function loadAgentEmails() {
+  const resultEl = document.getElementById('ae-result');
+  resultEl.style.display = 'none';
+  try {
+    const r = await fetch('/super-admin/agent-emails', {
+      headers: { 'X-Super-Admin-Token': token },
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.className = 'save-result error';
+      resultEl.textContent = data.detail || 'Failed to load agent emails';
+      resultEl.style.display = 'block';
+      return;
+    }
+    renderAgentEmails(data.entries || []);
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to load agent emails: ' + ex.message;
+    resultEl.style.display = 'block';
+  }
+}
+
+function renderAgentEmails(entries) {
+  const list = document.getElementById('ae-list');
+  list.innerHTML = '';
+  if (!entries.length) {
+    list.innerHTML = '<div class="ae-empty">No recipients yet — add one below or upload a document.</div>';
+    return;
+  }
+  entries.forEach(e => {
+    const row = document.createElement('div');
+    row.className = 'ae-row';
+
+    const info = document.createElement('div');
+    info.className = 'ae-info';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'ae-name';
+    nameEl.textContent = e.name || e.email;
+    info.appendChild(nameEl);
+    if (e.name) {
+      const emailEl = document.createElement('div');
+      emailEl.className = 'ae-email';
+      emailEl.textContent = e.email;
+      info.appendChild(emailEl);
+    }
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'ae-del';
+    delBtn.textContent = 'Remove';
+    delBtn.onclick = () => deleteAgentEmail(e.email);
+
+    row.appendChild(info);
+    row.appendChild(delBtn);
+    list.appendChild(row);
+  });
+}
+
+document.getElementById('ae-add-btn').onclick = async () => {
+  const resultEl = document.getElementById('ae-result');
+  const btn = document.getElementById('ae-add-btn');
+  resultEl.style.display = 'none';
+  const nameInput = document.getElementById('ae-name');
+  const emailInput = document.getElementById('ae-email');
+  const name = nameInput.value.trim();
+  const email = emailInput.value.trim();
+  if (!email) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Enter an email address';
+    resultEl.style.display = 'block';
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/super-admin/agent-emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Super-Admin-Token': token },
+      body: JSON.stringify({ name, email }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.className = 'save-result error';
+      resultEl.textContent = data.detail || 'Failed to add';
+      resultEl.style.display = 'block';
+      return;
+    }
+    nameInput.value = '';
+    emailInput.value = '';
+    renderAgentEmails(data.entries || []);
+    resultEl.className = 'save-result success';
+    resultEl.textContent = 'Added ✓';
+    resultEl.style.display = 'block';
+    setTimeout(() => { resultEl.style.display = 'none'; }, 3000);
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to add: ' + ex.message;
+    resultEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+async function deleteAgentEmail(email) {
+  const resultEl = document.getElementById('ae-result');
+  resultEl.style.display = 'none';
+  try {
+    const r = await fetch('/super-admin/agent-emails/' + encodeURIComponent(email), {
+      method: 'DELETE',
+      headers: { 'X-Super-Admin-Token': token },
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.className = 'save-result error';
+      resultEl.textContent = data.detail || 'Failed to remove';
+      resultEl.style.display = 'block';
+      return;
+    }
+    renderAgentEmails(data.entries || []);
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to remove: ' + ex.message;
+    resultEl.style.display = 'block';
+  }
+}
+
+document.getElementById('ae-upload-btn').onclick = async () => {
+  const resultEl = document.getElementById('ae-result');
+  const btn = document.getElementById('ae-upload-btn');
+  const fileInput = document.getElementById('ae-file-input');
+  resultEl.style.display = 'none';
+  const file = fileInput.files[0];
+  if (!file) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Choose a .csv or .xlsx file first';
+    resultEl.style.display = 'block';
+    return;
+  }
+  const formData = new FormData();
+  formData.append('file', file);
+  btn.disabled = true;
+  try {
+    const r = await fetch('/super-admin/agent-emails/upload', {
+      method: 'POST',
+      headers: { 'X-Super-Admin-Token': token },
+      body: formData,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.className = 'save-result error';
+      resultEl.textContent = data.detail || 'Failed to upload';
+      resultEl.style.display = 'block';
+      return;
+    }
+    fileInput.value = '';
+    renderAgentEmails(data.entries || []);
+    resultEl.className = 'save-result success';
+    resultEl.textContent = `Added ${data.added} new recipient(s) ✓`;
+    resultEl.style.display = 'block';
+    setTimeout(() => { resultEl.style.display = 'none'; }, 4000);
+  } catch (ex) {
+    resultEl.className = 'save-result error';
+    resultEl.textContent = 'Failed to upload: ' + ex.message;
+    resultEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
   }
 };
 

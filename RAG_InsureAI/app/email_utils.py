@@ -17,8 +17,13 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
-GMAIL_SENDER    = os.getenv("GMAIL_SENDER", "")
-GMAIL_PASSWORD  = os.getenv("GMAIL_APP_PASSWORD", "")
+import email_settings
+
+# GMAIL_SENDER / GMAIL_APP_PASSWORD used to be frozen module-level
+# constants read once at import — moved to email_settings.get_sender() /
+# get_app_password() (Super Admin panel, 2026-08-14) so a credential
+# rotation takes effect on the very next send, no restart needed. Every
+# use below is a live call, not a cached value.
 # Legacy single-recipient fallback — only used if the agent-emails database
 # file itself doesn't exist yet (first-time setup). Once the file exists, it
 # is the sole source of truth, even if that means it's empty.
@@ -42,6 +47,34 @@ _LLM_MAX_TOKENS = 450
 _SMTP_TIMEOUT_S = 10
 
 
+def _smtp_send(sender: str, password: str, recipients: List[str], msg) -> None:
+    """Connects, authenticates, and sends via whichever provider is
+    currently configured (email_settings.get_provider()) — Gmail wants
+    SMTP_SSL on port 465; Outlook/Office 365 wants plain SMTP + STARTTLS
+    on port 587. Both providers still just take a mailbox address + an
+    App Password, so nothing else about the caller changes.
+
+    Note for Outlook/Office 365 specifically: Microsoft disabled SMTP AUTH
+    tenant-wide by default a few years back — if login fails with an
+    authentication error even though the App Password is definitely
+    correct, an admin needs to explicitly re-enable SMTP AUTH for that
+    mailbox in the Microsoft 365 admin center first. Not something this
+    code can detect or work around.
+    """
+    cfg = email_settings.PROVIDERS.get(
+        email_settings.get_provider(), email_settings.PROVIDERS["gmail"]
+    )
+    if cfg["mode"] == "ssl":
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=_SMTP_TIMEOUT_S) as server:
+            server.login(sender, password)
+            server.sendmail(sender, recipients, msg.as_string())
+    else:  # "starttls"
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=_SMTP_TIMEOUT_S) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, recipients, msg.as_string())
+
+
 def _get_composer_client():
     """vLLM only (see note above) — returns (client, model) via the shared
     remote host, or (None, None) if VLLM_HOST isn't configured. Timeout and
@@ -63,13 +96,18 @@ AGENT_EMAILS_FILE = os.getenv(
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def _load_agent_emails() -> List[str]:
-    """Read the current list of agent recipient emails from AGENT_EMAILS_FILE.
+def _load_agent_email_entries() -> List[dict]:
+    """Read {"name", "email"} entries from AGENT_EMAILS_FILE — email in
+    column A (unchanged position, so any external tooling/exports that
+    only ever knew about the single-column legacy file still work), name
+    in column B (new, optional — blank for legacy rows or a bulk upload
+    that only had an email column).
 
-    Re-reads the file from disk on every call (no caching) so edits — adding
-    or removing a row — take effect on the very next email sent, without
-    needing a restart. Returns [] if the file is missing, unreadable, or has
-    no valid email rows; callers decide how to handle an empty list.
+    Re-reads the file from disk on every call (no caching) so edits take
+    effect on the very next read/send without needing a restart. Returns
+    [] if the file is missing, unreadable, or has no valid email rows.
+    No limit on how many rows this returns — the super-admin panel and the
+    send path both handle however many agents are actually in the file.
     """
     if not os.path.exists(AGENT_EMAILS_FILE):
         return []
@@ -77,24 +115,96 @@ def _load_agent_emails() -> List[str]:
         import openpyxl
         wb = openpyxl.load_workbook(AGENT_EMAILS_FILE, read_only=True, data_only=True)
         ws = wb.active
-        emails: List[str] = []
+        entries: List[dict] = []
         seen = set()
-        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
-            cell = row[0]
-            if cell is None:
+        for row in ws.iter_rows(min_row=2, max_col=2, values_only=True):
+            email_cell = row[0] if len(row) > 0 else None
+            name_cell = row[1] if len(row) > 1 else None
+            if email_cell is None:
                 continue
-            email = str(cell).strip()
+            email = str(email_cell).strip()
             if not email or not _EMAIL_RE.match(email):
                 continue
             key = email.lower()
             if key in seen:
                 continue
             seen.add(key)
-            emails.append(email)
-        return emails
+            name = str(name_cell).strip() if name_cell is not None else ""
+            entries.append({"name": name, "email": email})
+        return entries
     except Exception:
         logger.exception("Failed to read agent-emails database at %s", AGENT_EMAILS_FILE)
         return []
+
+
+def _save_agent_email_entries(entries: List[dict]) -> None:
+    """Overwrite AGENT_EMAILS_FILE with the given entries — one row each,
+    email in column A, name in column B. Called by the super-admin panel's
+    add/remove/upload actions; the send path only ever reads afterward."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "agents"
+    ws.append(["email", "name"])
+    for e in entries:
+        ws.append([e["email"], e.get("name", "")])
+    wb.save(AGENT_EMAILS_FILE)
+
+
+def _parse_email_entries_from_bytes(data: bytes, filename: str) -> List[dict]:
+    """Parse an uploaded .csv or .xlsx file into [{"name", "email"}, ...].
+    Looks for "email"/"name" column headers case-insensitively, in
+    whatever order they appear; falls back to treating a headerless file
+    as a plain single-column list of emails (column A). Raises ValueError
+    for anything else (unsupported extension)."""
+    ext = os.path.splitext(filename)[1].lower()
+    rows: List[List[str]] = []
+    if ext in (".xlsx", ".xlsm"):
+        import io
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(values_only=True):
+            rows.append(["" if c is None else str(c).strip() for c in row])
+    elif ext == ".csv":
+        import csv
+        import io
+        text = data.decode("utf-8-sig", errors="replace")
+        rows = [[c.strip() for c in row] for row in csv.reader(io.StringIO(text))]
+    else:
+        raise ValueError("Only .csv or .xlsx files are supported")
+
+    rows = [r for r in rows if any(c for c in r)]
+    if not rows:
+        return []
+
+    header = [c.lower() for c in rows[0]]
+    has_header = "email" in header
+    email_col = header.index("email") if has_header else 0
+    name_col = header.index("name") if "name" in header else None
+    data_rows = rows[1:] if has_header else rows
+
+    entries: List[dict] = []
+    seen = set()
+    for row in data_rows:
+        if email_col >= len(row):
+            continue
+        email = row[email_col].strip()
+        if not email or not _EMAIL_RE.match(email):
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        name = row[name_col].strip() if name_col is not None and name_col < len(row) else ""
+        entries.append({"name": name, "email": email})
+    return entries
+
+
+def _load_agent_emails() -> List[str]:
+    """Back-compat wrapper for the send path — just the email addresses,
+    in the same dedup'd order _load_agent_email_entries returns them."""
+    return [e["email"] for e in _load_agent_email_entries()]
 
 
 def _safe(text: str) -> str:
@@ -275,21 +385,24 @@ The full conversation transcript is attached as a PDF for your review.</p>
 
 def send_escalation_email(session_id: str, history, unanswerable_query: str) -> bool:
     """
-    Generate PDF + compose email body with LLM + send via Gmail SMTP to every
-    agent listed in the agent-emails database (AGENT_EMAILS_FILE).
+    Generate PDF + compose email body with LLM + send via SMTP (Gmail or
+    Outlook/Office 365, whichever is configured) to every agent listed in
+    the agent-emails database (AGENT_EMAILS_FILE).
 
-    No per-agent credentials are needed — the system sends FROM its own
-    GMAIL_SENDER account TO every address the database currently lists, so
-    adding or removing a row there changes who receives escalations without
-    touching any code or credentials.
+    No per-agent credentials are needed — the system sends FROM one shared
+    sender account (configurable in the Super Admin panel) TO every address
+    the database currently lists, so adding or removing a row there changes
+    who receives escalations without touching any code or credentials.
 
     Returns True on success, False on failure or if there are no recipients
     (logs the reason either way).
     """
-    if not GMAIL_SENDER or not GMAIL_PASSWORD:
+    sender, password = email_settings.get_sender(), email_settings.get_app_password()
+    if not sender or not password:
         logger.warning(
-            "Email escalation skipped — GMAIL_SENDER / GMAIL_APP_PASSWORD not set. "
-            "Add these to your .env to enable email notifications."
+            "Email escalation skipped — no sender/app password configured. "
+            "Set these in Super Admin > Settings > Escalation Email Sender "
+            "(or GMAIL_SENDER/GMAIL_APP_PASSWORD or OUTLOOK_SENDER/OUTLOOK_APP_PASSWORD in .env)."
         )
         return False
 
@@ -311,11 +424,11 @@ def send_escalation_email(session_id: str, history, unanswerable_query: str) -> 
         body_html = compose_email_body(session_id, history, unanswerable_query)
 
         msg = MIMEMultipart("mixed")
-        msg["From"]    = GMAIL_SENDER
+        msg["From"]    = sender
         # Real recipients go in Bcc (the SMTP envelope below, not a visible
         # header) so agents don't see each other's addresses. "To" needs
         # *some* address to be a well-formed message — use the sender's own.
-        msg["To"]      = GMAIL_SENDER
+        msg["To"]      = sender
         msg["Subject"] = f"[InsureHub] User Needs Help — Session #{session_id}"
 
         # HTML body
@@ -331,9 +444,7 @@ def send_escalation_email(session_id: str, history, unanswerable_query: str) -> 
                         filename=f"insurehub_session_{session_id}.pdf")
         msg.attach(part)
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT_S) as server:
-            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_SENDER, recipients, msg.as_string())
+        _smtp_send(sender, password, recipients, msg)
 
         logger.info(
             "Escalation email sent for session %s → %d agent(s): %s",
@@ -427,22 +538,23 @@ def send_quotation_email(to_email: str, subject: str, body_html: str) -> bool:
     path's Bcc-to-internal-agents trick) and carries no attachment. Returns
     False on any failure rather than raising — the caller decides how to
     surface that to the user."""
-    if not GMAIL_SENDER or not GMAIL_PASSWORD:
+    sender, password = email_settings.get_sender(), email_settings.get_app_password()
+    if not sender or not password:
         logger.warning(
-            "Quotation email skipped — GMAIL_SENDER / GMAIL_APP_PASSWORD not set."
+            "Quotation email skipped — no sender/app password configured "
+            "(Super Admin > Settings > Escalation Email Sender, or GMAIL_SENDER/GMAIL_APP_PASSWORD "
+            "or OUTLOOK_SENDER/OUTLOOK_APP_PASSWORD in .env)."
         )
         return False
 
     try:
         msg = MIMEMultipart("alternative")
-        msg["From"] = GMAIL_SENDER
+        msg["From"] = sender
         msg["To"] = to_email
         msg["Subject"] = subject
         msg.attach(MIMEText(_email_wrapper(body_html, title="✈️ InsureHub — Your Travel Insurance Quote"), "html"))
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT_S) as server:
-            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_SENDER, [to_email], msg.as_string())
+        _smtp_send(sender, password, [to_email], msg)
 
         logger.info("Quotation email sent to %s", to_email)
         return True

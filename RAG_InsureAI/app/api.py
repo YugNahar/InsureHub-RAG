@@ -626,6 +626,97 @@ async def super_admin_set_backend_settings(req: BackendSettingsRequest, token: s
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class EmailSettingsRequest(BaseModel):
+    provider: str = ""       # "gmail" | "outlook" — only sent when changing it
+    sender: str = ""         # only sent when the admin is setting/changing it
+    app_password: str = ""   # only sent when the admin is setting/changing it
+
+
+@app.get("/super-admin/email-settings")
+async def super_admin_get_email_settings(token: str = Depends(_check_super_admin)):
+    import email_settings
+    data = email_settings.get_email_settings()
+    data["providers"] = {k: v["label"] for k, v in email_settings.PROVIDERS.items()}
+    return data
+
+
+@app.post("/super-admin/email-settings")
+async def super_admin_set_email_settings(req: EmailSettingsRequest, token: str = Depends(_check_super_admin)):
+    import email_settings
+    if req.provider.strip() and req.provider.strip().lower() not in email_settings.PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {req.provider!r}")
+    if req.sender.strip() and "@" not in req.sender:
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid email address")
+    data = email_settings.set_email_settings(
+        provider=req.provider, sender=req.sender, app_password=req.app_password
+    )
+    data["providers"] = {k: v["label"] for k, v in email_settings.PROVIDERS.items()}
+    return data
+
+
+class AgentEmailAddRequest(BaseModel):
+    email: str
+    name: str = ""
+
+
+@app.get("/super-admin/agent-emails")
+async def super_admin_get_agent_emails(token: str = Depends(_check_super_admin)):
+    from email_utils import _load_agent_email_entries
+    return {"entries": _load_agent_email_entries()}
+
+
+@app.post("/super-admin/agent-emails")
+async def super_admin_add_agent_email(req: AgentEmailAddRequest, token: str = Depends(_check_super_admin)):
+    from email_utils import _EMAIL_RE, _load_agent_email_entries, _save_agent_email_entries
+    email = req.email.strip()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Not a valid email address")
+    entries = _load_agent_email_entries()
+    if any(e["email"].lower() == email.lower() for e in entries):
+        raise HTTPException(status_code=400, detail="That email is already in the list")
+    entries.append({"name": req.name.strip(), "email": email})
+    _save_agent_email_entries(entries)
+    return {"entries": entries}
+
+
+@app.delete("/super-admin/agent-emails/{email}")
+async def super_admin_delete_agent_email(email: str, token: str = Depends(_check_super_admin)):
+    from email_utils import _load_agent_email_entries, _save_agent_email_entries
+    entries = [e for e in _load_agent_email_entries() if e["email"].lower() != email.strip().lower()]
+    _save_agent_email_entries(entries)
+    return {"entries": entries}
+
+
+@app.post("/super-admin/agent-emails/upload")
+async def super_admin_upload_agent_emails(file: UploadFile = File(...), token: str = Depends(_check_super_admin)):
+    from email_utils import _load_agent_email_entries, _parse_email_entries_from_bytes, _save_agent_email_entries
+    data = await file.read()
+    try:
+        parsed = _parse_email_entries_from_bytes(data, file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not parsed:
+        raise HTTPException(status_code=400, detail="No valid email addresses found in that file")
+
+    # Merge rather than replace — uploading a file is treated the same as
+    # adding agents one at a time, so it can't silently wipe out entries a
+    # previous upload or manual add already put there. Existing entries
+    # win on a duplicate email (upload never overwrites a name that was
+    # already set).
+    entries = _load_agent_email_entries()
+    seen = {e["email"].lower() for e in entries}
+    added = 0
+    for p in parsed:
+        key = p["email"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(p)
+        added += 1
+    _save_agent_email_entries(entries)
+    return {"entries": entries, "added": added}
+
+
 @app.websocket("/ws/super-admin")
 async def ws_super_admin(websocket: WebSocket):
     await websocket.accept()
