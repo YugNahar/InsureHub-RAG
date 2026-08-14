@@ -247,17 +247,21 @@ a { color: var(--teal-600); }
 .msg__bubble code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 0.87em; }
 
 /* Ava quote-comparison table — real <table> markup (see buildComparisonTable()
-   in app.js), not markdown, since the chat bubble has no table renderer.
-   Horizontally scrollable: column headers (insurer + plan name) can be long
-   and the bubble itself is narrow. */
-.compare-table-wrap { margin-top: 10px; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
-.compare-table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); white-space: nowrap; }
-.compare-table th, .compare-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
-.compare-table thead th { background: var(--surface-2); font-weight: 700; color: var(--ink-text); }
-.compare-table thead th:first-child { background: var(--surface-2); }
-.compare-table tbody th { font-weight: 600; color: var(--text-muted); background: var(--surface-2); }
+   in app.js), not markdown, since the chat bubble has no table renderer. Also
+   used by Layla's RAG comparison_table replies, whose value cells can be a
+   full sentence (e.g. the Definition row) rather than Ava's short quote
+   values — table-layout: fixed + wrapping keeps those on-screen instead of
+   forcing one giant nowrap line that pushes the 2nd column off the visible
+   bubble width. overflow-x: auto on the wrap is a fallback for genuinely
+   many-column cases (comparing 4+ quotes) where even wrapping can't help. */
+.compare-table-wrap { margin-top: 10px; overflow-x: auto; max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.compare-table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); table-layout: fixed; }
+.compare-table th, .compare-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); overflow-wrap: break-word; word-break: break-word; }
+.compare-table thead th { background: var(--surface-2); font-weight: 700; color: var(--ink-text); min-width: 100px; }
+.compare-table thead th:first-child { background: var(--surface-2); width: 96px; min-width: 96px; }
+.compare-table tbody th { font-weight: 600; color: var(--text-muted); background: var(--surface-2); width: 96px; }
 .compare-table tbody tr:last-child th, .compare-table tbody tr:last-child td { border-bottom: none; }
-.compare-table td { color: var(--ink-text); }
+.compare-table td { color: var(--ink-text); min-width: 100px; }
 
 /* "Email me this quote" — attached below any quote-list assistant bubble
    (see buildEmailQuoteButton() in app.js). */
