@@ -1209,7 +1209,7 @@ async def _backend_completion(
     import aiohttp as _ah
     from router import (
         VLLM_HOST, VLLM_API_KEY, _resolve_vllm_model, _active_backend,
-        GROQ_API_KEY, GROQ_MODEL,
+        GROQ_API_KEY, GROQ_CLASSIFICATION_MODEL, GROQ_CLASSIFICATION_REASONING_EFFORT,
     )
     backend = backend_override or _active_backend()
     if backend == "vllm":
@@ -1217,8 +1217,13 @@ async def _backend_completion(
         model = _resolve_vllm_model()
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"}
     elif backend == "groq":
+        # Every caller of this function is a classification/extraction-
+        # shaped auxiliary call (query type, modifier intent, policy
+        # type, grounding check, contextualization, ...) — never Ava's
+        # live chat, which stays on GROQ_MODEL untouched. Safe to use
+        # the classification-specific model here unconditionally.
         url = "https://api.groq.com/openai/v1/chat/completions"
-        model = GROQ_MODEL
+        model = GROQ_CLASSIFICATION_MODEL
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"}
     elif backend == "manual":
         from router import _runtime_manual_api_key, _runtime_manual_base_url, _runtime_manual_model
@@ -1227,13 +1232,21 @@ async def _backend_completion(
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_runtime_manual_api_key}"}
     else:
         return None
+    # GROQ_CLASSIFICATION_MODEL is a reasoning model — see its own comment
+    # in router.py. Every call site here was tuned for the old non-
+    # reasoning model with max_tokens as low as 6, nowhere near enough
+    # headroom for reasoning tokens on top of the actual answer; raising
+    # the floor here (once, centrally) beats touching every call site.
+    _payload_max_tokens = max(max_tokens, 150) if backend == "groq" else max_tokens
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
+        "max_tokens": _payload_max_tokens,
         "temperature": temperature,
         "stream": False,
     }
+    if backend == "groq":
+        payload["reasoning_effort"] = GROQ_CLASSIFICATION_REASONING_EFFORT
     sem = _vllm_semaphore if backend == "vllm" else _unlimited_semaphore
     try:
         async with sem:

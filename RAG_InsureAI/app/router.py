@@ -24,8 +24,28 @@ logger = logging.getLogger(__name__)
 # ── Read env vars (no crash at import time) ────────────────────────────────────
 FORCE_BACKEND = os.getenv("FORCE_BACKEND", "").strip().lower()
 
+# Groq announced 2026-06-17 that llama-3.3-70b-versatile is deprecated,
+# shutdown date 2026-08-16 (confirmed via console.groq.com/docs/
+# deprecations) — still answering as of 2026-08-17 but past its stated
+# end-of-life. Default moved to openai/gpt-oss-120b, Groq's recommended
+# replacement, for both this (Ava's live chat + structured extraction —
+# see travel_bot/services/llm_service.py) and GROQ_CLASSIFICATION_MODEL
+# below. Unlike the old model it's a REASONING model — confirmed live
+# both use cases still work correctly (Ava's TravelInsuranceDetails/
+# CompanionTraveller function-calling extraction: correct fields, no
+# hallucination on empty input) as long as reasoning_effort is set and
+# max_tokens leaves headroom for reasoning tokens on top of the actual
+# output — see GROQ_CLASSIFICATION_REASONING_EFFORT below and
+# get_classification_llm's own comment for why that matters.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
+
+GROQ_CLASSIFICATION_MODEL = os.getenv("GROQ_CLASSIFICATION_MODEL", "openai/gpt-oss-120b").strip()
+# "low" still burns real tokens on internal reasoning before the actual
+# answer (confirmed live: 11-13 reasoning tokens even for a one-word
+# classification prompt) — callers need enough max_tokens headroom for
+# that on top of the answer itself, or the response comes back empty.
+GROQ_CLASSIFICATION_REASONING_EFFORT = os.getenv("GROQ_CLASSIFICATION_REASONING_EFFORT", "low").strip()
 
 VLLM_HOST  = os.getenv("VLLM_HOST", "").strip().rstrip("/")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "").strip()
@@ -242,8 +262,16 @@ def get_insurance_llm(temperature: float = 0, max_tokens: int = 0):
     if backend == "groq":
         from langchain_openai import ChatOpenAI
 
-        _mt = max_tokens if max_tokens > 0 else 500
-        logger.debug("[LLM] Groq model=%s max_tokens=%d", GROQ_MODEL, _mt)
+        # GROQ_MODEL is a reasoning model (see its own comment above) —
+        # same reasoning_effort/token-floor treatment as
+        # get_classification_llm, so this dormant opt-in path
+        # (FORCE_BACKEND=groq, normally left unset) doesn't silently
+        # return empty answers if someone flips it on for testing.
+        _mt = max(max_tokens, 150) if max_tokens > 0 else 500
+        logger.debug(
+            "[LLM] Groq model=%s max_tokens=%d reasoning_effort=%s",
+            GROQ_MODEL, _mt, GROQ_CLASSIFICATION_REASONING_EFFORT,
+        )
         return ChatOpenAI(
             model=GROQ_MODEL,
             base_url="https://api.groq.com/openai/v1",
@@ -252,6 +280,7 @@ def get_insurance_llm(temperature: float = 0, max_tokens: int = 0):
             max_tokens=_mt,
             timeout=60,
             max_retries=1,
+            reasoning_effort=GROQ_CLASSIFICATION_REASONING_EFFORT,
         )
 
     if backend == "vllm":
@@ -353,20 +382,34 @@ def get_classification_llm(temperature: float = 0, max_tokens: int = 0):
     routing) — prefers Groq whenever GROQ_API_KEY is configured,
     regardless of what get_insurance_llm()'s live-answer backend is set
     to. Falls back to get_insurance_llm() when Groq isn't configured, so
-    this still works in any environment without it."""
+    this still works in any environment without it.
+
+    Uses GROQ_CLASSIFICATION_MODEL, not GROQ_MODEL — the latter is Ava's
+    live-chat model and deliberately untouched by this swap (see the
+    comment above GROQ_CLASSIFICATION_MODEL's definition). That model is
+    a reasoning model, unlike the old one: the 150-token floor below
+    isn't headroom for a longer ANSWER, it's headroom for the internal
+    reasoning tokens the model spends before it even starts the actual
+    label — confirmed live, a bare max_tokens=6-60 (fine for the old
+    non-reasoning model) came back completely empty, every token spent
+    on reasoning that got cut off before reaching a real answer."""
     if GROQ_API_KEY:
         from langchain_openai import ChatOpenAI
 
-        _mt = max_tokens if max_tokens > 0 else 500
-        logger.debug("[LLM] Classification via Groq model=%s max_tokens=%d", GROQ_MODEL, _mt)
+        _mt = max(max_tokens, 150) if max_tokens > 0 else 500
+        logger.debug(
+            "[LLM] Classification via Groq model=%s max_tokens=%d reasoning_effort=%s",
+            GROQ_CLASSIFICATION_MODEL, _mt, GROQ_CLASSIFICATION_REASONING_EFFORT,
+        )
         return ChatOpenAI(
-            model=GROQ_MODEL,
+            model=GROQ_CLASSIFICATION_MODEL,
             base_url="https://api.groq.com/openai/v1",
             api_key=GROQ_API_KEY,
             temperature=temperature,
             max_tokens=_mt,
             timeout=60,
             max_retries=1,
+            reasoning_effort=GROQ_CLASSIFICATION_REASONING_EFFORT,
         )
     return get_insurance_llm(temperature=temperature, max_tokens=max_tokens)
 

@@ -41,14 +41,26 @@ class LLMService:
         groq_key = os.getenv("GROQ_API_KEY", "").strip()
         if groq_key:
             from langchain_openai import ChatOpenAI
+            from router import GROQ_CLASSIFICATION_REASONING_EFFORT
+            # GROQ_MODEL defaults to openai/gpt-oss-120b since 2026-08-17
+            # (llama-3.3-70b-versatile deprecated) — a reasoning model,
+            # unlike the old one. Confirmed live directly against this
+            # class's own extract_fields_from_conversation/
+            # extract_companion_traveller prompts + schemas: correct field
+            # extraction, correct empty-fields-on-nothing-to-extract
+            # behavior, no hallucination — as long as reasoning_effort is
+            # set and max_tokens leaves headroom for reasoning tokens on
+            # top of the actual structured output, same fix already
+            # applied to router.py's classification calls.
             return ChatOpenAI(
-                model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+                model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
                 base_url="https://api.groq.com/openai/v1",
                 api_key=groq_key,
                 temperature=temperature,
-                max_tokens=max_tokens if max_tokens > 0 else 500,
+                max_tokens=max(max_tokens, 150) if max_tokens > 0 else 500,
                 timeout=60,
                 max_retries=1,
+                reasoning_effort=GROQ_CLASSIFICATION_REASONING_EFFORT,
             )
         from router import get_insurance_llm
         return get_insurance_llm(temperature=temperature, max_tokens=max_tokens)
