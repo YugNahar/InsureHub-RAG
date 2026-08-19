@@ -4653,6 +4653,40 @@ TABLE:"""
     if _def_idx is not None and _def_idx != 0:
         rows.insert(0, rows.pop(_def_idx))
 
+    # Confirmed live (2026-08-19): despite the prompt's explicit "the FIRST
+    # value column is always {name_a}... even if the ANSWER's sentence
+    # about {name_a} happens to come later in the text" instruction, the
+    # reformat call still sometimes transcribes values in the ANSWER's own
+    # narrative order rather than by column identity — e.g. the ANSWER's
+    # prose discusses Premium first then Deductible, and despite columns
+    # being ["Deductible", "Premium"], every row's values[0] ends up
+    # describing Premium and values[1] ends up describing Deductible. A
+    # smaller model's positional bias winning out over an explicit identity
+    # instruction, not a prompt-wording gap — the Definition row's own
+    # mandatory "what {name_a} actually is" / "what {name_b} actually is"
+    # shape makes it a reliable, cheap diagnostic: a real Definition row
+    # opens with "A <name> is..."/"<name> is...", so checking which name
+    # each side's value actually opens with catches a whole-table swap
+    # directly, rather than trying to out-word the prompt further.
+    def _value_is_about(value: str, name: str) -> bool:
+        return bool(re.match(rf"^(?:a|an|the)?\s*{re.escape(name.strip().lower())}\b", value.strip().lower()))
+
+    _def_row = rows[0] if rows and rows[0]["label"].strip().lower() == "definition" else None
+    if _def_row is not None:
+        _val_a, _val_b = _def_row["values"]
+        _a_is_b = _value_is_about(_val_a, name_b)
+        _b_is_a = _value_is_about(_val_b, name_a)
+        _a_is_a = _value_is_about(_val_a, name_a)
+        _b_is_b = _value_is_about(_val_b, name_b)
+        if _a_is_b and _b_is_a and not _a_is_a and not _b_is_b:
+            logger.info(
+                "[ask_stream] comparison-table reformat swapped %s/%s — Definition row's "
+                "values[0] described %r, values[1] described %r; reversing every row's values",
+                name_a, name_b, name_b, name_a,
+            )
+            for r in rows:
+                r["values"] = [r["values"][1], r["values"][0]]
+
     if len(rows) < 2:
         logger.debug(
             "[ask_stream] comparison-table reformat produced %d usable row(s), keeping prose", len(rows)
