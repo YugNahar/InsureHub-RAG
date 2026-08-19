@@ -781,6 +781,38 @@ class TurboVecStore:
                 values.add(val)
         return sorted(values)
 
+    def get_by_source_page_range(self, source: str, page_min: int, page_max: int) -> List[Document]:
+        """Return every chunk from *source* whose 'page' metadata falls in
+        [page_min, page_max], regardless of semantic/BM25 relevance.
+
+        Built for "types of X" enumeration queries (see _resolve_modifier_intent
+        and _structural_detail in multi_source_rag.py): reranking scores each
+        chunk independently against the literal query text, so a source
+        document's own numbered list ("1) Term insurance... 2) Whole life...
+        3) Endowment... 4) Annuities...") gets split across the pool and only
+        the entries whose wording happens to echo the query most closely
+        survive a tight chunk_limit — even though every entry in the SAME
+        list is equally the right answer. Once retrieval finds one chunk
+        that's part of such a list, pulling in its neighboring pages from the
+        SAME source by page number (not by re-scoring them) is a direct fix
+        for that specific failure shape, rather than just widening the
+        semantic candidate pool and hoping the right chunks rank higher.
+        """
+        results = []
+        for doc_id, meta in self._metadatas.items():
+            if meta.get("source") != source:
+                continue
+            page = meta.get("page")
+            if page is None:
+                continue
+            try:
+                page_num = int(page)
+            except (TypeError, ValueError):
+                continue
+            if page_min <= page_num <= page_max:
+                results.append(Document(page_content=self._docs[doc_id], metadata=dict(meta)))
+        return results
+
     def get_metadata_summary(self, match_field: str, match_value: str) -> Dict[str, Any]:
         """Summarize metadata for all chunks where metadata[match_field] == match_value.
 

@@ -1083,7 +1083,25 @@ async def _resolve_modifier_intent(question: str) -> tuple[bool, bool, bool]:
     # these aren't a phrasing-recognition gap the LLM classifier would help
     # with, they're "is this objectively a big question" regardless of
     # wording, already phrasing-independent by construction.
-    _structural_detail = len(question.split()) > 25 or q.count(' and ') >= 3
+    #
+    # "types of X" / "kinds of X" (_TYPES_OF_QUERY_RE, already defined above
+    # for _enforce_numbered_list_format's post-generation formatting) belongs
+    # here too, for the retrieval-sizing side, not just formatting. Confirmed
+    # live: "types of life insurance" retrieved only enough chunks to cover
+    # 2 of the 6 real types this KB has (term, whole life — endowment,
+    # annuities, money-back, and ULIP all live in the same source document a
+    # few paragraphs later), because a bare "types of X" phrasing matches
+    # none of _DETAIL_SIGNALS and stayed on the tight chunk_limit=5 budget
+    # meant for single-fact questions. An enumeration question is
+    # structurally never a single-fact question — it needs the wider
+    # chunk_limit=8/doc_top_k=18 budget the same way a long or compound
+    # question does, regardless of whether the user also happened to type
+    # "in detail".
+    _structural_detail = (
+        len(question.split()) > 25
+        or q.count(' and ') >= 3
+        or bool(_TYPES_OF_QUERY_RE.search(q))
+    )
 
     if _fast_example or _fast_simple or _fast_detail or _structural_detail:
         _has_detail = (_fast_detail or _structural_detail) and not _fast_simple
@@ -5450,11 +5468,29 @@ class MultiSourceRAG:
         regardless of whether anything in a given source is actually
         useful for this specific question.
         """
-        doc_raw = await asyncio.to_thread(
-            self.doc_pipeline._vector_store.search,
-            retrieval_query, top_k=doc_top_k, use_hybrid=True, use_reranker=False,
-            filter_metadata=filter_meta,
-        )
+        # Sub-phase timing (2026-08-17, parallelized same day): doc/video/
+        # webpage/summary search used to be AWAITED SEQUENTIALLY, one after
+        # another — each individually dispatched via asyncio.to_thread (so
+        # the event loop stayed free for OTHER concurrent requests while
+        # waiting) but with no overlap against EACH OTHER within this one
+        # call. Measured live: these four sources were consistently fast on
+        # their own (a few hundred ms each) but still stacked up to ~1-1.6s
+        # combined purely from being serial — real, if modest, savings from
+        # running them concurrently via asyncio.gather() instead. Reranking
+        # (below, unaffected by this change since it needs the combined
+        # pool from all four first) remains the dominant cost by far —
+        # measured 5-12s on 16 candidates, ~85-88% of the whole phase — this
+        # parallelization does not address that; see the "rerank" timing.
+        _t_ras_start = time.time()
+
+        async def _timed_doc_search():
+            t0 = time.time()
+            result = await asyncio.to_thread(
+                self.doc_pipeline._vector_store.search,
+                retrieval_query, top_k=doc_top_k, use_hybrid=True, use_reranker=False,
+                filter_metadata=filter_meta,
+            )
+            return result, round((time.time() - t0) * 1000)
 
         # Skip a store entirely when it's empty — search() would return []
         # almost instantly anyway (count()==0 early return), but this also
@@ -5462,29 +5498,60 @@ class MultiSourceRAG:
         # dispatch, and stays skipped automatically once the store has
         # exactly zero content, without ever needing separate code to
         # re-enable it if content gets added later.
-        video_raw: List[Document] = []
-        if self.video_store.count() > 0:
-            video_raw = await asyncio.to_thread(
-                self.video_store.search, retrieval_query, top_k=media_top_k, use_hybrid=True, use_reranker=False,
-            )
-        webpage_raw: List[Document] = []
-        if self.webpage_store.count() > 0:
-            webpage_raw = await asyncio.to_thread(
-                self.webpage_store.search, retrieval_query, top_k=media_top_k, use_hybrid=True, use_reranker=False,
-            )
+        async def _timed_video_search():
+            t0 = time.time()
+            result: List[Document] = []
+            if self.video_store.count() > 0:
+                result = await asyncio.to_thread(
+                    self.video_store.search, retrieval_query, top_k=media_top_k, use_hybrid=True, use_reranker=False,
+                )
+            return result, round((time.time() - t0) * 1000)
+
+        async def _timed_webpage_search():
+            t0 = time.time()
+            result: List[Document] = []
+            if self.webpage_store.count() > 0:
+                result = await asyncio.to_thread(
+                    self.webpage_store.search, retrieval_query, top_k=media_top_k, use_hybrid=True, use_reranker=False,
+                )
+            return result, round((time.time() - t0) * 1000)
+
+        async def _timed_summary_search():
+            t0 = time.time()
+            result: List[Document] = []
+            if self.doc_pipeline._summary_store.count() > 0:
+                result = await asyncio.to_thread(
+                    self.doc_pipeline._summary_store.search, retrieval_query, summary_top_k
+                )
+            return result, round((time.time() - t0) * 1000)
+
+        (
+            (doc_raw, _t_doc_search_ms),
+            (video_raw, _t_video_search_ms),
+            (webpage_raw, _t_webpage_search_ms),
+            (relevant_summaries, _t_summary_search_ms),
+        ) = await asyncio.gather(
+            _timed_doc_search(), _timed_video_search(), _timed_webpage_search(), _timed_summary_search(),
+        )
+        _t_sources_parallel_ms = round((time.time() - _t_ras_start) * 1000)
 
         # Stage-1 summary-boost guarantee (same logic as _retrieve_doc_chunks):
         # a summary-identified document's best-matching chunk may not have
         # ranked highly enough in the raw top-k search to be included, so
         # fetch its top 2 chunks directly and fold them into the combined
         # pool — unreranked, they get scored fairly alongside everything
-        # else in the single rerank call below.
-        if self.doc_pipeline._summary_store.count() > 0:
+        # else in the single rerank call below. The per-summary boost
+        # searches below are independent of each other (each boosts a
+        # DIFFERENT source's chunks), so they're gathered in parallel too —
+        # dedup against seen_summary_srcs and against doc_raw's existing
+        # content still happens the same way, just after the parallel fetch
+        # rather than interleaved with it.
+        _t_summary_boost_start = time.time()
+        _summary_boost_calls = 0
+        if relevant_summaries:
             try:
-                relevant_summaries = await asyncio.to_thread(
-                    self.doc_pipeline._summary_store.search, retrieval_query, summary_top_k
-                )
                 seen_summary_srcs: set = set()
+                _boost_filters: list = []
                 for summary_doc in relevant_summaries:
                     src = summary_doc.metadata.get("source", "")
                     if not src or src in seen_summary_srcs:
@@ -5509,31 +5576,64 @@ class MultiSourceRAG:
                     # closes that gap without touching the boost's own
                     # purpose (rescuing an under-ranked chunk from a
                     # genuinely relevant, type-compatible document).
-                    _boost_filter = (
+                    _boost_filters.append(
                         {"$and": [filter_meta, {"source": {"$eq": src}}]}
                         if filter_meta else {"source": {"$eq": src}}
                     )
-                    boost = await asyncio.to_thread(
-                        self.doc_pipeline._vector_store.search,
-                        retrieval_query, 2, _boost_filter, True, False,
-                    )
-                    if boost:
-                        existing = {d.page_content[:80] for d in doc_raw}
+
+                if _boost_filters:
+                    boost_results = await asyncio.gather(*[
+                        asyncio.to_thread(
+                            self.doc_pipeline._vector_store.search,
+                            retrieval_query, 2, _bf, True, False,
+                        )
+                        for _bf in _boost_filters
+                    ])
+                    _summary_boost_calls = len(_boost_filters)
+                    existing = {d.page_content[:80] for d in doc_raw}
+                    for boost in boost_results:
+                        if not boost:
+                            continue
                         new_boost = [d for d in boost if d.page_content[:80] not in existing]
                         for d in new_boost:
                             d.metadata["stage1_boost"] = True
                         doc_raw = doc_raw + new_boost
+                        existing.update(d.page_content[:80] for d in new_boost)
             except Exception as _exc:
                 logger.debug("[MultiSourceRAG] stage-1 guarantee skipped: %s", _exc)
+        _t_summary_boost_ms = round((time.time() - _t_summary_boost_start) * 1000)
 
         combined = self._merge_chunks(doc_raw + video_raw + webpage_raw)
         if not combined:
+            logger.info(
+                "[_retrieve_all_sources_combined] TIMING sources_parallel=%dms(doc=%dms "
+                "video=%dms webpage=%dms summary=%dms) summary_boost=%dms(%d calls) "
+                "rerank=n/a total=%dms empty_pool=True",
+                _t_sources_parallel_ms, _t_doc_search_ms, _t_video_search_ms,
+                _t_webpage_search_ms, _t_summary_search_ms,
+                _t_summary_boost_ms, _summary_boost_calls,
+                round((time.time() - _t_ras_start) * 1000),
+            )
             return []
 
-        return await asyncio.to_thread(
+        _t_rerank_start = time.time()
+        reranked = await asyncio.to_thread(
             self.doc_pipeline._vector_store.rerank_documents,
             retrieval_query, combined, chunk_limit,
         )
+        _t_rerank_ms = round((time.time() - _t_rerank_start) * 1000)
+
+        logger.info(
+            "[_retrieve_all_sources_combined] TIMING sources_parallel=%dms(doc=%dms "
+            "video=%dms webpage=%dms summary=%dms) summary_boost=%dms(%d calls) "
+            "rerank=%dms total=%dms candidates=%d query=%r",
+            _t_sources_parallel_ms, _t_doc_search_ms, _t_video_search_ms,
+            _t_webpage_search_ms, _t_summary_search_ms,
+            _t_summary_boost_ms, _summary_boost_calls, _t_rerank_ms,
+            round((time.time() - _t_ras_start) * 1000),
+            len(combined), retrieval_query[:80],
+        )
+        return reranked
 
     async def _retrieve_doc_chunks(
         self,
@@ -6330,6 +6430,25 @@ class MultiSourceRAG:
         # runs after it, so it needs a wider net specifically to avoid
         # silently dropping a correct-but-differently-worded chunk before
         # the reranker ever gets a chance to judge it.
+        # "types of X" / "kinds of X" now routes into ordinary detailed
+        # mode's budget automatically — _keyword_detailed above is already
+        # True for these via _structural_detail in _resolve_modifier_intent
+        # (see that function's comment for why). Confirmed live 2026-08-18
+        # this alone took "types of life insurance" from 2 covered types to
+        # 3 (of 6 real ones in this KB), cleanly, no off-topic dilution.
+        # Tried pushing further with a dedicated wider budget (24/12)
+        # hoping to surface the remaining 3 (annuities, money-back, ULIP)
+        # — reverted: it pulled in tangential content (a generic
+        # "insurance principles" chunk, a participating/non-participating
+        # sub-detail of endowment) presented as if they were their own
+        # top-level types, without actually promoting the missing ones any
+        # higher. The gap for the remaining 3 looks like a genuine
+        # reranker-relevance issue, not a pool-size one — their source
+        # passages don't repeat the literal "types of life insurance"
+        # phrasing the way the term/whole-life passage does, so a bigger
+        # net doesn't reliably surface them, it just adds noise. Left at
+        # the same well-tested value normal detailed mode already uses
+        # rather than trading verified cleanliness for unverified coverage.
         _doc_top_k   = 18 if _keyword_detailed else 12
         # Trimmed 12/8 -> 8/5 (2026-07-13) — the final merged-and-reranked
         # pool actually sent to the LLM, kept deliberately separate from
@@ -7023,6 +7142,86 @@ class MultiSourceRAG:
             all_chunks = [c for c in all_chunks if c not in _candidate_dropped]
 
         all_chunks = _sort_and_truncate(all_chunks)
+
+        # ── "Types of X" neighbor expansion ─────────────────────────────────
+        # User explicitly asked for ALL types to be covered, not just
+        # whichever ones the reranker's per-chunk scoring happens to favor
+        # (see get_by_source_page_range's own docstring for the full
+        # reasoning — a document's own numbered list gets split across the
+        # candidate pool, and a tight chunk_limit only keeps the entries
+        # whose wording most closely echoes the literal query). Once the
+        # normal retrieval has already found ONE confirmed on-topic chunk,
+        # pull in its neighboring pages from the SAME source directly by
+        # page number — deterministic, not another semantic-similarity
+        # gamble — rather than just widening the candidate pool further
+        # (tried and reverted earlier: that pulled in tangential content
+        # from OTHER sources without reliably promoting the right ones).
+        # Only for general (non-document-scoped) queries — a document_filter
+        # question already told retrieval exactly where to look.
+        if not document_filter and all_chunks and _TYPES_OF_QUERY_RE.search(retrieval_query.lower()):
+            # Page-based neighbor expansion only makes sense for an actual
+            # document chunk — video/webpage chunks carry page=0 as a
+            # placeholder, not a real page number. Confirmed live: the
+            # single highest-reranked chunk overall was a YouTube snippet,
+            # not the document that actually has the fullest enumeration —
+            # picking just ONE anchor (even skipping past video/webpage
+            # chunks to find "a" document) is fragile, since the document
+            # whose OWN chunk happens to score highest isn't necessarily the
+            # one with the richest content on this topic. Expand around
+            # EVERY unique document source already present in the pool
+            # instead of gambling on one — each source's presence here
+            # already earned it a spot via the normal relevance ranking, so
+            # this doesn't pull in anything the query wasn't already judged
+            # relevant to, it just fills in that source's OWN gaps.
+            _doc_sources_seen: set = set()
+            _all_neighbors: list = []
+            for c in all_chunks:
+                if c.metadata.get("source_type") in ("video", "youtube_transcript", "youtube", "webpage", "web"):
+                    continue
+                _src = c.metadata.get("source")
+                _pg = c.metadata.get("page")
+                if not _src or _pg is None or _src in _doc_sources_seen:
+                    continue
+                _doc_sources_seen.add(_src)
+                try:
+                    _pg_num = int(_pg)
+                except (TypeError, ValueError):
+                    continue
+                _found = self.doc_pipeline._vector_store.get_by_source_page_range(_src, _pg_num - 4, _pg_num + 4)
+                # Sanity cap — confirmed live one source returned 351
+                # "neighbors" from a supposed ±4-page window: its ingestion
+                # apparently stamped every chunk with the same placeholder
+                # page number (mirroring how video chunks use page=0), so
+                # the range filter matched almost the entire document
+                # instead of an actual neighborhood. A real ±4-page window
+                # in a normally-paginated document should never return
+                # anywhere near this many chunks, so treat an oversized
+                # result as a signal the page field isn't reliable
+                # pagination for this source and skip it rather than
+                # flooding the context (which would just get arbitrarily
+                # truncated by max_context_chars anyway, likely pushing out
+                # the genuinely relevant neighbors from OTHER sources).
+                _MAX_NEIGHBORS_PER_SOURCE = 15
+                if len(_found) > _MAX_NEIGHBORS_PER_SOURCE:
+                    logger.info(
+                        "[ask_stream] types-of-X neighbor expansion: %s page %s -> %d chunks, way more than a real "
+                        "page-window should return (page field likely unreliable for this source) — skipping",
+                        _src, _pg_num, len(_found),
+                    )
+                    continue
+                if _found:
+                    _all_neighbors.extend(_found)
+                    logger.info(
+                        "[ask_stream] types-of-X neighbor expansion: %s page %s -> %d neighbor chunks found",
+                        _src, _pg_num, len(_found),
+                    )
+            if _all_neighbors:
+                _pool_before = len(all_chunks)
+                all_chunks = self._merge_chunks(all_chunks + _all_neighbors)
+                logger.info(
+                    "[ask_stream] types-of-X neighbor expansion total: pool %d -> %d across %d source(s)",
+                    _pool_before, len(all_chunks), len(_doc_sources_seen),
+                )
 
         # ── Hard reranker gate ────────────────────────────────────────────────
         # If the best reranker score across ALL retrieved chunks is below the

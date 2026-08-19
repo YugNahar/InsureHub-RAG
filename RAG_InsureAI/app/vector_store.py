@@ -89,6 +89,9 @@ class ChromaVectorStore:
         """Return ALL docs matching the filter by metadata scan (no ANN)."""
         return self._store.get_all_by_filter(filter_metadata)
 
+    def get_by_source_page_range(self, source: str, page_min: int, page_max: int) -> List[Document]:
+        return self._store.get_by_source_page_range(source, page_min, page_max)
+
     def get_full_content(self, source: str) -> str:
         """
         Return all chunk text for a given source, ordered by page.
