@@ -499,16 +499,29 @@ _CHUNK_INTENT_LABELS: dict[str, dict] = {
 _VALID_INTENT_LABELS = set(_CHUNK_INTENT_LABELS.keys()) | {"general"}
 
 
-def _regex_section_score(text: str) -> dict[str, int]:
-    """Return hit-count per label using regex patterns only (fast path)."""
+def _regex_section_score(text: str, heading: str = "") -> dict[str, int]:
+    """Return hit-count per label using regex patterns only (fast path).
+
+    A heading word is a much stronger signal than the same word buried in
+    the body — confirmed live: a section headed "Common Exclusions" whose
+    own bullet list never uses the words "excluded"/"not covered"/"except"
+    (every item was phrased as "X, unless Y has been declared...") scored
+    ZERO on the exclusions pattern set from body text alone, even though
+    the heading itself would have scored a clean, unambiguous match.
+    Counted 3x so a single heading hit alone (3) can already beat a
+    same-scoring runner-up from body text under the existing "≥2x ahead"
+    confidence rule, without needing 2 separate heading hits.
+    """
     t = text.lower()
+    h = heading.lower()
     return {
         label: sum(1 for p in info["regex"] if re.search(p, t))
+        + sum(3 for p in info["regex"] if h and re.search(p, h))
         for label, info in _CHUNK_INTENT_LABELS.items()
     }
 
 
-def _build_intent_prompt(text: str, doc_type: str, regex_scores: dict[str, int]) -> str:
+def _build_intent_prompt(text: str, doc_type: str, regex_scores: dict[str, int], heading: str = "") -> str:
     """
     Build the LLM classification prompt for chunk intent/section.
 
@@ -516,6 +529,14 @@ def _build_intent_prompt(text: str, doc_type: str, regex_scores: dict[str, int])
     the regex already found — without being restricted to just those signals.
     The few-shot label descriptions tell the model what each label means for
     text that has no regex hits at all (e.g. conversational YouTube content).
+
+    heading, when known, is the actual document heading this section falls
+    under (e.g. "Common Exclusions") — confirmed live: without it, a
+    section phrased entirely as "X, unless Y has been declared..." (no
+    literal "excluded"/"not covered" anywhere in the body) has nothing in
+    the first-600-chars TEXT block to signal it's an exclusions list, and
+    both the regex AND the LLM (reading only the body) can misclassify it
+    as "general". The heading alone usually settles it.
     """
     top_regex = sorted(regex_scores.items(), key=lambda x: x[1], reverse=True)[:3]
     regex_hint = ", ".join(
@@ -528,6 +549,8 @@ def _build_intent_prompt(text: str, doc_type: str, regex_scores: dict[str, int])
         for lbl, info in _CHUNK_INTENT_LABELS.items()
     )
 
+    heading_line = f"Section heading: {heading}\n" if heading else ""
+
     return f"""You are an insurance document section classifier.
 
 Classify the TEXT below into exactly ONE of these labels:
@@ -535,12 +558,18 @@ Classify the TEXT below into exactly ONE of these labels:
   - general: content that doesn't clearly fit any label above
 
 Document type context: {doc_type}
-Regex keyword signals (hints only, may be empty or wrong for conversational text): {regex_hint}
+{heading_line}Regex keyword signals (hints only, may be empty or wrong for conversational text): {regex_hint}
 
 IMPORTANT:
 - The regex signals are hints based on keyword matching — they can be empty or misleading
   for conversational or YouTube-style text. Read the FULL MEANING of the text.
 - Even if regex signals are empty, pick the most appropriate label based on content.
+- If a section heading is given above, weigh it heavily — it is the document's own
+  label for this content and is often the clearest signal available, especially
+  when the body text itself never repeats the heading's own words (e.g. a heading
+  "Common Exclusions" followed by a bullet list phrased entirely as "X, unless Y
+  has been declared..." with no literal "excluded"/"not covered" anywhere in the
+  body — that is still an exclusions list).
 - Conversational or video-style text (e.g. "how to get cheap insurance") → "how_to"
 - Text explaining what a policy covers → "benefits"
 - Text about what is not covered → "exclusions"
@@ -559,6 +588,7 @@ def classify_chunk_intent(
     llm: Any = None,
     *,
     force_llm: bool = False,
+    heading: str = "",
 ) -> str:
     """
     Classify the section/intent of a document chunk using a regex+LLM hybrid.
@@ -581,12 +611,18 @@ def classify_chunk_intent(
     llm       : Optional LangChain LLM instance. If None, only regex is used.
     force_llm : If True, always call LLM even when regex is confident
                 (useful for YouTube/conversational chunks).
+    heading   : The section's own detected heading text (e.g. "Common
+                Exclusions"), when known — see _regex_section_score and
+                _build_intent_prompt docstrings for why this matters: a
+                section's body can be a bare list with none of the
+                category's keywords ever repeated, and the heading alone
+                is often the only unambiguous signal available.
 
     Returns
     -------
     A label string from _VALID_INTENT_LABELS.
     """
-    regex_scores = _regex_section_score(text)
+    regex_scores = _regex_section_score(text, heading)
     best_label = max(regex_scores, key=regex_scores.__getitem__)
     best_score = regex_scores[best_label]
 
@@ -607,7 +643,7 @@ def classify_chunk_intent(
         return result
 
     try:
-        prompt = _build_intent_prompt(text, doc_type, regex_scores)
+        prompt = _build_intent_prompt(text, doc_type, regex_scores, heading)
         response = llm.invoke(prompt)
         raw = (response.content if hasattr(response, "content") else str(response)).strip().lower()
         # Clean: take first word/token only (model sometimes adds punctuation)
@@ -622,7 +658,7 @@ def classify_chunk_intent(
     return best_label if best_score >= 1 else "general"
 
 
-def _build_intent_batch_prompt(items: list[tuple[str, dict, str]]) -> str:
+def _build_intent_batch_prompt(items: list[tuple[str, dict, str, str]]) -> str:
     """
     Combined-prompt builder for classify_chunk_intents_batch() — one call
     classifying N sections instead of N separate calls. Reuses the exact
@@ -630,8 +666,12 @@ def _build_intent_batch_prompt(items: list[tuple[str, dict, str]]) -> str:
     out so they appear once instead of once per section) so batched output
     matches what the single-section prompt would have produced.
 
-    items: list of (text, regex_scores, doc_type) for sections that need
-    an LLM call — the regex-confident sections never reach here at all.
+    items: list of (text, regex_scores, doc_type, heading) for sections
+    that need an LLM call — the regex-confident sections never reach here
+    at all. heading is the section's own detected document heading (may
+    be empty) — see _build_intent_prompt's docstring for why it matters:
+    a section's body can be a bare list that never repeats the category's
+    own keywords, and the heading is often the only unambiguous signal.
     """
     label_list = "\n".join(
         f"  - {lbl}: {info['desc']}\n"
@@ -640,14 +680,16 @@ def _build_intent_batch_prompt(items: list[tuple[str, dict, str]]) -> str:
     )
 
     blocks = []
-    for i, (text, regex_scores, doc_type) in enumerate(items, start=1):
+    for i, (text, regex_scores, doc_type, heading) in enumerate(items, start=1):
         top_regex = sorted(regex_scores.items(), key=lambda x: x[1], reverse=True)[:3]
         regex_hint = ", ".join(
             f"{lbl}({score})" for lbl, score in top_regex if score > 0
         ) or "none"
+        heading_line = f"Section heading: {heading}\n" if heading else ""
         blocks.append(
             f"\n=== SECTION {i} ===\n"
             f"Document type context: {doc_type}\n"
+            f"{heading_line}"
             f"Regex keyword signals (hints only, may be empty or wrong for conversational text): {regex_hint}\n"
             f"TEXT (first 600 chars):\n{text[:600]}"
         )
@@ -662,6 +704,11 @@ IMPORTANT:
 - The regex signals are hints based on keyword matching — they can be empty or misleading
   for conversational or YouTube-style text. Read the FULL MEANING of each section's text.
 - Even if regex signals are empty, pick the most appropriate label based on content.
+- If a section heading is given, weigh it heavily — it is the document's own label for
+  that content and is often the clearest signal available, especially when the body text
+  itself never repeats the heading's own words (e.g. a heading "Common Exclusions"
+  followed by a bullet list phrased entirely as "X, unless Y has been declared..." with
+  no literal "excluded"/"not covered" anywhere in the body — that is still an exclusions list).
 - Conversational or video-style text (e.g. "how to get cheap insurance") → "how_to"
 - Text explaining what a policy covers → "benefits"
 - Text about what is not covered → "exclusions"
@@ -684,6 +731,7 @@ def classify_chunk_intents_batch(
     *,
     force_llm_flags: list[bool] | None = None,
     doc_type: str = "general",
+    headings: list[str] | None = None,
 ) -> list[str]:
     """
     Batched version of classify_chunk_intent() — classifies every section
@@ -704,17 +752,27 @@ def classify_chunk_intents_batch(
     chunk in mixed-source documents).
     force_llm_flags: per-section force_llm (e.g. is_youtube), same meaning
     as classify_chunk_intent's force_llm parameter.
+    headings: per-section detected document heading (e.g. "Common
+    Exclusions"), when known — SectionChunker already computes and stores
+    this in each chunk's metadata["section_heading"], but this function
+    used to never receive it, so a section whose body never repeats its
+    own category's keywords (e.g. an exclusions list phrased entirely as
+    "X, unless Y has been declared...", no literal "excluded"/"not
+    covered" anywhere) had nothing to classify against but a misleadingly
+    empty regex signal and 600 characters of body text — see
+    _build_intent_prompt's docstring for the confirmed live case.
     """
     n = len(texts)
     doc_types = doc_types or [doc_type] * n
     force_llm_flags = force_llm_flags or [False] * n
+    headings = headings or [""] * n
 
     labels: list[str] = [""] * n
     llm_needed: list[int] = []
     per_item_regex: dict[int, dict] = {}
 
     for i, text in enumerate(texts):
-        regex_scores = _regex_section_score(text)
+        regex_scores = _regex_section_score(text, headings[i])
         best_label = max(regex_scores, key=regex_scores.__getitem__)
         best_score = regex_scores[best_label]
         sorted_scores = sorted(regex_scores.values(), reverse=True)
@@ -738,7 +796,7 @@ def classify_chunk_intents_batch(
 
     if llm_needed:
         try:
-            items = [(texts[i], per_item_regex[i], doc_types[i]) for i in llm_needed]
+            items = [(texts[i], per_item_regex[i], doc_types[i], headings[i]) for i in llm_needed]
             prompt = _build_intent_batch_prompt(items)
             response = llm.invoke(prompt)
             raw = response.content if hasattr(response, "content") else str(response)

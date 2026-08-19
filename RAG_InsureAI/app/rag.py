@@ -145,7 +145,7 @@ _HANDBOOK_SECTION_PATTERNS: dict[str, list[str]] = {
 _SECTION_PATTERNS = _POLICY_SECTION_PATTERNS
 
 
-def _detect_section(text: str, doc_type: str = "policy_document") -> str:
+def _detect_section(text: str, doc_type: str = "policy_document", heading: str = "") -> str:
     """
     Detect the most likely section label for a chunk of text using regex.
 
@@ -156,6 +156,13 @@ def _detect_section(text: str, doc_type: str = "policy_document") -> str:
 
     Requires ≥ 2 pattern hits to assign a section label — a single weak hit
     is not enough evidence and causes false-positive labels.
+
+    heading, when known, is weighted 3x — a section's body text can be a
+    bare list that never repeats the category's own keywords (e.g. a
+    heading "Common Exclusions" followed by a bullet list phrased entirely
+    as "X, unless Y has been declared...", no literal "excluded"/"not
+    covered" anywhere in the body), and the heading is often the only
+    unambiguous signal available.
     """
     patterns = (
         _HANDBOOK_SECTION_PATTERNS
@@ -163,7 +170,11 @@ def _detect_section(text: str, doc_type: str = "policy_document") -> str:
         else _POLICY_SECTION_PATTERNS
     )
     t = text.lower()
-    scores = {s: sum(1 for p in pats if re.search(p, t)) for s, pats in patterns.items()}
+    h = heading.lower()
+    scores = {
+        s: sum(1 for p in pats if re.search(p, t)) + sum(3 for p in pats if h and re.search(p, h))
+        for s, pats in patterns.items()
+    }
     best = max(scores, key=scores.__getitem__)
     return best if scores[best] >= 2 else "general"
 
@@ -371,6 +382,7 @@ class SectionChunker:
         section_doc_types: list[str] = []
         section_is_youtube: list[bool] = []
         section_assigned_types: list[str] = []
+        section_headings: list[str] = []
 
         for section_chunks in section_groups:
             first = section_chunks[0]
@@ -417,6 +429,7 @@ class SectionChunker:
             section_doc_types.append(effective_doc_type)
             section_is_youtube.append(is_youtube)
             section_assigned_types.append(assigned_type)
+            section_headings.append(section_heading)
 
         # ── Pass 2: batched LLM calls — one request per document instead of
         # one per section. verify_and_enrich_section_metadata used to run
@@ -436,11 +449,12 @@ class SectionChunker:
                 doc_types=section_doc_types,
                 llm=llm,
                 force_llm_flags=section_is_youtube,
+                headings=section_headings,
             )
         else:
             section_intents = [
-                _detect_section(text, doc_type=edt)
-                for text, edt in zip(section_texts, section_doc_types)
+                _detect_section(text, doc_type=edt, heading=h)
+                for text, edt, h in zip(section_texts, section_doc_types, section_headings)
             ]
 
         enriched_list = verify_and_enrich_sections_batch(

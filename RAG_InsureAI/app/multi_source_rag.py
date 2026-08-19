@@ -5866,6 +5866,15 @@ class MultiSourceRAG:
                 page = chunk.metadata.get("page", "?")
                 label = f"Document: {src} (Page {page})"
                 sources.append(f"{src} (page {page})")
+            # Same fix as ask_stream's context builder — surface the
+            # chunk's detected heading (metadata["section_heading"]) so a
+            # headerless-looking bullet list (e.g. an exclusions list
+            # phrased without the word "excluded" anywhere in its own
+            # body) doesn't reach the model with no way to tell what kind
+            # of list it is.
+            _section_heading = chunk.metadata.get("section_heading", "")
+            if _section_heading:
+                label = f"{label} — Section: {_section_heading}"
             context_parts.append(f"[{label}]\n{chunk.page_content}")
         full_context = "\n\n".join(context_parts)
         if len(full_context) > self.max_context_chars:
@@ -7934,7 +7943,20 @@ class MultiSourceRAG:
         # same chunk and got dropped). Grounding checks should ask "is this
         # actually in what we retrieved," not "does it survive a budget
         # cut made for an unrelated reason."
-        _full_context_uncompressed = "\n\n".join(c.page_content for c in all_chunks)
+        # Prepend each chunk's detected heading (metadata["section_heading"],
+        # e.g. "Common Exclusions") when known — confirmed live: without it,
+        # a chunk whose own body text never repeats exclusion words (e.g. a
+        # bullet list phrased entirely as "X, unless Y has been declared...")
+        # never matches _EXCLUSION_INDICATOR_RE below at all, so the denial-
+        # claim check two screens down finds no exclusion-context window for
+        # a correct, newly-fixed "not covered unless declared" claim and
+        # deletes the sentence outright — the same underlying gap as the
+        # generation-context label fix above, just reached through this
+        # separate uncompressed copy of the context instead of full_context.
+        _full_context_uncompressed = "\n\n".join(
+            (f"[{h}]\n{c.page_content}" if (h := c.metadata.get("section_heading", "")) else c.page_content)
+            for c in all_chunks
+        )
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
@@ -7966,6 +7988,23 @@ class MultiSourceRAG:
                 page = chunk.metadata.get("page", "?")
                 label = f"Document: {src} (Page {page})"
                 sources.append(f"{src} (page {page})")
+            # Confirmed live (2026-08-19): SectionChunker already detects
+            # and stores each chunk's actual document heading in
+            # metadata["section_heading"] (e.g. "Common Exclusions") — but
+            # this label-building step never included it, so a chunk whose
+            # own body text never repeats words like "excluded"/"not
+            # covered" (e.g. a bullet list phrased entirely as "X, unless Y
+            # has been declared...") reached generation as a bare,
+            # unlabeled list. The model had no way to tell it apart from a
+            # coverage list and guessed wrong (answered that a pre-existing
+            # condition IS covered — the literal opposite of what "Common
+            # Exclusions" means). Surfacing the heading here costs nothing
+            # extra to retrieve (already computed at chunk time) and fixes
+            # this for every chunk whose heading was detected, not just
+            # this one document.
+            _section_heading = chunk.metadata.get("section_heading", "")
+            if _section_heading:
+                label = f"{label} — Section: {_section_heading}"
             # Phase 1 (contamination plan): generation used to see the
             # chunk's ENTIRE page_content, so a mixed "general"-tagged
             # chunk's off-topic sentence (e.g. a marine example embedded in
@@ -10884,6 +10923,28 @@ class MultiSourceRAG:
                     _window = _full_context_uncompressed[max(0, _m.start() - 300):_m.end() + 300]
                     _window_words = _denial_scenario_words(_window)
                     if not _window_words or (_window_words & _rare_scenario_words):
+                        _any_compatible_denial_src = True
+                        break
+                    # Fallback: even when no single word clears the global
+                    # "occurs ≤3 times" rarity bar, 2+ DISTINCT question-
+                    # scenario words co-occurring together in this SAME
+                    # local window is itself strong evidence of a genuine
+                    # topical match — a word repeating because a document
+                    # thoroughly covers one specific real scenario (in more
+                    # than one chunk) isn't the same failure mode the
+                    # rarity bar was built to catch (a single generic
+                    # domain word like "car"/"motor" appearing throughout
+                    # unrelated passages). Confirmed live: "pre"/"existing"/
+                    # "condition" from "pre-existing medical condition"
+                    # each occurred 5-6 times across a 5-chunk, 2-document
+                    # context, so none individually cleared the ≤3 bar even
+                    # though the actual exclusion window contained all
+                    # three together, naming the exact scenario asked
+                    # about — a correct "not covered unless declared"
+                    # answer got deleted as an unsupported denial claim.
+                    # Requiring 2+ (not 1) keeps this from reopening the
+                    # single-generic-word case the bar exists to reject.
+                    if len(_window_words & _question_scenario_words) >= 2:
                         _any_compatible_denial_src = True
                         break
                 # Only a real mismatch if the reply is actually making a
