@@ -25,9 +25,9 @@ from metadata_tagger import (
     classify_query,
     build_metadata_filter,
     classify_document_type,
-    classify_chunk_intent,
+    classify_chunk_intents_batch,
     regex_first_pass_policy_type,
-    verify_and_enrich_section_metadata,
+    verify_and_enrich_sections_batch,
     classify_candidate_type,
     derive_document_topic_prior,
 )
@@ -365,7 +365,14 @@ class SectionChunker:
             sid = chunk.metadata.get("section_id") or id(chunk)
             sections.setdefault(sid, []).append(chunk)
 
-        for section_chunks in sections.values():
+        # ── Pass 1: gather every section's inputs — no LLM calls yet ─────────
+        section_groups = list(sections.values())
+        section_texts: list[str] = []
+        section_doc_types: list[str] = []
+        section_is_youtube: list[bool] = []
+        section_assigned_types: list[str] = []
+
+        for section_chunks in section_groups:
             first = section_chunks[0]
             effective_doc_type = first.metadata.get("doc_type", doc_type)
             is_youtube = (
@@ -379,25 +386,18 @@ class SectionChunker:
             # the prompt already truncates to a safe upper bound.
             section_text = "\n\n".join(c.page_content for c in section_chunks)
 
-            if llm is not None:
-                section_intent = classify_chunk_intent(
-                    section_text, doc_type=effective_doc_type, llm=llm, force_llm=is_youtube,
-                )
-            else:
-                section_intent = _detect_section(section_text, doc_type=effective_doc_type)
-
             # First pass: fast, free heading-then-body regex guess (see
             # regex_first_pass_policy_type — checks the section HEADING
             # first, a much cleaner signal than scanning the full body,
             # falling back to the body only if the heading itself doesn't
-            # confidently resolve). Then the LLM verifies/corrects that
-            # guess (cheaper and more reliable than reclassifying from
-            # scratch — a targeted yes/no-with-confidence question, not an
-            # open "pick 1 of 12" one) and separately extracts metadata the
-            # structural pass has no way to determine (jurisdiction,
-            # document_version, language, effective_date,
-            # coverage_category — "unknown" is the correct, expected
-            # answer when a fixed-KB section doesn't state these).
+            # confidently resolve). The LLM verify/enrich batch call below
+            # then verifies/corrects that guess (cheaper and more reliable
+            # than reclassifying from scratch — a targeted yes/no-with-
+            # confidence question, not an open "pick 1 of 12" one) and
+            # separately extracts metadata the structural pass has no way to
+            # determine (jurisdiction, document_version, language,
+            # effective_date, coverage_category — "unknown" is the correct,
+            # expected answer when a fixed-KB section doesn't state these).
             section_heading = first.metadata.get("section_heading", "")
             first_pass_type = regex_first_pass_policy_type(section_heading, section_text)
             # For a confidently single-topic document, doc_prior itself is
@@ -412,9 +412,48 @@ class SectionChunker:
             # self-contained type when a section genuinely warrants it (see
             # _build_verify_and_enrich_prompt's DOCUMENT CONTEXT rules).
             assigned_type = doc_prior if doc_prior and doc_prior != "general" else first_pass_type
-            enriched = verify_and_enrich_section_metadata(
-                section_text, assigned_type, llm=llm, doc_prior=doc_prior,
+
+            section_texts.append(section_text)
+            section_doc_types.append(effective_doc_type)
+            section_is_youtube.append(is_youtube)
+            section_assigned_types.append(assigned_type)
+
+        # ── Pass 2: batched LLM calls — one request per document instead of
+        # one per section. verify_and_enrich_section_metadata used to run
+        # unconditionally for EVERY section with no throttling; on a
+        # multi-section document that fired a burst of back-to-back Groq
+        # requests that reliably tripped its per-minute rate limit
+        # (confirmed live 2026-08-19: an 8-section PDF ingestion produced
+        # repeated 429s with 18-22s retry backoffs). Batching collapses
+        # that to one call per document regardless of section count.
+        # classify_chunk_intents_batch keeps the same regex-fast-path gating
+        # as the old per-section classify_chunk_intent() — a section the
+        # regex already resolves confidently still never touches the LLM —
+        # it only combines the genuinely ambiguous sections into one request.
+        if llm is not None:
+            section_intents = classify_chunk_intents_batch(
+                section_texts,
+                doc_types=section_doc_types,
+                llm=llm,
+                force_llm_flags=section_is_youtube,
             )
+        else:
+            section_intents = [
+                _detect_section(text, doc_type=edt)
+                for text, edt in zip(section_texts, section_doc_types)
+            ]
+
+        enriched_list = verify_and_enrich_sections_batch(
+            list(zip(section_texts, section_assigned_types)),
+            llm=llm,
+            doc_prior=doc_prior,
+        )
+
+        # ── Pass 3: assign results back to chunks ─────────────────────────
+        for section_chunks, section_intent, section_text, enriched in zip(
+            section_groups, section_intents, section_texts, enriched_list,
+        ):
+            first = section_chunks[0]
             section_policy = enriched["policy_type"]
 
             # Mode-A fallback: the closed 12-type vocabulary couldn't place
@@ -423,6 +462,8 @@ class SectionChunker:
             # free-text hint used later for retrieval's candidate-match
             # bypass and logged as raw material for a future vocabulary
             # promotion review. See classify_candidate_type() docstring.
+            # Stays per-section (not batched) — it only fires for "general"
+            # sections, a small minority, so it isn't a rate-limit driver.
             section_candidate_type = None
             if section_policy == "general":
                 section_candidate_type = classify_candidate_type(

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import uuid
 from typing import Any, Optional
 
@@ -621,28 +622,143 @@ def classify_chunk_intent(
     return best_label if best_score >= 1 else "general"
 
 
-def classify_chunk_intent_batch(
+def _build_intent_batch_prompt(items: list[tuple[str, dict, str]]) -> str:
+    """
+    Combined-prompt builder for classify_chunk_intents_batch() — one call
+    classifying N sections instead of N separate calls. Reuses the exact
+    per-label descriptions/rules from _build_intent_prompt (just hoisted
+    out so they appear once instead of once per section) so batched output
+    matches what the single-section prompt would have produced.
+
+    items: list of (text, regex_scores, doc_type) for sections that need
+    an LLM call — the regex-confident sections never reach here at all.
+    """
+    label_list = "\n".join(
+        f"  - {lbl}: {info['desc']}\n"
+        f"    Example keywords: {', '.join(info['keywords'][:5])}"
+        for lbl, info in _CHUNK_INTENT_LABELS.items()
+    )
+
+    blocks = []
+    for i, (text, regex_scores, doc_type) in enumerate(items, start=1):
+        top_regex = sorted(regex_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        regex_hint = ", ".join(
+            f"{lbl}({score})" for lbl, score in top_regex if score > 0
+        ) or "none"
+        blocks.append(
+            f"\n=== SECTION {i} ===\n"
+            f"Document type context: {doc_type}\n"
+            f"Regex keyword signals (hints only, may be empty or wrong for conversational text): {regex_hint}\n"
+            f"TEXT (first 600 chars):\n{text[:600]}"
+        )
+
+    return f"""You are an insurance document section classifier.
+
+Classify EACH of the {len(items)} sections below into exactly ONE of these labels:
+{label_list}
+  - general: content that doesn't clearly fit any label above
+
+IMPORTANT:
+- The regex signals are hints based on keyword matching — they can be empty or misleading
+  for conversational or YouTube-style text. Read the FULL MEANING of each section's text.
+- Even if regex signals are empty, pick the most appropriate label based on content.
+- Conversational or video-style text (e.g. "how to get cheap insurance") → "how_to"
+- Text explaining what a policy covers → "benefits"
+- Text about what is not covered → "exclusions"
+- Text about filing a claim → "claims"
+- Judge each section entirely independently — do not let one section's content
+  influence another section's label.
+{"".join(blocks)}
+
+Reply with EXACTLY {len(items)} lines, one per section, in order, in this format:
+SECTION 1: <label>
+SECTION 2: <label>
+...
+No explanation, no extra text, no punctuation after the label."""
+
+
+def classify_chunk_intents_batch(
     texts: list[str],
-    doc_type: str = "general",
+    doc_types: list[str] | None = None,
     llm: Any = None,
     *,
-    force_llm_for_youtube: bool = True,
-    source_type: str = "",
+    force_llm_flags: list[bool] | None = None,
+    doc_type: str = "general",
 ) -> list[str]:
     """
-    Classify a batch of chunks efficiently.
+    Batched version of classify_chunk_intent() — classifies every section
+    of a document in ONE LLM call instead of one call per section.
 
-    For YouTube/conversational chunks (source_type contains 'whisper' or
-    'youtube'), force_llm=True so the LLM handles colloquial text.
-    For regular document chunks, regex fast-path is used first; LLM only
-    called for ambiguous ones.
+    Exactly the same regex-fast-path gating as classify_chunk_intent(): a
+    section the regex already resolves confidently (and isn't force_llm)
+    never touches the LLM at all, batched or not. Batching only combines
+    the genuinely ambiguous sections into a single request instead of N —
+    see verify_and_enrich_sections_batch()'s docstring for why this
+    matters (an 8-section document previously fired 8+ separate Groq
+    requests back-to-back with no throttling, reliably tripping Groq's
+    per-minute rate limit).
+
+    texts: section texts, in the order results should be returned.
+    doc_types: per-section doc_type context (defaults to `doc_type` for
+    every section when not given — matches effective_doc_type varying per
+    chunk in mixed-source documents).
+    force_llm_flags: per-section force_llm (e.g. is_youtube), same meaning
+    as classify_chunk_intent's force_llm parameter.
     """
-    is_youtube = "whisper" in source_type or "youtube" in source_type.lower()
-    force = is_youtube and force_llm_for_youtube
-    return [
-        classify_chunk_intent(t, doc_type=doc_type, llm=llm, force_llm=force)
-        for t in texts
-    ]
+    n = len(texts)
+    doc_types = doc_types or [doc_type] * n
+    force_llm_flags = force_llm_flags or [False] * n
+
+    labels: list[str] = [""] * n
+    llm_needed: list[int] = []
+    per_item_regex: dict[int, dict] = {}
+
+    for i, text in enumerate(texts):
+        regex_scores = _regex_section_score(text)
+        best_label = max(regex_scores, key=regex_scores.__getitem__)
+        best_score = regex_scores[best_label]
+        sorted_scores = sorted(regex_scores.values(), reverse=True)
+        runner_up = sorted_scores[1] if len(sorted_scores) > 1 else 0
+        regex_confident = best_score >= 2 and best_score >= (runner_up * 2 + 1)
+
+        if regex_confident and not force_llm_flags[i]:
+            labels[i] = best_label
+        elif llm is None:
+            labels[i] = best_label if best_score >= 1 else "general"
+        else:
+            llm_needed.append(i)
+            per_item_regex[i] = regex_scores
+
+    def _regex_fallback(idx: int) -> str:
+        scores = per_item_regex.get(idx) or {}
+        if not scores:
+            return "general"
+        best = max(scores, key=scores.__getitem__)
+        return best if scores[best] >= 1 else "general"
+
+    if llm_needed:
+        try:
+            items = [(texts[i], per_item_regex[i], doc_types[i]) for i in llm_needed]
+            prompt = _build_intent_batch_prompt(items)
+            response = llm.invoke(prompt)
+            raw = response.content if hasattr(response, "content") else str(response)
+            found = dict(re.findall(r"SECTION\s+(\d+)\s*:\s*(\S+)", raw, re.IGNORECASE))
+            if len(found) != len(llm_needed):
+                logger.warning(
+                    "[INTENT] batch classify returned %d label(s), expected %d — "
+                    "falling back to regex for unmatched sections",
+                    len(found), len(llm_needed),
+                )
+            for pos, idx in enumerate(llm_needed, start=1):
+                raw_label = (found.get(str(pos), "") or "").strip().lower()
+                label = re.split(r"[\s\n,.:;]", raw_label)[0].strip() if raw_label else ""
+                labels[idx] = label if label in _VALID_INTENT_LABELS else _regex_fallback(idx)
+        except Exception as exc:
+            logger.warning("[INTENT] batch LLM call failed: %s — using regex fallback", exc)
+            for idx in llm_needed:
+                labels[idx] = _regex_fallback(idx)
+
+    return labels
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1386,7 +1502,7 @@ def derive_document_topic_prior(chunk_texts: list[str], filename: str = "") -> t
     return "general", 0.0
 
 
-def _build_verify_and_enrich_prompt(text: str, assigned_type: str, doc_prior: str = "") -> str:
+def _verify_enrich_label_list() -> str:
     # Full descriptions, not just bare names — confirmed live this prompt
     # used to hand the model only a comma-separated name list (unlike
     # _build_policy_type_prompt's richer label_list), and a text unambiguously
@@ -1397,10 +1513,16 @@ def _build_verify_and_enrich_prompt(text: str, assigned_type: str, doc_prior: st
     # Matches the existing richer prompt's format for the same reason it
     # exists there: names alone from a whole-industry vocabulary don't
     # reliably disambiguate close pairs.
-    label_list = "\n".join(
+    return "\n".join(
         f"  - {pt}: {info['desc']}"
         for pt, info in get_active_vocab().items()
     )
+
+
+def _verify_enrich_step1_fields(assigned_type: str) -> tuple[str, str, str]:
+    """Returns (step1_instructions, reply_fields, confidence_desc) for ONE
+    section — factored out of _build_verify_and_enrich_prompt so the single
+    -section and batched prompt builders share byte-identical wording."""
     # "general" isn't a real topic to verify — it means the first pass found
     # no confident single type, not "this text is about general insurance."
     # Asking "does this discuss general insurance?" is a question the model
@@ -1476,6 +1598,10 @@ primarily discuss "{assigned_type}" insurance?
                          "CORRECTED_TYPE=<the correct type if VERIFIED=no, otherwise write \"same\">")
         confidence_desc = "how confident you are in this verification"
 
+    return step1, reply_fields, confidence_desc
+
+
+def _verify_enrich_doc_context(doc_prior: str) -> str:
     # Confirmed live (2026-07-31): classifying a chunk with zero visibility
     # into its own document flips genuinely on-topic chunks to the wrong
     # type — a travel guide's own "acute toothache during the journey" travel-
@@ -1487,9 +1613,9 @@ primarily discuss "{assigned_type}" insurance?
     # should still be classified as that other type. See
     # derive_document_topic_prior()'s own docstring for the confirmed
     # failure case and plan_policy_type_tagging.md for the fuller writeup.
-    doc_context = ""
-    if doc_prior and doc_prior != "general":
-        doc_context = f"""
+    if not doc_prior or doc_prior == "general":
+        return ""
+    return f"""
 - DOCUMENT CONTEXT: this text is one excerpt from a document whose OTHER
   sections are, on the whole, genuinely about **{doc_prior} insurance** — most
   chunks from this document are {doc_prior}. Default to {doc_prior} unless
@@ -1527,26 +1653,8 @@ primarily discuss "{assigned_type}" insurance?
     subject, with no connection to {doc_prior}. A single sentence reusing
     shared insurance vocabulary is not enough to override."""
 
-    # Investigating (2026-08): a full 414-chunk retag pass consistently
-    # misclassified the SAME ~7 travel-guide chunks the SAME wrong way,
-    # with zero connection/exception errors, while an isolated run of just
-    # those chunks (identical code, identical prompt) always came back
-    # correct. The vLLM server's own /metrics shows a 66% prefix-cache hit
-    # rate server-wide (prefix_cache_hits_total / prefix_cache_queries_total)
-    # on a shared, actively-used deployment — every one of these prompts
-    # shares a long, mostly-fixed instructional prefix across hundreds of
-    # calls in one run, which is exactly the shape automatic prefix caching
-    # targets. This nonce forces every call's prompt to be byte-unique, so
-    # vLLM can never find a matching cached prefix to (correctly or
-    # incorrectly) reuse across chunks — trading away a cache-hit speed
-    # benefit this offline batch workload doesn't need, in exchange for
-    # ruling out cross-request cache-state bleed as a cause. Not confirmed
-    # as THE root cause yet — this is the test, not a verified fix.
-    _cache_buster = f"[ref:{uuid.uuid4().hex[:12]}]\n\n"
-    return _cache_buster + f"""You are verifying and enriching metadata for a section of an insurance document.
 
-{step1}
-- WATCH FOR CONTRAST: text naming a DIFFERENT type specifically to distinguish
+_VERIFY_ENRICH_WATCH_RULES = """- WATCH FOR CONTRAST: text naming a DIFFERENT type specifically to distinguish
   itself from it ("unlike a health plan...", "not like ongoing treatment
   cover...", "irrelevant here in a way it would matter for a scheme built
   around X...") is telling you it is NOT that other type — the other type's
@@ -1566,16 +1674,45 @@ primarily discuss "{assigned_type}" insurance?
   year and in Fire Insurance the preamble states..." is LIABILITY insurance,
   not fire (another real KB chunk mistagged this way) — a passing
   cross-reference used only to illustrate a general point about renewal
-  notices, not the text's actual subject.{doc_context}
+  notices, not the text's actual subject."""
 
-STEP 2 — EXTRACT (from the text only — never guess or invent a value): for each
+_VERIFY_ENRICH_STEP2_BLOCK = """STEP 2 — EXTRACT (from the text only — never guess or invent a value): for each
 field below, give the value ONLY if it is explicitly stated in the text,
 otherwise write exactly "unknown".
 - language: the language the text is written in
 - jurisdiction: a specific country, state, or region the text is legally scoped to
 - document_version: an edition, version number, or year explicitly stated for this document
 - effective_date: an effective or commencement date explicitly stated
-- coverage_category: a specific named cover variant (e.g. "comprehensive", "third-party", "family floater") if the text is about ONE specific variant
+- coverage_category: a specific named cover variant (e.g. "comprehensive", "third-party", "family floater") if the text is about ONE specific variant"""
+
+
+def _build_verify_and_enrich_prompt(text: str, assigned_type: str, doc_prior: str = "") -> str:
+    label_list = _verify_enrich_label_list()
+    step1, reply_fields, confidence_desc = _verify_enrich_step1_fields(assigned_type)
+    doc_context = _verify_enrich_doc_context(doc_prior)
+
+    # Investigating (2026-08): a full 414-chunk retag pass consistently
+    # misclassified the SAME ~7 travel-guide chunks the SAME wrong way,
+    # with zero connection/exception errors, while an isolated run of just
+    # those chunks (identical code, identical prompt) always came back
+    # correct. The vLLM server's own /metrics shows a 66% prefix-cache hit
+    # rate server-wide (prefix_cache_hits_total / prefix_cache_queries_total)
+    # on a shared, actively-used deployment — every one of these prompts
+    # shares a long, mostly-fixed instructional prefix across hundreds of
+    # calls in one run, which is exactly the shape automatic prefix caching
+    # targets. This nonce forces every call's prompt to be byte-unique, so
+    # vLLM can never find a matching cached prefix to (correctly or
+    # incorrectly) reuse across chunks — trading away a cache-hit speed
+    # benefit this offline batch workload doesn't need, in exchange for
+    # ruling out cross-request cache-state bleed as a cause. Not confirmed
+    # as THE root cause yet — this is the test, not a verified fix.
+    _cache_buster = f"[ref:{uuid.uuid4().hex[:12]}]\n\n"
+    return _cache_buster + f"""You are verifying and enriching metadata for a section of an insurance document.
+
+{step1}
+{_VERIFY_ENRICH_WATCH_RULES}{doc_context}
+
+{_VERIFY_ENRICH_STEP2_BLOCK}
 
 Available policy types:
 {label_list}
@@ -1596,6 +1733,70 @@ JURISDICTION=<value or unknown>
 DOCUMENT_VERSION=<value or unknown>
 EFFECTIVE_DATE=<value or unknown>
 COVERAGE_CATEGORY=<value or unknown>"""
+
+
+def _build_verify_and_enrich_batch_prompt(sections: list[tuple[str, str]], doc_prior: str = "") -> str:
+    """
+    Combined-prompt builder for verify_and_enrich_sections_batch() — verifies
+    and enriches ALL of a document's sections in one call instead of one call
+    per section. Reuses _verify_enrich_step1_fields/_verify_enrich_doc_context
+    and the same WATCH/STEP2 wording as _build_verify_and_enrich_prompt
+    verbatim — hoisted OUT of the per-section loop so shared pieces (label
+    list, WATCH rules, doc context, STEP 2 rules) appear once instead of once
+    per section. This isn't just tidiness: confirmed live 2026-08-19 that
+    repeating them per section blew an 8-section batch past Groq's TPM
+    (tokens-per-minute) limit outright (12698 tokens requested vs an 8000
+    cap) even though it was still only ONE request — see
+    verify_and_enrich_sections_batch()'s token-budget sub-batching for the
+    other half of that fix.
+
+    sections: list of (text, assigned_type) tuples, in the order results
+    should be returned.
+    """
+    label_list = _verify_enrich_label_list()
+    doc_context = _verify_enrich_doc_context(doc_prior)
+
+    section_blocks = []
+    for i, (text, assigned_type) in enumerate(sections, start=1):
+        step1, reply_fields, confidence_desc = _verify_enrich_step1_fields(assigned_type)
+        section_blocks.append(f"""
+=== SECTION {i} ===
+{step1}
+
+TEXT:
+{text[:4000]}
+
+Reply for SECTION {i} in EXACTLY this format, one line per field, no explanation:
+{reply_fields}
+CONFIDENCE=<a number 0-100, {confidence_desc}>
+LANGUAGE=<value or unknown>
+JURISDICTION=<value or unknown>
+DOCUMENT_VERSION=<value or unknown>
+EFFECTIVE_DATE=<value or unknown>
+COVERAGE_CATEGORY=<value or unknown>""")
+
+    _cache_buster = f"[ref:{uuid.uuid4().hex[:12]}]\n\n"
+    return _cache_buster + f"""You are verifying and enriching metadata for {len(sections)} DIFFERENT sections
+of the SAME insurance document. Apply the reasoning below to EACH section
+entirely independently — judge every section only by its own TEXT, never by
+another section's content. These rules apply to EVERY section below:
+
+{_VERIFY_ENRICH_WATCH_RULES}{doc_context}
+
+{_VERIFY_ENRICH_STEP2_BLOCK}
+
+Available policy types:
+{label_list}
+  - general: text covers multiple types, is generic about insurance, or the type cannot be determined
+
+Use the EXACT label word shown above (e.g. "motor", not "auto" or "car"; "home",
+not "property" or "household") — these are fixed labels an automated system
+matches on, not free-text description.
+{"".join(section_blocks)}
+
+Reply with EXACTLY {len(sections)} blocks, one per section, each starting with
+its own "=== SECTION i ===" marker exactly as shown above, in order, no extra
+commentary before, after, or between blocks."""
 
 
 def verify_and_enrich_section_metadata(
@@ -1634,64 +1835,238 @@ def verify_and_enrich_section_metadata(
         prompt = _build_verify_and_enrich_prompt(text, assigned_type, doc_prior)
         response = llm.invoke(prompt)
         raw = response.content if hasattr(response, "content") else str(response)
-
-        def _field(name: str, default: str = "") -> str:
-            m = re.search(rf"{name}\s*=\s*(.+)", raw, re.IGNORECASE)
-            return m.group(1).strip().strip('"').strip() if m else default
-
-        try:
-            confidence = float(re.sub(r"[^\d.]", "", _field("CONFIDENCE", "0")) or 0)
-        except ValueError:
-            confidence = 0.0
-
-        # Two distinct reply shapes matching the two prompt branches above —
-        # see _build_verify_and_enrich_prompt for why IDENTIFY gets its own
-        # single field instead of reusing VERIFIED/CORRECTED_TYPE.
-        if assigned_type == "general":
-            identified = _normalize_policy_type(_field("IDENTIFIED_TYPE", "general").lower())
-            if identified != "general" and identified in _valid_policy_types():
-                if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
-                    logger.info(
-                        "[POLICY_TYPE] identified: general -> %r (confidence=%.0f)",
-                        identified, confidence,
-                    )
-                    result["policy_type"] = identified
-                else:
-                    logger.debug(
-                        "[POLICY_TYPE] identification suggested general -> %r but confidence %.0f "
-                        "< threshold %d — keeping general",
-                        identified, confidence, _VERIFY_OVERRIDE_THRESHOLD,
-                    )
-        else:
-            verified = _field("VERIFIED", "yes").lower().startswith("y")
-            corrected = _normalize_policy_type(_field("CORRECTED_TYPE", "same").lower())
-            if (
-                not verified
-                and corrected not in ("same", "", assigned_type.lower())
-                and corrected in _valid_policy_types()
-            ):
-                if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
-                    logger.info(
-                        "[POLICY_TYPE] verification override: %r -> %r (confidence=%.0f)",
-                        assigned_type, corrected, confidence,
-                    )
-                    result["policy_type"] = corrected
-                else:
-                    logger.debug(
-                        "[POLICY_TYPE] verification suggested %r -> %r but confidence %.0f "
-                        "< threshold %d — keeping first-pass %r",
-                        assigned_type, corrected, confidence, _VERIFY_OVERRIDE_THRESHOLD, assigned_type,
-                    )
-
-        for field in _ENRICHMENT_FIELDS:
-            value = _field(field.upper(), "unknown").lower()
-            if value and value != "unknown":
-                result[field] = value
-
+        result = _parse_verify_and_enrich_reply(raw, assigned_type)
     except Exception as exc:
         logger.warning("[POLICY_TYPE] verify/enrich LLM call failed: %s — keeping first-pass assignment", exc)
 
     return result
+
+
+def _parse_verify_and_enrich_reply(raw: str, assigned_type: str) -> dict:
+    """
+    Parse ONE section's reply block (whatever text followed its own
+    "=== SECTION i ===" marker in a batched call, or the whole response for
+    a single-section call) into the same {"policy_type": ..., **enrichment
+    fields} shape verify_and_enrich_section_metadata() returns. Factored out
+    of that function so verify_and_enrich_sections_batch() parses each of
+    its N reply blocks with identical logic.
+    """
+    result: dict = {"policy_type": assigned_type}
+    result.update({field: "unknown" for field in _ENRICHMENT_FIELDS})
+
+    def _field(name: str, default: str = "") -> str:
+        m = re.search(rf"{name}\s*=\s*(.+)", raw, re.IGNORECASE)
+        return m.group(1).strip().strip('"').strip() if m else default
+
+    try:
+        confidence = float(re.sub(r"[^\d.]", "", _field("CONFIDENCE", "0")) or 0)
+    except ValueError:
+        confidence = 0.0
+
+    # Two distinct reply shapes matching the two prompt branches in
+    # _verify_enrich_step1_fields — see that function for why IDENTIFY gets
+    # its own single field instead of reusing VERIFIED/CORRECTED_TYPE.
+    if assigned_type == "general":
+        identified = _normalize_policy_type(_field("IDENTIFIED_TYPE", "general").lower())
+        if identified != "general" and identified in _valid_policy_types():
+            if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
+                logger.info(
+                    "[POLICY_TYPE] identified: general -> %r (confidence=%.0f)",
+                    identified, confidence,
+                )
+                result["policy_type"] = identified
+            else:
+                logger.debug(
+                    "[POLICY_TYPE] identification suggested general -> %r but confidence %.0f "
+                    "< threshold %d — keeping general",
+                    identified, confidence, _VERIFY_OVERRIDE_THRESHOLD,
+                )
+    else:
+        verified = _field("VERIFIED", "yes").lower().startswith("y")
+        corrected = _normalize_policy_type(_field("CORRECTED_TYPE", "same").lower())
+        if (
+            not verified
+            and corrected not in ("same", "", assigned_type.lower())
+            and corrected in _valid_policy_types()
+        ):
+            if confidence >= _VERIFY_OVERRIDE_THRESHOLD:
+                logger.info(
+                    "[POLICY_TYPE] verification override: %r -> %r (confidence=%.0f)",
+                    assigned_type, corrected, confidence,
+                )
+                result["policy_type"] = corrected
+            else:
+                logger.debug(
+                    "[POLICY_TYPE] verification suggested %r -> %r but confidence %.0f "
+                    "< threshold %d — keeping first-pass %r",
+                    assigned_type, corrected, confidence, _VERIFY_OVERRIDE_THRESHOLD, assigned_type,
+                )
+
+    for field in _ENRICHMENT_FIELDS:
+        value = _field(field.upper(), "unknown").lower()
+        if value and value != "unknown":
+            result[field] = value
+
+    return result
+
+
+# A single combined batch call collapses REQUEST count, but if enough
+# sections (or long enough ones) are packed into it, the request's own
+# TOKEN count can exceed Groq's TPM (tokens-per-minute) cap outright —
+# confirmed live 2026-08-19: an 8-section combined call measured 12698
+# prompt tokens against gpt-oss-120b's 8000 TPM limit on this account and
+# Groq rejected it wholesale (413), rather than throttling or queuing it.
+# These constants keep each sub-batch's estimated PROMPT size well under
+# that ceiling, leaving headroom both for the COMPLETION tokens the same
+# call will also consume (see _batch_max_tokens below — TPM counts
+# prompt+completion together) and for whatever else concurrently shares
+# the same account's TPM budget (summary generation, doc-type
+# classification, etc.).
+_BATCH_TOKEN_BUDGET = 3000
+_BATCH_SECTION_OVERHEAD_TOKENS = 300  # rough cost of one section's step1 + reply-format lines, excluding its TEXT
+_BATCH_GROUP_PACING_SECONDS = 3       # gap between sub-batch calls so Groq's rolling TPM window can recover
+# Hard cap on sections per group, independent of the token-budget grouping
+# above. The token budget bounds PROMPT size, but a group of many small
+# sections can still need a large COMPLETION (one full reply block per
+# section) even when their combined prompt text is tiny — confirmed live
+# 2026-08-19: a 9-section group (all short text, one group under the old
+# prompt-only budget) came back with only 5 of 9 reply blocks, the
+# completion cut off mid-batch by max_tokens sized for a single section's
+# reply. Capping section COUNT per group bounds completion size directly.
+_MAX_SECTIONS_PER_GROUP = 4
+# GROQ_CLASSIFICATION_MODEL is a reasoning model — see get_classification_
+# llm()'s docstring in router.py: max_tokens has to cover BOTH the model's
+# internal reasoning tokens (a fixed-ish floor, not headroom for the
+# visible answer) AND the actual per-section reply blocks, which scale
+# with how many sections are in this call. A single-section call's
+# existing default (500) already covers the floor for a n=1 case, but a
+# batched call needs floor + (n_sections * a real per-block budget).
+_BATCH_REASONING_FLOOR_TOKENS = 500
+_BATCH_COMPLETION_TOKENS_PER_SECTION = 220
+
+
+def _batch_max_tokens(n_sections: int) -> int:
+    return _BATCH_REASONING_FLOOR_TOKENS + _BATCH_COMPLETION_TOKENS_PER_SECTION * n_sections
+
+
+def _estimate_tokens(s: str) -> int:
+    """Rough chars/4 estimate — good enough to size sub-batches conservatively,
+    not meant to match Groq's real tokenizer exactly."""
+    return max(1, len(s) // 4)
+
+
+def _group_sections_by_token_budget(
+    sections: list[tuple[str, str]],
+) -> list[list[tuple[str, str]]]:
+    """
+    Split `sections` into ordered groups whose estimated combined prompt
+    size stays under _BATCH_TOKEN_BUDGET AND whose section COUNT stays
+    under _MAX_SECTIONS_PER_GROUP (bounds the completion side too — see
+    that constant's comment), so verify_and_enrich_sections_batch can send
+    each group as its own request instead of risking one oversized
+    combined call. A single section that alone exceeds the token budget
+    still gets its own group (nothing left to split further) rather than
+    being dropped.
+    """
+    groups: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    current_tokens = 0
+    for text, assigned_type in sections:
+        section_tokens = _estimate_tokens(text[:4000]) + _BATCH_SECTION_OVERHEAD_TOKENS
+        if current and (
+            current_tokens + section_tokens > _BATCH_TOKEN_BUDGET
+            or len(current) >= _MAX_SECTIONS_PER_GROUP
+        ):
+            groups.append(current)
+            current, current_tokens = [], 0
+        current.append((text, assigned_type))
+        current_tokens += section_tokens
+    if current:
+        groups.append(current)
+    return groups
+
+
+def verify_and_enrich_sections_batch(
+    sections: list[tuple[str, str]],
+    llm: Any = None,
+    *,
+    doc_prior: str = "",
+) -> list[dict]:
+    """
+    Batched version of verify_and_enrich_section_metadata() — verifies and
+    enriches every section of a document in as few LLM calls as possible
+    instead of one call per section.
+
+    Exists because the per-section version is called unconditionally for
+    every section during ingestion (never regex-gated, unlike
+    classify_chunk_intent) — a document with N sections previously made N
+    separate Groq requests back-to-back with no throttling, which reliably
+    tripped Groq's per-minute REQUEST rate limit on multi-section documents
+    (confirmed live 2026-08-19: an 8-section PDF produced a burst of 429s
+    with 18-22s retry backoffs during ingestion).
+
+    Sections are grouped by _group_sections_by_token_budget() rather than
+    always sent as one call — a single oversized combined request can trip
+    Groq's separate TOKEN rate limit instead (see _BATCH_TOKEN_BUDGET's
+    comment), so this keeps each request's own size bounded and paces
+    consecutive sub-batch calls _BATCH_GROUP_PACING_SECONDS apart. This
+    still collapses what used to be N requests down to a small, roughly
+    constant number regardless of section count (typically 1-2 for a
+    normal document), and runs entirely inside a background thread so the
+    added pacing delay costs nothing user-facing.
+
+    sections: list of (text, assigned_type) tuples, in the order results
+    should be returned. Falls back to {"policy_type": assigned_type, ...all
+    "unknown"} for any section whose sub-batch call fails or whose reply
+    can't be parsed — same fail-safe behavior as the single-section
+    function, just applied per sub-batch rather than one call at a time.
+    """
+    results = [
+        {"policy_type": assigned_type, **{f: "unknown" for f in _ENRICHMENT_FIELDS}}
+        for _, assigned_type in sections
+    ]
+    if llm is None or not sections:
+        return results
+
+    groups = _group_sections_by_token_budget(sections)
+    offset = 0
+    for gi, group in enumerate(groups):
+        if gi > 0:
+            time.sleep(_BATCH_GROUP_PACING_SECONDS)
+        try:
+            prompt = _build_verify_and_enrich_batch_prompt(group, doc_prior)
+            # Override max_tokens for this call via .bind() rather than
+            # reconstructing the LLM — the caller's llm instance is shared
+            # across other classification calls (classify_candidate_type
+            # etc.) that need the smaller single-item default. A combined
+            # multi-section reply needs more room than that default covers
+            # (see _batch_max_tokens' comment) — confirmed live 2026-08-19:
+            # without this override, a 9-section reply came back truncated
+            # to 5 of 9 blocks under the single-section max_tokens default.
+            response = llm.bind(max_tokens=_batch_max_tokens(len(group))).invoke(prompt)
+            raw = response.content if hasattr(response, "content") else str(response)
+
+            blocks = re.split(r"===\s*SECTION\s+\d+\s*===", raw)[1:]
+            if len(blocks) != len(group):
+                logger.warning(
+                    "[POLICY_TYPE] batch verify/enrich sub-batch %d/%d returned %d block(s), "
+                    "expected %d — keeping first-pass assignment for this sub-batch",
+                    gi + 1, len(groups), len(blocks), len(group),
+                )
+            else:
+                for j, (block, (_, assigned_type)) in enumerate(zip(blocks, group)):
+                    results[offset + j] = _parse_verify_and_enrich_reply(block, assigned_type)
+
+        except Exception as exc:
+            logger.warning(
+                "[POLICY_TYPE] batch verify/enrich sub-batch %d/%d LLM call failed: %s — "
+                "keeping first-pass assignment for this sub-batch",
+                gi + 1, len(groups), exc,
+            )
+
+        offset += len(group)
+
+    return results
 
 
 # Generic insurance vocabulary excluded from candidate-hint keywords — these

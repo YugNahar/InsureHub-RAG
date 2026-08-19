@@ -1201,7 +1201,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
         try:
             from router import get_classification_llm
             from metadata_tagger import (
-                verify_and_enrich_section_metadata,
+                verify_and_enrich_sections_batch,
                 classify_candidate_type,
                 derive_document_topic_prior,
             )
@@ -1231,29 +1231,49 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             )
 
             updated = 0
+            # The synchronous step above already ran the free heading-first
+            # regex pass (SectionChunker.split_documents with llm=None, by
+            # design, to keep the upload response fast) — that result is
+            # already sitting in each chunk's policy_type metadata. Use it
+            # as the baseline the LLM verifies/corrects here, rather than
+            # reclassifying from scratch — cheaper, and lets a confident
+            # regex heading match (e.g. "MOTOR INSURANCE") skip straight to
+            # confirmation instead of re-deriving it. But when the document
+            # has a confident doc_prior, start from THAT instead — see
+            # rag.py's SectionChunker for why: a razor-thin regex call on an
+            # isolated section anchors the VERIFY question on the wrong
+            # type, and no amount of persuasive doc-context text reliably
+            # talks the model back off an anchor already baked into the
+            # question.
+            _section_items_list = list(sections.values())
+            _section_texts = [
+                "\n\n".join(c.page_content for _, c in section_items)
+                for section_items in _section_items_list
+            ]
+            _section_assigned_types = [
+                doc_prior if doc_prior and doc_prior != "general"
+                else section_items[0][1].metadata.get("policy_type", "general")
+                for section_items in _section_items_list
+            ]
+            # Batched — one Groq call for the whole document's sections
+            # instead of one call per section. This loop used to call
+            # verify_and_enrich_section_metadata() once per section_id
+            # group with no throttling; on a multi-section PDF that fired a
+            # burst of back-to-back Groq requests that reliably tripped
+            # Groq's per-minute rate limit (confirmed live 2026-08-19: an
+            # 8-section PDF upload produced repeated 429s with 18-22s retry
+            # backoffs, entirely inside this background thread). See
+            # verify_and_enrich_sections_batch()'s docstring for the same
+            # reasoning applied to SectionChunker's own synchronous path.
+            _enriched_list = verify_and_enrich_sections_batch(
+                list(zip(_section_texts, _section_assigned_types)),
+                llm=reclass_llm, doc_prior=doc_prior,
+            )
+
             _section_pass1 = []
-            for section_items in sections.values():
-                section_text = "\n\n".join(c.page_content for _, c in section_items)
-                # The synchronous step above already ran the free heading-
-                # first regex pass (SectionChunker.split_documents with
-                # llm=None, by design, to keep the upload response fast) —
-                # that result is already sitting in each chunk's
-                # policy_type metadata. Use it as the baseline the LLM
-                # verifies/corrects here, rather than reclassifying from
-                # scratch — cheaper, and lets a confident regex heading
-                # match (e.g. "MOTOR INSURANCE") skip straight to
-                # confirmation instead of re-deriving it. But when the
-                # document has a confident doc_prior, start from THAT
-                # instead — see rag.py's SectionChunker for why: a
-                # razor-thin regex call on an isolated section anchors the
-                # VERIFY question on the wrong type, and no amount of
-                # persuasive doc-context text reliably talks the model back
-                # off an anchor already baked into the question.
-                first_pass_type = section_items[0][1].metadata.get("policy_type", "general")
-                assigned_type = doc_prior if doc_prior and doc_prior != "general" else first_pass_type
-                enriched = verify_and_enrich_section_metadata(
-                    section_text, assigned_type, llm=reclass_llm, doc_prior=doc_prior,
-                )
+            for section_items, section_text, enriched in zip(
+                _section_items_list, _section_texts, _enriched_list,
+            ):
                 fresh = enriched["policy_type"]
                 # Mode-A fallback: the closed vocabulary still can't place
                 # this section even with a real LLM available — this is the
@@ -1262,6 +1282,9 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 # classify_candidate_type() docstring — never overrides
                 # `fresh`, only attaches an open-ended guess for retrieval's
                 # candidate-match bypass and the promotion-review log.
+                # Stays per-section (not batched) — only fires for
+                # "general" sections, a small minority, so it isn't a
+                # rate-limit driver.
                 section_candidate_type = None
                 if fresh == "general":
                     section_candidate_type = classify_candidate_type(
@@ -1304,12 +1327,20 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             if _doc_candidate_anchor and _candidate_tally[_doc_candidate_anchor] < 2:
                 _doc_candidate_anchor = None
 
-            _final_sections = []
-            for section_items, section_text, fresh, section_candidate_type, enriched in _section_pass1:
-                if _doc_candidate_anchor and fresh != "general" and section_candidate_type != _doc_candidate_anchor:
-                    enriched2 = verify_and_enrich_section_metadata(
-                        section_text, fresh, llm=reclass_llm, doc_prior=_doc_candidate_anchor,
-                    )
+            # Pass 2 is batched the same way — one Groq call covering every
+            # section that needs anchor re-verification, instead of one call
+            # per qualifying section.
+            _pass2_idx = [
+                i for i, (_, _, fresh, section_candidate_type, _) in enumerate(_section_pass1)
+                if _doc_candidate_anchor and fresh != "general" and section_candidate_type != _doc_candidate_anchor
+            ]
+            if _pass2_idx:
+                _pass2_inputs = [(_section_pass1[i][1], _section_pass1[i][2]) for i in _pass2_idx]
+                _pass2_results = verify_and_enrich_sections_batch(
+                    _pass2_inputs, llm=reclass_llm, doc_prior=_doc_candidate_anchor,
+                )
+                for i, enriched2 in zip(_pass2_idx, _pass2_results):
+                    section_items, section_text, fresh, section_candidate_type, enriched = _section_pass1[i]
                     fresh2 = enriched2["policy_type"]
                     if fresh2 != fresh:
                         logger.info(
@@ -1320,7 +1351,12 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                         if fresh == "general":
                             section_candidate_type = _doc_candidate_anchor
                             upsert_candidate(_doc_candidate_anchor, [], filename, "chunk")
-                _final_sections.append((section_items, fresh, section_candidate_type, enriched))
+                    _section_pass1[i] = (section_items, section_text, fresh, section_candidate_type, enriched)
+
+            _final_sections = [
+                (section_items, fresh, section_candidate_type, enriched)
+                for section_items, _, fresh, section_candidate_type, enriched in _section_pass1
+            ]
 
             for section_items, fresh, section_candidate_type, enriched in _final_sections:
                 for cid, _ in section_items:

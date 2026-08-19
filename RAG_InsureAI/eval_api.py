@@ -54,7 +54,7 @@ from app.document_loader import (
 )
 from app.metadata_tagger import (
     tag_document, classify_query, build_metadata_filter, classify_document_type,
-    classify_chunk_intent, classify_chunk_intent_batch,
+    classify_chunk_intent,
     classify_chunk_policy_type, classify_candidate_type,
 )
 from app.vector_store import ChromaVectorStore
