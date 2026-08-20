@@ -103,6 +103,56 @@ def get_active_vocab_extra() -> Dict[str, Dict]:
     return _load_json(_ACTIVE_VOCAB_EXTRA_PATH, {})
 
 
+def _safe_regex_from_keywords(keywords: List[str], label: str = "") -> List[str]:
+    """
+    Build a promoted type's regex list from its accumulated keywords,
+    restricted to genuinely discriminating phrases only.
+
+    Confirmed live 2026-08-20: the un-filtered fallback used to escape and
+    keep EVERY keyword, single bare words included — a promoted type's
+    keywords are accumulated across up to 20 entries from possibly many
+    different sources (see upsert_candidate/maybe_promote above), and
+    classify_candidate_type's open-ended guesses routinely include ordinary
+    English/generic-insurance words alongside genuinely topical ones (e.g.
+    "treaty_reinsurance" had ["treaty", "reinsurer", "terms", "within",
+    "reinsurance", "proportional", "agreement", "business", ...] — "terms",
+    "within", "business", "agreement" carry no topical signal at all).
+    _regex_policy_score() (metadata_tagger.py) then applies every one of
+    these with FULL scoring weight via a plain re.search(), no different
+    from a carefully hand-tuned hardcoded pattern — so a single-word entry
+    like "terms" silently matched an unrelated section just because its
+    heading was "Key Terms to Understand", and "business"/"risk"/"needs"/
+    "required"-style entries on other promoted types are equally capable of
+    matching almost any insurance document.
+
+    Every hand-tuned pattern in metadata_tagger.py's own hardcoded
+    _POLICY_TYPE_HINTS follows the same discipline already (phrases, not
+    bare generic words — crop's bare r"\\bcrops?\\b" is the one deliberate,
+    commented exception, added because it doesn't collide with any other
+    type). Multi-word phrases are inherently far less likely to be generic
+    false positives than single words, so — since a promoted type's
+    keywords are never manually reviewed the way the hardcoded ones were —
+    only phrases of 2+ words are kept as regex here; single-word keywords
+    still contribute to the softer "keywords" list (used by
+    match_candidate_vocab's cheap overlap check, which its own docstring
+    already documents as low-stakes and never touching the retrieval
+    filter) but are never promoted to a hard regex match on their own. The
+    label's own natural-language phrase is usually 2+ words (see
+    maybe_promote's own natural_phrase guarantee), but a genuinely
+    single-word label (e.g. "pension") produces a single-word natural
+    phrase too — the accumulated-keywords filter above would then leave it
+    with an empty regex list, silently making it unmatchable by the fast
+    path. The label's own name is always included regardless of word
+    count to guard against that: unlike an arbitrary accumulated keyword,
+    it's a deliberate identifier the classifier coined for this type, not
+    a loosely-associated word swept in from one guess among many.
+    """
+    phrases = {kw for kw in keywords if kw and len(kw.split()) >= 2}
+    if label:
+        phrases.add(label.replace("_", " "))
+    return [r"\b" + re.escape(kw) + r"\b" for kw in sorted(phrases)]
+
+
 def promote_to_active_vocab(
     label: str, desc: str, keywords: List[str], regex: Optional[List[str]] = None
 ) -> None:
@@ -117,7 +167,7 @@ def promote_to_active_vocab(
         extra[label] = {
             "desc": desc,
             "keywords": keywords,
-            "regex": regex or [re.escape(kw) for kw in keywords if kw],
+            "regex": regex or _safe_regex_from_keywords(keywords, label),
         }
         _atomic_write_json(_ACTIVE_VOCAB_EXTRA_PATH, extra)
         candidates = _load_json(_CANDIDATE_VOCAB_PATH, {})
