@@ -593,6 +593,25 @@ class SemanticChunker:
         docs = _merge_pages(docs)
 
         result: List[Document] = []
+        # section_id disambiguation: a heading's own TEXT recurring later in
+        # the same document (e.g. "General Exclusions" under both a Health
+        # chapter and a Motor chapter of one combined-lines PDF) must NOT
+        # collapse into the same section_id — confirmed by inspection: the
+        # bare f"{doc_source}::{heading}" key below has no way to tell two
+        # such occurrences apart, so both would merge into one group and
+        # get classified together as if they were one contiguous section.
+        # Tracked per doc_source (a single split_documents() call can cover
+        # multiple different source files) and carried across the outer
+        # `for doc in docs` loop below, since one physical document's pages
+        # can span more than one `doc` object after _merge_pages. Consecutive
+        # chunks that keep the SAME heading value still share one occurrence
+        # (that's the whole point of section_id — grouping a section's own
+        # sibling chunks together) -- only a genuine transition INTO a
+        # heading bumps the count, and only when that heading text has
+        # already been used by an earlier, non-adjacent section.
+        _prev_heading_by_source: dict[str, str] = {}
+        _heading_occurrence_by_source: dict[str, dict[str, int]] = {}
+        _current_occurrence_by_source: dict[str, int] = {}
         for doc in docs:
             page_value = (
                 doc.metadata.get("page")
@@ -643,6 +662,18 @@ class SemanticChunker:
                 # changing how chunks get grouped into sections.
                 effective_heading = heading or page_header_topic
 
+                # New section boundary (heading changed from the immediately
+                # preceding piece, tracked per doc_source) — bump the
+                # occurrence count for this heading text so a later,
+                # non-adjacent recurrence of the same text gets a distinct
+                # section_id instead of merging with an earlier section.
+                if heading != _prev_heading_by_source.get(doc_source):
+                    if heading:
+                        occ_map = _heading_occurrence_by_source.setdefault(doc_source, {})
+                        occ_map[heading] = occ_map.get(heading, 0) + 1
+                        _current_occurrence_by_source[doc_source] = occ_map[heading]
+                    _prev_heading_by_source[doc_source] = heading
+
                 # Count overlap words after marker stripping so the value is
                 # accurate for the stored (marker-free) text. section_id
                 # groups every chunk produced from the same detected section
@@ -664,7 +695,10 @@ class SemanticChunker:
                         "chunking_method":     "semantic",
                         "overlap_prefix_words": ov_size,
                         "section_heading":     effective_heading,
-                        "section_id":          f"{doc_source}::{heading}" if heading else f"{doc_source}::chunk{idx}",
+                        "section_id":          (
+                            f"{doc_source}::{heading}::{_current_occurrence_by_source[doc_source]}"
+                            if heading else f"{doc_source}::chunk{idx}"
+                        ),
                     },
                 ))
         return result
