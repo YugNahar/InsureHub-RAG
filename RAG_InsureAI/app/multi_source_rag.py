@@ -4606,6 +4606,135 @@ _PGF_CLAIMS_PROMPT = (
 )
 
 
+async def _detect_unjustified_recommendation(question: str, answer: str) -> Optional[str]:
+    """
+    Catches an answer that settles on and recommends ONE specific named
+    option (a particular plan/product/type) as clearly the right choice,
+    when the QUESTION itself provides no basis to prefer that option over
+    other valid alternatives the source material lists. Confirmed live,
+    reproduced identically on this same local machine (not a backend/Groq
+    quality fluke): "What should travel insurance cover before I buy it?"
+    — a plain coverage-checklist question, no recommendation asked for —
+    got "let's focus on a Single-Trip Plan... designed specifically for
+    one journey" as its opening framing, inventing an assumption about the
+    user's trip (that it's a single, occasional one) the question never
+    stated, to justify picking ONE of five plan types the source actually
+    lists (Single-Trip, Annual Multi-Trip, Family, Student, Senior
+    Citizen).
+
+    Deliberately an LLM judgment call, not a regex/keyword check — "did
+    the question actually justify singling out this one option" requires
+    understanding what the question asked and what the source offers as
+    alternatives, which a pattern match structurally can't do (and this
+    codebase has already hit this exact wall before: layering more regex
+    onto a semantic question just moves the false-negative surface around
+    rather than closing it). Kept to a single cheap call for the common
+    case (nothing flagged) — the caller only pays for a second call when
+    this one actually finds something.
+
+    Returns the specific recommended item's own name (e.g. "Single-Trip
+    Plan") if flagged, so the rewrite step below knows exactly what to
+    remove without re-deriving it. Returns None on no-flag or on any
+    failure — fails toward leaving the answer untouched, same fail-safe
+    direction as every other best-effort check in this file.
+    """
+    try:
+        prompt = f"""Does the ANSWER below settle on and recommend ONE specific named option
+(e.g. one particular plan, product, or type) as clearly the right choice, even though the
+QUESTION doesn't specify anything that would justify preferring that one option over other
+valid alternatives the source material might offer? This is about an UNSOLICITED, UNJUSTIFIED
+single pick — not about a genuinely correct answer to a question that actually asked for
+one, and not about simply naming an option as an EXAMPLE among several mentioned side by
+side.
+
+QUESTION: {question}
+
+ANSWER: {answer}
+
+If the ANSWER does this, reply with ONLY the exact name of the specific option it recommended
+(e.g. "Single-Trip Plan"), nothing else. If it does not do this — including if the QUESTION
+itself provided enough information to justify a specific recommendation, or the ANSWER just
+neutrally describes options without picking one — reply with exactly: NONE"""
+        # Pinned to Groq first (2026-09-03) — confirmed live this specific
+        # judgment call is genuinely beyond the small local vLLM model, not
+        # a prompt-phrasing problem: 8/8 identical "NONE" on a confirmed
+        # real case even after adding a worked example (the technique that
+        # fixed comparable small-model failures elsewhere this session).
+        # The SAME prompt against Groq's larger model correctly flagged it
+        # 3/3. Unlike the earlier attempt to pin EVERY policy-type
+        # classification call to Groq (abandoned — that fires on most
+        # queries and exhausted the shared 8000 TPM quota), this check
+        # only runs once per generated answer, and the follow-up rewrite
+        # call only fires on the rare answer that actually gets flagged —
+        # low enough volume to be worth the quota. Falls back to whatever
+        # backend is active if Groq is unavailable, same as every other
+        # Groq-preferring call in this file.
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=12, backend_override="groq")
+        if not raw:
+            raw = await _backend_completion(prompt, max_tokens=20, timeout=12)
+        if not raw:
+            return None
+        flagged = raw.strip().strip('"')
+        if not flagged or flagged.upper().startswith("NONE"):
+            return None
+        if len(flagged) > 80:
+            return None
+        return flagged
+    except Exception as exc:
+        logger.debug("[ask_stream] unjustified-recommendation detection failed (%s)", exc)
+        return None
+
+
+async def _neutralize_unjustified_recommendation(question: str, answer: str, flagged_item: str) -> Optional[str]:
+    """
+    Rewrites an answer flagged by _detect_unjustified_recommendation above
+    — removes the unsolicited specific recommendation and any invented
+    assumption used to justify it, while preserving every other real fact
+    in the answer unchanged. Same "try an LLM rewrite, fall back to the
+    original on any failure or suspicious output" discipline already used
+    for _srg_weave_items_into_unit elsewhere in this file — this can only
+    improve the answer on success, never make it worse on failure, since
+    the caller keeps the original untouched unless this returns a real
+    rewrite.
+
+    No length-ratio or word-overlap validation here (unlike the SRG weave
+    check) — removing a whole sentence's worth of unjustified content is
+    an EXPECTED, not suspicious, shrink, so a length-based safety check
+    would just fight the very thing this function is meant to do. The
+    prompt's own explicit "keep every other fact exactly as stated"
+    instruction is the safeguard instead.
+    """
+    try:
+        prompt = f"""The ANSWER below recommends "{flagged_item}" specifically, but the QUESTION
+doesn't provide enough information to justify that specific choice over other valid
+alternatives. Rewrite the ANSWER to remove that specific recommendation and any invented
+assumption used to justify it (don't say "you should buy X" or invent details about the
+user's own situation/trip) — but keep every OTHER real fact in the ANSWER exactly as stated,
+just presented neutrally rather than tied to the one recommended option. Don't add any new
+fact that wasn't already in the ANSWER.
+
+QUESTION: {question}
+
+ANSWER: {answer}
+
+Rewrite:"""
+        # Groq-first, same reasoning as the detection call above — this
+        # only fires on the rare answer detection already flagged, so the
+        # extra quota cost is small.
+        raw = await _backend_completion(prompt, max_tokens=250, timeout=15, backend_override="groq")
+        if not raw:
+            raw = await _backend_completion(prompt, max_tokens=250, timeout=15)
+        if not raw:
+            return None
+        rewritten = raw.strip().strip('"')
+        if not rewritten:
+            return None
+        return rewritten
+    except Exception as exc:
+        logger.debug("[ask_stream] unjustified-recommendation rewrite failed (%s)", exc)
+        return None
+
+
 async def _pgf_extract_claims(text: str) -> list:
     """LLM-based atomic-claim decomposition — a SALVAGE step for the prose
     post-generation faithfulness path in ask_stream, only invoked after a
@@ -14299,6 +14428,32 @@ class MultiSourceRAG:
                         _kv_reply = _corrected_text
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
+
+        # ── Unsolicited single-option recommendation check (2026-09-03) ──────
+        # See _detect_unjustified_recommendation's own docstring for the
+        # confirmed live failure this targets. Runs on the FULL current
+        # answer text (post the currency/qualifier phase above, so it sees
+        # whatever's already been corrected), not per-sentence — the
+        # problem this catches is about the answer's overall framing/
+        # recommendation, not one isolated claim, so a per-unit check
+        # (like the currency loop above) isn't the right shape for it.
+        try:
+            _reco_src = (_corrected_text or _reply_stripped).strip()
+            if _reco_src and len(_reco_src) > 40:
+                _flagged_reco = await _detect_unjustified_recommendation(question, _reco_src)
+                if _flagged_reco:
+                    _rewritten_reco = await _neutralize_unjustified_recommendation(
+                        question, _reco_src, _flagged_reco,
+                    )
+                    if _rewritten_reco:
+                        logger.info(
+                            "[ask_stream] unjustified recommendation neutralized: %r -> %r",
+                            _flagged_reco, _rewritten_reco[:150],
+                        )
+                        _corrected_text = _rewritten_reco
+                        _kv_reply = _rewritten_reco
+        except Exception as _reco_exc:
+            logger.debug("[ask_stream] unjustified-recommendation check skipped: %s", _reco_exc)
 
         # ── Relation-anchored grounding (Phase 3, plan_claim_answer_ ──────────
         # correctness.md) — LOG-ONLY diagnostic, does NOT modify the answer ───
