@@ -1,0 +1,127 @@
+{
+  "meta_path": "/app/app/turbovec_data/documents/insurance_docs_meta.ndjson",
+  "total_chunks_in_file": 1241,
+  "chunks_classified": 20,
+  "limited": true,
+  "decisions": [
+    {
+      "id": "288c5dde-d7b5-494e-a2a9-b9ee39da7b32",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "Why Livestock Insurance Matters",
+      "old": "general",
+      "new": "general"
+    },
+    {
+      "id": "cede61ac-9353-4ff5-b329-4b54f7265512",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "Types of Livestock Insurance",
+      "old": "general",
+      "new": "types_of_insurance"
+    },
+    {
+      "id": "453d891e-7941-4819-8049-ee0d4df541c1",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "What Livestock Insurance Typically Covers",
+      "old": "benefits",
+      "new": "benefits"
+    },
+    {
+      "id": "7de47e4e-b7fc-4b96-a0e3-825bb6b1f983",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "Common Exclusions",
+      "old": "exclusions",
+      "new": "exclusions"
+    },
+    {
+      "id": "3787234d-d646-4019-9601-6343eed75ae7",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "Key Terms to Understand",
+      "old": "benefits",
+      "new": "definitions"
+    },
+    {
+      "id": "98c1fbbe-5f83-42ec-96da-60f5d7de876d",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "How to File a Livestock Insurance Claim",
+      "old": "claims",
+      "new": "claims"
+    },
+    {
+      "id": "c8ffd864-0ad9-4d2a-90e6-b0479e7c521b",
+      "source": "96c6c1ee43dd_livestock_insurance_guide.pdf",
+      "heading": "Practical Tips",
+      "old": "general",
+      "new": "how_to"
+    },
+    {
+      "id": "90671e4f-c506-46cf-ba0d-1b47e449af0b",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "Why Travel Insurance Matters",
+      "old": "general",
+      "new": "benefits"
+    },
+    {
+      "id": "12490e35-5fce-4e18-9ed6-5d5f599e6c80",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "Single-Trip vs. Annual Multi-Trip Policies",
+      "old": "general",
+      "new": "benefits"
+    },
+    {
+      "id": "898038d9-15d4-434f-8576-226d42d0d566",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "Domestic vs. International Cover",
+      "old": "benefits",
+      "new": "benefits"
+    },
+    {
+      "id": "41a36645-206c-48e7-ad0a-d3836e6da30d",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "What Travel Insurance Typically Covers",
+      "old": "benefits",
+      "new": "benefits"
+    },
+    {
+      "id": "f157f02a-749c-4b11-948a-dd88db79fcd8",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "Common Exclusions",
+      "old": "exclusions",
+      "new": "exclusions"
+    },
+    {
+      "id": "b29e9259-41d2-4161-b451-fc684b7c2c04",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "How to File a Travel Insurance Claim",
+      "old": "claims",
+      "new": "claims"
+    },
+    {
+      "id": "a4d3f348-50a3-4b05-ad97-76791d6c667b",
+      "source": "6e0e3ba51525_travel_insurance_guide.pdf",
+      "heading": "Practical Tips",
+      "old": "benefits",
+      "new": "how_to"
+    },
+    {
+      "id": "98fe45cb-e750-4965-8933-2f72945e8cf0",
+      "source": "282e5b14f5f1_InsuranceFundamentals.pdf",
+      "heading": "Insurance Fundamentals",
+      "old": "general",
+      "new": "chapter"
+    },
+    {
+      "id": "0f27e0d8-96c4-4c4a-9dc2-12ba26444dc0",
+      "source": "282e5b14f5f1_InsuranceFundamentals.pdf",
+      "heading": "Insurable Interest",
+      "old": "principles",
+      "new": "principles"
+    },
+    {
+      "id": "5f9a4f3a-d752-4603-851b-aac2eef03bc4",
+      "source": "282e5b14f5f1_InsuranceFundamentals.pdf",
+      "heading": "Utmost Good Faith",
+      "old": "principles",
+      "new": "principles"
+    }
+  ]
+}

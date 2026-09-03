@@ -1206,6 +1206,22 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 derive_document_topic_prior,
             )
             from candidate_vocab import upsert_candidate
+            # classify_candidate_section (rag.py) is the SECTION-side sibling
+            # of classify_candidate_type just above — same open-vocabulary
+            # fallback shape, for _detect_section()'s fixed ~13-category
+            # list instead of policy_type's. Confirmed missing from this
+            # entire function before this fix: the synchronous ingest step
+            # (SectionChunker.split_documents, called with llm=None by
+            # design to keep the upload response fast) DOES call it, but
+            # classify_candidate_section() itself returns None immediately
+            # whenever llm is None and no existing candidate already
+            # matches — so a genuinely NEW section category, in a document
+            # uploaded through the live /upload endpoint, could never
+            # actually get a fresh candidate_section label, only ever match
+            # ONE it had somehow already discovered some other way. This is
+            # the one place in the live pipeline where a real LLM
+            # (reclass_llm, below) is actually available post-ingest.
+            from rag import classify_candidate_section
             reclass_llm = get_classification_llm(temperature=0)
             tvec = pipeline.vector_store._store
 
@@ -1271,6 +1287,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             )
 
             _section_pass1 = []
+            _section_candidate_sections = []
             for section_items, section_text, enriched in zip(
                 _section_items_list, _section_texts, _enriched_list,
             ):
@@ -1291,6 +1308,23 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                         section_text, llm=reclass_llm, source=filename, source_type="chunk",
                     )
                 _section_pass1.append((section_items, section_text, fresh, section_candidate_type, enriched))
+
+                # Same open-vocabulary fallback, one axis over: section
+                # (benefits/exclusions/claims/...) instead of policy_type.
+                # A completely separate axis from Pass 2 below (which only
+                # ever revisits policy_type), so this is computed once here
+                # and never needs to participate in that later rewrite —
+                # kept as its own parallel list, same order/length as
+                # _section_items_list, rather than threaded through
+                # _section_pass1's own tuple shape.
+                _existing_section = section_items[0][1].metadata.get("section", "general")
+                section_candidate_section = None
+                if _existing_section == "general":
+                    _section_heading = section_items[0][1].metadata.get("section_heading", "")
+                    section_candidate_section = classify_candidate_section(
+                        section_text, heading=_section_heading, llm=reclass_llm, source=filename,
+                    )
+                _section_candidate_sections.append(section_candidate_section)
 
             # Pass 2 — in-document open-vocabulary anchor correction.
             # derive_document_topic_prior() only scores the CLOSED 12-type
@@ -1358,7 +1392,9 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 for section_items, _, fresh, section_candidate_type, enriched in _section_pass1
             ]
 
-            for section_items, fresh, section_candidate_type, enriched in _final_sections:
+            for (section_items, fresh, section_candidate_type, enriched), section_candidate_section in zip(
+                _final_sections, _section_candidate_sections,
+            ):
                 for cid, _ in section_items:
                     meta = tvec._metadatas.get(cid)
                     if meta is None:
@@ -1368,6 +1404,9 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                         updated += 1
                     if section_candidate_type:
                         meta["candidate_policy_type"] = section_candidate_type
+                    if section_candidate_section and meta.get("candidate_section") != section_candidate_section:
+                        meta["candidate_section"] = section_candidate_section
+                        updated += 1
                     elif fresh != "general" and meta.get("candidate_policy_type"):
                         # Confirmed live 2026-08-10: without this, a chunk
                         # whose synchronous (regex-only) pass landed on
@@ -1464,7 +1503,7 @@ class URLRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 # MultiSourceRAG, VideoStore, WebpageStore
 # ══════════════════════════════════════════════════════════════════════════════
-from multi_source_rag import MultiSourceRAG, _reset_dynamic_anchor_cache
+from multi_source_rag import MultiSourceRAG, _reset_dynamic_anchor_cache, _confirm_insurance_adjacent_legitimate
 from document_loader import (
     ALLOWED_EXTENSIONS,
     FileValidationError,
@@ -1490,7 +1529,7 @@ def _get_multi_rag() -> MultiSourceRAG:
     return _multi_rag
 
 
-def _chunk_transcript(transcript_text: str, url: str, title: str = "", doc_meta: dict | None = None) -> list:
+def _chunk_transcript(transcript_text: str, url: str, title: str = "", doc_meta: dict | None = None, llm=None) -> list:
     from langchain_core.documents import Document
 
     if doc_meta is None:
@@ -1507,7 +1546,21 @@ def _chunk_transcript(transcript_text: str, url: str, title: str = "", doc_meta:
             "source_type": "youtube_transcript",
         },
     )
-    chunks = chunker.split_documents([doc], doc_type="youtube")
+    # llm threaded through so SectionChunker's own per-section classification
+    # (heading-first regex pass + LLM verify/enrich) actually runs for video
+    # transcripts — mirrors what /upload-webpage already does below. Without
+    # this, section_intents falls back to the regex-only _detect_section()
+    # path, which the pipeline's OWN force_llm_flags=is_youtube mechanism
+    # (see SectionChunker.split_documents / classify_chunk_intents_batch in
+    # rag.py) exists specifically because it isn't reliable enough for
+    # casual/spoken transcript phrasing — confirmed live: a transcript
+    # clearly about filing a claim (police report, claim documents, "we'll
+    # file the claim on your behalf") still landed every chunk on
+    # section="general" instead of "claims". filename=title also activates
+    # derive_document_topic_prior's highest-precision title-based
+    # policy_type signal, the same mechanism already used by rag.py's
+    # RAGPipeline.add_url() (its filename=url) for the same reason.
+    chunks = chunker.split_documents([doc], doc_type="youtube", llm=llm, filename=title)
     for chunk in chunks:
         # source_type="video" so VideoVectorStore.search(filter={"source_type":"video"}) matches
         chunk.metadata["source_type"] = "video"
@@ -1554,7 +1607,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
             url, doc_meta.get("insurer", "UNKNOWN"), doc_meta.get("policy_type", "general"),
         )
 
-        chunks = _chunk_transcript(transcript_text, url, title, doc_meta=doc_meta)
+        chunks = _chunk_transcript(transcript_text, url, title, doc_meta=doc_meta, llm=llm)
         multi.add_video_chunks(url, chunks, title=title)
         _invalidate_query_cache()
         return {
@@ -1631,8 +1684,13 @@ async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
         # classification (heading-first regex pass + LLM verify/enrich —
         # see SectionChunker.split_documents in rag.py) runs once per
         # detected section, not once per chunk redundantly afterward below.
+        # filename=page_title activates derive_document_topic_prior's
+        # highest-precision title-based policy_type signal (a page titled
+        # e.g. "Travel Insurance Guide" resolves unambiguously from the
+        # title alone) — same mechanism rag.py's RAGPipeline.add_url()
+        # already uses via filename=url for this exact reason.
         chunker = SectionChunker(chunk_size=2000, chunk_overlap=600)
-        chunks  = chunker.split_documents(docs, llm=llm)
+        chunks  = chunker.split_documents(docs, llm=llm, filename=page_title)
 
         # ── Finish per-chunk metadata (section/policy_type already set) ──────
         for chunk in chunks:
@@ -2385,10 +2443,17 @@ async def ask_stream(req: AskRequest):
         r"premium|cyber|deductible|reimburs|payout|indemnity)\b"
     )
     _q_lower_for_illegal_check = req.question.lower()
-    _is_illegal = bool(_ILLEGAL_PATTERNS_ALWAYS.search(_q_lower_for_illegal_check)) or (
-        bool(_ILLEGAL_PATTERNS_INSURANCE_ADJACENT.search(_q_lower_for_illegal_check))
-        and not _INSURANCE_CONTEXT_RE.search(_q_lower_for_illegal_check)
-    )
+    _is_illegal = bool(_ILLEGAL_PATTERNS_ALWAYS.search(_q_lower_for_illegal_check))
+    if not _is_illegal and _ILLEGAL_PATTERNS_INSURANCE_ADJACENT.search(_q_lower_for_illegal_check):
+        if not _INSURANCE_CONTEXT_RE.search(_q_lower_for_illegal_check):
+            # No explicit insurance keyword — before blocking outright,
+            # confirm with one cheap LLM call whether this is genuinely a
+            # request for help with something illegal, or just an
+            # indirectly-worded real insurance question (see
+            # _confirm_insurance_adjacent_legitimate's own docstring for
+            # the live case this fixes). Fails closed: any doubt or
+            # backend error keeps the original block in place.
+            _is_illegal = not await _confirm_insurance_adjacent_legitimate(req.question)
     if _is_illegal:
         async def _illegal_gen():
             yield "I'm only here to help with insurance questions. Let's keep our conversation focused on insurance. 😊"

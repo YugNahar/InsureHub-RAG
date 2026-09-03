@@ -76,8 +76,27 @@ _POLICY_SECTION_PATTERNS: dict[str, list[str]] = {
         r"\bmaximum benefit\b", r"\bschedule of benefit\b",
     ],
     "exclusions": [
-        r"\bexclusion\b", r"\bnot cover", r"\bnot include", r"\bexclud",
+        # "exclusion\b" (singular only) never matches the heading text
+        # every one of this KB's exclusion sections actually uses —
+        # "Common Exclusions" (plural). Confirmed live: this silently
+        # zeroed out the heading's 3x weight for every such document;
+        # it only "worked" by accident for the handful whose BODY TEXT
+        # happened to independently score 2 hits some other way. Any
+        # document whose exclusions are phrased as bare factual bullets
+        # (no repeated "excluded"/"not covered") had nothing to fall
+        # back on and stayed stuck at "general".
+        r"\bexclusions?\b", r"\bnot cover", r"\bnot include", r"\bexclud",
         r"\bexcept\b", r"\bnot payable\b", r"\bvoid\b",
+        # Confirmed live: a real exclusions section (cyber insurance,
+        # phrased as bullet-point factual statements — "the law does not
+        # allow...", "unless a specific extension applies" — rather than
+        # repeating "excluded"/"not covered") scored only 1 hit above and
+        # fell back to "general". Both patterns are genuine, common
+        # exclusion-clause constructions, not specific to this one
+        # document — "unless" in particular is already recognized
+        # elsewhere in this file as a conditional/exclusionary marker
+        # (see _CONDITION_TRIGGERS above).
+        r"\bnot allow", r"\bunless\b",
     ],
     "claims": [
         r"\bclaim\b", r"\bnotif", r"\bprocedure\b",
@@ -177,6 +196,68 @@ def _detect_section(text: str, doc_type: str = "policy_document", heading: str =
     }
     best = max(scores, key=scores.__getitem__)
     return best if scores[best] >= 2 else "general"
+
+
+def classify_candidate_section(
+    text: str, heading: str = "", llm: Any = None, *, source: str = "",
+) -> Optional[str]:
+    """
+    Open-vocabulary fallback for _detect_section() — the section-side
+    sibling of metadata_tagger.classify_candidate_type() (same
+    cheap-match-then-LLM structure, same reasoning for it). Called only
+    when _detect_section() already landed on "general" for this chunk;
+    never changes the official `section` value, only ever produces a
+    `candidate_section` label for a genuinely novel category the fixed
+    ~13-category list (benefits/exclusions/claims/definitions/
+    eligibility/flight_delay/medical/baggage/legislation/types_of_
+    insurance/principles/history/case_law/chapter) doesn't cover, so
+    that category becomes recognizable — via match_candidate_section_
+    vocab(), no LLM needed — the next time similar content shows up in
+    ANY future document, without anyone having to hand-write a new regex
+    pattern for it first.
+    """
+    from candidate_section_vocab import (
+        match_candidate_section_vocab, normalize_section_label, upsert_candidate_section,
+    )
+
+    hit = match_candidate_section_vocab(f"{heading}\n{text}")
+    if hit:
+        upsert_candidate_section(hit, [], source)
+        return hit
+
+    if llm is None:
+        return None
+
+    try:
+        prompt = f"""This is one section of an insurance document. Read it and decide: does it
+belong to a SPECIFIC, NAMEABLE category of insurance-document content — in
+1-3 words (e.g. "premium calculation", "policy renewal", "grievance
+redressal", "nomination process")?
+
+- If yes, reply with ONLY that category name, lowercase, 1-3 words,
+  nothing else.
+- If the text is genuinely generic narrative, background, or doesn't fit
+  one clear category, reply with exactly: general
+
+HEADING: {heading or "(none)"}
+TEXT:
+{text[:1500]}
+
+ANSWER:"""
+        response = llm.invoke(prompt)
+        raw = (response.content if hasattr(response, "content") else str(response)).strip()
+    except Exception as exc:
+        logger.debug("[CANDIDATE_SECTION] open-ended LLM call failed: %s", exc)
+        return None
+
+    label = normalize_section_label(raw)
+    if label is None:
+        return None
+
+    from metadata_tagger import _extract_candidate_keywords
+    upsert_candidate_section(label, _extract_candidate_keywords(f"{heading}\n{text}"), source)
+    logger.info("[CANDIDATE_SECTION] open-ended guess: %r (from %r, source=%r)", label, raw[:60], source[:60])
+    return label
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -464,8 +545,8 @@ class SectionChunker:
         )
 
         # ── Pass 3: assign results back to chunks ─────────────────────────
-        for section_chunks, section_intent, section_text, enriched in zip(
-            section_groups, section_intents, section_texts, enriched_list,
+        for section_chunks, section_intent, section_text, enriched, section_heading in zip(
+            section_groups, section_intents, section_texts, enriched_list, section_headings,
         ):
             first = section_chunks[0]
             section_policy = enriched["policy_type"]
@@ -486,8 +567,22 @@ class SectionChunker:
                     source_type="chunk",
                 )
 
+            # Same open-vocabulary fallback, one axis over: _detect_section's
+            # fixed ~13-category list couldn't place this section EITHER.
+            # See classify_candidate_section()'s own docstring for why this
+            # is a separate, section-shaped sibling of the policy_type
+            # fallback above rather than reusing it.
+            section_candidate_section = None
+            if section_intent == "general":
+                section_candidate_section = classify_candidate_section(
+                    section_text, heading=section_heading, llm=llm,
+                    source=str(first.metadata.get("source", "")),
+                )
+
             for chunk in section_chunks:
                 chunk.metadata["section"] = section_intent
+                if section_candidate_section:
+                    chunk.metadata["candidate_section"] = section_candidate_section
                 # Always set the key, even when section_policy is "general" —
                 # confirmed live this must be an explicit, truthy string, not
                 # an absent key. api.py's ingest step saves each chunk's own
@@ -696,7 +791,14 @@ class RAGPipeline:
             redis_url=_redis_url,
             ttl_seconds=int(os.getenv("KV_CACHE_TTL", "3600")),
             max_entries=int(os.getenv("KV_CACHE_MAX_ENTRIES", "500")),
-            sem_threshold=float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92")),
+            # No sem_threshold override here — QueryKVCache's own default
+            # (kv_cache.py's _SEMANTIC_THRESHOLD_DEFAULT) is the single
+            # source of truth for SEMANTIC_CACHE_THRESHOLD. A hardcoded
+            # "0.92" fallback used to live here too, drifting silently out
+            # of sync when that default was deliberately raised to 0.94 —
+            # this instance kept serving direct cache hits at the old,
+            # looser threshold since multi_source_rag.py's ask_stream
+            # reuses this exact cache object (self.doc_pipeline._cache).
         )
         logger.info("[RAGPipeline] KV cache ready — redis=%s", _redis_url)
 

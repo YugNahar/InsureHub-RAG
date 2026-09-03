@@ -1,0 +1,118 @@
+{
+  "notes": "Ground-truth expected_items are hand-verified against live /retrieve output for each query (see session notes) — not derived from the same structural-detection logic the production guard uses, to avoid grading circularity (same principle as contamination_corpus.json's hand-labeled forbidden_phrases). enumerable cases check specificity recall; control cases must show ~zero point/word-count drift between the pre-guard and post-guard runs.",
+  "cases": [
+    {
+      "id": "motor_claim_documents",
+      "category": "enumerable",
+      "query": "How to claim the motor insurance?",
+      "item_group_hint": "documents",
+      "expected_items": ["registration certificate", "driving licence", "police report", "repair estimates"]
+    },
+    {
+      "id": "health_reimbursement_claim_documents",
+      "category": "enumerable",
+      "query": "How do I claim health insurance if I paid the hospital bill myself?",
+      "item_group_hint": "documents",
+      "expected_items": ["discharge summary", "prescriptions", "diagnostic reports", "original bills"]
+    },
+    {
+      "id": "travel_claim_steps",
+      "category": "enumerable",
+      "query": "What documents do I need for a travel insurance claim?",
+      "item_group_hint": "documents/steps",
+      "expected_items": ["property irregularity report", "medical certificate", "death certificate", "original bills"]
+    },
+    {
+      "id": "life_claim_documents",
+      "category": "enumerable",
+      "query": "How do I file a life insurance claim?",
+      "item_group_hint": "documents",
+      "expected_items": ["death certificate", "identity proof", "original policy document"]
+    },
+    {
+      "id": "personal_accident_covered_events",
+      "category": "enumerable",
+      "query": "What events are covered under personal accident insurance?",
+      "item_group_hint": "events",
+      "expected_items": ["rail/road/air accident", "collision", "gas cylinder", "snake-bite", "drowning"]
+    },
+    {
+      "id": "fire_insurance_exclusions",
+      "category": "enumerable",
+      "query": "What are the exclusions in fire insurance?",
+      "item_group_hint": "exclusions",
+      "expected_items": ["war", "nuclear", "pollution", "electrical", "burglary"]
+    },
+    {
+      "id": "cyber_insurance_exclusions",
+      "category": "enumerable",
+      "query": "What are the common exclusions in cyber insurance?",
+      "item_group_hint": "exclusions",
+      "expected_items": ["security standards", "pre-existing", "cryptocurrency", "bodily injury", "fines", "war", "betterment"]
+    },
+    {
+      "id": "pet_insurance_claim_steps",
+      "category": "enumerable",
+      "query": "What are the steps to file a pet insurance claim?",
+      "item_group_hint": "steps/documents",
+      "expected_items": ["itemized invoice", "medical records", "mobile app", "online portal", "reimbursement"]
+    },
+    {
+      "id": "liability_insurance_types",
+      "category": "enumerable",
+      "query": "What are the different types of liability insurance?",
+      "item_group_hint": "types",
+      "expected_items": ["public liability", "product liability", "professional indemnity", "directors and officers", "employer's liability"]
+    },
+    {
+      "id": "control_motor_definition",
+      "category": "control",
+      "query": "What is motor insurance?"
+    },
+    {
+      "id": "control_deductible_definition",
+      "category": "control",
+      "query": "What is a deductible in insurance?"
+    },
+    {
+      "id": "control_no_claim_bonus",
+      "category": "control",
+      "query": "What is a no-claim bonus?"
+    },
+    {
+      "id": "control_third_party_motor",
+      "category": "control",
+      "query": "What is third-party motor insurance?"
+    },
+    {
+      "id": "control_home_insurance_overview",
+      "category": "control",
+      "query": "What does home insurance typically cover?"
+    },
+    {
+      "id": "control_drone_insurance_overview",
+      "category": "control",
+      "query": "What does drone insurance typically cover?"
+    },
+    {
+      "id": "control_premium_definition",
+      "category": "control",
+      "query": "What is an insurance premium?"
+    },
+    {
+      "id": "control_waiting_period",
+      "category": "control",
+      "query": "What is a waiting period in health insurance?"
+    },
+    {
+      "id": "control_cashless_claim",
+      "category": "control",
+      "query": "What is a cashless claim in health insurance?"
+    },
+    {
+      "id": "control_sum_insured",
+      "category": "control",
+      "query": "What does sum insured mean?"
+    }
+  ]
+}

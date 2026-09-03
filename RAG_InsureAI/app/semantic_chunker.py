@@ -17,7 +17,14 @@ Strategy (same for ALL content types — PDFs, YouTube, web pages):
    discuss the same concept get grouped into ONE chunk even though only
    consecutive pairs are directly compared by other methods.
 4. Cap chunks at 500 words. Force a new chunk even without a topic shift.
-5. Prepend the last 60 words of each chunk to the next chunk (overlap).
+5. Prepend the LAST SENTENCE of each chunk to the next chunk (overlap) —
+   not a fixed word count. A fixed-word overlap can dominate a short
+   next chunk (60 words is a small fraction of a 500-word chunk but
+   over half of a 100-word one) and routinely starts the next chunk
+   mid-sentence. A whole-sentence overlap scales with the actual unit
+   of meaning being carried forward and never starts mid-sentence.
+   Falls back to a word-count tail (capped at OVERLAP_WORDS) only when
+   the previous chunk has no real internal sentence boundary at all.
 """
 from __future__ import annotations
 
@@ -35,9 +42,38 @@ logger = logging.getLogger(__name__)
 
 # ── Tuning ──────────────────────────────────────────────────────────────────────
 MAX_CHUNK_WORDS   = 500   # hard word ceiling per chunk
-OVERLAP_WORDS     = 60    # words from previous chunk prepended to next
+OVERLAP_WORDS     = 60    # overlap unit is now the previous chunk's LAST SENTENCE;
+                          # this is only the fallback/cap for when no real sentence
+                          # boundary exists, or the real last sentence runs unusually long
 SIM_THRESHOLD     = 0.4   # cosine similarity floor — below this = topic shift
 _MIN_PARA_CHARS   = 20    # drop blank / very short fragments
+
+# Reuses the exact abbreviation-guard pattern already proven in
+# multi_source_rag.py's _pgf_split_sentences (PGF's prose-sentence path) —
+# same regex, same "merge back after an abbreviation" behavior, so a period
+# after "Rs." or "Ltd." (both common in this KB) doesn't falsely end a
+# sentence here either.
+_OVERLAP_ABBREV_RE = re.compile(
+    r'\b(?:Rs|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|no|vol|'
+    r'pp|approx|Inc|Ltd|Co|St|Ave|Fig)\.$',
+    re.IGNORECASE,
+)
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """Split on [.!?] followed by whitespace, then merge a split-off piece
+    back onto the previous one whenever that previous piece ends in a
+    known abbreviation — so "Rs. 5,000" or "M/s. ABC Ltd." never counts
+    as a sentence boundary on their own.
+    """
+    raw = re.split(r'(?<=[.!?])\s+', text)
+    merged: List[str] = []
+    for piece in raw:
+        if merged and _OVERLAP_ABBREV_RE.search(merged[-1]):
+            merged[-1] = f"{merged[-1]} {piece}"
+        else:
+            merged.append(piece)
+    return merged
 
 # ── Embedding model ─────────────────────────────────────────────────────────────
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
@@ -95,6 +131,76 @@ def _split_paragraphs(text: str) -> List[str]:
             return windows
 
     return [text.strip()] if text.strip() else []
+
+
+# ── Bulleted-list detection ──────────────────────────────────────────────────────
+# A section built from several DISTINCT bulleted tips/points (e.g. "■ Buy term
+# insurance early... ■ Disclose all material facts... ■ Choose a sum assured...
+# ■ Keep nominee details updated...") shares enough surface vocabulary (all
+# about "buying life insurance") that the similarity-grouping below could
+# still merge them back into one chunk even once paragraph-splitting
+# correctly separates them — SIM_THRESHOLD=0.4 is a low bar, and several
+# tips on the same broad topic can clear it. Confirmed live 2026-08-31: a
+# real "Practical Tips" section with 4 distinct bullet tips stayed ONE
+# ~700-char chunk end to end (never reached the similarity check at all —
+# _split_paragraphs' three tiers don't recognize a bullet glyph as a
+# boundary, so this whole section looked like a single paragraph), diluting
+# its embedding match for any query about just ONE of the four tips enough
+# that a genuinely grounded, almost-verbatim-present fact ("premium is
+# generally locked in based on age at purchase") got dropped by the
+# post-generation grounding check simply because that one tip's sentence
+# never made it into the small set of chunks the checker actually saw —
+# same root shape as the webpage FAQ-bundling bug this session already
+# fixed (see project_webpage_chunking_heading_detection_gap), just via a
+# different mechanism (bullet markers instead of missing HTML heading
+# structure).
+#
+# Same "structural marker beats embedding similarity" principle used
+# throughout this module for section headings (see the comment above
+# _extract_sections): an explicit, repeated bullet GLYPH is unambiguous,
+# ground-truth list structure straight from the source document's own
+# formatting, not an inferred shape. Once a genuine list is detected, each
+# item becomes its own chunk directly — bypassing the greedy similarity
+# merge entirely, never re-joined even if two adjacent tips happen to
+# score high similarity, the same "never cross a detected boundary"
+# guarantee split_text already gives section headings. Deliberately a
+# small, closed set of unambiguous bullet GLYPHS (not a plain "-" or "*",
+# both of which appear constantly inside ordinary prose — hyphenated
+# words, math, emphasis — and would false-positive constantly).
+_BULLET_MARKER_RE = re.compile(r'(?:^|\s)([■•●▪‣◦])\s+')
+_MIN_BULLET_ITEMS = 3
+
+
+def _split_bullet_items(text: str) -> "List[str] | None":
+    """Returns one string per bulleted item when *text* contains a genuine
+    bulleted list (>= _MIN_BULLET_ITEMS occurrences of a recognized bullet
+    glyph), collapsing each item's own internal line-wrap whitespace/
+    newlines into single spaces first — PDF extraction routinely wraps one
+    bullet's sentence across several physical lines with blank-line-shaped
+    gaps between them, which would otherwise look like several separate
+    short paragraphs rather than one coherent item. Any text before the
+    first marker (a lead-in sentence, if the section has one) is prepended
+    to the first item rather than dropped. Returns None when fewer than
+    _MIN_BULLET_ITEMS markers are found — a single stray bullet character
+    isn't a real list, and callers should fall through to the normal
+    paragraph-based splitting.
+    """
+    markers = list(_BULLET_MARKER_RE.finditer(text))
+    if len(markers) < _MIN_BULLET_ITEMS:
+        return None
+    items: List[str] = []
+    for i, m in enumerate(markers):
+        start = m.start(1)
+        end = markers[i + 1].start(1) if i + 1 < len(markers) else len(text)
+        item = " ".join(text[start:end].split())
+        if item:
+            items.append(item)
+    if len(items) < _MIN_BULLET_ITEMS:
+        return None
+    lead_in = text[:markers[0].start(1)].strip()
+    if lead_in:
+        items[0] = f"{lead_in} {items[0]}"
+    return items
 
 
 # ── Section-boundary detection ───────────────────────────────────────────────────
@@ -182,8 +288,140 @@ def _is_title_case(line: str) -> bool:
     return capitalized / len(significant) >= 0.8
 
 
+# A "#"/"##"/... prefix means document_loader._parse_html_to_text found a
+# real HTML <h1>-<h6> tag at this line -- ground-truth structure straight
+# from the source markup, not an inferred shape. That's strictly stronger
+# evidence than the Title-Case/punctuation heuristics below, which are
+# tuned for un-marked plain text and would otherwise reject a real FAQ-style
+# heading like "How do I determine the right life insurance coverage for
+# me?" on BOTH counts at once: it ends in "?" (an immediate reject in
+# _is_title_case) and its content words are mostly lowercase, natural-
+# question phrasing rather than Title Case (confirmed live 2026-08-31: a
+# policybazaar FAQ page's <h2> questions all failed silently this way,
+# leaving every FAQ bundled into one oversized, unbounded chunk despite
+# the extraction layer correctly marking each heading).
+_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+")
+
+# Strips markdown emphasis/underline decoration a heading line can carry
+# after the "#" prefix itself is removed — confirmed live 2026-09-01 with
+# pymupdf4llm markdown output: "## 7. **<u>LIFE INSURANCE</u>**" leaves
+# "7. **<u>LIFE INSURANCE</u>**" as the raw heading text once the "##" is
+# stripped, decoration and all, unless removed separately.
+_HEADING_DECORATION_RE = re.compile(r"\*\*|__|<u>|</u>|<b>|</b>")
+
+
+def _clean_heading_text(text: str) -> str:
+    return _HEADING_DECORATION_RE.sub("", text).strip()
+
+# ── Sub-headings within a section's own body ─────────────────────────────────────
+# A real markdown "#" heading marks a genuine SECTION boundary — but a
+# section can itself enumerate several distinct sub-items, each with its
+# own bold, numbered/lettered lead-in immediately followed by its own
+# definition, e.g. (confirmed live 2026-09-01, pymupdf4llm markdown output
+# of a real insurance textbook): "- **1) Term insurance** \n\n A term
+# insurance product provides..." / "- **2) Whole life insurance** \n\n
+# Whole life insurance product provides...". pymupdf4llm itself does NOT
+# promote these to real "#"/"##" headers (confirmed: they render as bold
+# list items, one level below its own heading threshold) — but they are
+# still genuine, visually-distinct sub-topic boundaries in the source
+# PDF's own formatting (that's WHY they're bold at all), and multiple
+# such items were previously getting bundled into one oversized chunk,
+# with only the FIRST item's content reliably surviving retrieval and the
+# rest silently unavailable. Bold + a short marker immediately inside it
+# is a deliberately narrow, high-precision pattern (not "any bold text")
+# — ordinary emphasis on a word or two mid-sentence never matches this
+# because it lacks the leading marker.
+#
+# Covers every enumeration style actually seen across this KB's PDFs, not
+# just plain digits — confirmed live 2026-09-01 in this SAME document
+# ("LIFE INSURANCE PRODUCTS" section uses Roman numerals: "I. Term
+# insurance & Health Insurance plans - II. Endowment & Money-back
+# plans..."), plus the full alphabet (not just a-h — there was never a
+# real reason to cap there) and the same bullet-glyph set already
+# established and tuned for list-splitting elsewhere in this file
+# (_BULLET_MARKER_RE) reused here for consistency rather than inventing a
+# second glyph list. The Roman-numeral fragment requires a leading valid
+# Roman character before trying to match (avoids a zero-length match),
+# and single letters/numerals still need trailing "." or ")" — a bare
+# bullet glyph doesn't, since that's its own complete, self-punctuating
+# marker in normal usage (e.g. "■ Term insurance").
+_ROMAN_NUMERAL_FRAGMENT = r"(?=[MDCLXVI])M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})"
+_SUBHEADING_RE = re.compile(
+    r"\*\*\(?(?:" + _ROMAN_NUMERAL_FRAGMENT + r"|\d{1,3}|[a-zA-Z])[.)]\s*([^*\n]{2,80}?)\*\*"
+    r"|\*\*[■•●▪‣◦]\s*([^*\n]{2,80}?)\*\*"
+)
+
+
+_MIN_SUBHEADING_BODY_WORDS = 15
+
+
+def _split_by_subheadings(text: str) -> List[tuple]:
+    """
+    Split *text* at bold numbered/lettered sub-item markers (see
+    _SUBHEADING_RE) into (sub_heading, piece_text) tuples. sub_heading is
+    "" for any text BEFORE the first marker (may be the whole text, if no
+    markers are found at all — always at least one tuple is returned).
+    The marker itself is stripped from the piece text; the piece runs
+    from just after one marker to just before the next (or end of text).
+
+    A matched marker only counts as a genuine sub-heading boundary if it
+    is followed by at least _MIN_SUBHEADING_BODY_WORDS words of its own
+    body text before the next marker (or end of text) — confirmed live
+    2026-09-01: a BARE enumerated name list, where every item is bold and
+    numbered but has ZERO elaboration before the next item starts (e.g.
+    "- **I. Term insurance & Health Insurance plans** - **II. Endowment &
+    Money-back plans** - **III. Whole life plans**..."), is structurally
+    just an index/summary list, not a set of self-contained definitions
+    — the real definitions of these types live in a COMPLETELY DIFFERENT
+    section of the same document. Splitting a bare list like this would
+    only produce empty, useless chunks (just a name, nothing else) —
+    worse than not splitting at all, since real content that already
+    existed as one coherent unit would get fragmented for no benefit.
+    A marker that fails this bar is simply not treated as a boundary —
+    its own text flows through as ordinary body content of whichever
+    section/sub-section it falls inside, exactly as if it had never
+    matched _SUBHEADING_RE at all.
+    """
+    all_matches = list(_SUBHEADING_RE.finditer(text))
+    if not all_matches:
+        return [("", text)]
+
+    matches = []
+    for i, m in enumerate(all_matches):
+        body_end = all_matches[i + 1].start() if i + 1 < len(all_matches) else len(text)
+        body_word_count = len(text[m.end():body_end].split())
+        if body_word_count >= _MIN_SUBHEADING_BODY_WORDS:
+            matches.append(m)
+    if not matches:
+        return [("", text)]
+
+    pieces: List[tuple] = []
+    lead_in = text[: matches[0].start()].strip()
+    if lead_in:
+        pieces.append(("", lead_in))
+    for i, m in enumerate(matches):
+        # group(1) = numbered/lettered/Roman marker; group(2) = bullet-glyph
+        # marker — exactly one is non-None depending on which alternative
+        # in _SUBHEADING_RE matched.
+        raw_sub_heading = m.group(1) if m.group(1) is not None else m.group(2)
+        sub_heading = _clean_heading_text(raw_sub_heading).rstrip(":;,.")
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[body_start:body_end].strip()
+        pieces.append((sub_heading, f"{sub_heading}\n\n{body}" if body else sub_heading))
+    return pieces
+
+
 def _is_heading_candidate(line: str) -> bool:
     line = line.strip()
+    _md_match = _MARKDOWN_HEADING_RE.match(line)
+    if _md_match:
+        heading_text = line[_md_match.end():].strip()
+        if not (1 <= len(heading_text) < 200):
+            return False
+        if heading_text.lower() in _HEADING_BOILERPLATE:
+            return False
+        return True
     if not (3 <= len(line) < 70):
         return False
     if not (line.isupper() or _is_title_case(line)):
@@ -201,11 +439,18 @@ def _is_heading_candidate(line: str) -> bool:
 
 def _extract_sections(text: str) -> List[tuple]:
     """
-    Split *text* into (section_heading, section_text) tuples using detected
-    headings as boundaries.
+    Split *text* into (section_heading, sub_heading, section_text) triples
+    using detected headings as top-level boundaries, then further split
+    each section at any detected bold numbered/lettered sub-item markers
+    (see _split_by_subheadings) — a document like "## Whole Life vs
+    Endowment" containing "- **1) Term insurance** ... - **2) Whole life
+    insurance** ..." now produces separate pieces for each numbered item,
+    not one blob only the first item's content reliably survives
+    retrieval from (confirmed live 2026-09-01). sub_heading is "" for a
+    section with no such markers — fully backward compatible.
 
-    Falls back to a single ("", text) section when fewer than 2 genuine
-    heading breaks are found — short documents or content with no
+    Falls back to a single ("", "", text) section when fewer than 2
+    genuine heading breaks are found — short documents or content with no
     heading-like structure at all (plain prose, YouTube transcripts)
     shouldn't be forced into artificial section boundaries; the existing
     embedding-similarity grouping is the right tool for those.
@@ -225,7 +470,10 @@ def _extract_sections(text: str) -> List[tuple]:
         if stripped in genuine_headings and _is_heading_candidate(stripped):
             if current_lines:
                 sections.append((current_heading, "\n".join(current_lines)))
-            current_heading = stripped
+            _md_match = _MARKDOWN_HEADING_RE.match(stripped)
+            current_heading = _clean_heading_text(
+                stripped[_md_match.end():] if _md_match else stripped
+            )
             current_lines = []
         else:
             current_lines.append(line)
@@ -233,8 +481,14 @@ def _extract_sections(text: str) -> List[tuple]:
         sections.append((current_heading, "\n".join(current_lines)))
 
     if len([s for s in sections if s[0]]) < 2:
-        return [("", text)]
-    return sections
+        sections = [("", text)]
+
+    expanded: List[tuple] = []
+    for heading, section_text in sections:
+        for sub_heading, piece_text in _split_by_subheadings(section_text):
+            if piece_text.strip():
+                expanded.append((heading, sub_heading, piece_text))
+    return expanded
 
 
 # ── Page-header/footer topic mining (plan_policy_type_tagging.md RC-4) ──────────
@@ -425,7 +679,38 @@ class SemanticChunker:
                    If similar enough AND fits 500 words → add to group.
                    Else → flush group as chunk, start fresh group.
         Step 4 — 60-word overlap between consecutive chunks
+
+        A genuine bulleted list (see _split_bullet_items above) is handled
+        BEFORE any of this — each item becomes its own chunk directly,
+        never subject to the similarity/word-limit grouping decision at
+        all, since that grouping is exactly what let several distinct
+        bulleted tips collapse back into one diluted chunk (confirmed
+        live, see that function's own comment for the full incident).
         """
+        bullet_items = _split_bullet_items(text)
+        if bullet_items is not None:
+            # No overlap applied here, unlike the paragraph path below.
+            # _apply_overlap prepends the last _overlap_words (60) words of
+            # the PREVIOUS chunk to bridge context across a boundary that
+            # cuts through continuous flowing prose — necessary there
+            # because a paragraph chunk can be truncated mid-thought. A
+            # bulleted item is already a complete, self-contained fact by
+            # construction (that's the whole reason it's being kept as its
+            # own chunk in the first place), so there's no mid-thought
+            # continuity to bridge. Confirmed live 2026-08-31: applying the
+            # same word-count overlap here backfired badly on SHORT items —
+            # each bullet tip in this KB runs well under 60 words, so "the
+            # last 60 words of the previous chunk" was the ENTIRE previous
+            # item, producing a sliding 2-item window (chunk N = item[N-1]
+            # + item[N]) instead of 4 clean, distinct chunks. Zero overlap
+            # keeps each chunk exactly one item, which is the entire point.
+            logger.info(
+                "[SemanticChunker] detected a %d-item bulleted list -> %d chunks "
+                "(one per item, bypassing similarity grouping and overlap)",
+                len(bullet_items), len(bullet_items),
+            )
+            return bullet_items, [0] * len(bullet_items)
+
         paragraphs = _split_paragraphs(text)
         if len(paragraphs) < 2:
             stripped = text.strip()
@@ -529,21 +814,28 @@ class SemanticChunker:
         chunk, since that would reintroduce the exact topic-blending this
         exists to prevent.
 
-        Returns (chunks, overlap_sizes, section_headings) — a 3-tuple, the
-        heading each chunk belongs to ("" when no section structure was
-        detected) so callers can classify once per section and apply that
-        result to every chunk sharing the same heading, instead of
-        classifying each chunk independently.
+        Returns (chunks, overlap_sizes, section_headings, sub_headings) — a
+        4-tuple. section_headings is the top-level heading each chunk
+        belongs to ("" when no section structure was detected); sub_headings
+        is the bold numbered/lettered sub-item heading within that section,
+        if one was detected ("" otherwise — most chunks) — see
+        _extract_sections/_split_by_subheadings for how it's found. Lets
+        callers classify once per section and apply that result to every
+        chunk sharing the same heading, instead of classifying each chunk
+        independently, while still keeping each sub-item's own identity
+        available in metadata.
         """
         sections = _extract_sections(text)
         all_chunks: List[str] = []
         all_overlap_sizes: List[int] = []
         all_headings: List[str] = []
-        for heading, section_text in sections:
+        all_sub_headings: List[str] = []
+        for heading, sub_heading, section_text in sections:
             section_chunks, section_overlaps = self._group_paragraphs_into_chunks(section_text)
             all_chunks.extend(section_chunks)
             all_overlap_sizes.extend(section_overlaps)
             all_headings.extend([heading] * len(section_chunks))
+            all_sub_headings.extend([sub_heading] * len(section_chunks))
 
         if len(sections) > 1:
             logger.info(
@@ -551,23 +843,62 @@ class SemanticChunker:
                 len(sections), len(all_chunks),
             )
 
-        return all_chunks, all_overlap_sizes, all_headings
+        return all_chunks, all_overlap_sizes, all_headings, all_sub_headings
 
     @staticmethod
     def _apply_overlap(
         chunks: List[str], overlap_words: int
     ) -> tuple:
         """
-        Prepend the last N words of chunk[i-1] to the start of chunk[i].
-        Returns (new_chunks, overlap_word_counts) where overlap_word_counts[i]
-        is the number of words prepended to chunk[i] (0 for chunk[0]).
+        Prepend the LAST SENTENCE of chunk[i-1] — not a fixed word count —
+        to the start of chunk[i]. Returns (new_chunks, overlap_word_counts)
+        where overlap_word_counts[i] is the number of words prepended to
+        chunk[i] (0 for chunk[0]).
+
+        Confirmed live (2026-09-01): the old fixed-N-words tail cut a
+        disproportionate share of a SHORT next chunk — 60 words is a small
+        fraction of a normal ~500-word chunk but over half of a ~100-word
+        one (a real case: a document's tail-end chunk after its bulk of
+        content already went into the previous chunk). It also routinely
+        started the next chunk mid-sentence (e.g. "investments. As the
+        name of the plan specifies..."), which isn't broken but is
+        visibly a raw slice, not a real unit of meaning. A whole-sentence
+        overlap scales with the actual content being carried forward
+        instead of an arbitrary cut, and never starts mid-sentence.
+
+        overlap_words is kept as a fallback AND a safety cap for two
+        cases a pure last-sentence approach can't cover on its own:
+        - The previous chunk has no real internal sentence boundary at
+          all (ends on a heading, a list marker, a fragment with no
+          terminal punctuation) — _split_into_sentences then returns the
+          WHOLE chunk as "one sentence", which would overlap the entire
+          previous chunk rather than a bounded unit. Falls back to the
+          old word-count tail in that case.
+        - The genuine last sentence is unusually long (some regulatory/
+          legal sentences in this KB run 100+ words) — capped to the
+          last overlap_words words of it, so one pathological long
+          sentence can't balloon the overlap unboundedly.
         """
         result: List[str] = [chunks[0]]
         sizes: List[int]  = [0]
         for i in range(1, len(chunks)):
-            prev_words = chunks[i - 1].split()
-            tail_words = prev_words[-overlap_words:] if len(prev_words) > overlap_words else prev_words
-            tail = " ".join(tail_words)
+            prev_text = chunks[i - 1].strip()
+            prev_words = prev_text.split()
+            prev_sentences = [s for s in _split_into_sentences(prev_text) if s.strip()]
+            tail = prev_sentences[-1].strip() if prev_sentences else ""
+            tail_words = tail.split()
+
+            if not tail or (len(prev_sentences) <= 1 and len(tail_words) > overlap_words):
+                # No real sentence boundary found — fall back to the old
+                # fixed-word-count tail rather than overlapping the
+                # entire previous chunk.
+                tail_words = prev_words[-overlap_words:] if len(prev_words) > overlap_words else prev_words
+                tail = " ".join(tail_words)
+            elif len(tail_words) > overlap_words:
+                # A genuine but unusually long final sentence — cap it.
+                tail_words = tail_words[-overlap_words:]
+                tail = " ".join(tail_words)
+
             current = chunks[i]
             # Skip overlap if the next chunk already starts with the same content
             # (happens when consecutive PDF pages repeat the same boundary text).
@@ -609,8 +940,8 @@ class SemanticChunker:
         # sibling chunks together) -- only a genuine transition INTO a
         # heading bumps the count, and only when that heading text has
         # already been used by an earlier, non-adjacent section.
-        _prev_heading_by_source: dict[str, str] = {}
-        _heading_occurrence_by_source: dict[str, dict[str, int]] = {}
+        _prev_key_by_source: dict[str, tuple] = {}
+        _key_occurrence_by_source: dict[str, dict[tuple, int]] = {}
         _current_occurrence_by_source: dict[str, int] = {}
         for doc in docs:
             page_value = (
@@ -619,13 +950,15 @@ class SemanticChunker:
                 or doc.metadata.get("page_num")
                 or 0
             )
-            pieces_raw, overlap_sizes, headings = self.split_text(doc.page_content)
+            pieces_raw, overlap_sizes, headings, sub_headings = self.split_text(doc.page_content)
             doc_source = doc.metadata.get("source") or doc.metadata.get("filename") or "doc"
             # Once per document (see _mine_page_header_topic above) -- a
             # fallback signal for chunks with no genuine detected heading,
             # not a replacement for one that already exists.
             page_header_topic = _mine_page_header_topic(doc.page_content)
-            for idx, (piece, ov_size, heading) in enumerate(zip(pieces_raw, overlap_sizes, headings)):
+            for idx, (piece, ov_size, heading, sub_heading) in enumerate(
+                zip(pieces_raw, overlap_sizes, headings, sub_headings)
+            ):
                 markers = _PAGE_MARKER_RE.findall(piece)
                 recovered_page = page_value
                 if markers:
@@ -662,17 +995,25 @@ class SemanticChunker:
                 # changing how chunks get grouped into sections.
                 effective_heading = heading or page_header_topic
 
-                # New section boundary (heading changed from the immediately
-                # preceding piece, tracked per doc_source) — bump the
-                # occurrence count for this heading text so a later,
-                # non-adjacent recurrence of the same text gets a distinct
-                # section_id instead of merging with an earlier section.
-                if heading != _prev_heading_by_source.get(doc_source):
-                    if heading:
-                        occ_map = _heading_occurrence_by_source.setdefault(doc_source, {})
-                        occ_map[heading] = occ_map.get(heading, 0) + 1
-                        _current_occurrence_by_source[doc_source] = occ_map[heading]
-                    _prev_heading_by_source[doc_source] = heading
+                # New section boundary (heading OR sub_heading changed from
+                # the immediately preceding piece, tracked per doc_source)
+                # — bump the occurrence count for this (heading, sub_heading)
+                # pair so a later, non-adjacent recurrence of the same text
+                # gets a distinct section_id instead of merging with an
+                # earlier section. Keying on the PAIR (not heading alone)
+                # means two different sub-items under the same parent
+                # heading — "1) Term insurance" then "2) Whole life
+                # insurance" — are correctly treated as separate sections,
+                # not silently merged just because their parent heading
+                # didn't change; a sub-item long enough to span multiple
+                # chunks still shares one section_id, same as before.
+                _key = (heading, sub_heading)
+                if _key != _prev_key_by_source.get(doc_source):
+                    if heading or sub_heading:
+                        occ_map = _key_occurrence_by_source.setdefault(doc_source, {})
+                        occ_map[_key] = occ_map.get(_key, 0) + 1
+                        _current_occurrence_by_source[doc_source] = occ_map[_key]
+                    _prev_key_by_source[doc_source] = _key
 
                 # Count overlap words after marker stripping so the value is
                 # accurate for the stored (marker-free) text. section_id
@@ -695,9 +1036,10 @@ class SemanticChunker:
                         "chunking_method":     "semantic",
                         "overlap_prefix_words": ov_size,
                         "section_heading":     effective_heading,
+                        "sub_heading":         sub_heading,
                         "section_id":          (
-                            f"{doc_source}::{heading}::{_current_occurrence_by_source[doc_source]}"
-                            if heading else f"{doc_source}::chunk{idx}"
+                            f"{doc_source}::{heading}::{sub_heading}::{_current_occurrence_by_source[doc_source]}"
+                            if heading or sub_heading else f"{doc_source}::chunk{idx}"
                         ),
                     },
                 ))

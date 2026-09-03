@@ -151,8 +151,13 @@ def _clean_webpage_text(raw_text: str) -> str:
                 cleaned.append("")
             prev_stripped = ""
             continue
-        # Drop very short lines — almost always navigation / cookie / breadcrumb
-        if len(stripped.split()) < _MIN_LINE_WORDS:
+        # Drop very short lines — almost always navigation / cookie / breadcrumb.
+        # Exempt markdown-style heading markers (# .. ###### , inserted by
+        # _parse_html_to_text from real <h1>-<h6> tags) — a short but
+        # genuine heading ("## FAQ", "### Overview") is a real section
+        # boundary SectionChunker downstream needs to see, not noise, even
+        # though it easily falls under this word-count floor on its own.
+        if not re.match(r"^#{1,6}\s", stripped) and len(stripped.split()) < _MIN_LINE_WORDS:
             continue
         # Drop consecutive duplicate lines
         if stripped == prev_stripped:
@@ -542,11 +547,118 @@ def _strip_repeating_page_furniture(page_texts: dict[int, str]) -> dict[int, str
     return cleaned
 
 
+# Confirmed live (2026-08-27): several source PDFs' auto-numbered lists
+# extract with the NEXT list item's own number fused directly into the
+# middle of the PRECEDING item's last word — "...before settling the 4.
+# Once the insurer is satisfied..." where "claim." was dropped and "4."
+# (which should have started its own numbered point, "4. Once the
+# insurer...") landed mid-sentence instead. Tested directly against the
+# raw PDF with BOTH pypdf and pdfplumber — both produced the EXACT SAME
+# corrupted text, byte for byte — so this is not a library parsing quirk
+# to switch away from; it reflects how the source PDF's own auto-numbered
+# list got embedded in its content stream (most likely how the original
+# document-authoring tool, e.g. Word's automatic numbering, laid down the
+# list-marker glyphs), and no available extraction library sees anything
+# different. A full auto-repair isn't reliably possible either — nothing
+# in the extracted text says what the missing word actually was; "claim"
+# only became knowable by reading the surrounding sentence's meaning.
+#
+# What IS achievable and worth doing: catch the signature at ingestion
+# time so a human notices immediately instead of it silently shipping
+# into the KB and only surfacing by accident later (which is how the
+# first instance of this was found — as a cosmetic artifact in a live
+# generated answer). Manually confirmed across the KB: a closed set of
+# grammatically-incomplete trailing words (an article, preposition, or
+# adjective that needs a noun/object after it) immediately followed by a
+# bare 1-2 digit number + period + capital letter is the actual tell —
+# NOT bare "digit + period + capital letter" alone, which also matches
+# perfectly well-formed numbered lists ("1. Coercion, or 2. Undue
+# influence...") and legitimate in-text numbers ("Section 27. It
+# lists...", "Regulation 8. Claims procedure...") constantly. Scanning
+# the existing KB with just the bare pattern gave 47 hits; requiring this
+# dangling-word set narrowed it to the 7 confirmed real ones with zero
+# missed and zero extra false positives on manual review.
+_SUSPECT_LIST_MARKER_CORRUPTION_RE = re.compile(
+    r'\b(?:the|a|an|to|of|for|with|in|on|at|by|from|its|their|his|her|early|'
+    r'this|these|those|such)\s(\d{1,2})\.\s[A-Z][a-z]',
+    re.IGNORECASE,
+)
+
+
+# Confirmed live (2026-08-31): some source PDFs' rupee symbol (₹) extracts
+# as "■" instead — a font/encoding quirk distinct from the list-marker
+# corruption above (that one has no reliable auto-repair; this one does).
+# Found via `insurance_terms_glossary.pdf`: "on a health policy with a
+# ■5,000 deductible" where "■5,000" should read "₹5,000" — confirmed by the
+# chunk's OWN surrounding sentence literally saying "a deductible is a
+# fixed rupee amount", plus every instance sitting exactly where a currency
+# figure belongs (a deductible amount, a hospital bill, a co-payment
+# split). Unlike the list-marker case, this one IS safely auto-repairable:
+# a genuine "■" bullet marker is always followed by a space before the
+# item text starts (confirmed by this exact convention throughout this
+# KB's other PDFs, and by _split_bullet_items in semantic_chunker.py using
+# the identical "■" immediately followed by whitespace signal to recognize
+# a real list item) — "■" glued directly onto a digit with NO space is
+# never a legitimate list marker, so repairing it to "₹" carries no real
+# risk of corrupting an actual bulleted list.
+_RUPEE_SYMBOL_CORRUPTION_RE = re.compile(r'■(?=\d)')
+
+
+def _repair_rupee_symbol_corruption(text: str, filename: str, page_num: int) -> str:
+    """Auto-repairs "■" immediately followed by a digit (a rupee-symbol
+    extraction corruption — see the module comment above) back to "₹".
+    Runs once per page, per PDF ingestion, before the text is chunked, so
+    a future upload with this same font/encoding quirk gets fixed
+    automatically instead of needing another manual discovery-and-patch
+    cycle like the one that found this in insurance_terms_glossary.pdf.
+    """
+    if "■" not in text:
+        return text
+    count = len(_RUPEE_SYMBOL_CORRUPTION_RE.findall(text))
+    if not count:
+        return text
+    logger.info(
+        "[PDF] repaired %d rupee-symbol extraction corruption(s) (■ -> ₹) in '%s' page %d",
+        count, filename, page_num + 1,
+    )
+    return _RUPEE_SYMBOL_CORRUPTION_RE.sub('₹', text)
+
+
+def _detect_list_marker_corruption(page_texts: dict[int, str], filename: str) -> None:
+    """Log-only check, run once per PDF ingestion — see this module's own
+    comment above _SUSPECT_LIST_MARKER_CORRUPTION_RE for the full
+    rationale. Never modifies the extracted text (no reliable auto-repair
+    exists); flags it for a human to check and correct the same way
+    project_pdf_extraction_list_marker_corruption.md's confirmed
+    instances were fixed — a direct, manual text correction to the
+    specific chunk once ingested.
+    """
+    for page_num, text in page_texts.items():
+        for m in _SUSPECT_LIST_MARKER_CORRUPTION_RE.finditer(text):
+            start = max(0, m.start() - 50)
+            end = min(len(text), m.end() + 50)
+            logger.warning(
+                "[PDF] possible list-marker corruption in '%s' page %d — a word may be "
+                "missing right before this list marker: %r",
+                filename, page_num + 1, text[start:end].replace("\n", " "),
+            )
+
+
 def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     """
     Load a PDF with per-page Documents.
 
     Strategy:
+      0. pymupdf4llm markdown conversion is tried FIRST (see
+         pdf_to_markdown.load_pdf_pages_as_markdown) — it derives heading
+         structure from the PDF's own font-size/bold metadata rather than
+         guessing from plain text, which the chunker downstream now uses
+         to detect real section AND sub-section boundaries (see
+         semantic_chunker.py's _extract_sections/_split_by_subheadings).
+         Falls through to the plain-text path below automatically on ANY
+         failure (missing dependency, corrupt/unreadable file, or any
+         other pymupdf4llm error) — this is strictly additive, never a
+         hard requirement for a PDF to load at all.
       1. pypdf extracts all pages it can
       2. For pages pypdf returned empty text, pdfplumber is tried as a per-page fallback
          (handles complex layouts, tables, and PDFs with non-standard encoding)
@@ -556,7 +668,43 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     _src  = filename or file_path
     _base = filename or os.path.basename(file_path)
 
-    # ── pypdf (preferred — fast pure-Python reader) ───────────────────────────
+    # ── pymupdf4llm markdown conversion (preferred — real PDF structure) ──────
+    try:
+        from pdf_to_markdown import load_pdf_pages_as_markdown
+
+        md_pages = load_pdf_pages_as_markdown(file_path)
+        if md_pages:
+            md_pages = _strip_repeating_page_furniture(md_pages)
+            md_pages = {
+                page_num: _repair_rupee_symbol_corruption(text, _base, page_num)
+                for page_num, text in md_pages.items()
+            }
+            _detect_list_marker_corruption(md_pages, _base)
+            docs = [
+                Document(
+                    page_content=md_pages[page_num],
+                    metadata={
+                        "source":      _src,
+                        "filename":    _base,
+                        "page":        page_num + 1,
+                        "total_pages": max(md_pages) + 1,
+                    },
+                )
+                for page_num in sorted(md_pages)
+            ]
+            logger.info(
+                "[PDF/markdown] Loaded %d page(s) from '%s' via pymupdf4llm",
+                len(docs), _base,
+            )
+            return docs
+    except Exception as exc:
+        logger.info(
+            "[PDF/markdown] pymupdf4llm conversion unavailable or failed for '%s' "
+            "(%s) — falling back to plain-text extraction",
+            _base, exc,
+        )
+
+    # ── pypdf (preferred plain-text fallback — fast pure-Python reader) ───────
     try:
         from pypdf import PdfReader  # type: ignore
 
@@ -591,6 +739,11 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
                 pass
 
         all_texts = _strip_repeating_page_furniture({**pypdf_texts, **plumber_texts})
+        all_texts = {
+            page_num: _repair_rupee_symbol_corruption(text, _base, page_num)
+            for page_num, text in all_texts.items()
+        }
+        _detect_list_marker_corruption(all_texts, _base)
         docs: list[Document] = [
             Document(
                 page_content=all_texts[page_num],
@@ -625,6 +778,11 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
                     plumber_only_texts[page_num] = text
 
         plumber_only_texts = _strip_repeating_page_furniture(plumber_only_texts)
+        plumber_only_texts = {
+            page_num: _repair_rupee_symbol_corruption(text, _base, page_num)
+            for page_num, text in plumber_only_texts.items()
+        }
+        _detect_list_marker_corruption(plumber_only_texts, _base)
         docs = [
             Document(
                 page_content=plumber_only_texts[page_num],
@@ -809,7 +967,7 @@ def _parse_html_to_text(html: str) -> tuple[str, str]:
 
     Returns (clean_text, title).
     """
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -818,6 +976,42 @@ def _parse_html_to_text(html: str) -> tuple[str, str]:
                      "aside", "form", "noscript", "svg", "iframe",
                      "button", "figure", "picture"]):
         tag.decompose()
+
+    # ── Mark heading tags with a markdown-style prefix BEFORE flattening ─────
+    # container.get_text() below throws away ALL HTML tag structure,
+    # including which lines were <h1>-<h6> headings — so SectionChunker
+    # (the same chunker PDF uploads use, downstream of this function) never
+    # gets the heading-boundary signal it relies on to split a page into
+    # real, per-topic sections. Confirmed live this causes real
+    # contamination: a multi-question FAQ page (presumably one <h2>/<h3>
+    # per question, standard practice) collapsed into one 10,000+-char
+    # blob with no recoverable boundaries, and an unrelated fact from one
+    # FAQ answer ended up attached to a different, correct answer entirely
+    # (see project_srg_generic_vocabulary_false_match.md). PDFs in this KB
+    # don't hit this because their own text extraction evidently DOES
+    # preserve heading-level structure (every PDF chunk in this KB carries
+    # a real, specific section_heading).
+    #
+    # Replaces the heading's contents with ONE combined text node (marker
+    # + its own text, already merged into a single string) rather than
+    # inserting the marker as a separate sibling node — confirmed live
+    # this distinction matters: get_text(separator="\n") puts a newline
+    # between every DISTINCT node, so a marker inserted as its own node
+    # lands on its own line ("###") completely detached from the heading
+    # text that follows on the NEXT line, leaving the actual heading text
+    # unmarked and indistinguishable from ordinary paragraph text — the
+    # opposite of what this is for. get_text() is called on the heading
+    # FIRST (before clearing it) specifically so nested inline tags (a
+    # link, an icon span, emphasis inside the heading) still get flattened
+    # into the heading's own text correctly, same as get_text() would do
+    # for any other tag.
+    for _level in range(1, 7):
+        for _heading_tag in soup.find_all(f"h{_level}"):
+            _heading_text = _heading_tag.get_text(strip=True)
+            if not _heading_text:
+                continue
+            _heading_tag.clear()
+            _heading_tag.append(NavigableString(("#" * _level) + " " + _heading_text))
 
     # ── Prefer semantic content containers ───────────────────────────────────
     container = (

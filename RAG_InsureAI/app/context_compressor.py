@@ -49,6 +49,17 @@ _MIN_VIABLE_CHUNK_CHARS = 220
 # a window is a sub-unit of a chunk, not a whole chunk on its own.
 _MIN_VIABLE_WINDOW_CHARS = 80
 
+# Matches a sentence that opens with a numbered or lettered list marker
+# ("1. ", "2) ", "a. ") — only reliably present after _split_sentences'
+# own forward-merge fix (see its docstring/comment) reattaches an
+# isolated marker fragment to the sentence that follows it. Used in
+# compress_to_budget to recognize a genuine multi-item enumeration
+# (medical emergency / baggage loss / trip cancellation / ... as
+# separate numbered claim steps) so it can be prioritized over a
+# smaller, lower-scoring, non-enumeration window during packing — see
+# that function's own comment for why order alone isn't enough there.
+_LIST_MARKER_RE = re.compile(r"^\s*(?:\d{1,2}|[a-hA-H])[.\)]\s+\S")
+
 
 def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
     """
@@ -69,7 +80,47 @@ def _split_sentences(text: str, for_youtube: bool = False) -> List[str]:
     )
     abbrev = re.sub(r'(\d+)\.(\d)', r'\1<DOT>\2', abbrev)
     raw = re.split(r'(?<=[.!?])\s+(?=[A-Z\d\"\'\(])', abbrev)
-    punct_sentences = [s.replace('<DOT>', '.').strip() for s in raw if len(s.replace('<DOT>', '').strip()) >= _MIN_SENT_CHARS]
+
+    # Merge a too-short fragment onto the FOLLOWING piece rather than
+    # discarding it outright. Confirmed live: splitting "...settlement.
+    # 2. For baggage loss..." on the sentence-boundary regex above
+    # isolates "2." as its own 2-char fragment — a numbered-list marker
+    # that happens to end in the punctuation the split regex looks for —
+    # which used to just vanish under the length filter below, silently
+    # stripping every list marker from a numbered enumeration except
+    # whichever one stays glued to the text before it (the first, if
+    # nothing precedes it). That made a genuine multi-item list
+    # indistinguishable from ordinary prose downstream: compress_to_budget's
+    # window-packing has no way to recognize "these next few sentences are
+    # separate, equally-important scenarios" once their own markers are
+    # gone, so a numbered claims procedure (medical emergency / baggage
+    # loss / trip cancellation / ...) reads as a single undifferentiated
+    # blob and the packer has no signal that skipping the middle items
+    # loses something structurally different from trimming a paragraph.
+    # Carrying the short fragment forward and re-testing the combined
+    # length keeps "2. For baggage loss..." together as one sentence,
+    # matching how a reader actually parses a numbered list — and does
+    # nothing for ordinary prose, where a too-short fragment is rare and
+    # merging it into its neighbor is still a reasonable default rather
+    # than silent data loss.
+    _cleaned_pieces = [p.replace('<DOT>', '.').strip() for p in raw]
+    _cleaned_pieces = [p for p in _cleaned_pieces if p]
+    punct_sentences: List[str] = []
+    _carry = ""
+    for _piece in _cleaned_pieces:
+        _combined = f"{_carry} {_piece}".strip() if _carry else _piece
+        if len(_combined) < _MIN_SENT_CHARS:
+            _carry = _combined
+        else:
+            punct_sentences.append(_combined)
+            _carry = ""
+    if _carry:
+        # Trailing short fragment with nothing left to merge into —
+        # attach it onto the last real sentence rather than dropping it.
+        if punct_sentences:
+            punct_sentences[-1] = f"{punct_sentences[-1]} {_carry}"
+        else:
+            punct_sentences.append(_carry)
 
     # If we got real sentence boundaries and this isn't a YouTube chunk, done.
     if len(punct_sentences) >= 2 and not for_youtube:
@@ -278,8 +329,59 @@ class ContextCompressor:
         )[0]
 
         sizes = [len(d.page_content) for d in chunks]
-        fair_share = max_total_chars // n
-        allocations = [min(s, fair_share) for s in sizes]
+
+        # Weight the chunk-level allocation toward the pool's dominant
+        # relevance score instead of always splitting evenly across every
+        # surviving chunk. Confirmed live: a query correctly retrieved one
+        # clearly dominant chunk (rerank_score 0.997 — the actual
+        # claims-procedure passage, describing several distinct claim
+        # scenarios as a numbered list) alongside two much weaker chunks
+        # (0.695, a general policy-mechanics definition; 0.475, a small
+        # fragment). Equal fair-share gave the dominant chunk the SAME
+        # budget as either weaker one — not enough for even one of its own
+        # sentence-windows to fit whole, so it fragmented down to a single
+        # sentence no matter how the packing order inside that one chunk's
+        # own allocation was fixed (see the window-priority enumeration fix
+        # above — that fix can only reorder WHICH sentences survive a
+        # chunk's existing allocation, not grow the allocation itself).
+        # Chunks within _ALLOC_PRIMARY_RATIO of the top score share the
+        # budget (after a minimal floor for everyone else) via ordinary
+        # fair-share among themselves; everything else gets just
+        # _MIN_VIABLE_WINDOW_CHARS — enough for one real sentence as
+        # supplementary color, not equal billing with the chunk that's
+        # actually answering the question. Only engages when EVERY chunk
+        # in the pool has a rerank_score — falls back to the OLD flat
+        # fair-share otherwise (a pool mixing scored and unscored sources,
+        # or one with no clear dominant chunk at all — every score within
+        # the ratio of the top, e.g. several genuinely comparable sections
+        # for a broad "explain X in detail" query) degrades to exactly
+        # today's behavior, byte for byte.
+        _ALLOC_PRIMARY_RATIO = 0.85
+        _has_all_scores = all(d.metadata.get("rerank_score") is not None for d in chunks)
+        _primary: List[int] = []
+        _secondary: List[int] = []
+        if _has_all_scores:
+            _scores = [float(d.metadata.get("rerank_score")) for d in chunks]
+            _top_score = max(_scores)
+            if _top_score > 0:
+                _threshold = _top_score * _ALLOC_PRIMARY_RATIO
+                _primary = [i for i, sc in enumerate(_scores) if sc >= _threshold]
+                _secondary = [i for i in range(n) if i not in _primary]
+
+        if _secondary and _primary:
+            allocations = [0] * n
+            for i in _secondary:
+                allocations[i] = min(sizes[i], _MIN_VIABLE_WINDOW_CHARS)
+            _budget_for_primary = max_total_chars - sum(allocations[i] for i in _secondary)
+            _primary_fair_share = max(
+                _MIN_VIABLE_CHUNK_CHARS, _budget_for_primary // len(_primary)
+            )
+            for i in _primary:
+                allocations[i] = min(sizes[i], _primary_fair_share)
+        else:
+            fair_share = max_total_chars // n
+            allocations = [min(s, fair_share) for s in sizes]
+
         leftover = max_total_chars - sum(allocations)
         for i, s in enumerate(sizes):
             if leftover <= 0:
@@ -475,12 +577,51 @@ class ContextCompressor:
             kept_indices: set = set()
             remaining = alloc
             skipped: list = []
+            _enum_filled = False
             for idx in ranked_active:
                 s, e = window_bounds[idx]
                 size = window_sizes[idx]
                 if size <= remaining:
                     kept_indices.update(range(s, e))
                     remaining -= size
+                    continue
+                # Oversized window. Confirmed live (2026-08-25): when this
+                # window is a genuine multi-item enumeration (each of its
+                # sentences its own separately-marked scenario/step — a
+                # numbered claims procedure with separate steps for
+                # "medical emergency abroad," "baggage loss or delay,"
+                # "trip cancellation," ...), deferring it to the
+                # post-loop leftover-fill below lets a SMALLER,
+                # LOWER-SCORING window claim budget first just because it
+                # happens to fit whole — "How to claim a travel
+                # insurance?" lost every scenario but one this way,
+                # because a small trailing "the insurer settles the
+                # claim" window (lower score, but small enough to fit)
+                # got taken before the actual claims-procedure window
+                # ever got a chance at the leftover. An enumeration isn't
+                # "background detail leading up to one important
+                # sentence" the way ordinary prose is — every item in it
+                # is an equally real, equally citable answer — so it gets
+                # first claim on whatever budget remains, filled in
+                # document order (list order IS the natural reading
+                # order here, unlike a re-ranked jumble), before smaller
+                # non-enumeration windows later in score order get a
+                # turn. Only fires once per chunk (there's realistically
+                # one such list per chunk in this KB) and only when there
+                # IS real remaining budget to spend on it.
+                _marked = sum(
+                    1 for j in range(s, e)
+                    if _LIST_MARKER_RE.match(sentences[j])
+                )
+                if not _enum_filled and _marked >= 2 and remaining >= _MIN_VIABLE_WINDOW_CHARS:
+                    _enum_filled = True
+                    used = 0
+                    for j in range(s, e):
+                        L = len(sentences[j]) + 2
+                        if used + L <= remaining:
+                            kept_indices.add(j)
+                            used += L
+                    remaining -= used
                 else:
                     skipped.append(idx)
 

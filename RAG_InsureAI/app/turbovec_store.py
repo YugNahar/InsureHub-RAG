@@ -712,7 +712,26 @@ class TurboVecStore:
             return []
 
         ids = [str(uuid.uuid4()) for _ in docs]
-        texts = [doc.page_content for doc in docs]
+        # Prepend each chunk's own heading to its stored/embedded/BM25-
+        # indexed text — confirmed live (2026-08-25): a chunk's real
+        # section_heading ("Common Exclusions") lived ONLY in metadata,
+        # never in page_content itself, so the chunk's own embedding had
+        # zero signal that it was about exclusions at all — just a bare
+        # list of scenarios (wilful misconduct, wear and tear...) with no
+        # categorical anchor word. A query literally containing "common
+        # exclusions" then lost to unrelated chunks that merely shared
+        # more surface vocabulary (marine/insurance/cover) with the
+        # query, on both dense similarity AND BM25 (which indexes this
+        # same stored text — same blind spot, same fix point). One
+        # transform covers both retrieval paths plus citation display
+        # (the heading now showing alongside its content there is a
+        # genuine improvement, not just a side effect).
+        texts = [
+            (f"{h}\n\n{doc.page_content}" if (h := (doc.metadata or {}).get("section_heading", "").strip())
+             and not doc.page_content.lstrip().startswith(h)
+             else doc.page_content)
+            for doc in docs
+        ]
         metadatas = []
         for doc, iid in zip(docs, ids):
             meta = dict(doc.metadata)

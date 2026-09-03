@@ -27,6 +27,10 @@ import time
 import uuid
 from typing import Any, Optional
 
+import numpy as np
+
+from turbovec_store import _get_shared_embed_model, EMBED_MODEL_NAME
+
 logger = logging.getLogger(__name__)
 
 # ── Pattern dictionaries ───────────────────────────────────────────────────────
@@ -48,23 +52,23 @@ _POLICY_PATTERNS: dict[str, list[str]] = {
     # Patterns are ordered most-specific → least-specific within each type.
     # Short bare words (life, car, home) are intentionally excluded — they
     # appear in generic insurance text and cause false-positive tagging.
-    "travel":            ["travel insurance", "trip cancellation", "flight delay",
+    "travel":            ["travel insurance", "travel policy", "trip cancellation", "flight delay",
                           "baggage loss", "baggage delay", "baggage",
                           "hajj insurance", "umrah insurance", "outbound travel"],
-    "health":            ["health insurance", "medical insurance", "hospitalisation",
+    "health":            ["health insurance", "health policy", "medical insurance", "hospitalisation",
                           "hospitalization", "medical expense", "clinical",
                           "group health", "mediclaim", "critical illness",
                           "cashless treatment", "pre-existing disease"],
-    "life":              ["life insurance", "term life", "whole life",
+    "life":              ["life insurance", "life policy", "term life", "whole life",
                           "accidental death benefit", "death benefit",
                           "life assurance", "sum assured", "endowment plan",
                           "ulip", "unit linked", "money back plan",
                           "annuity", "pension plan", "lic policy"],
-    "motor":             ["motor insurance", "vehicle insurance", "car insurance",
+    "motor":             ["motor insurance", "motor policy", "vehicle insurance", "car insurance",
                           "auto insurance", "motor vehicle", "comprehensive motor",
                           "third party motor", "own damage", "ncb", "no claim bonus",
                           "road accident", "traffic accident"],
-    "home":              ["home insurance", "property insurance", "building insurance",
+    "home":              ["home insurance", "home policy", "property insurance", "building insurance",
                           "contents insurance", "household insurance",
                           "houseowners policy", "householders policy"],
     "personal_accident": ["personal accident", "pa insurance", "accidental injury",
@@ -473,7 +477,26 @@ _CHUNK_INTENT_LABELS: dict[str, dict] = {
         "desc": "Classification or overview of insurance types.",
         "keywords": ["types of insurance", "classification", "life insurance", "motor insurance",
                      "health insurance", "general insurance", "marine insurance"],
-        "regex": [r"\btypes of insurance\b", r"\bclassification\b", r"\bgeneral insurance\b"],
+        # Confirmed live 2026-09-01: the original r"\btypes of insurance\b"
+        # required that EXACT literal substring with nothing in between —
+        # tested against 8 completely natural real headings ("Important
+        # Types of Life Insurance products", "Various types of life
+        # Insurance Policy in India", "Types of Motor Insurance Policies",
+        # "What are the different types of life insurance", "Kinds of
+        # Health Insurance Plans"...) and it matched ZERO of them, because
+        # every one inserts a qualifier word ("life"/"motor"/"health")
+        # between "type(s)/kind(s) of" and "insurance", or uses "kind(s)"
+        # instead of "type(s)". This was the single biggest reason genuine
+        # types-of-X sections kept falling through to the harder, more
+        # error-prone "general"/IDENTIFY classification path instead of
+        # resolving confidently and for free via regex. \w*\s* allows an
+        # optional one-word qualifier without turning into an open-ended
+        # match — still requires the real anchor words "type(s)/kind(s)
+        # of ... insurance" together, so it doesn't fire on unrelated text
+        # that merely mentions insurance and a number nearby.
+        "regex": [r"\btypes?\s+of\s+(?:\w+\s+)?insurance\b",
+                  r"\bkinds?\s+of\s+(?:\w+\s+)?insurance\b",
+                  r"\bclassification\b", r"\bgeneral insurance\b"],
     },
     "history": {
         "desc": "History, evolution, or origin of insurance.",
@@ -498,6 +521,131 @@ _CHUNK_INTENT_LABELS: dict[str, dict] = {
 
 _VALID_INTENT_LABELS = set(_CHUNK_INTENT_LABELS.keys()) | {"general"}
 
+# ── Embedding-based section classification (semantic, not lexical) ──────────
+# A regex pattern can only ever catch phrasings someone has already
+# anticipated — confirmed live 2026-09-01: r"\btypes of insurance\b" matched
+# ZERO of 8 completely natural real headings ("Important Types of Life
+# Insurance products", "Different types of policy insurance", "Kinds of
+# Health Insurance Plans"...) because every one inserted a qualifier word or
+# used "kinds" instead of "types". Widening that one pattern fixed those 8
+# cases specifically, but the underlying problem — a regex only recognizes
+# the EXACT shapes it was written for — is structural, not something any
+# finite set of patterns fully solves. This reuses the SAME embedding model
+# already loaded and used throughout this codebase for retrieval (no new
+# dependency, no new network call, no per-call cost) to classify by MEANING
+# instead: one representative sentence per label, compared to the chunk's
+# own heading+text by cosine similarity. "Types of Motor Insurance
+# Policies", "Different kinds of motor insurance", and "LIFE INSURANCE
+# PRODUCTS" all score similarly against the types_of_insurance prototype
+# without needing any of those exact phrasings to be predicted in advance.
+# Deterministic (same text always produces the same embedding — no LLM
+# stochasticity/batch-dilution risk) and fast enough to sit between the
+# regex fast-path and the LLM fallback, catching genuinely ambiguous-to-
+# regex cases before they ever need to pay for an LLM call at all.
+_SECTION_PROTOTYPES: dict[str, str] = {
+    "benefits": "This section explains what the insurance policy covers, pays for, "
+                "and the benefits, coverage amounts, and payouts it provides.",
+    "exclusions": "This section lists what is not covered by the policy, exclusions, "
+                  "exceptions, and situations where a claim will be denied.",
+    "premiums": "This section explains the premium amount, how and when to pay it, "
+                "renewal, and what happens if a payment is missed or lapses.",
+    "claims": "This section explains how to file an insurance claim, the claims "
+              "process, required documents, and how reimbursement or settlement works.",
+    "eligibility": "This section explains who is eligible to buy this policy, age "
+                   "limits, and other entry requirements.",
+    "definitions": "This section defines what specific insurance terms mean, a "
+                   "glossary of definitions used in the policy.",
+    "principles": "This section explains one of these specific named insurance law "
+                  "doctrines: the principle of utmost good faith, subrogation, "
+                  "contribution, insurable interest, or proximate cause — not general "
+                  "contract law, not agent licensing, not regulatory procedure.",
+    "case_law": "This section discusses court cases, legal judgments, and precedents "
+                "related to insurance disputes.",
+    "legislation": "This section discusses insurance acts, laws, regulations, and "
+                   "government notifications.",
+    "types_of_insurance": "This section describes and classifies the different types "
+                          "or kinds of insurance products available, such as life "
+                          "insurance, motor insurance, or health insurance.",
+    "history": "This section describes the history, origin, and evolution of insurance.",
+    "how_to": "This section gives practical tips, steps, or a guide on how to do "
+              "something related to insurance.",
+    "chapter": "This is an introductory chapter overview or summary section, not "
+               "detailed content about a specific topic.",
+}
+
+# Calibrated empirically 2026-09-01 against a real held-out set of KB
+# chunks — and the first calibration attempt (0.55) was WRONG, caught by
+# actually testing negative controls before deploying, not just guessing:
+# genuine contract-law and agent-licensing content (confirmed "general" by
+# hand tonight) scored 0.58-0.64 against the "principles" prototype — high
+# enough to clear 0.55 and get falsely classified.
+#
+# Retested at 0.65 against 5 confirmed-correct positives and 4 confirmed-
+# general negatives: every negative (0.50-0.64) correctly fell below it,
+# and 2 of 5 positives (a real claims section 0.683, a real types_of_
+# insurance section 0.674) cleared it — but 3 borderline positives (0.60-
+# 0.65) did NOT, including one (a real ULIP-type section, 0.623) that
+# scored BELOW a genuine negative (0.643) — confirming there is NO single
+# threshold that perfectly separates this specific sample; the ranges
+# genuinely overlap. Chose to keep the higher, safer threshold rather than
+# thread a razor-thin gap between two data points from a small calibration
+# set — that would be overfitting to this one sample, not a robust general
+# rule. This is a deliberately conservative, precision-over-recall choice,
+# and it's safe to be conservative here specifically because a section
+# this function doesn't confidently resolve simply falls through to the
+# EXISTING regex-then-LLM pipeline unchanged — missing a catchable case
+# costs nothing (same reliability as before this function existed), while
+# a wrong confident label would actively make things worse. Only ever
+# trade coverage for safety here, never the reverse.
+_SECTION_EMBEDDING_CONFIDENCE = 0.65
+
+_section_prototype_embeddings: Optional[tuple] = None
+
+
+def _get_section_prototype_embeddings() -> tuple:
+    global _section_prototype_embeddings
+    if _section_prototype_embeddings is None:
+        model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        labels = list(_SECTION_PROTOTYPES.keys())
+        vecs = model.encode(
+            [_SECTION_PROTOTYPES[l] for l in labels], normalize_embeddings=True,
+        )
+        _section_prototype_embeddings = (labels, vecs)
+    return _section_prototype_embeddings
+
+
+def classify_by_section_embedding(text: str, heading: str = "") -> tuple[Optional[str], float]:
+    """
+    Classify a chunk's section by semantic similarity to a prototype
+    sentence per label, instead of exact-phrase regex matching. Returns
+    (label, score) if the best match clears _SECTION_EMBEDDING_CONFIDENCE,
+    otherwise (None, best_score_seen) so the caller can log/inspect how
+    close it came without treating a near-miss as a real classification.
+
+    heading is weighted implicitly by being prepended to the text sent for
+    embedding (short heading text dominates less of a long chunk's meaning
+    than the same heading dominates a REGEX heading-weighted score, but
+    still meaningfully shifts the embedding toward what the heading says
+    this section is about — confirmed live this is enough to correctly
+    resolve cases where the body alone is ambiguous).
+    """
+    try:
+        model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        labels, proto_vecs = _get_section_prototype_embeddings()
+        query_text = f"{heading}\n{text[:600]}" if heading else text[:600]
+        if not query_text.strip():
+            return None, 0.0
+        vec = model.encode([query_text], normalize_embeddings=True)[0]
+        scores = np.dot(proto_vecs, vec)
+        best_idx = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
+        if best_score >= _SECTION_EMBEDDING_CONFIDENCE:
+            return labels[best_idx], best_score
+        return None, best_score
+    except Exception as exc:
+        logger.debug("[INTENT] embedding classification failed: %s", exc)
+        return None, 0.0
+
 
 def _regex_section_score(text: str, heading: str = "") -> dict[str, int]:
     """Return hit-count per label using regex patterns only (fast path).
@@ -521,14 +669,66 @@ def _regex_section_score(text: str, heading: str = "") -> dict[str, int]:
     }
 
 
-def _build_intent_prompt(text: str, doc_type: str, regex_scores: dict[str, int], heading: str = "") -> str:
+def _regex_section_evidence(text: str, heading: str = "") -> dict[str, list[str]]:
+    """Return the ACTUAL matched words/phrases per label — raw surface
+    evidence, not a pre-computed winner — for use in the LLM prompt.
+
+    Confirmed live 2026-09-01: the previous prompt design handed the LLM
+    a pre-RANKED hint like "benefits(3), exclusions(1)" (see the old
+    version of _build_intent_prompt) — a label-level conclusion the
+    regex had already reached, not the evidence behind it. A chunk
+    defining ONE product in a "types of X" classification, whose body
+    happens to also use the word "benefits" (a common, generic word in
+    insurance text), got classified "benefits" over the more precise
+    "types_of_insurance" — the LLM wasn't independently weighing the
+    text, it was largely confirming whichever label the regex already
+    led with. Worse: the prompt's own worked-example rules ("Text
+    explaining what a policy covers -> benefits") only reinforced 4 of
+    12 labels, giving those an unfair structural advantage regardless of
+    what the regex found. This function fixes both problems the same
+    way: surface WHAT matched (the literal words, per label, unranked),
+    not a conclusion about WHICH label is best — the LLM has to look at
+    the same raw signal a human reading the regex output would and draw
+    its own conclusion, the same as it does for content the regex found
+    nothing in at all.
+    """
+    t = text.lower()
+    h = heading.lower()
+    evidence: dict[str, list[str]] = {}
+    for label, info in _CHUNK_INTENT_LABELS.items():
+        hits: list[str] = []
+        for p in info["regex"]:
+            if h:
+                hm = re.search(p, h)
+                if hm:
+                    hits.append(f'"{hm.group(0)}" (in heading)')
+            tm = re.search(p, t)
+            if tm:
+                hits.append(f'"{tm.group(0)}"')
+        if hits:
+            evidence[label] = hits
+    return evidence
+
+
+def _build_intent_prompt(text: str, doc_type: str, heading: str = "") -> str:
     """
     Build the LLM classification prompt for chunk intent/section.
 
-    Regex scores are surfaced as 'keyword signals' so the model knows what
-    the regex already found — without being restricted to just those signals.
-    The few-shot label descriptions tell the model what each label means for
-    text that has no regex hits at all (e.g. conversational YouTube content).
+    Per-label matched-keyword EVIDENCE (see _regex_section_evidence) is
+    attached to each label's own description line, in the SAME order as
+    the label list — not surfaced as a separate, pre-ranked "hint" line.
+    This is a deliberate structural choice, not a formatting preference:
+    an earlier version computed the regex's own best-scoring label and
+    handed the LLM that conclusion directly ("benefits(3), exclusions(1)")
+    — confirmed live 2026-09-01 this measurably anchored the LLM into
+    confirming whichever label already led, rather than weighing the text
+    itself, and a worked-example list that only reinforced 4 of 12 labels
+    compounded it further, giving those 4 an unfair structural edge no
+    matter what the regex actually found. Attaching evidence per-label
+    (present for every label that matched anything, absent otherwise)
+    keeps every label's presentation symmetric, and requires the model to
+    look at what the words actually establish rather than which single
+    label the regex already picked as the "winner."
 
     heading, when known, is the actual document heading this section falls
     under (e.g. "Common Exclusions") — confirmed live: without it, a
@@ -538,14 +738,12 @@ def _build_intent_prompt(text: str, doc_type: str, regex_scores: dict[str, int],
     both the regex AND the LLM (reading only the body) can misclassify it
     as "general". The heading alone usually settles it.
     """
-    top_regex = sorted(regex_scores.items(), key=lambda x: x[1], reverse=True)[:3]
-    regex_hint = ", ".join(
-        f"{lbl}({score})" for lbl, score in top_regex if score > 0
-    ) or "none"
+    evidence = _regex_section_evidence(text, heading)
 
     label_list = "\n".join(
         f"  - {lbl}: {info['desc']}\n"
         f"    Example keywords: {', '.join(info['keywords'][:5])}"
+        + (f"\n    Matched in this text: {', '.join(evidence[lbl])}" if lbl in evidence else "")
         for lbl, info in _CHUNK_INTENT_LABELS.items()
     )
 
@@ -558,22 +756,23 @@ Classify the TEXT below into exactly ONE of these labels:
   - general: content that doesn't clearly fit any label above
 
 Document type context: {doc_type}
-{heading_line}Regex keyword signals (hints only, may be empty or wrong for conversational text): {regex_hint}
-
+{heading_line}
 IMPORTANT:
-- The regex signals are hints based on keyword matching — they can be empty or misleading
-  for conversational or YouTube-style text. Read the FULL MEANING of the text.
-- Even if regex signals are empty, pick the most appropriate label based on content.
+- "Matched in this text" next to a label is raw surface evidence (literal words found),
+  not a conclusion — it can be present for the WRONG label too (e.g. a chunk defining
+  one product in a type classification will often also use the word "benefit" while
+  still being more precisely "types_of_insurance", not "benefits"). Weigh the FULL
+  MEANING of the text and which label it is REALLY about, not just which label has
+  the most matches.
+- A label with no matches listed is not disqualified — pick the most appropriate
+  label based on the text's actual meaning even when nothing matched at all
+  (common for conversational or YouTube-style text).
 - If a section heading is given above, weigh it heavily — it is the document's own
   label for this content and is often the clearest signal available, especially
   when the body text itself never repeats the heading's own words (e.g. a heading
   "Common Exclusions" followed by a bullet list phrased entirely as "X, unless Y
   has been declared..." with no literal "excluded"/"not covered" anywhere in the
   body — that is still an exclusions list).
-- Conversational or video-style text (e.g. "how to get cheap insurance") → "how_to"
-- Text explaining what a policy covers → "benefits"
-- Text about what is not covered → "exclusions"
-- Text about filing a claim → "claims"
 - Reply with ONLY the label name, nothing else. No explanation, no punctuation.
 
 TEXT (first 600 chars):
@@ -636,6 +835,22 @@ def classify_chunk_intent(
         logger.debug("[INTENT] regex confident → %s (score=%d)", best_label, best_score)
         return best_label
 
+    # ── Embedding path ───────────────────────────────────────────────────────
+    # Semantic fallback before paying for an LLM call — see
+    # classify_by_section_embedding's own docstring. Skipped under
+    # force_llm for the same reason regex-confident is: conversational/
+    # YouTube-style text is exactly the case this formal, textbook-style
+    # prototype wording is least likely to match well, and the LLM
+    # already handles that case reliably.
+    if not force_llm:
+        embed_label, embed_score = classify_by_section_embedding(text, heading)
+        if embed_label:
+            logger.info(
+                "[INTENT] embedding confident → %s (score=%.3f, regex was: %s/%d)",
+                embed_label, embed_score, best_label, best_score,
+            )
+            return embed_label
+
     # ── LLM path ──────────────────────────────────────────────────────────────
     if llm is None:
         result = best_label if best_score >= 1 else "general"
@@ -643,7 +858,7 @@ def classify_chunk_intent(
         return result
 
     try:
-        prompt = _build_intent_prompt(text, doc_type, regex_scores, heading)
+        prompt = _build_intent_prompt(text, doc_type, heading)
         response = llm.invoke(prompt)
         raw = (response.content if hasattr(response, "content") else str(response)).strip().lower()
         # Clean: take first word/token only (model sometimes adds punctuation)
@@ -668,9 +883,17 @@ def _build_intent_batch_prompt(items: list[tuple[str, dict, str, str]]) -> str:
 
     items: list of (text, regex_scores, doc_type, heading) for sections
     that need an LLM call — the regex-confident sections never reach here
-    at all. heading is the section's own detected document heading (may
-    be empty) — see _build_intent_prompt's docstring for why it matters:
-    a section's body can be a bare list that never repeats the category's
+    at all. regex_scores is accepted for call-site compatibility but NOT
+    used for the prompt hint anymore — see _build_intent_prompt's own
+    docstring for why a pre-ranked "benefits(3)" style hint was replaced
+    with per-label matched-keyword evidence (_regex_section_evidence)
+    computed fresh from text+heading here, same fix, same reasoning,
+    applied to this batched path too since THIS is the one real ingestion
+    actually calls whenever an LLM is available (classify_chunk_intent,
+    the single-item version, is the less-used path).
+    heading is the section's own detected document heading (may be
+    empty) — see _build_intent_prompt's docstring for why it matters: a
+    section's body can be a bare list that never repeats the category's
     own keywords, and the heading is often the only unambiguous signal.
     """
     label_list = "\n".join(
@@ -680,17 +903,17 @@ def _build_intent_batch_prompt(items: list[tuple[str, dict, str, str]]) -> str:
     )
 
     blocks = []
-    for i, (text, regex_scores, doc_type, heading) in enumerate(items, start=1):
-        top_regex = sorted(regex_scores.items(), key=lambda x: x[1], reverse=True)[:3]
-        regex_hint = ", ".join(
-            f"{lbl}({score})" for lbl, score in top_regex if score > 0
-        ) or "none"
+    for i, (text, _regex_scores, doc_type, heading) in enumerate(items, start=1):
+        evidence = _regex_section_evidence(text, heading)
+        evidence_lines = "\n".join(
+            f"    {lbl}: {', '.join(hits)}" for lbl, hits in evidence.items()
+        ) or "    none"
         heading_line = f"Section heading: {heading}\n" if heading else ""
         blocks.append(
             f"\n=== SECTION {i} ===\n"
             f"Document type context: {doc_type}\n"
             f"{heading_line}"
-            f"Regex keyword signals (hints only, may be empty or wrong for conversational text): {regex_hint}\n"
+            f"Matched keywords per label (raw evidence, NOT a ranked conclusion):\n{evidence_lines}\n"
             f"TEXT (first 600 chars):\n{text[:600]}"
         )
 
@@ -701,18 +924,20 @@ Classify EACH of the {len(items)} sections below into exactly ONE of these label
   - general: content that doesn't clearly fit any label above
 
 IMPORTANT:
-- The regex signals are hints based on keyword matching — they can be empty or misleading
-  for conversational or YouTube-style text. Read the FULL MEANING of each section's text.
-- Even if regex signals are empty, pick the most appropriate label based on content.
+- "Matched keywords per label" next to each section is raw surface evidence (literal
+  words found), not a conclusion — it can be present for the WRONG label too (e.g. a
+  section defining one product in a type classification will often also use the word
+  "benefit" while still being more precisely "types_of_insurance", not "benefits").
+  Weigh the FULL MEANING of each section's text and which label it is REALLY about,
+  not just which label has the most matches.
+- A label with no matches listed is not disqualified — pick the most appropriate
+  label based on the text's actual meaning even when nothing matched at all
+  (common for conversational or YouTube-style text).
 - If a section heading is given, weigh it heavily — it is the document's own label for
   that content and is often the clearest signal available, especially when the body text
   itself never repeats the heading's own words (e.g. a heading "Common Exclusions"
   followed by a bullet list phrased entirely as "X, unless Y has been declared..." with
   no literal "excluded"/"not covered" anywhere in the body — that is still an exclusions list).
-- Conversational or video-style text (e.g. "how to get cheap insurance") → "how_to"
-- Text explaining what a policy covers → "benefits"
-- Text about what is not covered → "exclusions"
-- Text about filing a claim → "claims"
 - Judge each section entirely independently — do not let one section's content
   influence another section's label.
 {"".join(blocks)}
@@ -781,6 +1006,22 @@ def classify_chunk_intents_batch(
 
         if regex_confident and not force_llm_flags[i]:
             labels[i] = best_label
+            continue
+
+        # Same embedding fallback as the single-item classify_chunk_intent
+        # — see classify_by_section_embedding's docstring — checked before
+        # queuing this section for the (batched, but still costlier and
+        # quota-limited) LLM pass.
+        embed_label = None
+        if not force_llm_flags[i]:
+            embed_label, embed_score = classify_by_section_embedding(text, headings[i])
+            if embed_label:
+                logger.info(
+                    "[INTENT] embedding confident (batch) → %s (score=%.3f, regex was: %s/%d)",
+                    embed_label, embed_score, best_label, best_score,
+                )
+        if embed_label:
+            labels[i] = embed_label
         elif llm is None:
             labels[i] = best_label if best_score >= 1 else "general"
         else:
@@ -848,13 +1089,13 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "liability, road accidents, traffic incidents, driving-related topics."
         ),
         "keywords": [
-            "car insurance", "motor insurance", "vehicle insurance", "auto insurance",
+            "car insurance", "car policy", "motor insurance", "motor policy", "vehicle insurance", "auto insurance",
             "motor vehicle", "comprehensive motor", "third party liability",
             "own damage", "road accident", "traffic", "driving", "bike insurance",
             "two-wheeler", "automobile", "collision", "fender bender",
         ],
         "regex": [
-            r"\bcar insurance\b", r"\bmotor insurance\b", r"\bvehicle insurance\b",
+            r"\bcar insurance\b", r"\bcar policy\b", r"\bmotor insurance\b", r"\bmotor policy\b", r"\bvehicle insurance\b",
             r"\bauto insurance\b", r"\bmotor vehicle\b", r"\bcomprehensive motor\b",
             # Narrowed from bare \bthird.?party\b (2026-07-16) — "third party"
             # alone is a general legal/insurance concept spanning liability,
@@ -879,13 +1120,13 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "medicine costs, surgery, emergency medical care."
         ),
         "keywords": [
-            "health insurance", "medical insurance", "hospitalization", "hospital",
+            "health insurance", "health policy", "medical insurance", "hospitalization", "hospital",
             "medical expense", "clinical", "OPD", "IPD", "cashless treatment",
             "doctor", "surgery", "medicine", "treatment", "illness", "disease",
             "pre-existing", "maternity", "dental", "vision", "pharmacy",
         ],
         "regex": [
-            r"\bhealth insurance\b", r"\bmedical insurance\b", r"\bhospitali[sz]ation\b",
+            r"\bhealth insurance\b", r"\bhealth policy\b", r"\bmedical insurance\b", r"\bhospitali[sz]ation\b",
             r"\bhospital\b", r"\bmedical expense\b", r"\bclinical\b",
             r"\bdoctor\b", r"\bsurgery\b", r"\billness\b", r"\btreatment\b",
             r"\bpre.?existing\b", r"\bmaternity\b",
@@ -912,13 +1153,13 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "pension, retirement savings with life component."
         ),
         "keywords": [
-            "life insurance", "term insurance", "term life", "whole life", "death benefit",
+            "life insurance", "life policy", "term insurance", "term life", "whole life", "death benefit",
             "sum assured", "life assurance", "accidental death", "critical illness",
             "terminal illness", "annuity", "pension", "retirement plan",
             "endowment", "unit-linked", "ULIP", "nominee", "beneficiary",
         ],
         "regex": [
-            r"\blife insurance\b", r"\bterm insurance\b", r"\bterm life\b", r"\bwhole life\b",
+            r"\blife insurance\b", r"\blife policy\b", r"\bterm insurance\b", r"\bterm life\b", r"\bwhole life\b",
             r"\bdeath benefit\b", r"\bsum assured\b", r"\blife assurance\b",
             r"\bcritical illness\b", r"\bannuity\b", r"\bpension\b",
             r"\bendowment\b", r"\bulip\b",
@@ -931,13 +1172,13 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "overseas medical, travel accident."
         ),
         "keywords": [
-            "travel insurance", "trip cancellation", "flight delay", "baggage",
+            "travel insurance", "travel policy", "trip cancellation", "flight delay", "baggage",
             "baggage loss", "baggage delay", "hajj insurance", "outbound",
             "passport loss", "overseas medical", "travel accident",
             "holiday insurance", "vacation", "abroad", "international travel",
         ],
         "regex": [
-            r"\btravel insurance\b", r"\btrip cancellation\b", r"\bflight delay\b",
+            r"\btravel insurance\b", r"\btravel policy\b", r"\btrip cancellation\b", r"\bflight delay\b",
             r"\bbaggage\b", r"\bhajj insurance\b", r"\bumrah insurance\b",
             r"\bpassport loss\b", r"\boverseas\b", r"\bholiday insurance\b",
             r"\babroad\b",
@@ -959,13 +1200,15 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "regardless of how similar the covered perils are worded."
         ),
         "keywords": [
-            "home insurance", "property insurance", "building insurance",
+            "home insurance", "home policy", "house insurance", "house policy",
+            "property insurance", "building insurance",
             "contents insurance", "household insurance",
             "flood damage", "theft at home", "structural damage", "landlord",
             "houseowners", "householders",
         ],
         "regex": [
-            r"\bhome insurance\b", r"\bproperty insurance\b", r"\bbuilding insurance\b",
+            r"\bhome insurance\b", r"\bhome policy\b", r"\bhouse insurance\b", r"\bhouse policy\b",
+            r"\bproperty insurance\b", r"\bbuilding insurance\b",
             r"\bcontents insurance\b", r"\bhousehold insurance\b",
             r"\bflood\b", r"\btheft\b", r"\blandlord\b",
             r"\bhouseowners\b", r"\bhouseholders\b",
@@ -1047,14 +1290,28 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
         ],
     },
     "liability": {
+        # "employer liability" deliberately removed from desc/keywords
+        # (2026-08-25) — it was never in the regex list below, so this
+        # only ever affected the query-side LLM classification fallback's
+        # prompt text, not the fast regex path or chunk tagging. Confirmed
+        # live: "one of our factory workers got injured on the job, does
+        # the company have to pay" kept classifying "liability" instead of
+        # the more specific "workmens_compensation" type (now promoted in
+        # this KB's active vocabulary), because this entry's own
+        # description explicitly claimed "employer liability" as part of
+        # its territory — the LLM wasn't wrong to pick liability, the two
+        # types' own descriptions genuinely overlapped. This description
+        # predates workmens_compensation existing as a dedicated type;
+        # now that it does, employer-liability-for-employee-injury has a
+        # more specific home and shouldn't be double-claimed here.
         "desc": (
             "Liability insurance. Covers public liability, product liability, "
-            "professional indemnity, D&O, employer liability, errors and omissions."
+            "professional indemnity, D&O, errors and omissions."
         ),
         "keywords": [
             "liability insurance", "public liability", "product liability",
             "professional indemnity", "errors and omissions", "e&o",
-            "directors and officers", "d&o insurance", "employer liability",
+            "directors and officers", "d&o insurance",
             "third party liability",
         ],
         "regex": [
@@ -1992,6 +2249,25 @@ _BATCH_GROUP_PACING_SECONDS = 3       # gap between sub-batch calls so Groq's ro
 # completion cut off mid-batch by max_tokens sized for a single section's
 # reply. Capping section COUNT per group bounds completion size directly.
 _MAX_SECTIONS_PER_GROUP = 4
+# Sections whose regex first-pass already came up "general" get the
+# harder STEP 1 — IDENTIFY framing (open-ended "what type IS this, if
+# any" — see _verify_enrich_step1_fields), not the easier STEP 1 — VERIFY
+# framing (a yes/no confirm/deny on a specific candidate) that a
+# confident regex match gets. Confirmed live 2026-09-01: the exact same
+# text, asked about ALONE, correctly resolved its type 3/3 times — but
+# batched together with 3 OTHER sections (the standard
+# _MAX_SECTIONS_PER_GROUP=4 group size) it came back "general" (wrong).
+# A harder, open-ended judgment measurably degrades when several
+# independent open-ended judgments compete for the model's attention in
+# one completion — a batch of simple yes/no VERIFY confirmations doesn't
+# show the same fragility. Capping IDENTIFY-framed sections much lower
+# (effectively removing the batching that causes this, at the cost of
+# more total calls/tokens for exactly this harder subset — an accepted
+# tradeoff, since these are also the sections the cheap regex path
+# already failed on, so getting them right matters more, not less) fixes
+# the specific population actually at risk, without slowing down the
+# easier VERIFY-framed majority that doesn't have this problem.
+_MAX_GENERAL_SECTIONS_PER_GROUP = 1
 # GROQ_CLASSIFICATION_MODEL is a reasoning model — see get_classification_
 # llm()'s docstring in router.py: max_tokens has to cover BOTH the model's
 # internal reasoning tokens (a fixed-ish floor, not headroom for the
@@ -2015,16 +2291,21 @@ def _estimate_tokens(s: str) -> int:
 
 def _group_sections_by_token_budget(
     sections: list[tuple[str, str]],
+    max_per_group: int = _MAX_SECTIONS_PER_GROUP,
 ) -> list[list[tuple[str, str]]]:
     """
     Split `sections` into ordered groups whose estimated combined prompt
     size stays under _BATCH_TOKEN_BUDGET AND whose section COUNT stays
-    under _MAX_SECTIONS_PER_GROUP (bounds the completion side too — see
-    that constant's comment), so verify_and_enrich_sections_batch can send
-    each group as its own request instead of risking one oversized
-    combined call. A single section that alone exceeds the token budget
-    still gets its own group (nothing left to split further) rather than
-    being dropped.
+    under max_per_group (bounds the completion side too — see
+    _MAX_SECTIONS_PER_GROUP's comment), so verify_and_enrich_sections_batch
+    can send each group as its own request instead of risking one
+    oversized combined call. A single section that alone exceeds the token
+    budget still gets its own group (nothing left to split further) rather
+    than being dropped.
+
+    max_per_group is a parameter, not always the module constant, because
+    verify_and_enrich_sections_batch calls this twice with two DIFFERENT
+    caps — see that function's own docstring for why.
     """
     groups: list[list[tuple[str, str]]] = []
     current: list[tuple[str, str]] = []
@@ -2033,7 +2314,7 @@ def _group_sections_by_token_budget(
         section_tokens = _estimate_tokens(text[:4000]) + _BATCH_SECTION_OVERHEAD_TOKENS
         if current and (
             current_tokens + section_tokens > _BATCH_TOKEN_BUDGET
-            or len(current) >= _MAX_SECTIONS_PER_GROUP
+            or len(current) >= max_per_group
         ):
             groups.append(current)
             current, current_tokens = [], 0
@@ -2078,6 +2359,17 @@ def verify_and_enrich_sections_batch(
     "unknown"} for any section whose sub-batch call fails or whose reply
     can't be parsed — same fail-safe behavior as the single-section
     function, just applied per sub-batch rather than one call at a time.
+
+    Processed as TWO separate passes, not one flat grouping — sections
+    whose assigned_type is "general" (the harder, open-ended STEP 1 —
+    IDENTIFY framing) are grouped at _MAX_GENERAL_SECTIONS_PER_GROUP,
+    sections with any other assigned_type (the easier STEP 1 — VERIFY
+    yes/no framing) stay at the larger _MAX_SECTIONS_PER_GROUP. See
+    _MAX_GENERAL_SECTIONS_PER_GROUP's own comment for why — confirmed
+    live this isn't just caution, it fixes a real, reproducible failure.
+    Each pass's own sub-batches are still paced _BATCH_GROUP_PACING_SECONDS
+    apart, continuously across both passes (never two calls back-to-back
+    with no gap, regardless of which pass they belong to).
     """
     results = [
         {"policy_type": assigned_type, **{f: "unknown" for f in _ENRICHMENT_FIELDS}}
@@ -2086,43 +2378,57 @@ def verify_and_enrich_sections_batch(
     if llm is None or not sections:
         return results
 
-    groups = _group_sections_by_token_budget(sections)
-    offset = 0
-    for gi, group in enumerate(groups):
-        if gi > 0:
-            time.sleep(_BATCH_GROUP_PACING_SECONDS)
-        try:
-            prompt = _build_verify_and_enrich_batch_prompt(group, doc_prior)
-            # Override max_tokens for this call via .bind() rather than
-            # reconstructing the LLM — the caller's llm instance is shared
-            # across other classification calls (classify_candidate_type
-            # etc.) that need the smaller single-item default. A combined
-            # multi-section reply needs more room than that default covers
-            # (see _batch_max_tokens' comment) — confirmed live 2026-08-19:
-            # without this override, a 9-section reply came back truncated
-            # to 5 of 9 blocks under the single-section max_tokens default.
-            response = llm.bind(max_tokens=_batch_max_tokens(len(group))).invoke(prompt)
-            raw = response.content if hasattr(response, "content") else str(response)
+    general_idx = [i for i, (_, t) in enumerate(sections) if t == "general"]
+    other_idx = [i for i, (_, t) in enumerate(sections) if t != "general"]
+    passes = [
+        (general_idx, _MAX_GENERAL_SECTIONS_PER_GROUP),
+        (other_idx, _MAX_SECTIONS_PER_GROUP),
+    ]
 
-            blocks = re.split(r"===\s*SECTION\s+\d+\s*===", raw)[1:]
-            if len(blocks) != len(group):
+    call_count = 0
+    for indices, max_per_group in passes:
+        if not indices:
+            continue
+        subset = [sections[i] for i in indices]
+        groups = _group_sections_by_token_budget(subset, max_per_group=max_per_group)
+        offset = 0
+        for gi, group in enumerate(groups):
+            if call_count > 0:
+                time.sleep(_BATCH_GROUP_PACING_SECONDS)
+            call_count += 1
+            try:
+                prompt = _build_verify_and_enrich_batch_prompt(group, doc_prior)
+                # Override max_tokens for this call via .bind() rather than
+                # reconstructing the LLM — the caller's llm instance is shared
+                # across other classification calls (classify_candidate_type
+                # etc.) that need the smaller single-item default. A combined
+                # multi-section reply needs more room than that default covers
+                # (see _batch_max_tokens' comment) — confirmed live 2026-08-19:
+                # without this override, a 9-section reply came back truncated
+                # to 5 of 9 blocks under the single-section max_tokens default.
+                response = llm.bind(max_tokens=_batch_max_tokens(len(group))).invoke(prompt)
+                raw = response.content if hasattr(response, "content") else str(response)
+
+                blocks = re.split(r"===\s*SECTION\s+\d+\s*===", raw)[1:]
+                if len(blocks) != len(group):
+                    logger.warning(
+                        "[POLICY_TYPE] batch verify/enrich sub-batch %d/%d (%s pass) returned "
+                        "%d block(s), expected %d — keeping first-pass assignment for this sub-batch",
+                        gi + 1, len(groups), "general" if max_per_group == _MAX_GENERAL_SECTIONS_PER_GROUP else "other",
+                        len(blocks), len(group),
+                    )
+                else:
+                    for j, (block, (_, assigned_type)) in enumerate(zip(blocks, group)):
+                        results[indices[offset + j]] = _parse_verify_and_enrich_reply(block, assigned_type)
+
+            except Exception as exc:
                 logger.warning(
-                    "[POLICY_TYPE] batch verify/enrich sub-batch %d/%d returned %d block(s), "
-                    "expected %d — keeping first-pass assignment for this sub-batch",
-                    gi + 1, len(groups), len(blocks), len(group),
+                    "[POLICY_TYPE] batch verify/enrich sub-batch %d/%d (%s pass) LLM call failed: "
+                    "%s — keeping first-pass assignment for this sub-batch",
+                    gi + 1, len(groups), "general" if max_per_group == _MAX_GENERAL_SECTIONS_PER_GROUP else "other", exc,
                 )
-            else:
-                for j, (block, (_, assigned_type)) in enumerate(zip(blocks, group)):
-                    results[offset + j] = _parse_verify_and_enrich_reply(block, assigned_type)
 
-        except Exception as exc:
-            logger.warning(
-                "[POLICY_TYPE] batch verify/enrich sub-batch %d/%d LLM call failed: %s — "
-                "keeping first-pass assignment for this sub-batch",
-                gi + 1, len(groups), exc,
-            )
-
-        offset += len(group)
+            offset += len(group)
 
     return results
 
@@ -2163,6 +2469,20 @@ _CANDIDATE_STOPWORDS = frozenset({
     # cause) rather than anything distinctive of one specific product.
     "loss", "losses", "compensation", "indemnity", "principle", "principles",
     "cause", "causes",
+    # Confirmed live (2026-09-01): candidate_section_vocab.json's
+    # "policy_loan" entry (54 guesses) had accumulated these five generic
+    # financial words as half its stored keyword list. _metadata_scoped_
+    # retrieval's own live extension to the candidate_section case (see
+    # multi_source_rag.py) surfaced a real false match: a query about
+    # taking a loan against a policy retrieved 2 chunks that were actually
+    # about unrelated REGULATORY INVESTMENT EXPOSURE LIMITS, matched
+    # purely because that text also happened to mention "against",
+    # "balance", "interest", "outstanding", "value" (2+ hits clears
+    # match_candidate_section_vocab()'s bar). None of these five are
+    # distinctive of policy loans specifically — they're as generic to
+    # insurance/finance text as "premium"/"risk" above. "loan" and
+    # "surrender" stay: genuinely specific to this topic.
+    "against", "balance", "interest", "outstanding", "value",
 })
 
 # General-English function/filler words, on top of the domain list above.
@@ -2255,16 +2575,58 @@ def _extract_candidate_keywords(text: str) -> list[str]:
     which is exactly the failure mode the stopword list alone can't catch
     (there's no fixed list of every possible boilerplate word). Ties
     (equal frequency) break by first-occurrence order for determinism.
+
+    Also excludes words that read as proper nouns (place/company/brand
+    names) rather than real subject-matter vocabulary — detected
+    structurally from the ORIGINAL, case-preserved text, not from a
+    hardcoded name list: a word that is Title-Cased every time it shows up
+    mid-sentence (i.e. not just because it opens a sentence, where every
+    word is capitalized regardless of what it is) is almost certainly a
+    name. ALL-CAPS acronyms (ULIP, IRDAI, NAV) are deliberately exempted —
+    only initial-cap-then-lowercase counts as "capitalized" here — since
+    those are real domain vocabulary, not names.
+    Confirmed live (2026-09-01): candidate_section_vocab.json had
+    accumulated literal address fragments ("Gurgaon", "Haryana", "Plot",
+    "Sector"), a brand name ("Policybazaar"), and webpage UI text ("Did
+    you Find the Content Helpful") as promoted keywords for company_
+    details/price_assurance/customer_feedback — all missed by the fixed
+    stopword lists above (which only know GENERIC words, not names), and
+    only possible in the first place because the old version of this
+    function lowercased text before matching, throwing away the one
+    signal that would have caught them without needing to know their
+    names in advance.
     """
-    tokens = re.findall(r"\b[a-z]{4,}\b", text.lower())
     counts: dict[str, int] = {}
     first_seen: dict[str, int] = {}
-    for i, t in enumerate(tokens):
-        if t in _CANDIDATE_STOPWORDS or t in _GENERAL_STOPWORDS:
+    mid_sentence_total: dict[str, int] = {}
+    mid_sentence_capitalized: dict[str, int] = {}
+    i = 0
+    for m in re.finditer(r"\b[A-Za-z]{4,}\b", text):
+        word = m.group()
+        low = word.lower()
+        if low in _CANDIDATE_STOPWORDS or low in _GENERAL_STOPWORDS:
             continue
-        counts[t] = counts.get(t, 0) + 1
-        first_seen.setdefault(t, i)
-    ranked = sorted(counts, key=lambda t: (-counts[t], first_seen[t]))
+        counts[low] = counts.get(low, 0) + 1
+        first_seen.setdefault(low, i)
+        i += 1
+
+        before = text[: m.start()].rstrip()
+        is_sentence_start = (not before) or before[-1] in ".!?\n"
+        if not is_sentence_start:
+            mid_sentence_total[low] = mid_sentence_total.get(low, 0) + 1
+            if word[0].isupper() and word[1:].islower():
+                mid_sentence_capitalized[low] = mid_sentence_capitalized.get(low, 0) + 1
+
+    def _is_likely_proper_noun(word: str) -> bool:
+        total = mid_sentence_total.get(word, 0)
+        if total < 1:
+            return False
+        return mid_sentence_capitalized.get(word, 0) / total >= 1.0
+
+    ranked = sorted(
+        (t for t in counts if not _is_likely_proper_noun(t)),
+        key=lambda t: (-counts[t], first_seen[t]),
+    )
     return ranked[:8]
 
 

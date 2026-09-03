@@ -46,6 +46,13 @@ what something IS, what it covers, or how it works, with no purchase/pricing int
 stays "none" even if it matches an agent's topic — Layla answers those from her own
 knowledge base.
 
+Check the PRODUCT the message names, not just its shape. "How much does X cost" is
+only a quote request FOR THAT AGENT if X is the product that agent's own description
+above actually covers. The exact same phrasing asking about a DIFFERENT, unrelated
+insurance product (e.g. "how much does motor insurance cost" when the agent only
+handles travel insurance) is "none" — Layla answers that herself. Don't route on
+sentence shape alone; the named product has to match.
+
 MESSAGE: {query}
 
 Reply with ONLY the agent name or the word "none" — nothing else."""

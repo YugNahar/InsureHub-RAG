@@ -8,7 +8,7 @@ import os
 import random
 import re
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 
 try:
     from openai import APIConnectionError as _APIConnectionError, APITimeoutError as _APITimeoutError, APIStatusError as _APIStatusError
@@ -17,11 +17,12 @@ except ImportError:
     _APITimeoutError = Exception
     _APIStatusError = Exception
 
+import numpy as np
 from rapidfuzz import fuzz, process
-from turbovec_store import _rerank_windows, _get_shared_reranker
+from turbovec_store import _rerank_windows, _get_shared_reranker, _get_shared_embed_model, EMBED_MODEL_NAME
 from metadata_tagger import (
     classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
-    _is_duplicate_of_existing_type, _regex_policy_score,
+    _is_duplicate_of_existing_type, _regex_policy_score, classify_chunk_intent,
 )
 import contamination_trace
 
@@ -235,6 +236,17 @@ _ABBREVIATION_EXPANSIONS = {
     "uae": "united arab emirates",
     "ksa": "kingdom of saudi arabia",
     "irdai": "insurance regulatory and development authority of india",
+    # Not a regional abbreviation like the others above, but the exact same
+    # failure shape: confirmed live, "copay" (a valid, common colloquial
+    # spelling — already in _INSURANCE_VOCAB, so _correct_typos correctly
+    # leaves it alone, there's no typo to fix) scores meaningfully lower
+    # against the KB's own "Co-payment" chunk than the KB's own spelling
+    # does (0.57 vs 0.76 cosine similarity, direct comparison tested) —
+    # embedding similarity alone wasn't enough to keep that chunk
+    # competitive against other chunks scoring well on an "example"-shaped
+    # query. Appending the KB's own spelling gives retrieval a matching
+    # form to latch onto without touching the user's original wording.
+    "copay": "co-payment",
 }
 _ABBREVIATION_RE = re.compile(
     r'\b(' + '|'.join(re.escape(k) for k in _ABBREVIATION_EXPANSIONS) + r')\b',
@@ -798,12 +810,450 @@ _DETAIL_PATTERN = re.compile(r'\bin\s+(?:\w+\s+){0,2}details?\b', re.IGNORECASE)
 # the exact same "prompt-only compliance holds most but not all of the time"
 # pattern as _DETAIL_PATTERN's own "in detail" gap and _strip_source_self_reference's
 # source-reference gap.
-_TYPES_OF_QUERY_RE = re.compile(r"\b(?:types?|kinds?)\s+of\b", re.IGNORECASE)
+# "categories"/"varieties" added 2026-09-02 — confirmed live that "tell me
+# about the various categories of health insurance" pulled the identical
+# KB content (Mediclaim + Overseas Mediclaim) as "what kinds of health
+# insurance are there" but came back as one flowing paragraph instead of a
+# numbered list, purely because "categories of" isn't "type(s) of"/"kind(s)
+# of". Same content, same intent, different container.
+#
+# This regex is the LOOSE signal of a three-tier check — see
+# _is_types_enumeration_query below. Patching one more synonym in here
+# every time a new phrasing surfaces live doesn't generalize (same lesson
+# already learned for _DETAIL_PATTERN/_EXAMPLE_PATTERN/_has_modifier_hint
+# elsewhere in this file); a word like "options" is a clean synonym in
+# "what options do I have for marine insurance" but a completely
+# different question in "what options do I have if my claim is denied" —
+# too context-dependent to ever safely hardcode into a regex, which is
+# exactly the case the LLM fallback below exists to resolve.
+_TYPES_OF_QUERY_RE = re.compile(r"\b(?:types?|kinds?|categories|varieties)\s+of\b", re.IGNORECASE)
+
+# STRICT fast path — confirmed live (2026-09-02) that the loose regex
+# above matches "kind of"/"type of" followed by ANYTHING, insurance or
+# not: "what kind of documents do I need to file a claim" matched it and
+# returned True unconditionally, with zero chance for the LLM fallback to
+# ever run and correctly say no (the function returned before reaching
+# that code at all). This narrower version additionally requires an
+# insurance-context word within a few words of "of" — generous enough
+# (0-6 filler words) to cover a real multi-word type name ("types of
+# long term health and critical illness insurance"), tight enough to
+# reject "kind of documents"/"type of proof" claims-process phrasing. It
+# is the ONLY case allowed to skip the LLM entirely (true zero-latency
+# fast path); the loose regex above still matters as a secondary signal
+# in _is_types_enumeration_query — a "kind of X" that fails THIS strict
+# check isn't auto-rejected, it's handed to the LLM instead of trusted
+# blindly either way.
+_TYPES_OF_QUERY_STRICT_RE = re.compile(
+    r"\b(?:types?|kinds?|categories|varieties)\s+of\s+(?:\w+\s+){0,6}?"
+    r"(?:insurance|polic(?:y|ies)|cover(?:age)?|plans?)\b",
+    re.IGNORECASE,
+)
 _COMPARISON_QUERY_RE = re.compile(
     r"\bcompare\b|\bdifference\s+between\b|\bvs\.?\b|\bversus\b|"
     r"\bwhat\s+(?:is|are)\b[^.?!]*\band\b",  # "what are Form A and Form B ...?" — two named items joined by "and", not just an explicit "compare"
     re.IGNORECASE,
 )
+
+# ── Hybrid fallback for "types of X" recognition (2026-09-02) ──────────────
+# Same two-tier shape as _resolve_modifier_intent/_is_type_decision_query
+# above: a free, instant regex for phrasings already seen, and — only when
+# the wording at least LOOKS types-adjacent — a small LLM call that
+# understands the actual meaning instead of matching one more fixed
+# phrase. This is what lets "options"/"forms"/any future synonym resolve
+# correctly (including telling a genuine "what options do I have for
+# marine insurance" apart from an unrelated "what options do I have if my
+# claim is denied") without needing a code change for each new wording.
+_TYPES_HINT_WORDS = {
+    'types', 'type', 'kinds', 'kind', 'categories', 'category',
+    'varieties', 'variety', 'classes', 'class', 'options', 'option',
+    'forms', 'form', 'variants', 'variant',
+}
+
+_TYPES_ENUMERATION_LLM_PROMPT = """\
+Read the user's question to an insurance chatbot. Does it ask for a LIST \
+of every type, kind, category, or variety of an insurance product that \
+exists (e.g. "what types of motor insurance are there", "what options do \
+I have for marine insurance", "what varieties of health cover exist")?
+
+Answer NO for anything that is not this — including a question about the \
+user's OWN situation asking which ONE type to pick ("which policy should \
+I buy for my pet"), a claims/coverage/definition question ("what does my \
+policy cover", "how do I file a claim", "what options do I have if my \
+claim is denied" — that asks about the CLAIMS PROCESS, not insurance \
+product types), or any unrelated question.
+
+Output EXACTLY one word: YES or NO.
+
+Question: "What options do I have when it comes to marine insurance?"
+YES
+
+Question: "What options do I have if my claim is denied?"
+NO
+
+Question: "Which policy is right for my pet?"
+NO
+
+Question: "What does my home insurance cover?"
+NO
+
+Question: {question}
+"""
+
+
+async def _is_types_enumeration_query(question: str) -> bool:
+    """True when the question asks to enumerate every type/kind/category/
+    variety of an insurance product — used everywhere _TYPES_OF_QUERY_RE
+    used to be checked directly (retrieval width, numbered-list format
+    enforcement, page-neighbor expansion). Three tiers: (1) _TYPES_OF_QUERY_STRICT_RE
+    — "type(s)/kind(s) of" with an insurance-context word nearby — is a
+    true zero-latency fast path, confidently correct on its own. (2)
+    Anything that only matches the LOOSE _TYPES_OF_QUERY_RE ("kind of X"
+    with no insurance-context word nearby, e.g. "what kind of documents
+    do I need") or contains a loosely types-adjacent word
+    (_TYPES_HINT_WORDS, e.g. "options"/"forms") is ambiguous enough to be
+    worth one cheap LLM call rather than either trusting or discarding it
+    blindly — confirmed live both directions matter: the loose regex
+    alone previously returned True unconditionally for "what kind of
+    documents do I need to file a claim" (not a types-of-insurance
+    question at all), and a bare hint word like "options" means two
+    completely different things depending on what follows it. (3) A
+    genuinely unrelated question (neither regex, no hint word) never pays
+    any extra cost — same "loose hint-word pre-filter" gate as
+    _has_modifier_hint uses for the detail/simple/example classifier.
+    """
+    q = question.lower()
+    if _TYPES_OF_QUERY_STRICT_RE.search(q):
+        return True
+    tokens = set(re.findall(r"[a-z]+(?:'[a-z]+)?", q))
+    if not (tokens & _TYPES_HINT_WORDS) and not _TYPES_OF_QUERY_RE.search(q):
+        return False
+    try:
+        prompt = _TYPES_ENUMERATION_LLM_PROMPT.format(question=question)
+        raw = await _backend_completion(prompt, max_tokens=4, timeout=10)
+        _result = bool(raw) and raw.strip().upper().startswith("YES")
+        logger.info(
+            "[ask_stream] types-enumeration LLM fallback fired: result=%s query=%r",
+            _result, question[:80],
+        )
+        return _result
+    except Exception:
+        return False
+
+
+# ── "I have/got X" ownership-statement fast path — hybrid check ────────────
+# The fast path this backs (in ask_stream, "User-statement fast path") used
+# to trust _USER_STATEMENT_OPENER_RE alone: match the OPENING few words of
+# the message, and if so, skip retrieval entirely and reply with a canned
+# "That's great that you have a {type} plan!" acknowledgment. Same bug
+# shape as the old _TYPES_OF_QUERY_RE fast path (see that regex's own
+# comment trail) — matching only the sentence's opening words says nothing
+# about what the REST of the sentence actually is. Confirmed live:
+# "I got some concerning test results and I'm worried about the hospital
+# bills piling up" matched "I got" and got the canned ownership-
+# acknowledgment reply, with zero retrieval, for someone describing a real,
+# urgent problem — not announcing they own a plan. _is_insurance_related's
+# own keyword list (which includes "hospital") never caught this either,
+# since it's a topic gate, not a statement-vs-problem gate — a different
+# job it does correctly, just not this one.
+_USER_STATEMENT_OPENER_RE = re.compile(
+    r"^\s*i\s+(have|got|have\s+got|purchased|bought|own|took|taken|recently\s+got|just\s+got"
+    r"|am\s+covered|am\s+insured|enrolled|signed\s+up)\b",
+    re.IGNORECASE,
+)
+
+_USER_STATEMENT_LLM_PROMPT = """\
+Read this message sent to an insurance chatbot. Is the user simply \
+ANNOUNCING that they already own or have an insurance POLICY/PLAN — a \
+plain statement with no real question or problem attached (e.g. "I have \
+a health plan", "I just bought term insurance", "I'm covered under my \
+company's group policy")?
+
+Answer NO if the message describes a problem, event, or situation the \
+user needs help with or an answer to — even if it happens to start with \
+similar words (e.g. "I got some concerning test results and I'm worried \
+about the hospital bills" is NOT just an announcement, it's a real \
+problem; "I got into an accident yesterday" and "I got denied for a \
+claim" are NOT announcements either).
+
+Answer NO when "own"/"have"/"got" refers to owning the INSURED THING \
+ITSELF (a car, a house, a pet) rather than owning a policy for it — \
+"I own a car and I'm thinking about getting insurance for it" means the \
+user does NOT have a policy yet and is asking for help, not announcing \
+coverage. Only say YES when the thing owned/had/bought is explicitly the \
+policy/plan/cover itself, not the underlying asset.
+
+Output EXACTLY one word: YES or NO.
+
+Message: "I have a health plan."
+YES
+
+Message: "I got some concerning test results and I'm worried about the hospital bills piling up"
+NO
+
+Message: "I just bought term insurance last month."
+YES
+
+Message: "I got denied for a claim and I don't know what to do."
+NO
+
+Message: "I own a car and I'm thinking about getting insurance for it."
+NO
+
+Message: "I own a house and I'm not sure if I need insurance for it."
+NO
+
+Message: {question}
+"""
+
+
+async def _is_genuine_ownership_statement(question: str) -> bool:
+    """True only when the message is genuinely just announcing the user
+    already owns a plan — not describing a problem that happens to share
+    an opening word. Fast regex first (free — most real messages don't
+    even start with "I have/got", so this rarely fires at all); only when
+    it DOES match does one cheap LLM call confirm the rest of the
+    sentence is actually an announcement, not a problem needing a real
+    answer. Unlike _is_types_enumeration_query's three-tier design, there
+    is no separate loose-regex/hint-word middle tier here — the opener
+    regex is already narrow enough (a specific closed set of verbs at the
+    very start of the message) that every match is worth the one LLM call
+    to disambiguate, rather than needing a pre-filter to avoid paying for
+    ordinary unrelated traffic.
+    """
+    if not _USER_STATEMENT_OPENER_RE.match(question.lower()):
+        return False
+    try:
+        prompt = _USER_STATEMENT_LLM_PROMPT.format(question=question)
+        raw = await _backend_completion(prompt, max_tokens=4, timeout=10)
+        _result = bool(raw) and raw.strip().upper().startswith("YES")
+        logger.info(
+            "[ask_stream] ownership-statement LLM check fired: result=%s query=%r",
+            _result, question[:80],
+        )
+        return _result
+    except Exception:
+        return False
+
+
+# ── Decision-query sub-branch disambiguation (2026-09-02) ──────────────────
+# A policy_type can bundle several distinct, differently-scoped named
+# products under one roof — marine has Cargo/Hull/Freight, motor has
+# Liability Only/Package, etc. Confirmed live: "We're exporting machinery
+# parts by sea and want to protect against damage" got recommended Hull
+# Insurance (covers the SHIP) instead of Cargo Insurance (covers the
+# GOODS) — even though Cargo's own chunk reranked ~3.4x higher than
+# Hull's (0.0162 vs 0.0047, confirmed via direct reranker scoring, so
+# retrieval/reranking were not at fault). The generation call picked Hull
+# anyway because the KB's own Hull-branch text happens to say "...and
+# related machinery", lexically echoing the query's "machinery parts"
+# despite meaning something completely different (the ship's own
+# machinery, not the user's cargo). Simply listing the branch names in
+# the SAME generation prompt wouldn't fix this — that call is already
+# busy with tone/structure/citations, and is exactly what got pulled off
+# by the lexical coincidence in the first place. This is a SEPARATE,
+# single-purpose classification call instead — same principle as
+# _is_types_enumeration_query/_is_genuine_ownership_statement above: a
+# call with exactly one job resists this kind of surface-level pull far
+# better than a call juggling several jobs at once.
+_SUBBRANCH_DECISION_PROMPT = """\
+Read the description below of the different named products/branches within \
+{policy_type} insurance, and the user's own situation. Decide which ONE \
+named product actually applies to the user's situation — base this on WHO \
+or WHAT is being protected (the specific asset, person, or party named in \
+each branch's own description), not on which individual words happen to \
+also appear in the user's own wording.
+
+Branches description (from the knowledge base):
+{branches_text}
+
+User's situation: {question}
+
+Output ONLY the exact name of the one branch that applies, copied verbatim \
+from the branches description above (e.g. "Cargo Insurance"). If the \
+description above does not clearly name more than one distinct product, or \
+none of them clearly matches the user's situation, output exactly: NONE
+"""
+
+
+async def _classify_decision_subbranch(
+    question: str, policy_type: str, branch_chunks: list,
+) -> Optional[str]:
+    """For a decision-shaped query, determine which specific named
+    sub-branch/product within policy_type applies, via a call whose ONLY
+    job is that decision — see the block comment above for why this is
+    separate from the main generation call.
+
+    Generic by design, not tied to marine or any other specific
+    policy_type: entirely driven by whatever the KB itself already
+    contains. `branch_chunks` are chunks THIS SAME request already
+    retrieved and classified (via classify_chunk_intent, at the
+    "decision-query full-policy-type retrieval" call site) as
+    "types_of_insurance" — the KB's own enumeration-style content for
+    this policy_type. If that content doesn't actually distinguish
+    multiple named products (most policy_types only ever have one real
+    product — the LLM decides this from the actual text, not a
+    hardcoded per-policy_type list), or the model can't confidently pick
+    one, returns None and the caller proceeds exactly as before this fix
+    — this only ever ADDS a stated fact to the generation prompt, never
+    blocks or replaces the normal path.
+    """
+    if not branch_chunks:
+        return None
+    branches_text = "\n\n".join(c.page_content[:800] for c in branch_chunks[:4])
+    try:
+        prompt = _SUBBRANCH_DECISION_PROMPT.format(
+            policy_type=policy_type, branches_text=branches_text, question=question,
+        )
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=12)
+        if not raw:
+            return None
+        raw = raw.strip()
+        if not raw or raw.upper().startswith("NONE"):
+            return None
+        # Verbatim gate — same discipline as this file's other salvage/
+        # extraction code: only trust a branch name that's a real
+        # substring of the source text actually shown to the classifier,
+        # never let the LLM's own output alone decide what counts as real.
+        if raw.lower() not in branches_text.lower():
+            logger.info(
+                "[ask_stream] sub-branch classifier returned a name not present "
+                "in its own source text, discarding: %r", raw,
+            )
+            return None
+        logger.info(
+            "[ask_stream] sub-branch classifier: policy_type=%s decided=%r query=%r",
+            policy_type, raw, question[:80],
+        )
+        return raw
+    except Exception as _sb_exc:
+        logger.debug("[ask_stream] sub-branch classifier skipped: %s", _sb_exc)
+        return None
+
+
+# ── PGF decision-query "names the type" check — hybrid (2026-09-02) ────────
+# Confirmed live: "I just bought a new car... legal minimum or full
+# protection" survived PGF's per-sentence grounding check with real,
+# specific, correctly-grounded content ("protects your car against flood
+# while in transit", "doesn't cover damages to your own car") — but the
+# OLD check here required one of a small set of exact multi-word PHRASES
+# ("car insurance", "motor policy", "vehicle insurance", ...) to appear
+# verbatim, and natural writing about a vehicle just says "your car"/"your
+# vehicle" once the topic is established, never redundantly repeating
+# "motor insurance" in every sentence. Correct, substantive content got
+# wrongly treated as hollow on BOTH the original attempt and its retry,
+# ending in a false "not in KB" refusal for an answer the KB fully
+# supported. Same bug shape as every other rigid-phrase-list fix this
+# session — hybrid fast-list-then-LLM-semantic-check, not a bigger list.
+_PGF_NAMES_TYPE_LLM_PROMPT = """\
+Read this text, written as part of an answer recommending an insurance \
+product for someone's situation. Does it substantively explain a \
+{policy_type} insurance product — what it covers, how it helps, or what \
+it's called — even if it never uses the exact phrase "{policy_type} \
+insurance" itself (e.g. it might just say "your car"/"your vehicle" \
+instead of ever saying "motor insurance")?
+
+Answer NO if the text is only vague reassurance with no actual product \
+information (e.g. "you should look into coverage for this" with nothing \
+concrete about what that coverage actually is or does).
+
+Output EXACTLY one word: YES or NO.
+
+Text: {text}
+"""
+
+
+async def _pgf_survivor_names_type(text: str, policy_type: str) -> bool:
+    """True when `text` substantively covers a `policy_type` product —
+    used to decide whether a decision-query's surviving content (after
+    PGF drops unsupported sentences) is a real answer or effectively
+    hollow. Fast phrase-list check first (free, matches the common case
+    where the answer DOES use one of the curated phrases); only when that
+    finds nothing does one cheap LLM call confirm the text is actually
+    about a real product, semantically, before concluding "hollow" and
+    triggering a retry. On a backend failure, returns False — the same
+    outcome this check had unconditionally before this fix existed, so a
+    classifier failure degrades to the prior (safe, if occasionally
+    over-cautious) behavior rather than a new, unproven default.
+    """
+    _hints = get_active_vocab().get(policy_type, {}).get("keywords", [])
+    _lower = text.lower()
+    if any(h in _lower for h in _hints):
+        return True
+    try:
+        prompt = _PGF_NAMES_TYPE_LLM_PROMPT.format(policy_type=policy_type, text=text[:1000])
+        raw = await _backend_completion(prompt, max_tokens=4, timeout=10)
+        _result = bool(raw) and raw.strip().upper().startswith("YES")
+        logger.info(
+            "[ask_stream] pgf-names-type LLM fallback: policy_type=%s result=%s",
+            policy_type, _result,
+        )
+        return _result
+    except Exception:
+        return False
+
+
+# ── Illegal-adjacent-word insurance-context check — hybrid (2026-09-02) ────
+# api.py's off-topic/illegal-content guard blocks a small "insurance-
+# adjacent" word list (steal, robbery, fraud, scam, forge, launder, hack,
+# malware, ransomware) UNLESS the question also contains an explicit
+# insurance keyword (insurance, policy, cover, claim, premium, cyber,
+# deductible, reimburs, payout, indemnity) — needed because these words
+# are also exactly how someone asks a real coverage question ("does cyber
+# insurance cover a hack"). Confirmed live: "I run a small shop and
+# worried an employee might steal money from the register" — a genuine,
+# if indirect, question about fidelity/theft coverage (this KB has real
+# content for it) — got blocked outright as if it were "how do I steal",
+# purely because it never happens to say "insurance"/"cover"/"claim"
+# anywhere. Same bug shape as every other "explicit keyword required"
+# gap fixed this session, just guarding a different, higher-stakes
+# decision (block vs. answer) — hybrid fast-list-then-LLM fallback, kept
+# conservative: on any doubt or backend failure, still blocks (this
+# check only widens what counts as legitimate, never narrows the
+# existing safety margin).
+_ILLEGAL_ADJACENT_CONTEXT_LLM_PROMPT = """\
+Read this message sent to an insurance chatbot. It contains a word that \
+could mean either (a) the user is describing a real situation or risk \
+they want insurance/protection against, or (b) the user is actually \
+asking for help doing something illegal or harmful.
+
+Answer YES only if this is clearly (a) — a legitimate question about a \
+real situation, loss, or risk the user wants coverage/protection/advice \
+for, even if it never uses words like "insurance" or "policy" (e.g. \
+"worried an employee might steal from the register" is a real business-\
+risk question, not a request for help stealing).
+
+Answer NO if it's actually (b) — genuinely asking how to commit theft, \
+fraud, hacking, or another illegal act, or anything unrelated to \
+insurance/risk/protection entirely.
+
+Output EXACTLY one word: YES or NO.
+
+Message: {question}
+"""
+
+
+async def _confirm_insurance_adjacent_legitimate(question: str) -> bool:
+    """Called only when a question matched an "illegal-adjacent" word
+    (steal/hack/fraud/...) but none of the fast explicit insurance
+    keywords — decides whether this is really a legitimate, if indirectly
+    worded, insurance question before letting it through. Deliberately
+    fails CLOSED: any backend error, empty response, or non-YES answer
+    keeps the existing block in place — this check can only widen what
+    counts as legitimate on a confident YES, never weaken the underlying
+    safety gate on doubt.
+    """
+    try:
+        prompt = _ILLEGAL_ADJACENT_CONTEXT_LLM_PROMPT.format(question=question)
+        raw = await _backend_completion(prompt, max_tokens=4, timeout=10)
+        _result = bool(raw) and raw.strip().upper().startswith("YES")
+        logger.info(
+            "[ask_stream] illegal-adjacent context LLM fallback: result=%s query=%r",
+            _result, question[:80],
+        )
+        return _result
+    except Exception:
+        return False
+
 
 # ── Warm lead-in (shared by both fallback sites below) ─────────────────────
 # Used to rotate through several candidates ("So,", "Good question,",
@@ -856,19 +1306,24 @@ _TYPE_ENUMERATION_RE = re.compile(
 )
 
 _TYPE_SHAPE_PROMPT = """\
-Read the user's question to an insurance chatbot. It contains the phrase \
-"type of" or "types of" (or "kind(s) of"). Decide which of these two shapes \
-it actually is:
+Read the user's question to an insurance chatbot. Decide which of these \
+shapes it actually is:
 
-ENUMERATION = the user wants a LIST of every type/kind of X that exists \
-("what types of motor insurance are there", "what kinds of health plans \
-does the company offer", "list all the types of X").
+DECISION = the user describes their OWN situation, need, pet/car/house/trip, \
+or a specific event, and wants a RECOMMENDATION of the ONE type or plan that \
+fits it — not a list of every type that exists. This includes questions that \
+never use the words "type of" or "kind of" at all — "which policy is right \
+for my pet", "what should I get for my pet's insurance", "help me choose a \
+pet insurance plan", "what kind of insurance do I need for my car", "which \
+type of policy is best if I travel a lot", "if my house catches fire what \
+type of insurance should I buy" are ALL decision questions, phrased \
+differently.
 
-DECISION = the user describes their OWN situation, need, or a specific \
-event, and wants a RECOMMENDATION of the ONE type of insurance that fits \
-it — not a list of every type that exists ("if my house catches fire what \
-type of insurance should I buy", "what kind of insurance do I need for my \
-car", "which type of policy is best if I travel a lot").
+ENUMERATION = everything else — the user explicitly wants a LIST of every \
+type/kind that exists ("what types of motor insurance are there", "list all \
+the types of X"), OR the question isn't really about choosing between \
+insurance types/plans at all (asking what's covered, how to file a claim, \
+what a term means, etc. — anything that isn't "help me pick one").
 
 Output EXACTLY one word: ENUMERATION or DECISION.
 
@@ -878,11 +1333,14 @@ ENUMERATION
 Question: "If my house is on fire then what type of insurance should i buy"
 DECISION
 
-Question: "What kinds of health insurance plans are there?"
-ENUMERATION
-
-Question: "My car got stolen, what type of insurance covers that?"
+Question: "Which policy is right for my pet?"
 DECISION
+
+Question: "Help me choose a pet insurance plan"
+DECISION
+
+Question: "What does my home insurance cover?"
+ENUMERATION
 
 Question: {question}
 """
@@ -908,12 +1366,19 @@ async def _classify_type_query_shape_llm(question: str) -> bool:
 
 
 async def _is_type_decision_query(question: str) -> bool:
-    """True when a "type(s)/kind(s) of X" question is asking for a
-    recommendation of ONE type for the user's own situation, not a
+    """True when a question is asking for a recommendation of ONE
+    insurance type/plan for the user's own situation, rather than a
     request to enumerate every type that exists — see _TYPE_DECISION_RE
-    above for why this distinction matters. Only meaningful after the
-    caller has already confirmed _TYPES_OF_QUERY_RE matched; a question
-    without that phrase never needs this check.
+    above for why this distinction matters. Called unconditionally on
+    EVERY question (as of 2026-08-31 — a caller-side gate requiring the
+    literal phrase "type of"/"kind of" first was found to skip this
+    check entirely for real, differently-phrased decision questions like
+    "which policy is right for my pet?"). Safe to call universally: the
+    fast internal regexes below resolve the common cases at zero extra
+    latency, and _TYPE_SHAPE_PROMPT's LLM fallback correctly returns
+    False/ENUMERATION for anything that isn't actually a decision
+    question at all (a coverage question, a claims question, etc.), so
+    this naturally no-ops for the large majority of unrelated queries.
     """
     q = question.lower()
     if _TYPE_DECISION_RE.search(q):
@@ -1084,8 +1549,9 @@ async def _resolve_modifier_intent(question: str) -> tuple[bool, bool, bool]:
     # with, they're "is this objectively a big question" regardless of
     # wording, already phrasing-independent by construction.
     #
-    # "types of X" / "kinds of X" (_TYPES_OF_QUERY_RE, already defined above
-    # for _enforce_numbered_list_format's post-generation formatting) belongs
+    # "types of X" / "kinds of X" / any equivalent phrasing
+    # (_is_types_enumeration_query, already defined above for
+    # _enforce_numbered_list_format's post-generation formatting) belongs
     # here too, for the retrieval-sizing side, not just formatting. Confirmed
     # live: "types of life insurance" retrieved only enough chunks to cover
     # 2 of the 6 real types this KB has (term, whole life — endowment,
@@ -1100,7 +1566,7 @@ async def _resolve_modifier_intent(question: str) -> tuple[bool, bool, bool]:
     _structural_detail = (
         len(question.split()) > 25
         or q.count(' and ') >= 3
-        or bool(_TYPES_OF_QUERY_RE.search(q))
+        or await _is_types_enumeration_query(question)
     )
 
     if _fast_example or _fast_simple or _fast_detail or _structural_detail:
@@ -1128,6 +1594,306 @@ async def _resolve_modifier_intent(question: str) -> tuple[bool, bool, bool]:
         _has_detail, _llm_simple, _llm_example, question[:80],
     )
     return (_has_detail, _llm_simple, _llm_example)
+
+
+# ── Hybrid fallback for section-intent classification ──────────────────────
+# Same underlying problem as the detail/simple/example hybrid above, same
+# fix, applied to a different classifier: _QUERY_SECTION_INTENT_PATTERNS
+# (the closed regex list _classify_query_section_intent checks first) can
+# only ever cover phrasings someone has already hit. Confirmed live —
+# three real gaps found in one afternoon of testing fresh, previously-
+# untried query phrasings, each needing its own regex patch before this
+# fallback existed: "Explain in detail how a health insurance claim
+# works" (not "how do I file/claim/submit"), "Walk me through the process
+# of claiming a life insurance policy" (not "claims process/procedure"),
+# and there will always be a next one — a query classifier that only ever
+# recognizes exact phrasings already seen can't cover something as open-
+# ended as how people actually ask questions. Semantic understanding
+# generalizes to any phrasing; lexical matching never fully does.
+#
+# Kept as a fallback, not the primary path, for the same latency reason as
+# the modifier hybrid: the fast regex list already resolves the vast
+# majority of real traffic for free, so only genuinely novel phrasing
+# should ever pay the LLM round trip.
+_SECTION_INTENT_LLM_PROMPT = """\
+Read the user's question to an insurance chatbot and decide which ONE \
+section of an insurance document it's really asking about, if any.
+
+Categories:
+benefits — what a policy covers or includes. This INCLUDES a question \
+that describes a specific real-world situation or incident and asks \
+whether it would be covered, or whether it could cost the person money \
+out of pocket ("would insurance help me if X happened", "could that end \
+up costing me money", "am I on the hook for this") — that is still \
+asking about coverage for that situation, not asking generically about \
+refunds, premiums, or a product's payment structure. Judge it by whether \
+a SPECIFIC situation is described, not by whether the word "money" or \
+"cost" appears.
+exclusions — what's NOT covered, exceptions, limitations
+claims — how to file/submit a claim, the claims process, what happens \
+when making a claim
+definitions — the query explicitly asks what a specific TERM means \
+("define X", "what does X mean", "meaning of X") — a bare "What is X?" \
+about a named product, policy, or concept is NOT automatically \
+"definitions": it's usually really asking about that thing's benefits, \
+claims process, or general nature, and the real answer in this \
+knowledge base is filed under one of THOSE categories instead, or under \
+none at all. Only pick "definitions" when the question is asking for a \
+dictionary-style meaning, not when "X" just happens to be the topic.
+eligibility — who can buy a policy, age limits, entry requirements
+flight_delay — a flight, trip, or departure being delayed (travel \
+insurance)
+baggage — lost, delayed, or damaged baggage/luggage (travel insurance)
+legislation — laws, regulations, IRDAI rules, legal requirements
+types_of_insurance — different types or kinds of a policy
+principles — insurance principles or doctrines
+history — the history or origins of insurance
+case_law — court cases, legal precedent, judgments
+medical — a medical emergency or evacuation while traveling
+none — doesn't clearly fit any single category above, or is a broad/\
+general question
+
+Judge the underlying INTENT, not just literal keyword overlap — "what \
+happens when I claim" and "walk me through claiming" both mean "claims" \
+even though neither contains the word "process" or "file".
+
+Output EXACTLY one line, nothing else, in this exact format:
+category=<one label from the list above>
+
+Question: "How do I get money back if I never claim anything?"
+category=none
+(a general question about a PRODUCT FEATURE — a no-claim refund/bonus
+structure — with no specific situation described; different from a
+question that describes an actual incident and asks if it's covered)
+
+Question: "My neighbor's kid broke his arm playing in my backyard, could
+that end up costing me money?"
+category=benefits
+(a specific real-world incident, asking whether the policy would cover
+the cost of it — this is a coverage/benefits question even though it
+never uses the words "cover" or "policy")
+
+Question: "What happens when I claim under a fire insurance policy?"
+category=claims
+
+Question: "What is No Claim Bonus?"
+category=none
+
+Question: {question}
+"""
+
+# Semantic (embedding) classifier for query section-intent, sitting
+# between the fast regex path and the LLM fallback below. Root-cause fix
+# for a pattern confirmed TWICE live in one night (2026-09-01): the
+# fixed-12-category LLM classifier answering "category=none" for a real,
+# substantively-covered question just because it doesn't cleanly fit one
+# category in the LLM's own judgment — first a misleading few-shot
+# example biased it ("could that end up costing me money" pattern-
+# matched a "none" example about refunds), then a genuinely broad,
+# multi-faceted question ("what should I sort out before I go") had no
+# single obvious category. Patching the PROMPT one example at a time
+# doesn't scale to every future phrasing shape. This classifies by
+# MEANING instead — cosine similarity against a question-form prototype
+# per category, reusing the shared embedding model already loaded for
+# retrieval (no new dependency) — the same principled fix already used
+# for chunk-side section classification earlier this session (see
+# metadata_tagger.py's classify_by_section_embedding), just built fresh
+# for QUERY-length text and the query-side label set, since chunk
+# prototypes (statement-form, e.g. "Describes what a policy pays for")
+# and this taxonomy (13 different labels: flight_delay/baggage/
+# legislation/case_law/etc. vs. chunk-side's own set) don't transfer —
+# confirmed live: applying the chunk classifier directly to these same
+# queries returned entirely wrong labels ("premiums", "chapter",
+# "how_to") that aren't even valid values in this taxonomy.
+_QUERY_SECTION_PROTOTYPES = {
+    "benefits": "Does my policy cover this specific situation or event, and what does it pay for?",
+    "exclusions": "What is not covered or excluded under this policy?",
+    "claims": "How do I file or submit a claim, and what is the claims process?",
+    "definitions": "What does this specific insurance term mean?",
+    "eligibility": "Who is eligible to buy this policy, and what are the entry requirements or age limits?",
+    "flight_delay": "My flight or trip departure was delayed, am I covered for that?",
+    "baggage": "My baggage or luggage was lost, delayed, or damaged, what happens?",
+    "legislation": "What do the insurance laws, regulations, or IRDAI rules require?",
+    "types_of_insurance": "What are the different types or kinds of this insurance?",
+    "principles": "What insurance principle or doctrine applies here?",
+    "history": "What is the history or origin of this kind of insurance?",
+    "case_law": "What court case or legal precedent applies to this?",
+    "medical": "I have a medical emergency or need evacuation while traveling, what do I do?",
+}
+
+# Calibrated empirically against 10 real positive queries (one per
+# category) and 5 genuine negatives (off-topic questions like "tell me
+# a joke"). An absolute-score-only cutoff does NOT cleanly separate
+# them — a genuinely AMBIGUOUS query (the backpacking-prep question,
+# which touches benefits/eligibility/medical roughly equally) can score
+# almost as high on its WRONG top label (0.581) as a clearly-correct
+# match does on its right one (0.620). What DOES separate them cleanly
+# is the MARGIN between the top and runner-up label: the confirmed-
+# correct backyard-liability match beat its next-best rival by 0.113;
+# every genuinely ambiguous or off-topic query in the calibration set
+# had its top few candidates bunched within 0.008-0.061 of each other,
+# however high the top score itself looked. Requiring both a score
+# floor AND a margin catches this reliably without needing to have
+# seen the specific query shape before.
+_QUERY_SECTION_EMBED_FLOOR = 0.55
+_QUERY_SECTION_EMBED_MARGIN = 0.08
+_query_section_prototype_embeddings: Optional[tuple] = None
+
+
+def _get_query_section_prototype_embeddings():
+    global _query_section_prototype_embeddings
+    if _query_section_prototype_embeddings is None:
+        _model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        _labels = list(_QUERY_SECTION_PROTOTYPES.keys())
+        _vecs = _model.encode(list(_QUERY_SECTION_PROTOTYPES.values()), normalize_embeddings=True)
+        _query_section_prototype_embeddings = (_labels, _vecs)
+    return _query_section_prototype_embeddings
+
+
+def _classify_query_section_by_embedding(query: str) -> Optional[tuple[str, bool]]:
+    """See the _QUERY_SECTION_PROTOTYPES block comment above for the full
+    rationale and calibration evidence. Returns (label, False) — same
+    shape as a fixed-category regex/LLM match, never a candidate/open-
+    vocabulary result — or None if neither the score floor nor the
+    margin bar is cleared, in which case the caller falls through to the
+    LLM tier exactly as if this check didn't exist."""
+    try:
+        _labels, _proto_vecs = _get_query_section_prototype_embeddings()
+        _model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        _qvec = _model.encode([query], normalize_embeddings=True)[0]
+        _sims = np.dot(_proto_vecs, _qvec)
+        _order = np.argsort(-_sims)
+        _top_score = float(_sims[_order[0]])
+        _margin = _top_score - float(_sims[_order[1]])
+        if _top_score >= _QUERY_SECTION_EMBED_FLOOR and _margin >= _QUERY_SECTION_EMBED_MARGIN:
+            _label = _labels[_order[0]]
+            logger.info(
+                "[ask_stream] section-intent embedding match: label=%r score=%.3f "
+                "margin=%.3f query=%r",
+                _label, _top_score, _margin, query[:80],
+            )
+            return (_label, False)
+        return None
+    except Exception as exc:
+        logger.debug("[ask_stream] section-intent embedding classification failed (%s)", exc)
+        return None
+
+
+# Loose, cheap pre-filter for whether the LLM fallback is even worth
+# trying — same role as _MODIFIER_HINT_WORDS/_has_modifier_hint: a plain
+# question with none of this vocabulary at all ("What is fire
+# insurance?") resolves to "no section intent" here, still free; the LLM
+# call only fires when the wording contains SOME section-adjacent
+# vocabulary the strict regex list didn't happen to cover. Deliberately
+# broader/looser than any single category's own strict pattern — it only
+# has to gate whether asking is worth it, not classify anything itself.
+_SECTION_HINT_WORDS = {
+    'benefit', 'benefits', 'cover', 'covers', 'covered', 'coverage',
+    'exclude', 'excludes', 'excluded', 'exclusion', 'exclusions',
+    'claim', 'claims', 'define', 'definition', 'meaning', 'mean',
+    'eligible', 'eligibility', 'age', 'delay', 'delayed', 'flight',
+    'trip', 'departure', 'baggage', 'luggage', 'regulation',
+    'regulations', 'legislation', 'irda', 'irdai', 'legal', 'law',
+    'laws', 'type', 'types', 'kind', 'kinds', 'principle', 'principles',
+    'history', 'origin', 'origins', 'court', 'judgment', 'judgement',
+    'precedent', 'medical', 'emergency', 'evacuation',
+    # Confirmed live (2026-08-25): "My cargo was damaged during shipping,
+    # what do I do to get compensated?" is genuinely a claims question but
+    # contains none of the words above — no "claim" anywhere in it — so it
+    # fell through this pre-filter without ever reaching the LLM
+    # classifier at all, not because the LLM said "none" but because it
+    # was never asked. These cover the common ways people describe a
+    # claims situation without using the word "claim" itself.
+    'compensate', 'compensated', 'compensation', 'reimburse',
+    'reimbursed', 'reimbursement', 'settle', 'settlement', 'damage',
+    'damaged', 'loss', 'lost', 'stolen', 'theft', 'accident', 'refund',
+}
+
+
+def _has_section_hint(question_lower: str) -> bool:
+    tokens = set(re.findall(r"[a-z]+(?:'[a-z]+)?", question_lower))
+    return bool(tokens & _SECTION_HINT_WORDS)
+
+
+async def _classify_query_section_llm(question: str) -> Optional[str]:
+    """LLM fallback for section-intent classification — only called when
+    the fast regex list found nothing. max_tokens=20 so the round trip
+    stays short. Returns None on any error/timeout or an unrecognized
+    label, same as the fast path finding nothing — a failed classification
+    call degrades to the pre-hybrid behavior (no section intent detected)
+    rather than blocking or crashing the request.
+    """
+    try:
+        prompt = _SECTION_INTENT_LLM_PROMPT.format(question=question)
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=10)
+        if not raw:
+            return None
+        m = re.search(r"category\s*=\s*([a-z_]+)", raw.lower())
+        if not m:
+            return None
+        label = m.group(1)
+        if label == "none" or label not in MultiSourceRAG._QUERY_SECTION_INTENT_PATTERNS:
+            return None
+        return label
+    except Exception:
+        return None
+
+
+async def _classify_query_candidate_section_llm(question: str) -> Optional[str]:
+    """Open-vocabulary sibling of _classify_query_section_llm() — only
+    called when the fixed-12-category LLM classifier already said "none".
+    _classify_query_section_intent's own fast path already does a CHEAP,
+    free keyword-overlap check against candidate_section_vocab.json (see
+    match_candidate_section_vocab) for exactly this same open-vocabulary
+    case — but that only catches a query using 2+ of a discovered
+    label's literal stored keywords. Confirmed live 2026-09-01: a
+    query can genuinely be about a real, already-discovered topic
+    without hitting that literal-keyword bar, the same way the fixed-12
+    LLM classifier exists because the fixed regex list has the same
+    literal-phrase limitation. This is that same upgrade, one level up.
+
+    Deliberately does NOT invent brand-new labels here, unlike
+    _classify_query_candidate_type_llm on the policy_type side —
+    ingestion-time discovery (classify_candidate_section in rag.py) has
+    the actual source document text to work from when deciding a new
+    label is warranted; a query alone doesn't have enough context to
+    safely invent one, and a wrong invented label here would just
+    silently fail to match anything anyway (candidate_section filtering
+    only ever helps if the label already exists on some chunk). Purely
+    a MATCHING step against whatever's already been discovered.
+    """
+    from candidate_section_vocab import get_candidate_section_vocab
+    vocab = get_candidate_section_vocab()
+    if not vocab:
+        return None
+    try:
+        label_list = "\n".join(f"  - {lbl}" for lbl in sorted(vocab.keys()))
+        prompt = f"""These are topic labels discovered from real documents in an insurance
+knowledge base, on top of the standard categories already checked (which didn't match):
+
+{label_list}
+
+Does the user's question below genuinely match ONE of these labels? Only answer yes if
+it's a clear, specific match to what that label is actually about — not a loose or
+generic connection.
+
+QUESTION: {question}
+
+Reply with ONLY the exact label word if one clearly matches, or reply with exactly: none"""
+        raw = await _backend_completion(prompt, max_tokens=15, timeout=10)
+        if not raw:
+            return None
+        label = raw.strip().strip('"').lower()
+        label = re.split(r"[\s\n,.:;()]", label)[0]
+        if label and label in vocab:
+            logger.info(
+                "[ask_stream] candidate-section LLM fallback: %r -> %s", question, label,
+            )
+            return label
+        return None
+    except Exception as exc:
+        logger.debug("[ask_stream] candidate-section LLM classification failed (%s)", exc)
+        return None
 
 
 _FOLLOWUP_SIGNALS = {
@@ -1493,95 +2259,6 @@ _LEGAL_REQUIREMENT_CLAIM_RE = re.compile(
 _LEGAL_REQUIREMENT_SUPPORT_RE = re.compile(
     r"\bvisa\b|\blegal(?:ly)?\s+requir\w*|\bmandator\w+\b", re.IGNORECASE,
 )
-
-# Confirmed live 2026-08-12 while investigating a "detailed answers feel
-# padded/generic" report that turned out to affect every policy type, not
-# just motor: a large share of "general"-tagged chunks from at least one
-# KB source (9.3 INSURANCE LAW AND PRACTICE.pdf, an academic textbook) are
-# not generic-but-real insurance content at all — they're literal table-
-# of-contents lines ("Loss Control … 11 Loss prevention … 11"), textbook
-# section-structure markers ("LESSON ROUND UP", "SELF TEST QUESTIONS",
-# "Learning Objectives"), the issuing institute's own front-matter/office-
-# hours/contact info, or cover-page word-repeat OCR garbling
-# ("INSURANCE LAW INSURANCE LAW INSURANCE LAW... AND AND AND AND"). None
-# of this is ever a genuine answer to any question, regardless of the
-# query's own policy type — this almost certainly explains this session's
-# earlier, previously-unresolved "at the end of this lesson..." textbook-
-# leak finding (textbook lesson-scaffolding text leaking straight into a
-# generated answer). The EXISTING _TYPE_MISMATCH_DISCOUNT/_sort_and_
-# truncate softly discounts "general"-tagged chunks but still lets them
-# backfill a chunk_limit slot when on-topic content is thin — appropriate
-# for genuinely useful generic content, but this specific noise category
-# is never useful at any discount, so it's excluded outright here instead
-# of just discounted, same "deterministic exclusion over a discount or a
-# prompt rule" approach already proven for regulatory boilerplate (see
-# [[project_prioritize_topic_chunks_density_risk]]).
-_TOC_PAGENUM_RE = re.compile(r"(?:\.{3,}|…)\s*\d{1,4}\b")
-_TEXTBOOK_STRUCTURE_MARKER_RE = re.compile(
-    r"\b(?:LESSON\s+ROUND\s+UP|SELF\s+TEST\s+QUESTIONS|PRACTICE\s+TEST\s+PAPER|Learning\s+Objectives)\b",
-    re.IGNORECASE,
-)
-_WORD_REPEAT_GARBLE_RE = re.compile(r"\b(\w{3,})\b(?:\s+\1\b){2,}", re.IGNORECASE)
-# Added after live-verifying the fix above: a DIFFERENT phrasing of the
-# same underlying problem slipped through the first pass — "In India,
-# this lesson helps you understand buying methods of health insurance
-# policies, settle claims, and comprehend the practice of health
-# insurance" (a lesson's own introduction sentence, not a TOC entry, so
-# none of the three signals above catch it). This is the textbook talking
-# about ITSELF ("this lesson"/"this chapter" teaches X) rather than
-# stating a fact about insurance — never a genuine answer to anything,
-# same reasoning as DETAILED_GROUNDED_PROMPT's own rule 9 banning the
-# MODEL from saying "the guide mentions" — this is the same self-
-# reference pattern, just originating in the source text instead of the
-# model's own phrasing.
-_LESSON_SELF_REFERENCE_RE = re.compile(
-    r"\bthis\s+(?:lesson|chapter|module)\s+(?:helps?|covers?|explains?|discusses?|teaches?|will\s+help)\b"
-    r"|\byou\s+will\s+(?:learn|be\s+able\s+to)\b"
-    r"|\bin\s+this\s+(?:lesson|chapter|module)\b",
-    re.IGNORECASE,
-)
-# Added 2026-08-13 after a live "explain health insurance in detail" answer
-# leaked "The correct option for the statements is d. Statement 1 is false
-# but statement 2 is true" as if it were a real fact — traced to a
-# different textbook source (not the 9.3 INSURANCE LAW AND PRACTICE one)
-# whose end-of-module self-test uses an assertion-reason MCQ format:
-# "a. Both statements are false b. Both statements are true c. Statement
-# 1 true but statement 2 is false d. Statement 1 is false but statement 2
-# is true". Same category as the three signals above (textbook self-
-# reference content, never a genuine answer) but a distinct phrasing this
-# corpus's OTHER quiz sources also use, so it's checked independent of
-# source file. "correct option" alone is a near-zero-false-positive
-# signal (real insurance prose never uses this phrase); "Statement 1 ...
-# Statement 2" within a short span catches the options list itself even
-# when "correct option" isn't in the same chunk.
-_MCQ_ANSWER_KEY_RE = re.compile(
-    r"\bcorrect\s+option\b"
-    r"|\bstatement\s*1\b.{0,150}\bstatement\s*2\b",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _is_textbook_structural_noise(text: str) -> bool:
-    """True for table-of-contents lines, textbook section-marker
-    boilerplate, cover-page word-repeat OCR garbling, a lesson/chapter
-    talking about itself, or an MCQ self-test answer key — never a real
-    answer to anything, independent of the query's own policy type or
-    which source file it came from. Five independent signals, any one is
-    sufficient: (1) 3+ "….123" style page-number references (real prose
-    essentially never contains even one of these), (2) a fixed textbook
-    structural marker phrase, (3) the same word repeated 3+ times
-    consecutively (a cover-page OCR/rendering artifact, not real sentence
-    structure), (4) the text describing what "this lesson"/"this chapter"
-    itself teaches, rather than stating an actual insurance fact, (5) an
-    assertion-reason MCQ answer key ("correct option is d" / "Statement
-    1 ... Statement 2 ...")."""
-    return bool(
-        len(_TOC_PAGENUM_RE.findall(text)) >= 3
-        or _TEXTBOOK_STRUCTURE_MARKER_RE.search(text)
-        or _WORD_REPEAT_GARBLE_RE.search(text)
-        or _LESSON_SELF_REFERENCE_RE.search(text)
-        or _MCQ_ANSWER_KEY_RE.search(text)
-    )
 
 # Module-level (not request-scoped) so both the detailed-mode point filter
 # and the brief-mode whole-reply check below can share one definition rather
@@ -2036,6 +2713,73 @@ def _duplicate_point_word_overlap(a: str, b: str) -> float:
     if not wa or not wb:
         return 0.0
     return len(wa & wb) / len(wa | wb)
+
+
+async def _verify_points_are_duplicate(point_a: str, point_b: str) -> bool:
+    """LLM confirmation gate for BOTH numbered-point dedup mechanisms in
+    this file (_DUPLICATE_POINT_THRESHOLD's reranker-score check, and the
+    separate cosine+jaccard "semantic dedup" pass) — called only on the
+    minority of pairs the cheap heuristic already flagged as a candidate
+    duplicate, same efficiency shape as _verify_point_faithfulness's own
+    vLLM-flags/Groq-confirms design.
+
+    Confirmed live (2026-08-27), user-directed ("if the answer is
+    grounded then it shouldn't be dropped even if phrasing is different
+    — smarter, not mugging up"): cosine+jaccard alone cannot reliably
+    tell "the same fact said twice" apart from "a different fact that
+    happens to explain itself relative to an earlier point." Two
+    confirmed real cases, both scoring comfortably inside what this
+    file's own jaccard floor treats as "genuine duplicate" range: (1)
+    "Package Policy – covers loss or damage to the vehicle... IN
+    ADDITION TO the liability only coverage mentioned above" (cosine=
+    0.818, jaccard=0.240) dropped as a restatement of "Liability Only
+    Policy" — these are two DIFFERENT, real motor insurance products,
+    not the same fact; Package Policy adds a real, distinct fact (vehicle
+    damage cover) the answer needs. (2) "Reimbursement Claim — IF YOU
+    CHOOSE NOT TO use a hospital within your insurer's network..."
+    (cosine 0.748-0.803, jaccard 0.200-0.219) dropped as a restatement
+    of "Pre-Authorisation Request" (the cashless, in-network path) —
+    these are two genuinely different claim PROCEDURES for two
+    different scenarios, not a restatement; a real "how do I file a
+    health claim" answer needs both. Both false positives share the
+    same shape: the SECOND point uses relational/contrastive language
+    ("in addition to", "if you choose not to") that explains its
+    relationship to the first point, which floods embedding similarity
+    and lexical overlap with shared procedural vocabulary regardless of
+    how different the underlying facts actually are.
+
+    Fail-open toward KEEPING both points on any failure/timeout/empty
+    response — the risk direction here is losing real, grounded content
+    the answer needs, not the risk of showing a genuine restatement
+    twice (mildly redundant, not wrong). This is the opposite fail
+    direction from _verify_point_faithfulness (which fails toward
+    dropping/refusing on repeated unreachability) because the two checks
+    protect against opposite failure modes: faithfulness protects against
+    showing something FALSE, this protects against silently REMOVING
+    something TRUE.
+    """
+    if not point_a or not point_a.strip() or not point_b or not point_b.strip():
+        return False
+    prompt = (
+        "Do these two numbered points from the same insurance answer state "
+        "the SAME underlying fact, or genuinely DIFFERENT facts — even if "
+        "related, or if one explains itself relative to the other using "
+        "words like \"in addition to\" or \"if you choose not to\"? Two "
+        "different named products, two different scenarios, or two "
+        "different steps in a process are DIFFERENT facts, not the same "
+        "one restated.\n"
+        f'Answer with yes/no. "point A": {point_a[:500]} '
+        f'"point B": {point_b[:500]} "same fact":'
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=15.0)
+        if not raw:
+            return False
+        cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
+        words = set(cleaned.split())
+        return "yes" in words and "no" not in words
+    except Exception:
+        return False
 
 
 def _score_points_against_query(query: str, points: List[str]) -> List[float]:
@@ -2741,6 +3485,13 @@ Examples:
   Context: "User: what is a deductible\nLayla: A deductible is what you pay first..."
   Follow-up: "how is it calculated?" → "How is a deductible amount calculated?"
 
+The examples above (life insurance, premiums, reinsurance, subrogation, term
+insurance, deductibles) are ONLY illustrations of the rewrite PATTERN — never
+pull any topic, product name, or fact from them into your actual output.
+Ground the rewrite ONLY in the real Conversation and Follow-up shown below;
+if that real conversation is about something else entirely, your rewrite
+must be about that, never about anything named in the examples above.
+
 Conversation:
 {recent}
 
@@ -2945,9 +3696,143 @@ async def _extract_intent_topics(question: str) -> set[str]:
         return set()
 
 
+async def _reformulate_query_for_policy_type_classification(query: str) -> Optional[str]:
+    """
+    Same technique as _reformulate_scenario_query_for_retrieval further
+    below (the reranker fix) — a real-world scenario question ("I'm
+    flying my own small plane...") gets rewritten into a direct question
+    using proper, SPECIFIC insurance terminology BEFORE it's classified,
+    instead of classifying the raw colloquial phrasing.
+
+    Applied one stage EARLIER than the reranker version: that one already
+    knows the resolved policy_type/section and uses them to guide the
+    rewrite ("rephrase this LIABILITY question about BENEFITS"); this one
+    runs BEFORE policy_type is known — it's what the classification below
+    itself runs on — so it can't be told the type, only instructed to
+    name the real thing being asked about explicitly rather than
+    paraphrasing it into something vaguer.
+
+    Same motivating shape of bug as the reranker fix: a vague, colloquial
+    phrasing ("...want to know about protection") shares loose incidental
+    vocabulary with several unrelated type descriptions, while a specific,
+    jargon-normalized rewrite ("insurance coverage for operating my own
+    private aircraft") makes the actual real-world subject explicit,
+    giving both the embedding ranker and the shortlist LLM below the same
+    kind of clear signal the reranker fix already proved helps retrieval.
+
+    Never used for the actual answer shown to the user, and never used
+    for retrieval either — this is classification-only, upstream of both.
+    Returns None (never the original query) on any failure or a clearly-
+    unusable reply, same safety checks as the reranker version — the
+    caller falls back to classifying the raw query, exactly as if this
+    step didn't exist.
+    """
+    try:
+        prompt = f"""The user's question below describes a real-world situation in plain,
+everyday language. Rewrite it as a single direct question using proper insurance
+terminology, naming the SPECIFIC real-world thing, activity, or asset involved
+explicitly — don't paraphrase it into a vaguer or more generic term. Keep it
+asking about the EXACT SAME underlying situation, don't add or invent new facts.
+
+Do NOT name or invent a specific insurance PRODUCT, POLICY, or CATEGORY that
+isn't already stated in the question — describe the concrete situation itself
+(the object, activity, event, or loss involved) and let the reader work out
+which category it belongs to. For example, if the question describes a food
+truck owner worried a customer might get sick from their food, rewrite it as
+asking whether a customer getting food poisoning from the truck is covered —
+NOT as asking about "food truck liability insurance" or any other invented
+product/category name. "insurance"/"policy"/"covered" alone is fine; a
+specific category name is not, unless the original question already used one.
+
+Question: "My neighbor's kid broke his arm playing in my backyard, could that end
+up costing me money?"
+Rewrite: Am I covered if a visitor is injured on my property?
+
+Question: "My laptop got stolen out of my car last week, is there anything that
+would have covered that?"
+Rewrite: Does my policy cover theft of personal belongings from a vehicle?
+
+The two examples above (backyard injury, stolen laptop) are ONLY illustrations
+of the rewrite PATTERN — never reuse their wording, their scenario, or any
+fact from them. Rewrite ONLY the real Question below, about its own actual
+situation, whatever that situation is.
+
+Question: {query!r}
+Rewrite:"""
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=10)
+        if not raw:
+            return None
+        rewritten = raw.strip().strip('"')
+        if not rewritten or len(rewritten) > len(query) * 3 + 80:
+            return None
+        logger.info(
+            "[QUERY_POLICY_TYPE] query reformulated for classification: %r -> %r",
+            query, rewritten,
+        )
+        return rewritten
+    except Exception as exc:
+        logger.debug("[QUERY_POLICY_TYPE] classification reformulation failed (%s) — using original", exc)
+        return None
+
+
+# Dynamic per-type prototype embeddings backing _classify_query_policy_type_llm
+# below — same architecture as _QUERY_SECTION_PROTOTYPES/_get_query_section_
+# prototype_embeddings above, just built from get_active_vocab()'s own `desc`
+# field instead of a hardcoded dict, since policy types aren't fixed (new
+# ones get auto-promoted at runtime — see candidate_vocab.py). Cached and
+# keyed off the vocab's own (label, desc) content, so a newly-promoted type
+# or an edited description is picked up automatically on its very next call
+# — no separate cache-invalidation hook needed anywhere else.
+_policy_type_prototype_cache: Optional[tuple] = None
+
+
+def _get_policy_type_prototype_embeddings():
+    global _policy_type_prototype_cache
+    vocab = get_active_vocab()
+    signature = tuple(sorted((pt, info.get("desc", "")) for pt, info in vocab.items()))
+    if _policy_type_prototype_cache is None or _policy_type_prototype_cache[0] != signature:
+        _model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        _labels = [pt for pt, _ in signature]
+        _descs = [desc for _, desc in signature]
+        _vecs = _model.encode(_descs, normalize_embeddings=True)
+        _policy_type_prototype_cache = (signature, _labels, _vecs)
+    return _policy_type_prototype_cache[1], _policy_type_prototype_cache[2]
+
+
+def _rank_policy_types_by_embedding(query: str) -> Optional[List[Tuple[str, float]]]:
+    """Cosine-ranks every active policy type's own `desc` against the query,
+    most-similar first. None only on a genuine failure (embed model
+    unavailable, etc.) — an ordinary "nothing really fits" result still
+    returns a normal ranked list, just with low scores throughout; turning
+    that into "general" is the caller's job (see the floor/margin logic in
+    _classify_query_policy_type_llm below), not this function's."""
+    try:
+        _labels, _vecs = _get_policy_type_prototype_embeddings()
+        _model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        _qvec = _model.encode([query], normalize_embeddings=True)[0]
+        _sims = np.dot(_vecs, _qvec)
+        _order = np.argsort(-_sims)
+        return [(_labels[i], float(_sims[i])) for i in _order]
+    except Exception as exc:
+        logger.debug("[QUERY_POLICY_TYPE] embedding ranking failed (%s)", exc)
+        return None
+
+
+# Same two-number shape as _QUERY_SECTION_EMBED_FLOOR/_MARGIN above and the
+# same reasoning: an absolute score alone doesn't reliably separate "this
+# really is the type" from "this is merely the least-bad option nothing
+# else beat" — the MARGIN over the runner-up is what does that. Values are
+# an initial calibration against this rewrite's own motivating failures
+# (aviation/racehorse/drone, see the docstring below) — adjust from real
+# logged (score, margin) pairs as more live queries accumulate, the same
+# way the section-intent constants were originally set.
+_POLICY_TYPE_EMBED_FLOOR = 0.40
+_POLICY_TYPE_EMBED_MARGIN = 0.06
+
+
 async def _classify_query_policy_type_llm(query: str) -> str:
-    """LLM fallback for query policy_type, used only when the free regex
-    pass (classify_query_policy_type) can't confidently name one.
+    """Fallback for query policy_type, used only when the free regex pass
+    (classify_query_policy_type) can't confidently name one.
 
     Most real queries don't name their type in the exact textbook phrase
     regex looks for — confirmed live: "what's not covered if my car is
@@ -2956,46 +3841,153 @@ async def _classify_query_policy_type_llm(query: str) -> str:
     and falls through to "general," meaning the query gets no type signal
     at all despite obviously being about motor insurance to a human reader.
 
-    Kept deliberately fast and cheap (few output tokens, short timeout)
-    since — unlike the document/chunk-classification LLM calls elsewhere
-    in this codebase, which run in a background thread after the ingest
-    response has already returned — this sits on the LIVE query's
-    critical path: the result feeds directly into the retrieval filter
-    below, so it has to resolve before the vector search can even run.
+    Rewritten 2026-09-03 to rank by embedding similarity FIRST, asking an
+    LLM only to break a genuine tie — not, as before, asking the LLM to
+    freely pick 1 of ~30 types from scratch on every call. Root cause that
+    forced this: with ~25-30 active types (12 hardcoded + auto-promoted
+    ones, see get_active_vocab()), a flat one-shot classification over the
+    whole list turned out to be beyond what the small model actually
+    serving these calls (Qwen2.5-7B-Instruct-AWQ, local vLLM) can reliably
+    do — confirmed by direct repeat-testing: the exact same query ("I'm
+    flying my own small plane...") returned "motor" 5/5 times at
+    temperature=0, every time, not occasionally — a reasoning-capacity
+    ceiling, not sampling noise, so no amount of one-off worked examples in
+    the old giant prompt could fix it without risking a regression
+    elsewhere (confirmed: an earlier attempt to strengthen one case did
+    exactly that to a different case). Routing the same call to a much
+    larger model (Groq's 120B) was tried next and also rejected — not for
+    accuracy, but because Groq's shared per-minute token quota (8000 TPM)
+    was already exhausted by other traffic, so most calls got rate-limited
+    (429) and silently fell back to the same weak local model anyway.
+
+    Embedding similarity sidesteps the model-capacity problem entirely for
+    the easy majority of cases — a clear best match, or clearly nothing
+    plausible (-> general) — both fully deterministic, no LLM involved.
+
+    For the genuinely ambiguous remainder (top types scoring close
+    together), an earlier version of this narrowed the field down to a
+    small shortlist (the top few close-scoring types) before asking the
+    LLM to pick between just those. That was DROPPED (2026-09-03) after
+    isolating it as the actual cause of a specific failure, not a fix for
+    one: given only a shortlist of "the closest matches", the model kept
+    picking the least-bad one of them even when NONE of them genuinely
+    fit (confirmed: "I'm flying my own small plane..." against a
+    narrowed shortlist [drone_insurance, motor, liability, ...] picked
+    liability or motor depending on run; the SAME query against the FULL
+    type list, same prompt otherwise, correctly said "general" 3/3).
+    Seeing the full list — most of which is obviously irrelevant — gives
+    the model the contrast it needs to recognize "even the closest
+    option here doesn't really fit"; a pre-filtered shortlist removes
+    that contrast and quietly pressures it toward picking something.
+    So the tie-break call below always sees every active type, never a
+    narrowed subset — embedding still does the real work of skipping the
+    LLM entirely for confident/clearly-absent cases, it just no longer
+    also decides which types the LLM is allowed to consider.
+
+    Also reformulates the query into proper insurance terminology BEFORE
+    ranking/classifying it (_reformulate_query_for_policy_type_
+    classification above) — same technique already proven for the
+    reranker (_reformulate_scenario_query_for_retrieval below): a vague,
+    colloquial phrasing shares loose incidental vocabulary with several
+    unrelated type descriptions, while naming the real thing explicitly
+    gives the embedding ranker a clearer signal to work with. Falls back
+    to the raw query on any reformulation failure, same as every other
+    best-effort step in this file.
+
     Falls back to "general" (no filtering) on any failure, exactly like
     the regex path already does.
     """
+    _reformulated = await _reformulate_query_for_policy_type_classification(query)
+    _classify_query = _reformulated or query
+    _ranked = _rank_policy_types_by_embedding(_classify_query)
+    if not _ranked:
+        return "general"
+    _top_label, _top_score = _ranked[0]
+    _runner_score = _ranked[1][1] if len(_ranked) > 1 else -1.0
+    _margin = _top_score - _runner_score
+    if _top_score < _POLICY_TYPE_EMBED_FLOOR:
+        logger.debug(
+            "[QUERY_POLICY_TYPE] embedding: no plausible match (top=%r score=%.3f) -> general",
+            _top_label, _top_score,
+        )
+        return "general"
+    if _margin >= _POLICY_TYPE_EMBED_MARGIN:
+        logger.debug(
+            "[QUERY_POLICY_TYPE] embedding confident: %r score=%.3f margin=%.3f",
+            _top_label, _top_score, _margin,
+        )
+        return _top_label
+    logger.debug(
+        "[QUERY_POLICY_TYPE] embedding ambiguous (top=%r score=%.3f margin=%.3f) -> full-list LLM tie-break",
+        _top_label, _top_score, _margin,
+    )
+    _llm_label = await _classify_query_policy_type_tiebreak_llm(_classify_query)
+    # Falls back to "general", NOT _top_label (2026-09-03, explicit user
+    # direction) — landing in this branch already means the embedding
+    # score alone wasn't confident enough to trust on its own (that's WHY
+    # the tie-break ran), so on top of that, an unconfident or failed
+    # tie-break call is two weak signals stacked, not one — not a good
+    # enough basis to force a specific type and hard-filter retrieval by
+    # it. Confirmed live as the actual failure mode worth guarding
+    # against: "I'm worried my ex might try to commit fraud using my
+    # identity" resolved to "cyber" with no confidence gate at all,
+    # which then hard-filtered retrieval down to cyber-tagged chunks —
+    # an honest "general" (no filtering) is the safer default here.
+    return _llm_label if _llm_label else "general"
+
+
+async def _classify_query_policy_type_tiebreak_llm(query: str) -> Optional[str]:
+    """Tie-break for when embedding similarity is ambiguous (see the
+    docstring on _classify_query_policy_type_llm above for why this sees
+    every active type rather than a narrowed shortlist — a narrowed list
+    was tried and confirmed to bias the model toward over-picking).
+
+    Also asks the model to self-rate its confidence and only accepts the
+    label on "high" — since embedding was already ambiguous going in,
+    this is the last chance to catch a low-confidence guess before it
+    becomes a hard retrieval filter. Returns None on low/medium
+    confidence, an invalid label, or any failure — the caller treats
+    every one of those the same way: fall back to "general", not the
+    guess.
+    """
     try:
-        label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in get_active_vocab().items())
-        prompt = f"""Classify the ONE insurance policy type this short user question is about.
+        vocab = get_active_vocab()
+        label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in vocab.items())
+        prompt = f"""Classify the ONE insurance policy type this question is about, using the
+descriptions below to judge which one actually fits. Reply "general" if the question
+genuinely doesn't match any of them, even if one looks like the closest available option.
 
 {label_list}
-  - general: the question doesn't name or clearly imply one specific type, or spans several
+  - general: none of the types above genuinely fits this question
 
-Don't default to "commercial" just because a question mentions a business,
-fleet, company, or workplace context — check whether a MORE SPECIFIC type
-fits first (a business's fleet of vans is still motor insurance, a business
-being sued by a client is still liability insurance, a business's stock
-lost to fire is still fire insurance). Only use "commercial" when the
-question is genuinely about the business's own premises or operational
-continuity, with no more specific type actually fitting.
+Reply in EXACTLY this two-line format, nothing else — no explanation, no
+"QUESTION"/"Reply" echoed back:
+label: <the exact label word>
+confidence: <high, medium, or low — how sure you actually are, not just
+which option looks least-bad>
 
-Use the EXACT label word above (e.g. "motor", not "car" or "auto"; "home", not "property").
-
-QUESTION: {query}
-
-Reply with ONLY the label word, nothing else."""
-        raw = await _backend_completion(prompt, max_tokens=10, timeout=10)
+QUESTION: {query}"""
+        raw = await _backend_completion(prompt, max_tokens=20, timeout=15)
         if not raw:
-            return "general"
-        label = re.split(r"[\s\n,.:;()]", raw.strip().lower())[0]
-        label = _normalize_policy_type(label)
-        result = label if label in _valid_policy_types() else "general"
-        logger.debug("[QUERY_POLICY_TYPE] LLM fallback: %r -> %s", query, result)
+            return None
+        _label_m = re.search(r"label\s*:\s*([a-z_]+)", raw.lower())
+        _conf_m = re.search(r"confidence\s*:\s*(high|medium|low)", raw.lower())
+        if not _label_m or not _conf_m or _conf_m.group(1) != "high":
+            logger.info(
+                "[QUERY_POLICY_TYPE] tie-break LLM not confident enough: query=%r raw=%r -> general",
+                query[:80], raw[:80],
+            )
+            return None
+        label = _normalize_policy_type(_label_m.group(1))
+        result = label if label in _valid_policy_types() else None
+        logger.info(
+            "[QUERY_POLICY_TYPE] full-list tie-break LLM (high confidence): query=%r -> %s",
+            query[:80], result,
+        )
         return result
     except Exception as exc:
-        logger.debug("[QUERY_POLICY_TYPE] LLM fallback failed (%s) — treating as general", exc)
-        return "general"
+        logger.debug("[QUERY_POLICY_TYPE] tie-break LLM failed (%s)", exc)
+        return None
 
 
 async def _classify_query_policy_types_multi_llm(query: str) -> list[str]:
@@ -3058,6 +4050,97 @@ Reply with the label word(s), comma-separated, nothing else."""
     except Exception as exc:
         logger.debug("[QUERY_POLICY_TYPE] multi-label LLM failed (%s) — no additional signal", exc)
         return []
+
+
+async def _reformulate_scenario_query_for_retrieval(
+    query: str, policy_type: Union[str, List[str]], section: str,
+) -> Optional[str]:
+    """
+    Rewrites a real-world SCENARIO question ("my neighbor's kid broke his
+    arm in my backyard, could that cost me money") into a direct question
+    using proper insurance terminology ("am I covered under public
+    liability insurance if a visitor is injured on my property") — for
+    RETRIEVAL/RERANKING purposes only. Never used for the actual answer
+    shown to the user; the generation prompt still sees the user's
+    original, natural question.
+
+    Root cause this exists to fix, confirmed live 2026-09-01: the cross-
+    encoder reranker (a lightweight model leaning heavily on literal
+    vocabulary overlap, not deep semantic reasoning) scores a scenario-
+    phrased query against the exact correct chunk as pure noise —
+    0.0000, actually LOSING to a genuinely irrelevant chunk that
+    happened to share a few more incidental words. The SAME chunk
+    against a jargon-phrased version of the identical underlying
+    question scored 0.2320 — a real, clearly-correct signal, thousands
+    of times higher. Swapping to a larger reranker model (bge-reranker-
+    v2-m3) was tested and did NOT fix this — it showed the same
+    near-zero, non-discriminating scores on the scenario phrasing, while
+    also being markedly slower on CPU. The gap is specifically about
+    HOW the question is phrased, not the model's general capability
+    against this content, so fixing the phrasing (rather than the model
+    or the scoring gate) is the actual fix.
+
+    Told the ALREADY-resolved policy_type and section explicitly (both
+    confidently known by the time this is called — see
+    _metadata_scoped_retrieval's caller) so this is a narrow, guided
+    rewrite task rather than a cold, open-ended one: "rephrase this
+    LIABILITY question about BENEFITS using proper terms" is a much
+    easier, more reliable job for an LLM than "figure out what this is
+    about AND rephrase it" would be — that harder combined task is
+    already handled by the classifiers that ran before this.
+
+    Returns None (never the original query) on any failure or a
+    clearly-unusable reply (empty, or suspiciously long — a real
+    rewrite of a short scenario question should stay a similar length,
+    not turn into a paragraph) — the caller falls back to the original
+    query text exactly like every other LLM-assisted step in this file.
+    """
+    try:
+        _type_label = (
+            " / ".join(policy_type) if isinstance(policy_type, (list, tuple, set)) else policy_type
+        )
+        # section is optional (2026-09-01) — when the caller only has a
+        # confident policy_type and no section (see _metadata_scoped_
+        # retrieval's own docstring), the "(specifically about X)" aside
+        # is simply omitted rather than printing a literal "None".
+        _section_aside = f" (specifically about {section})" if section else ""
+        prompt = f"""The user's question below describes a real-world situation in plain,
+everyday language, for a chatbot answering questions about {_type_label} insurance{_section_aside}.
+Rewrite it as a single direct question using proper insurance terminology, so it can be
+matched against formal policy-document language —
+but keep it asking about the EXACT SAME underlying situation, don't add or invent
+new facts.
+
+Question: "My neighbor's kid broke his arm playing in my backyard, could that end
+up costing me money?"
+Rewrite: Am I covered under public liability insurance if a visitor is injured on
+my property?
+
+Question: "My laptop got stolen out of my car last week, is there anything that
+would have covered that?"
+Rewrite: Does my policy cover theft of personal belongings from a vehicle?
+
+The two examples above (backyard injury, stolen laptop) are ONLY illustrations
+of the rewrite PATTERN — never reuse their wording, their scenario, or any
+fact from them. Rewrite ONLY the real Question below, about its own actual
+situation, whatever that situation is.
+
+Question: {query!r}
+Rewrite:"""
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=10)
+        if not raw:
+            return None
+        rewritten = raw.strip().strip('"')
+        if not rewritten or len(rewritten) > len(query) * 3 + 80:
+            return None
+        logger.info(
+            "[ask_stream] scenario query reformulated for retrieval: %r -> %r",
+            query, rewritten,
+        )
+        return rewritten
+    except Exception as exc:
+        logger.debug("[ask_stream] scenario query reformulation failed (%s) — using original", exc)
+        return None
 
 
 async def _classify_query_candidate_type_llm(query: str) -> Optional[str]:
@@ -3311,6 +4394,286 @@ async def _verify_grounding(question: str, context: str, backend_override: Optio
         return "yes" in words and "no" not in words
     except Exception:
         return False
+
+
+async def _verify_point_faithfulness(point: str, context: str) -> bool:
+    """Post-GENERATION entailment check — does ONE numbered point of a
+    finished answer actually hold up against the retrieved evidence?
+
+    This is a different question from _verify_grounding above, which runs
+    BEFORE generation and asks "is the QUESTION answerable from this
+    context" — a go/no-go gate that, once passed, never looks at what
+    actually gets written. A model can pass that gate (the context IS
+    genuinely relevant) and still write an answer that goes beyond what
+    the context supports — confirmed live: asked whether one policy could
+    cover both a flooded house and a storm-damaged car, _verify_grounding
+    correctly said the retrieved motor-comprehensive content was relevant
+    enough to attempt an answer, and the model then combined "comprehensive
+    cover includes flood/storm" (true, for the vehicle) with the user's own
+    mention of "house" into a bundling claim neither source ever makes.
+    Two direct prompt-instruction attempts to stop this failed identically
+    on live re-test (see prompt_template.py's own "STOP. Before writing..."
+    addition, kept for the cases it DOES catch).
+
+    Directly reimplements the evidence/hypothesis/entailment framing NeMo
+    Guardrails' `self_check_facts` action uses. The framework itself added
+    nothing beyond that prompt — no Colang flow, no new dependency, just a
+    short call to the SAME backend already used everywhere else in this
+    file, kept here rather than adding nemoguardrails as a dependency. The
+    prompt below is close to NeMo's own default wording DELIBERATELY, not
+    a paraphrase — an earlier, more elaborate version of this prompt
+    (explaining the task as a question, with extra caveats about combining
+    separately-true facts) measurably under-performed it: same real
+    retrieved context and same real answer text both times, the elaborate
+    version caught a real target fabrication only 1 time in 6 live
+    attempts; installing the actual NVIDIA library in an isolated
+    environment and testing it directly against the SAME real (truncated)
+    context caught the SAME fabrication 4/4 once re-tested with THIS
+    terser prompt. A short, cloze-style completion ("...\"entails\":")
+    apparently gives this size of model a cleaner signal to complete than
+    a longer question-plus-caveats framing — the same lesson this session
+    already learned elsewhere (e.g. the policy-type classifier needing a
+    short worked example over an abstract rule).
+
+    This function checks ONE point, not a whole answer — an earlier
+    version checked the whole answer in one shot and was dropped entirely
+    after two separate confirmed failure modes: (1) checking the exact
+    same real context and real 6-point answer both as a numbered list AND
+    as rewritten flowing prose, it said "faithful" 3/3 times either way —
+    a single yes/no over a MIX of mostly-plausible points and one
+    fabricated one gets dominated by the plausible majority, reformatting
+    alone doesn't fix that; checking each of the 6 points individually
+    against that SAME context instead correctly caught 4 of the 6
+    unsupported points, including the one whole-answer checking missed
+    every time. (2) The same whole-answer approach, even on plain,
+    single-source, pre-SRG prose with no composite sentence at all, also
+    false-positived on a genuinely correct, repeatedly-verified motor-claim
+    answer and replaced it with a refusal shown to a real user — multi-
+    claim prose folded into one paragraph hits the same whole-block
+    unreliability, just in the opposite direction (one point the model is
+    slightly unsure about can sink an otherwise-fine answer). Only
+    checking one self-contained claim at a time has actually proven
+    reliable — prose answers now get this SAME check, one SENTENCE at a
+    time (see the prose branch of the caller in ask_stream), reusing this
+    exact function.
+
+    One retry on an empty response — confirmed live this call can hit a
+    transient network failure against the remote backend (same class of
+    intermittent outage already documented elsewhere in this file), and
+    the fail-open default would otherwise silently treat a dropped
+    connection as "yes, entailed" for the one point that most needed
+    checking.
+
+    The prompt explicitly says a PARTIAL claim still counts as entailed.
+    Confirmed live (2026-08-27), reproduced with the EXACT live context
+    and point text captured from a real request (not a reconstruction —
+    an earlier attempt to reproduce this via a fresh, separately-fetched
+    context gave a different, misleading result, since retrieval isn't
+    perfectly deterministic run to run): the source literally says "1.
+    Ensure everyone's safety first, and if the accident involves injury...
+    inform the police..." — combining two actions into ONE numbered
+    source point. The generated answer split this into two separate
+    sentences (as it should — they're two distinct actions). Without this
+    line, the model consistently said "No" to the safety-only half, 5/5
+    times against the identical real context — apparently penalizing a
+    hypothesis for being a SUBSET of a longer evidence sentence rather
+    than crediting it as still true. Adding this one line fixed it 5/5,
+    without weakening the check's ability to catch a real fabrication
+    (re-verified against the known target case afterward). A second
+    attempted fix — requiring two independent "No" verdicts to agree
+    before dropping anything — was tried FIRST and reverted: it didn't
+    address this failure mode at all (both calls agreed "No" consistently,
+    since the underlying misjudgment was systematic, not noisy), and a
+    boolean-logic bug in that version's own final line briefly also
+    broke the fabrication catch outright — caught and fixed before this
+    version shipped.
+
+    A "No" verdict requires TWO independent calls to agree before this
+    function actually returns False. Confirmed live (2026-08-27): a
+    genuinely grounded sentence ("ensure everyone's safety", matching the
+    source's own "make sure everyone is safe" — confirmed present in the
+    exact evidence used) was flagged False on one live call, then passed
+    True on 5/5 immediate retests against the identical context — not a
+    real ungrounded claim, a one-off noisy response (the remote backend
+    logged a connection failure in the same window). A single "No" isn't
+    trustworthy enough on its own to discard content that already passed
+    every earlier check in the pipeline; requiring a second, independent
+    "No" before dropping trades a little extra latency (only for the
+    minority of points that fail once) for a much lower risk of throwing
+    away genuinely correct content.
+    """
+    if not point or not point.strip() or not context or not context.strip():
+        return True
+    prompt = (
+        "You are given a task to identify if the hypothesis is grounded "
+        "and entailed to the evidence.\n"
+        "You will only use the contents of the evidence and not rely on "
+        "external knowledge.\n"
+        "The hypothesis may state only PART of a longer evidence sentence "
+        "— that still counts as entailed.\n"
+        "The hypothesis may use plainer, more general wording than the "
+        "evidence's own — that alone is not a reason to say no; judge "
+        "whether the evidence supports its MEANING, not whether it repeats "
+        "the evidence's exact words.\n"
+        "A hypothesis stating that two named things are SEPARATE, not "
+        "combined, or not covered by the same product also counts as "
+        "entailed when the evidence discusses one of them without ever "
+        "stating they are combined — the evidence does not need to "
+        "explicitly say \"these are separate\" for that to be true.\n"
+        f'Answer with yes/no. "evidence": {context[:_ENTAILMENT_CONTEXT_CHARS]} '
+        f'"hypothesis": {point[:800]} "entails":'
+    )
+
+    async def _single_check(backend: str) -> Optional[bool]:
+        try:
+            raw = await _backend_completion(
+                prompt, max_tokens=10, timeout=15.0, backend_override=backend,
+            )
+            if not raw:
+                return None
+            cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
+            words = set(cleaned.split())
+            if "no" in words and "yes" not in words:
+                return False
+            return True
+        except Exception:
+            return None
+
+    # Hybrid, user-directed 2026-08-27: each backend showed a DIFFERENT
+    # reliability profile on this exact task, tested head-to-head against
+    # the same real live cases both ways. vLLM catches real fabrications
+    # more consistently (correctly flagged the target case in roughly
+    # half to two-thirds of fresh live runs) but had shown a false
+    # positive on genuinely correct content before the partial-claim
+    # prompt fix. Groq never reproduced that false positive (5/5 clean)
+    # and returns a cleaner, easier-to-parse "yes"/"no" — but its catch
+    # rate on the SAME target fabrication dropped to roughly 1 in 8 fresh
+    # live runs, a reasoning model apparently finding a generous, loosely
+    # plausible connection more often than vLLM's more literal read.
+    # Neither one alone is clearly better — this uses each one's own
+    # strength: vLLM does the FIRST-PASS detection (it catches more), and
+    # a point only actually gets dropped if Groq INDEPENDENTLY agrees on
+    # a second call (it doesn't over-flag) — vLLM's flag alone is not
+    # enough. Groq is called only for the minority of points vLLM
+    # flags, keeping the common case (vLLM says yes) to one call.
+    _vllm_verdict = await _single_check("vllm")
+    if _vllm_verdict is None:
+        _vllm_verdict = await _single_check("vllm")
+    if _vllm_verdict is not False:
+        return True  # None (still failed after retry) or True -> fail open / pass
+
+    # vLLM flagged it — confirm with Groq before actually dropping
+    # content. An explicit Groq "Yes" fails open (True, keep) — Groq
+    # independently disagreeing with vLLM's flag is a real signal, same
+    # direction as every other ambiguous case here.
+    _groq_verdict = await _single_check("groq")
+    if _groq_verdict is None:
+        _groq_verdict = await _single_check("groq")
+    if _groq_verdict is None:
+        # Confirmation genuinely UNREACHABLE both attempts (not "Groq
+        # looked and said yes" — the call itself failed, e.g. rate-
+        # limited or down) — trust vLLM's own flag rather than silently
+        # treating an unreachable confirmation step as if it had cleared
+        # the content. Confirmed live (2026-08-27): Groq hit its own
+        # daily token quota mid-session (a 429 with "Used 199717/200000"
+        # visible in the logs), and the OLD "None -> keep" behavior let a
+        # genuinely invented figure ("the deductible is exactly Rs.
+        # 25,000", nothing like it anywhere in the evidence) pass
+        # straight through untouched the moment Groq stopped answering —
+        # silently defeating the whole hybrid mechanism for as long as
+        # the outage/rate-limit lasted, right when the safety net matters
+        # most. vLLM's own "No" is a real signal on its own (see this
+        # function's whole earlier history before Groq was added) — it
+        # shouldn't count for nothing just because the confirmation step
+        # couldn't be reached.
+        return False
+    return _groq_verdict is not False
+
+
+_PGF_CLAIMS_PROMPT = (
+    'Based on the given text, extract a list of separate FACTUAL claims made in it. '
+    'Split any sentence that bundles more than one distinct fact into separate claims, '
+    'so each claim can be checked independently. Each claim must be a coherent, '
+    'standalone statement, not cherry-picked out of context. '
+    'Preserve the actual instruction or fact from the text in each claim — do NOT '
+    'reduce a claim to a vague, circular restatement of the category it belongs to.\n'
+    'Example: "Gather your documents, like the policy and the ID card." splits into '
+    '["Gather the policy.", "Gather the ID card."] — NOT into '
+    '["There are documents to gather.", "The policy is a document.", '
+    '"The ID card is a document."], which throws away the actual instruction.\n'
+    'Return ONLY JSON in this exact format, no explanation: {{"claims": ["...", ...]}}\n\n'
+    'Text:\n{text}\n\nJSON:'
+)
+
+
+async def _pgf_extract_claims(text: str) -> list:
+    """LLM-based atomic-claim decomposition — a SALVAGE step for the prose
+    post-generation faithfulness path in ask_stream, only invoked after a
+    sentence has already failed the whole-sentence _verify_point_faithfulness
+    check above. Inspired by (not a dependency on) DeepEval's
+    FaithfulnessMetric generate_claims prompt
+    (deepeval/metrics/faithfulness/templates/generate_claims.txt) — tested
+    standalone 2026-08-27 in an isolated venv against this app's own real
+    retrieved context and Groq backend before wiring in, same methodology
+    as the NeMo Guardrails evaluation this whole mechanism traces back to.
+
+    NOT adopting DeepEval's own verdict step alongside the claim-extraction
+    one: its default FaithfulnessMetric only flags a claim as unfaithful
+    when the retrieval context DIRECTLY CONTRADICTS it (confirmed by
+    reading generate_verdicts.txt and its guidelines fragment) — a claim
+    that's simply absent from context with nothing to contradict it scores
+    "idk", which does NOT count against the metric's score unless the
+    caller opts into penalize_ambiguous_claims=True. That would silently
+    fail to catch a pure fabrication (nothing in context to contradict —
+    exactly this app's original "wellness programs and 24/7 helpline" bug).
+    _verify_point_faithfulness's own entailment prompt already requires
+    POSITIVE support, so it's kept unchanged as the verdict step here —
+    only the claim-splitting idea is reused.
+
+    Confirmed live: a bundled sentence combining one TRUE sub-claim with
+    one FABRICATED sub-claim ("...within the specified time limit, and
+    the insurer will also give you a free annual health checkup
+    voucher...") gets a single DROP verdict from the existing whole-
+    sentence check — correct in that the fabrication doesn't get through,
+    but the genuinely correct half bundled with it is lost too, worse UX
+    than necessary. Extracting claims and checking each independently
+    kept the true half and dropped only the fabricated half on the same
+    case. A fully-correct bundled sentence, by contrast, extracted as a
+    single claim and passed unchanged in the same test — no over-
+    splitting observed on real content.
+
+    Runs on Groq specifically, not vLLM — this app's smaller vLLM model
+    has an established pattern of poor compliance on structured-output/
+    judgment tasks (see _verify_point_faithfulness's own hybrid design
+    and its docstring), and a malformed claims list here would just fall
+    back to the original whole-sentence drop anyway, so there's little to
+    gain from risking a less reliable model on a salvage path that only
+    ever runs after a failure.
+
+    Returns an empty list — "nothing salvageable via decomposition" — on
+    any failure (empty response, unparseable JSON, fewer than 2 claims
+    found) or exception, so the caller's fallback is always to keep
+    today's behavior of dropping the whole sentence, never to falsely
+    claim a successful decomposition.
+    """
+    try:
+        raw = await _backend_completion(
+            _PGF_CLAIMS_PROMPT.format(text=text[:1500]),
+            max_tokens=400, timeout=15.0, backend_override="groq",
+        )
+        if not raw:
+            return []
+        import json as _pgf_json
+        _m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not _m:
+            return []
+        _claims = _pgf_json.loads(_m.group(0)).get("claims")
+        if not isinstance(_claims, list):
+            return []
+        _cleaned = [str(c).strip() for c in _claims if str(c).strip()]
+        return _cleaned if len(_cleaned) >= 2 else []
+    except Exception:
+        return []
 
 
 async def _verify_grounding_any_chunk(
@@ -4096,7 +5459,7 @@ async def _enforce_numbered_list_format(
     out, or produces something that fails a basic length-sanity check
     (guards against a truncated or hallucinated rewrite slipping through).
     """
-    _is_types_query = bool(_TYPES_OF_QUERY_RE.search(query))
+    _is_types_query = await _is_types_enumeration_query(query)
     if _is_types_query and is_type_decision:
         return None
     if not _is_types_query:
@@ -4166,6 +5529,89 @@ REFORMATTED:"""
     return reformatted
 
 
+async def _enforce_prose_format(
+    query: str, answer_text: str, is_type_decision: bool = False,
+) -> Optional[str]:
+    """
+    Mirror of _enforce_numbered_list_format above, for the opposite
+    failure direction: a DECISION question ("what type should I buy for
+    my pet") whose answer STILL came back as a numbered list despite the
+    prompt override that's supposed to force plain prose for exactly
+    this case (see _TYPE_DECISION_RE's block comment and the "Type-of-X
+    decision-vs-enumeration override" in ask_stream, which reassigns
+    `detailed = False` and routes to a prose-capable prompt with an
+    explicit "Plain prose, no numbered list" instruction specifically
+    because DETAILED_GROUNDED_PROMPT's own FORMAT section has no prose
+    branch at all).
+
+    Confirmed live 2026-09-01: even with that override correctly firing,
+    the model still generated a numbered list anyway — the same "a
+    prompt's own worked examples/habits beat a one-off instruction"
+    failure already documented elsewhere in this file, just recurring
+    for a DIFFERENT prompt. The real damage isn't the numbering itself —
+    it's what happens NEXT: downstream numbered-list-specific checks
+    (the dangling they/these opener check, PGF's per-point grounding
+    check) evaluate each numbered line as an independent, isolated unit.
+    A pronoun that clearly refers back to the PREVIOUS point when read as
+    connected prose ("...Accident and Illness Plans. They typically
+    include...") reads as a dangling reference with no antecedent once
+    that previous point is a separate numbered line instead of the
+    previous sentence — and gets dropped, taking real, correct content
+    down with it. Confirmed live: "what type of policy should I buy for
+    my pet" lost its single most informative sentence ("They typically
+    include a wide range of medical treatments and can help with
+    unexpected vet bills...") to exactly this, leaving a thin, one-line
+    answer. Converting back to prose HERE, before either downstream
+    check runs, means the pronoun is read in its original, correct
+    context and never gets isolated in the first place.
+
+    Same "restructure only, never add/remove/reword a fact" discipline
+    and safety checks as _enforce_numbered_list_format: a temperature=0
+    LLM call whose only job is to join numbered lines into flowing
+    prose, rejected if the result still has numbered-list formatting or
+    fails the same length-sanity bounds a truncated/hallucinated rewrite
+    would fail.
+    """
+    if not is_type_decision:
+        return None
+    if not _has_numbered_list_format(answer_text):
+        return None
+    if answer_text.strip().lower().startswith("hmm, i don't have"):
+        return None
+
+    prompt = f"""Reformat the ANSWER below from a numbered list into flowing prose — plain
+sentences, no numbering, no line-by-line list structure. Do NOT add, remove, change, or
+reword any fact — only restructure it: join the points into natural connected sentences,
+so a pronoun like "it", "this", or "they" clearly refers back to what it's about within
+the flowing text, the same way it would if it had been written as prose from the start.
+
+ANSWER:
+{answer_text}
+
+REFORMATTED:"""
+
+    try:
+        raw = await _backend_completion(
+            prompt, max_tokens=min(700, max(200, len(answer_text) // 3 + 150)),
+            timeout=35, temperature=0,
+        )
+    except Exception as exc:
+        logger.debug("[ask_stream] prose reformat call failed: %s", exc)
+        return None
+    if not raw:
+        return None
+    reformatted = raw.strip()
+    if _has_numbered_list_format(reformatted):
+        return None
+    if not (0.6 * len(answer_text) <= len(reformatted) <= 1.6 * len(answer_text)):
+        logger.debug(
+            "[ask_stream] prose reformat rejected on length sanity check (%d -> %d chars)",
+            len(answer_text), len(reformatted),
+        )
+        return None
+    return reformatted
+
+
 # ── Named-pair depth enforcement (deterministic trigger, LLM-executed) ─────
 # prompt_template.py's COMPARISON QUESTIONS rule already asks the model to
 # give both named items equal depth — confirmed live (2026-07-24) this
@@ -4207,6 +5653,23 @@ REFORMATTED:"""
 # phrase.
 _PHRASE = r"(?!(?:how|why|what|where|when|does|do|did|is|are|can|will|would|should|could|shall)\b)(?:the\s+|an?\s+)?[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,1}"
 
+# Same as _PHRASE, but also refuses to sweep a trailing subordinating
+# conjunction into the optional second word — needed for the bundling
+# patterns below specifically, which (unlike "compare X and Y") commonly
+# have a conditional clause immediately after the second name ("...cover
+# both my house and my car IF a storm damages both"). Confirmed live
+# (2026-08-27): plain _PHRASE captured "car if" as the second item
+# verbatim. Kept separate from _PHRASE itself rather than editing the
+# shared pattern, since _PHRASE's existing 2-word greediness is relied on
+# by the comparison patterns above, where a trailing conjunction isn't a
+# real risk (a comparison question ends at the second name, it doesn't
+# keep going into a conditional clause).
+_BUNDLE_PHRASE = (
+    r"(?!(?:how|why|what|where|when|does|do|did|is|are|can|will|would|should|could|shall)\b)"
+    r"(?:the\s+|an?\s+)?[A-Za-z][\w'-]*"
+    r"(?:\s+(?!(?:if|since|unless|because|as|so|though|although|when|while)\b)[A-Za-z][\w'-]*){0,1}"
+)
+
 # Patterns tried against the QUERY, in order — these are all genuine
 # comparison-intent phrasings ("compare X and Y", "what are X and Y",
 # etc.), so a match here is a strong, low-false-positive signal of which
@@ -4216,6 +5679,34 @@ _NAMED_PAIR_QUERY_PATTERNS = [
     re.compile(rf"\bdifference\s+between\s+({_PHRASE})\s+and\s+({_PHRASE})", re.IGNORECASE),
     re.compile(rf"\b({_PHRASE})\s+(?:vs\.?|versus)\s+({_PHRASE})", re.IGNORECASE),
     re.compile(rf"\bwhat\s+(?:is|are)\s+({_PHRASE})\s+and\s+({_PHRASE})", re.IGNORECASE),
+    # Bundling shape, not a comparison — "does one policy cover both my
+    # house and my car" names two separate items too, just to ask whether
+    # ONE product spans both rather than to contrast them. Confirmed live
+    # (2026-08-27) this shape has zero regex hit for either type on its
+    # own (no "home insurance"/"motor insurance" phrase anywhere in it),
+    # so it fell through to a single-label LLM guess that could only pick
+    # ONE side — which then fed a single-type retrieval reservation
+    # skewed entirely toward that one side, fabricating a bundling claim
+    # exactly like [[project_cross_type_bundling_hallucination]] already
+    # fixed once at the prompt level, just reached via a different path.
+    # Feeding this into the SAME named-pair machinery as the comparison
+    # patterns above gets it the SAME dual-type retrieval split (both
+    # sides actually retrieved and merged, see _np_pair_for_retrieval's
+    # own call site) — NOT the comparison-TABLE formatting, which is
+    # gated separately on _COMPARISON_QUERY_RE and doesn't match this
+    # phrasing at all, so a bundling question still reads as prose.
+    # Optional possessive ("my"/"our"/"your") kept OUTSIDE the capturing
+    # group, same reasoning as _LEADING_ARTICLE_RE's article-stripping —
+    # every caller wants the bare noun, not "my house" verbatim.
+    re.compile(
+        rf"\b(?:one|the\s+same|a\s+single)\s+policy\s+cover\s+(?:both\s+)?"
+        rf"(?:my|our|your|the)?\s*({_BUNDLE_PHRASE})\s+and\s+(?:my|our|your|the)?\s*({_BUNDLE_PHRASE})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bcover\s+both\s+(?:my|our|your|the)?\s*({_BUNDLE_PHRASE})\s+and\s+(?:my|our|your|the)?\s*({_BUNDLE_PHRASE})",
+        re.IGNORECASE,
+    ),
 ]
 
 # Tried against the ANSWER text (not the query) — this is the
@@ -4399,15 +5890,49 @@ async def _enforce_comparison_table_format(query: str, answer_text: str) -> Opti
     if len(answer_text) < 80:
         return None
 
-    prompt = f"""Convert the ANSWER below, which compares "{name_a}" and "{name_b}", into a
-comparison table. Do this in two separate steps, both required.
+    # Split the ALREADY-GENERATED answer into its own sentences and hand
+    # the LLM that numbered list directly, rather than the whole essay —
+    # every one of these sentences already passed this pipeline's own
+    # grounding/faithfulness checks before this function ever runs, so the
+    # reformat call's job is narrowed to DECOMPOSING sentences already
+    # known to be true into table rows, never discovering what to compare
+    # or restating a fact from scratch. Confirmed live this distinction
+    # matters: asked to "find each distinct attribute the ANSWER makes"
+    # from a whole paragraph, this reformat call failed outright (produced
+    # <2 usable rows, silently fell back to prose) in 2 of 3 fresh
+    # attempts on the exact same question, and inverted one row's values
+    # once (a "Coverage" row stated backwards from what the same table's
+    # own Definition row said) — open attribute-discovery across an
+    # entire paragraph is a much harder task than deciding, one given
+    # sentence at a time, which two values it states.
+    _table_example_re = re.compile(
+        r'^(for example|for instance|as an example|to illustrate|'
+        r"here'?s an example|let'?s say|let us say|say you|"
+        r'suppose you|imagine you)\b', re.IGNORECASE,
+    )
+    _table_raw_sentences = [
+        s.strip() for s in re.split(r'(?<=[.!?])\s+', answer_text.strip()) if s.strip()
+    ]
+    _table_example_sentences = [s for s in _table_raw_sentences if _table_example_re.match(s)]
+    _table_fact_sentences = [s for s in _table_raw_sentences if not _table_example_re.match(s)]
+    if len(_table_fact_sentences) < 1:
+        return None
+    _table_numbered_sentences = "\n".join(f"{i+1}. {s}" for i, s in enumerate(_table_fact_sentences))
+    _table_example_hint = (
+        " ".join(_table_example_sentences) if _table_example_sentences
+        else "(none — the ANSWER never gave a worked example, invent one for STEP 2 below)"
+    )
 
-STEP 1 — restructure real facts, definition row first. Every row you write in this step —
-INCLUDING the Definition row described below — must follow this shape: one label, then BOTH
-items' values side by side on the SAME line. Never write a row whose LABEL is {name_a} or
-{name_b} themselves — that produces one row per ITEM instead of one row per shared POINT,
-which is wrong even for the Definition row. Wrong shape (never do this, for any row,
-including Definition):
+    prompt = f"""The numbered SENTENCES below are already-verified, true statements comparing
+"{name_a}" and "{name_b}". Do not question, re-derive, or add to what they say — only
+restructure them into a comparison table. Do this in two separate steps, both required.
+
+STEP 1 — decompose the SENTENCES into rows, definition row first. Every row you write in
+this step — INCLUDING the Definition row described below — must follow this shape: one
+label, then BOTH items' values side by side on the SAME line. Never write a row whose LABEL
+is {name_a} or {name_b} themselves — that produces one row per ITEM instead of one row per
+shared POINT, which is wrong even for the Definition row. Wrong shape (never do this, for
+any row, including Definition):
 {name_a} | <something about {name_a}> | Not specified
 {name_b} | Not specified | <something about {name_b}>
 Right shape, illustrated with a completely unrelated, non-insurance example so it can never
@@ -4416,68 +5941,83 @@ point, never the item's own name, and BOTH items get a value on the SAME row; ne
 this wording or these facts, it is only to show the shape):
 Color | Red or green | Orange
 
-With that shape in mind: before any other row, add ONE row labeled "Definition" (literally
-that word — never {name_a} or {name_b}) that states, in one short plain sentence per side,
-what {name_a} actually is and what {name_b} actually is — enough that someone who has never
-heard either term before understands what each one even IS, not just how they differ. Most
-of these ANSWERs already open by explaining each term (e.g. "A deductible is...", "Life
-insurance provides...") — take the definition from there, only lightly reworded to fit one
-row; never invent a definition that contradicts the ANSWER. This Definition row is mandatory
-and must come first, even if the rest of the ANSWER only discusses differences afterward.
+With that shape in mind: the SENTENCES near the start that introduce or define each term
+(e.g. "A deductible is...", "Life insurance provides...") become ONE row labeled
+"Definition" (literally that word — never {name_a} or {name_b}), one short plain clause per
+side, only lightly reworded from those SENTENCES — enough that someone who has never heard
+either term before understands what each one even IS, not just how they differ. This
+Definition row is mandatory and must come first.
 
-After the Definition row, find each distinct attribute or point of comparison the
-ANSWER makes about {name_a} and {name_b}, one row per shared attribute (such as cost,
-duration, who it covers, when it applies), following the same right shape shown above —
-using an attribute name of your own choosing and real facts from the ANSWER, not the word
-"Color" and not that illustration's words. Do NOT add, remove, or invent any fact in this
-step — only restructure what the ANSWER already says, about {name_a} and {name_b}
-specifically and no other product. Never invent a number or amount in this step either —
-every figure in a STEP 1 row must appear in the ANSWER text verbatim; if you want to state an
-amount that isn't in the ANSWER, that only belongs in the Example row from STEP 2, never
-here. The same rule applies to LISTS, not just numbers: if a row restates something the
-ANSWER enumerates — which methods, types, categories, or items something covers or
-involves — include only the items the ANSWER itself names, never an extra item of your
+For every SENTENCE after that, output one row per SENTENCE, or per small group of adjacent
+SENTENCES that state the exact same shared point — following the same right shape shown
+above, with a shared-attribute label of your own choosing (such as cost, duration, who it
+covers, when it applies) — but only when the SENTENCE actually is about that attribute; the
+label must describe what the row's own two values actually say, never a label picked from
+this list just because it sounds like a plausible comparison point in general. Confirmed
+live: a row was labeled "Cost" for two values that were both really about the BREADTH of
+what's covered ("wider range of coverage for various medical expenses" vs "focuses on
+immediate financial needs") — neither value names a price, premium, or amount, so "Cost" was
+wrong; "Scope of Coverage" would have matched what the row actually said. Never label a row
+"Cost" (or "Duration", "Who It Covers", etc.) unless its own SENTENCE states a price, time
+period, or covered-person fact — otherwise write a label straight from what that SENTENCE is
+actually about. Cover every SENTENCE below with a row: do not skip one, and do not
+add a row for a fact not stated in these SENTENCES — you are decomposing given true
+statements, not researching or inventing new ones. Never invent a number or amount in this
+step either — every figure in a STEP 1 row must appear in the SENTENCES verbatim; if you want
+to state an amount that isn't there, that only belongs in the Example row from STEP 2, never
+here. The same rule applies to LISTS, not just numbers: if a row restates something a
+SENTENCE enumerates — which methods, types, categories, or items something covers or
+involves — include only the items that SENTENCE itself names, never an extra item of your
 own on top, even one that would obviously belong on that kind of list in general (confirmed
-live: a "modes of transport" row correctly carried over the ANSWER's own list, then added
-two more transport methods that were never in the ANSWER at all — invented because they're
-common real-world examples of the category, not because the source said so). If you notice
-yourself about to write a fact about some other insurance type, stop —
-it does not belong in this table. If the ANSWER only states
-a fact for one side of a real attribute, use "Not specified" for the other side's value on
-that row rather than guessing — but never label the row with {name_a} or {name_b} themselves,
-always with the shared attribute.
+live: a "modes of transport" row correctly carried over the source sentence's own list, then
+added two more transport methods that were never stated at all — invented because they're
+common real-world examples of the category, not because the source said so). If a SENTENCE is
+about some other insurance type entirely, skip it — it does not belong in this table. If a
+SENTENCE only states a fact for one side of a real attribute, use "Not specified" for the
+other side's value on that row rather than guessing — but never label the row with {name_a}
+or {name_b} themselves, always with the shared attribute.
 
-Before writing each row, double check which item the fact you're about to write is actually
+Before writing each row, double check which item the SENTENCE you're decomposing is actually
 about — the FIRST value column is always {name_a}, the SECOND is always {name_b}, in that
-order, every row. A fact that the ANSWER states about {name_a} must go in the {name_a} column,
-never the {name_b} column, even if the ANSWER's sentence about {name_a} happens to come later
-in the text than the sentence about {name_b}. Putting a true fact in the wrong column states
-something false about both items — re-read the ANSWER sentence you're restructuring and
-confirm which of the two names it names before placing the value.
+order, every row. A fact a SENTENCE states about {name_a} must go in the {name_a} column,
+never the {name_b} column, even if that SENTENCE happens to come later in the numbered list
+than a SENTENCE about {name_b}. Putting a true fact in the wrong column states something
+false about both items — re-read the SENTENCE and confirm which of the two names it names
+before placing the value, and confirm the polarity of what it says (what it DOES cover/cost/
+include versus what it does NOT) lands on the correct side, not swapped.
 
 STEP 2 — add one example row, always, no exceptions. After ALL of the STEP 1 rows (not
 after each one — exactly one Example row total for the whole table, no matter how many
 STEP 1 rows you wrote), add exactly one more row, labeled "Example", giving one short,
 concrete real-world SCENARIO sentence for EACH side, each with its OWN specific invented
-figure worked in naturally. Neither a bare fragment like "$500 hospital bill" nor a
+figure worked in naturally. Neither a bare fragment like "₹500 hospital bill" nor a
 scenario with no number at all is acceptable — every Example value needs both a
-situation AND a figure, always, for both sides. Right shape (never reuse this wording or
-the $15, it is a deliberately unrelated non-insurance example only to show the shape —
-one that names a real insurance type gets copied verbatim into real answers about that
-same type instead of prompting the model to invent its own, confirmed live): "A
-commuter's train is delayed by two hours and the rail operator refunds $15 of their
-ticket." Unlike STEP 1, this row does NOT need to come from the ANSWER
-text — if the ANSWER already states a real example scenario for both sides, adapt it into
-one sentence each; otherwise invent one plausible, representative scenario for each side,
-specifically about {name_a} and {name_b} (it only needs to help the reader picture the
-comparison, not be a real quoted rate). This step is mandatory even if STEP 1 produced no
-rows at all. Never leave either side of the Example row as "Not specified" or blank.
+situation AND a figure, always, for both sides. ANY invented currency figure in this row
+must use ₹ (Indian Rupees) — this is an Indian insurance context throughout, never $ or
+any other currency symbol (confirmed live: an earlier version of this instruction's own
+placeholder example used $, and the model copied that currency symbol into its own
+invented insurance figures even though every other real figure in this KB is in ₹ —
+jarring and wrong for a reader with Indian policies). Right shape (never reuse this
+wording or the ₹15, it is a deliberately unrelated non-insurance example only to show the
+shape — one that names a real insurance type gets copied verbatim into real answers about
+that same type instead of prompting the model to invent its own, confirmed live): "A
+commuter's train is delayed by two hours and the rail operator refunds ₹15 of their
+ticket." Unlike STEP 1, this row does NOT need to come only from the numbered SENTENCES —
+the ANSWER's own example, if any, is quoted below for this step specifically; adapt it into
+one sentence each if present, otherwise invent one plausible, representative scenario for
+each side, specifically about {name_a} and {name_b} (it only needs to help the reader
+picture the comparison, not be a real quoted rate). This step is mandatory even if STEP 1
+produced no rows at all. Never leave either side of the Example row as "Not specified" or
+blank.
 
 Output ONLY the rows from both steps — no header row, no markdown, no numbering, no extra
 commentary before or after.
 
-ANSWER:
-{answer_text}
+SENTENCES:
+{_table_numbered_sentences}
+
+ANSWER's own example (for STEP 2 only, may be "none"):
+{_table_example_hint}
 
 TABLE:"""
 
@@ -4546,6 +6086,7 @@ TABLE:"""
     _expected_anchor_types = _anchor_types_in(name_a) | _anchor_types_in(name_b)
 
     rows = []
+    _seen_row_labels: set = set()
     for line in raw.strip().split("\n"):
         line = line.strip().lstrip("-*").strip()
         if line.count("|") < 2:
@@ -4615,20 +6156,51 @@ TABLE:"""
         # sometimes repeats STEP 2's "add an Example row" after EVERY
         # STEP 1 row instead of once at the end — 4 separate rows all
         # labeled "Example" instead of the single row the prompt asks
-        # for. Keep only the first; the STEP 2 instruction is explicit
-        # that this should never happen more than once.
-        _is_duplicate_example = (
-            label.strip().lower() == "example"
-            and any(r["label"].strip().lower() == "example" for r in rows)
-        )
+        # for. Originally caught only for "example" specifically; widened
+        # (2026-09-03) to any label after the same failure showed up on
+        # "Definition" too — a source ANSWER with a definitional-sounding
+        # sentence elsewhere besides its opening (e.g. a later summary
+        # restating what each item is) gets its own row, and the model's
+        # free-form labeling of a definitional row naturally lands on
+        # "Definition" again, producing two rows with the same label
+        # instead of one being folded into the first. No label in this
+        # table is meant to repeat — Definition and Example are each
+        # explicitly singular by the prompt's own instructions, and every
+        # STEP 1 attribute row is supposed to be its own distinct point —
+        # so a repeated label is always a formatting bug, never a
+        # legitimate second row. Keep only the first occurrence.
+        _is_duplicate_label = label.strip().lower() in _seen_row_labels
         # Confirmed live: the Example row is explicitly allowed to invent a
         # generic illustrative scenario ("$1,000 medical bill") that isn't
         # drawn from the ANSWER — exempted for the same reason the
         # hallucination-figure check above exempts it (STEP 2's content
         # isn't required to come from — or be scoped to — the ANSWER).
-        _is_cross_topic_contaminated = label.strip().lower() != "example" and bool(
-            (_strong_anchor_types_in(val_a) | _strong_anchor_types_in(val_b)) - _expected_anchor_types
-        )
+        #
+        # Confirmed live (2026-08-25): "What is the difference between term
+        # insurance and whole life insurance?" — the mandatory Definition
+        # row got silently dropped every time. Root cause: _ANCHOR_TYPE_RE
+        # has both "life" and "whole\s*life" as separate alternatives, so
+        # _expected_anchor_types for this pair is {"term", "whole life"} —
+        # but a genuinely correct Definition row explaining "Term insurance
+        # is a type of LIFE INSURANCE that..." mentions the bare parent
+        # category "life", not the compound "whole life", which isn't IN
+        # _expected_anchor_types and got flagged as contamination. Term
+        # insurance and whole life insurance are both named sub-types of
+        # life insurance — mentioning that shared parent category while
+        # defining either one is correct content, not a different product
+        # leaking in, the same "named variant of the same broader thing"
+        # distinction already generalized into this file's main answer
+        # prompts (see DETAILED_GROUNDED_PROMPT rule 9d). An anchor type
+        # that's a whole-word SUBSTRING of one of the expected types (like
+        # "life" inside "whole life") is that type's own parent category,
+        # not a genuinely different, unrelated product — exclude it from
+        # the contamination set rather than flagging it.
+        _flagged_anchor_types = (_strong_anchor_types_in(val_a) | _strong_anchor_types_in(val_b)) - _expected_anchor_types
+        _flagged_anchor_types = {
+            t for t in _flagged_anchor_types
+            if not any(re.search(rf"\b{re.escape(t)}\b", e) for e in _expected_anchor_types)
+        }
+        _is_cross_topic_contaminated = label.strip().lower() != "example" and bool(_flagged_anchor_types)
         if (
             not label
             or _TABLE_ROW_SKIP_LABEL_RE.match(label)
@@ -4639,11 +6211,12 @@ TABLE:"""
             or _is_item_name_label_row
             or _is_partial_name_echo
             or _is_hallucinated_figure_row
-            or _is_duplicate_example
+            or _is_duplicate_label
             or _is_cross_topic_contaminated
         ):
             continue
         rows.append({"label": label, "values": [val_a or "Not specified", val_b or "Not specified"]})
+        _seen_row_labels.add(label.strip().lower())
 
     # STEP 1 asks for the Definition row first, but prompt-only compliance
     # on row ORDER (as opposed to row presence) has proven unreliable
@@ -4892,6 +6465,230 @@ Reply with ONLY the 1-2 new sentences (or "NONE") — no lead-in, no commentary.
     if addition[-1] not in ".!?":
         addition += "."
 
+    sign_off_re = re.compile(
+        r"(Let me know if you want more details! 😊|Hope that clears it up! Let me know if you want me to dig into any part of this\. 😊)\s*$"
+    )
+    sm = sign_off_re.search(answer_text)
+    if sm:
+        return answer_text[:sm.start()].rstrip() + " " + addition + " " + answer_text[sm.start():]
+    return answer_text.rstrip() + " " + addition
+
+
+_REQUIREMENT_QUESTION_RE = re.compile(
+    r"\b(should i|do i need|is it required|do i have to|must i|"
+    r"need to (?:buy|get|have|carry)|is .{0,40} required)\b",
+    re.IGNORECASE,
+)
+
+
+async def _enforce_requirement_type_named(
+    query: str, context_text: str, answer_text: str
+) -> Optional[str]:
+    """
+    Some KNOWLEDGE BASE chunks tie an insurance requirement to a SPECIFIC
+    named process or document (a visa, permit, license, certificate,
+    declaration, ...) required by a named place or authority — not just a
+    generic "minimum coverage" statement. Confirmed live and reproducible
+    on one real case (a travel-insurance chunk ties its coverage minimum
+    to a Schengen-area VISA application) that fresh, uncached brief-mode
+    answers named the specific requirement type ("visa") only about half
+    the time — the rest settled for a generic "meets a minimum
+    requirement for the Schengen Area" that drops which specific process
+    the requirement is actually for, even though the full chunk text
+    (confirmed short enough to skip context-compression's sentence
+    trimming entirely, so nothing was lost in retrieval) reaches the
+    model intact every time. This is ordinary LLM summarization variance
+    — when compressing several source facts into a short answer, a
+    secondary qualifying noun sometimes loses out to the primary place
+    name — not something specific to Schengen's wording, so this check
+    is driven entirely by whatever CONTEXT/ANSWER text is actually in
+    front of it each call, with no hardcoded place or requirement-type
+    vocabulary anywhere in the prompt below. It applies unchanged to any
+    future KNOWLEDGE BASE document naming a different place and a
+    different specific requirement type.
+
+    Only runs for "should I"/"do I need"-shaped questions — the same
+    question shape the prompt's own STOP-checkpoint rule about this
+    targets — so this stays a bounded, occasional extra call, not one
+    added to every reply.
+
+    Returns None (no correction) when the query isn't this shape, the
+    answer is a refusal or too short, the LLM finds no such specific
+    named requirement in the CONTEXT, the answer already names it, the
+    returned phrase doesn't share any real word with the CONTEXT (a
+    lightweight grounding sanity check — this never invents a new fact,
+    only surfaces one already present in the CONTEXT), or the call
+    fails/times out.
+
+    Extended (same shape, two questions in one call rather than a
+    second function) to also catch a related but distinct gap: even
+    once the requirement TYPE is named, a place-specific question
+    deserves the CONTEXT's actual SCOPE specifics (how long it stays
+    valid, where it applies, what it must cover, when it's checked),
+    not a bare "meets the requirement" sentence — confirmed live this
+    is a real, separate reliability gap even after the requirement-type
+    fix above: fresh, uncached runs of the same Schengen case sometimes
+    named "visa" correctly but still gave zero scope detail (validity/
+    duration/repatriation all present in the CONTEXT, none surfaced).
+    Runs as two separate, single-purpose LLM calls in parallel (not one
+    combined call asking both questions) — confirmed live a combined
+    call reliably under-delivered on one line or the other, a known LLM
+    tendency to under-effort on a multi-part ask; splitting doubles the
+    call count but keeps latency roughly the same since both run
+    concurrently via asyncio.gather.
+    """
+    if not _REQUIREMENT_QUESTION_RE.search(query or ""):
+        return None
+    if not answer_text or answer_text.strip().lower().startswith("hmm, i don't have"):
+        return None
+    if len(answer_text) < 40:
+        return None
+
+    _type_prompt = f"""The KNOWLEDGE BASE below may tie an insurance requirement to a
+SPECIFIC named process or document (a visa, permit, license, certificate,
+authorization, declaration, or similar) required by a named place or
+authority — not just a generic minimum-coverage statement.
+
+Read the KNOWLEDGE BASE and the EXISTING ANSWER below. If the KNOWLEDGE BASE
+names such a specific process/document, but the EXISTING ANSWER only
+describes it generically (e.g. "meets a minimum requirement", "required
+coverage") without ever naming what specific process/document it actually
+is, reply with ONLY that missing name, exactly as the KNOWLEDGE BASE states
+it, in 2-6 words. Right shape (never reuse this wording — it is a
+deliberately unrelated, non-insurance example only to show the SHAPE of a
+correct reply, two or three words naming a specific document tied to a
+place or authority): "a fishing license". Take the actual name only from
+the KNOWLEDGE BASE text below, never from this example — if the KNOWLEDGE
+BASE names something else entirely (a permit, a certificate, anything),
+reply with THAT, in its own words, not this placeholder.
+
+If the EXISTING ANSWER already names the specific process/document, or the
+KNOWLEDGE BASE does not tie the requirement to any such specific named
+process/document, reply with exactly the single word "NONE".
+
+KNOWLEDGE BASE:
+{context_text[:4000]}
+
+EXISTING ANSWER:
+{answer_text}
+
+Reply with ONLY the missing name (or "NONE") — no lead-in, no commentary."""
+
+    _scope_prompt = f"""The KNOWLEDGE BASE below may state specific SCOPE details about an
+insurance requirement — how long it must stay valid, where it must apply,
+what it must cover, or when it gets checked — beyond just a generic
+minimum-coverage statement.
+
+Read the KNOWLEDGE BASE and the EXISTING ANSWER below. If the KNOWLEDGE BASE
+states a scope specific that the EXISTING ANSWER leaves out entirely, reply
+with ONLY the single most important missing detail, in one short clause
+under 15 words, using the KNOWLEDGE BASE's own wording. Right shape (never
+reuse this wording or these facts — it is a deliberately unrelated, non-
+insurance example only to show the SHAPE of a correct reply): "valid for
+the full calendar year regardless of when the fee was paid". Take the
+actual detail only from the KNOWLEDGE BASE text below, never from this
+example.
+
+If the EXISTING ANSWER already covers the KNOWLEDGE BASE's scope specifics,
+or the KNOWLEDGE BASE states none, reply with exactly the single word "NONE".
+
+KNOWLEDGE BASE:
+{context_text[:4000]}
+
+EXISTING ANSWER:
+{answer_text}
+
+Reply with ONLY the missing detail (or "NONE") — no lead-in, no commentary."""
+
+    # Two SEPARATE, single-purpose calls run in parallel, not one combined
+    # call asking both questions — confirmed live this matters: the earlier
+    # combined-question version reliably under-delivered on one line or the
+    # other (missed the requirement type roughly as often as it missed
+    # scope, in different runs), a known LLM tendency to under-effort on a
+    # multi-part ask. Splitting doubles the call count but keeps latency
+    # roughly the same as one call, since both run concurrently. Each gets
+    # its own retry-on-empty, matching the same reasoning: this function
+    # only ever ADDS grounded content, never edits or removes anything, so
+    # a wasted retry costs one extra call, not correctness — confirmed
+    # live, an isolated re-run of a case that flaked to NONE on live's
+    # first attempt came back with a real, correctly-grounded addition.
+    async def _single_check(prompt_text: str) -> Optional[str]:
+        raw = None
+        for _attempt in range(2):
+            try:
+                _candidate = await _backend_completion(prompt_text, max_tokens=40, timeout=12, temperature=0)
+            except Exception as exc:
+                logger.debug("[ask_stream] requirement-completeness check call failed (attempt %d): %s", _attempt + 1, exc)
+                continue
+            if not _candidate:
+                continue
+            raw = _candidate
+            if _candidate.strip().upper() != "NONE":
+                break
+        return raw
+
+    _type_raw, _scope_raw = await asyncio.gather(
+        _single_check(_type_prompt), _single_check(_scope_prompt),
+    )
+    if not _type_raw and not _scope_raw:
+        return None
+
+    _kb_lower = context_text.lower()
+    _answer_lower = answer_text.lower()
+
+    def _grounded(phrase: str) -> bool:
+        _words = re.findall(r"[a-z]{4,}", phrase.lower())
+        return not _words or any(w in _kb_lower for w in _words)
+
+    # Confirmed live: the LLM's own "does the EXISTING ANSWER already cover
+    # this" judgment (asked directly in the prompt above) isn't reliable
+    # enough on its own — it sometimes proposes a "missing" scope detail
+    # that's already explicitly stated in the answer, just reworded
+    # slightly ("covering the full length of your stay" already present,
+    # then re-added as "covering the full length of the intended stay"),
+    # producing an awkward, genuinely redundant duplicate sentence. A
+    # cheap, deterministic word-overlap check against the answer's OWN
+    # text (not the KNOWLEDGE BASE) catches this: if most of the
+    # candidate addition's real words already appear literally in the
+    # answer, treat it as already-covered and skip it, regardless of what
+    # the LLM itself judged.
+    def _already_in_answer(phrase: str) -> bool:
+        _words = re.findall(r"[a-z]{4,}", phrase.lower())
+        if not _words:
+            return False
+        _present = sum(1 for w in _words if w in _answer_lower)
+        return (_present / len(_words)) >= 0.6
+
+    missing_type = _type_raw.strip().strip('"').strip("'").rstrip(".") if _type_raw else ""
+    missing_scope = _scope_raw.strip().strip('"').strip("'").rstrip(".") if _scope_raw else ""
+
+    additions = []
+    if (
+        missing_type and missing_type.upper() != "NONE" and len(missing_type) <= 60
+        and _grounded(missing_type) and not _already_in_answer(missing_type)
+    ):
+        additions.append(f"You'll need this specifically for {missing_type}.")
+    elif missing_type and missing_type.upper() != "NONE":
+        logger.debug(
+            "[ask_stream] requirement-type-named check discarded type %r (ungrounded, oversized, or already present)",
+            missing_type,
+        )
+    if (
+        missing_scope and missing_scope.upper() != "NONE" and len(missing_scope) <= 150
+        and _grounded(missing_scope) and not _already_in_answer(missing_scope)
+    ):
+        _clause = missing_scope[0].upper() + missing_scope[1:] if missing_scope else missing_scope
+        additions.append(f"{_clause}.")
+    elif missing_scope and missing_scope.upper() != "NONE":
+        logger.debug(
+            "[ask_stream] requirement-type-named check discarded scope detail %r (ungrounded, oversized, or already present)",
+            missing_scope,
+        )
+
+    if not additions:
+        return None
+
+    addition = " ".join(additions)
     sign_off_re = re.compile(
         r"(Let me know if you want more details! 😊|Hope that clears it up! Let me know if you want me to dig into any part of this\. 😊)\s*$"
     )
@@ -5348,15 +7145,72 @@ from rag import LLM_CONTEXT_WINDOW_CHARS
 _CHARS_PER_TOKEN = 3
 
 
-def _measure_prompt_tokens(prompt: str) -> int:
+def _measure_prompt_tokens_ex(prompt: str) -> "tuple[int, bool]":
     """Real token count via vLLM's own /tokenize endpoint (note: lives
-    directly under VLLM_HOST, NOT under /v1/ — confirmed live 2026-08-04).
+    directly under VLLM_HOST, NOT under /v1/ — confirmed live 2026-08-04),
+    plus whether that real measurement actually succeeded.
     Falls back to the char/_CHARS_PER_TOKEN heuristic on ANY failure so a
     transient hiccup at container boot (vLLM not up yet, a network blip)
     degrades to exactly today's behavior rather than crashing import or
     silently under-budgeting every request for the process's lifetime.
     Calling out to the vLLM host here isn't a NEW failure mode — this app
     already hard-depends on that same host for every single request.
+
+    The bool return exists because the char/N fallback is materially less
+    reliable than a real measurement for the specific mixed English/table/
+    numeric content this app retrieves — confirmed live (2026-08-27): a
+    /tokenize timeout on a genuinely busy vLLM host forced the char/3
+    fallback for one request's whole budget calculation, and the resulting
+    estimate was close enough to correct to pass the 50-token buffer sized
+    for REAL measurements, but not close enough to avoid the backend's own
+    tokenizer counting 4064+ input tokens against a 4096 ceiling — a live
+    "Could not generate an answer due to an internal error" 400. Callers
+    close to the ceiling need to know when they only have an estimate so
+    they can widen their safety margin accordingly.
+
+    Tokenizes as a CHAT message (`messages=[{"role": "user", ...}]`), not
+    as a raw completion `prompt=`, even though this measurement is only
+    ever used to budget for `llm.invoke(prompt)` calls (a bare string,
+    which langchain's ChatOpenAI wraps into exactly one user message).
+    Confirmed live (2026-08-27) this distinction is NOT cosmetic: vLLM's
+    chat template injects a default system message plus role/special
+    tokens when none is supplied — "hello world" measured 2 raw tokens vs
+    31 as a chat message on this deployment's model. A same-request 400
+    survived even a genuinely REAL (non-fallback) /tokenize measurement
+    once the trim loop had chewed the buffer down to its floor, because
+    the raw-prompt form was silently undercounting by that same ~29-token
+    template overhead on every single measurement in this function.
+    """
+    if not VLLM_HOST:
+        return len(prompt) // _CHARS_PER_TOKEN, False
+    try:
+        import json as _json_tok
+        import urllib.request as _urlreq_tok
+        body = _json_tok.dumps({
+            "model": _resolve_vllm_model(),
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode()
+        req = _urlreq_tok.Request(
+            f"{VLLM_HOST}/tokenize", data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"},
+            method="POST",
+        )
+        with _urlreq_tok.urlopen(req, timeout=15) as resp:
+            return _json_tok.loads(resp.read())["count"], True
+    except Exception as exc:
+        logger.warning(
+            "[token-budget] /tokenize measurement failed, falling back to "
+            "char/%d estimate for this prompt: %s", _CHARS_PER_TOKEN, exc,
+        )
+        return len(prompt) // _CHARS_PER_TOKEN, False
+
+
+def _measure_prompt_tokens(prompt: str) -> int:
+    """Real token count via vLLM's /tokenize endpoint, char/N estimate on
+    failure. See _measure_prompt_tokens_ex for the full rationale and for
+    getting the real-vs-estimate flag when that distinction matters (it
+    doesn't for this function's own callers — the three module-level
+    constants below, computed once at import time from static templates).
     Computed once at import time and cached in the module-level constants
     below, never re-measured per request. Deliberately NOT hardcoding the
     measured numbers as literals: that's the exact staleness bug that
@@ -5365,25 +7219,7 @@ def _measure_prompt_tokens(prompt: str) -> int:
     if a prompt template's size changes, the next process boot re-measures
     it automatically.
     """
-    if not VLLM_HOST:
-        return len(prompt) // _CHARS_PER_TOKEN
-    try:
-        import json as _json_tok
-        import urllib.request as _urlreq_tok
-        body = _json_tok.dumps({"model": _resolve_vllm_model(), "prompt": prompt}).encode()
-        req = _urlreq_tok.Request(
-            f"{VLLM_HOST}/tokenize", data=body,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"},
-            method="POST",
-        )
-        with _urlreq_tok.urlopen(req, timeout=15) as resp:
-            return _json_tok.loads(resp.read())["count"]
-    except Exception as exc:
-        logger.warning(
-            "[token-budget] /tokenize measurement failed, falling back to "
-            "char/%d estimate for this prompt: %s", _CHARS_PER_TOKEN, exc,
-        )
-        return len(prompt) // _CHARS_PER_TOKEN
+    return _measure_prompt_tokens_ex(prompt)[0]
 
 
 _STRICT_PROMPT_TOKENS_EST = _measure_prompt_tokens(STRICT_GROUNDED_PROMPT)
@@ -5417,6 +7253,59 @@ logger.info(
 # again, the same principle _measure_prompt_tokens uses above.
 _VLLM_MAX_TOKENS_DETAILED = int(os.getenv("VLLM_MAX_TOKENS", "900"))
 _VLLM_MAX_TOKENS_BRIEF = int(os.getenv("VLLM_MAX_TOKENS_BRIEF", "300"))
+
+# _verify_point_faithfulness's own evidence-char budget, kept separate from
+# _GROUNDING_CONTEXT_CHARS (a DIFFERENT, shorter prompt template used by
+# _build_grounding_context's pre-generation relevance check) rather than
+# sharing one constant across two prompts with different fixed overhead.
+# Confirmed live 2026-08-31: a claim ("buying life insurance young locks in
+# a lower premium") that's genuinely, almost verbatim present in the
+# retrieved pool got dropped as "not grounded" purely because the flat
+# 6000-char evidence cap this used to share with the other prompt truncated
+# it out of view after the per-sentence embedding re-sort — the checker
+# never got to see the one chunk that would have proven the claim true,
+# same root shape as the "6000-char truncation-order bug" already fixed
+# once for salvage claims (see project_postgen_faithfulness_check memory),
+# just for whole points/sentences instead. Measures THIS prompt's own real
+# fixed overhead (instructions + an 800-char worst-case hypothesis, the
+# same slice _verify_point_faithfulness applies below) via the same real-
+# tokenizer measurement _STRICT_PROMPT_TOKENS_EST etc. use just above,
+# rather than hand-picking a number — the exact "stale hardcoded token
+# constant" bug class _measure_prompt_tokens exists to prevent. Uses the
+# same 3900-token safe ceiling (out of the model's real 4096) and 3-chars/
+# token conservative ratio already established for this codebase, with a
+# 100-token output/safety reserve (this check's own answer is a single
+# word) and a floor at the OLD 6000 so a measurement failure (fallback to
+# the char/3 estimate) can only ever raise this, never shrink it below
+# what was already safely shipping.
+_ENTAILMENT_FIXED_PROMPT_TOKENS_EST = _measure_prompt_tokens(
+    "You are given a task to identify if the hypothesis is grounded "
+    "and entailed to the evidence.\n"
+    "You will only use the contents of the evidence and not rely on "
+    "external knowledge.\n"
+    "The hypothesis may state only PART of a longer evidence sentence "
+    "— that still counts as entailed.\n"
+    "The hypothesis may use plainer, more general wording than the "
+    "evidence's own — that alone is not a reason to say no; judge "
+    "whether the evidence supports its MEANING, not whether it repeats "
+    "the evidence's exact words.\n"
+    "A hypothesis stating that two named things are SEPARATE, not "
+    "combined, or not covered by the same product also counts as "
+    "entailed when the evidence discusses one of them without ever "
+    "stating they are combined — the evidence does not need to "
+    "explicitly say \"these are separate\" for that to be true.\n"
+    'Answer with yes/no. "evidence": '
+    '"hypothesis": ' + ("x" * 800) + ' "entails":'
+)
+_ENTAILMENT_CONTEXT_CHARS = max(
+    6000,
+    (3900 - _ENTAILMENT_FIXED_PROMPT_TOKENS_EST - 100) * _CHARS_PER_TOKEN,
+)
+logger.info(
+    "[token-budget] entailment-check fixed overhead=%d tokens -> evidence budget=%d chars "
+    "(was a flat 6000)",
+    _ENTAILMENT_FIXED_PROMPT_TOKENS_EST, _ENTAILMENT_CONTEXT_CHARS,
+)
 
 
 class MultiSourceRAG:
@@ -5466,6 +7355,805 @@ class MultiSourceRAG:
                     seen[h] = chunk
         return list(seen.values())
 
+    # Same 0.5x figure already tuned and in production use for the
+    # rerank-stage discount (_TYPE_MISMATCH_DISCOUNT's general-query
+    # branch) — reused here rather than a second, independently-guessed
+    # constant, since it's the same underlying judgment call ("how much
+    # should a general-tagged chunk be discounted against a confident
+    # specific-type match").
+    _RETRIEVAL_GENERAL_DISCOUNT = 0.5
+    # How much wider than the final doc_top_k to pull from the vector
+    # store before re-weighting and cutting back down. Confirmed live
+    # (2026-08-25): the metadata filter for a confident, specific-type
+    # query passes BOTH that type's chunks AND every "general"-tagged
+    # chunk (by design — see build_metadata_filter's own docstring, so
+    # cross-cutting reference content is never hidden from any query).
+    # That's fine when "general" is a small bucket, but a single
+    # document that ends up entirely general-tagged (a broad reference
+    # textbook, not specific to one policy type) can flood the ORIGINAL
+    # top_k on raw dense+BM25 similarity alone — reweighting only what
+    # already survived a too-narrow top_k cut can't recover a chunk that
+    # never made it that far. Widening first, then reweighting, then
+    # cutting back to the real doc_top_k is what actually gives a
+    # smaller, correctly-typed document's own best chunk a fair shot at
+    # surviving alongside a much larger general-tagged one.
+    _RETRIEVAL_WIDEN_FACTOR = 3
+
+    # A chunk with fewer real body words than this (its own heading
+    # excluded from the count) is treated as extraction noise, not a
+    # genuine short answer — a mis-split heading that swallowed almost
+    # none of its section's real content, a table-fragment/form-field
+    # artifact, an answer-key snippet. 15 chosen from direct corpus
+    # inspection (2026-08-25): every one of the 45 chunks below this bar
+    # was a genuine fragment, not a legitimately terse real answer.
+    _THIN_BODY_WORD_THRESHOLD = 15
+    # More aggressive than _RETRIEVAL_GENERAL_DISCOUNT (0.5x) — a thin
+    # fragment isn't "less specifically typed than ideal" the way a
+    # general-tagged chunk is, it's usually not real answerable content
+    # at all. Still a discount, not a hard drop — the rare case where a
+    # short chunk genuinely IS the whole real answer still gets a chance
+    # to surface if nothing else in the pool is a better match.
+    _THIN_BODY_DISCOUNT = 0.15
+
+    # High-precision QUERY-side phrasing, not chunk-classification
+    # vocabulary reused as-is — a chunk classifier needs >=2 keyword hits
+    # to avoid false positives on a whole paragraph's worth of text, but
+    # a short query gets one shot, so these are specific multi-word
+    # phrasings people actually use to ask for exactly ONE category,
+    # scoped narrowly enough that a broad "explain X in detail" query —
+    # which shares no vocabulary with any of them — never matches any
+    # category, on purpose: guaranteed-inclusion should only ever narrow
+    # what's ADDED to the pool for a query that's clearly asking about
+    # one specific thing, never for a genuinely broad request that needs
+    # a mix of sections. "definitions"/"eligibility" deliberately
+    # excluded as their own category — bare "what is X" is too easily
+    # confused with a general "explain X" ask to be safe here, but
+    # "define X"/"meaning of X" are specific enough to keep.
+    _QUERY_SECTION_INTENT_PATTERNS = {
+        "benefits": [
+            r"\bwhat (does|do) .{0,40}\bcovers?\b",
+            r"\bwhat.{0,10}covered\b",
+            r"\bbenefits? of\b",
+            r"\bcoverage (details|includes?)\b",
+        ],
+        "exclusions": [
+            r"\bexclu\w*",
+            r"\bnot covered\b",
+            r"\bdoesn'?t cover\b",
+            r"\bdoes not cover\b",
+        ],
+        "claims": [
+            r"\bclaims? process\b",
+            r"\bclaims? procedure\b",
+            r"\bhow (to|do i) (file|claim|submit)\b",
+            r"\bfile a claim\b",
+            # Confirmed live (2026-08-25): "Explain in detail how a health
+            # insurance claim works" matched none of the patterns above —
+            # "how X claim works" isn't "how do I file/claim/submit" or
+            # "claims process/procedure" — so the section-intent veto never
+            # fired, and an off-topic "definitions" chunk (0.993, about
+            # contract interpretation, not claims) outscored the real
+            # claims-procedure chunk (0.742) that actually had both the
+            # cashless and reimbursement content the answer needed.
+            r"\bclaims? works?\b",
+            r"\bhow (does|do|did) .{0,30}\bclaims?\b",
+            r"\bwalk me through .{0,30}\bclaim",
+            # Confirmed live (2026-08-27): "my dad passed away last month
+            # and he had a life policy, what do we as a family need to do
+            # now" matched none of the patterns above either — it never
+            # uses the word "claim" at all, describing the triggering
+            # event (a death) and asking what to do next in plain,
+            # bereavement-euphemism language instead. With no section
+            # signal at all, retrieval fell back to pure semantic
+            # similarity, where a "benefits" chunk about how much life
+            # cover to buy outscored the actual "How to File a Life
+            # Insurance Claim" chunk (nominee informs insurer, claim form,
+            # death certificate) that directly answered the question.
+            # Scoped to a family-relation term near a death euphemism —
+            # not bare "died"/"passed away" alone — so this doesn't
+            # over-trigger on an unrelated mechanics question like "what
+            # happens to my premium payments if I die before the term
+            # ends" (no named relation, hypothetical framing).
+            r"\b(dad|father|mom|mother|husband|wife|spouse|parent)\b.{0,40}"
+            r"\b(passed away|passed on|died|is dead|deceased)\b",
+            r"\b(passed away|passed on|died|deceased)\b.{0,40}\b(life (policy|insurance)|policy)\b",
+        ],
+        "definitions": [
+            r"\bdefine\b",
+            r"\bmeaning of\b",
+            r"\bwhat does .{0,30}\bmean\b",
+            r"\bdefinition of\b",
+        ],
+        "eligibility": [
+            r"\bwho (is|are|can be) eligible\b",
+            r"\beligibility (criteria|requirements?)\b",
+            r"\b(minimum|maximum|entry) age\b",
+            r"\bage limit\b",
+            r"\bwho can (buy|apply|purchase)\b",
+        ],
+        "flight_delay": [
+            r"\bflight delay\b",
+            r"\btrip delay\b",
+            r"\bdeparture delay\b",
+            r"\bdelayed flight\b",
+        ],
+        "baggage": [
+            r"\bbaggage (loss|delay|lost|damaged)\b",
+            r"\blost (my )?luggage\b",
+            r"\bluggage (loss|delay|lost|damaged)\b",
+            r"\b(baggage|luggage).{0,15}\b(lost|delayed|damaged)\b",
+            r"\b(lost|delayed|damaged).{0,15}\b(baggage|luggage)\b",
+        ],
+        # Handbook-only categories (reference/textbook content, not the
+        # product-guide shape) — the ones with genuine, real chunk volume
+        # in this corpus (legislation=136, types_of_insurance=108 are the
+        # 2nd and 3rd largest section categories overall, ahead of
+        # benefits+exclusions+claims combined) and a query shape someone
+        # would plausibly actually type. "chapter" and "general" are
+        # deliberately excluded — those are document-structure labels
+        # ("Lesson 3", "Self-Test Questions"), not a topic a query could
+        # name intent for.
+        "legislation": [
+            r"\bregulations?\b",
+            r"\blegislation\b",
+            r"\binsurance act\b",
+            r"\birda\b",
+            r"\blegal(ly)? requirements?\b",
+            r"\bwhat does the law\b",
+        ],
+        "types_of_insurance": [
+            r"\btypes? of\b.{0,20}\binsurance\b",
+            r"\bkinds? of\b.{0,20}\binsurance\b",
+            r"\bdifferent (types|kinds) of\b",
+            r"\bvarieties of\b.{0,20}\binsurance\b",
+        ],
+        "principles": [
+            r"\bprinciple(s)? of\b",
+            r"\binsurance principles?\b",
+            r"\bdoctrine of\b",
+        ],
+        "history": [
+            r"\bhistory of\b",
+            r"\borigins? of\b",
+            r"\bhow did.{0,20}(start|begin|originate)\b",
+            r"\bwhen (was|did).{0,20}(introduced|start|begin|found)",
+        ],
+        "case_law": [
+            r"\bcourt case\b",
+            r"\bcase law\b",
+            r"\blegal precedent\b",
+            r"\bjudge?ment\b",
+        ],
+        "medical": [
+            r"\bemergency medical\b",
+            r"\bmedical evacuation\b",
+            r"\bmedical expenses?\b.{0,25}\b(travel|trip|abroad)\b",
+        ],
+    }
+
+    def _classify_query_section_intent(self, query: str) -> Optional[tuple[str, bool]]:
+        """
+        Returns (section_label, is_candidate) — is_candidate distinguishes
+        a fixed-pattern match (filter on the chunk's real `section` field)
+        from an open-vocabulary match (filter on `candidate_section`
+        instead — see candidate_section_vocab.py). Falls back to the
+        candidate lookup ONLY when the fixed patterns miss — a query
+        matching a real, known category should never be second-guessed by
+        a coincidental candidate-vocab keyword overlap.
+        """
+        q = (query or "").lower()
+        for section, patterns in self._QUERY_SECTION_INTENT_PATTERNS.items():
+            if any(re.search(p, q) for p in patterns):
+                return (section, False)
+
+        from candidate_section_vocab import match_candidate_section_vocab
+        candidate = match_candidate_section_vocab(query)
+        if candidate:
+            return (candidate, True)
+        return None
+
+    async def _resolve_query_section_intent(
+        self, query: str, *, skip_hint_prefilter: bool = False,
+    ) -> Optional[tuple[str, bool]]:
+        """
+        Hybrid, LLM-fallback version of _classify_query_section_intent, for
+        call sites that can afford an occasional round trip — currently
+        just the section-intent mismatch VETO in ask_stream. Three stages,
+        mirroring _resolve_modifier_intent exactly: (1) the existing fast
+        path (regex, then candidate_vocab) resolves the vast majority of
+        real traffic for free; (2) if that finds nothing, a loose hint-word
+        pre-filter (_has_section_hint) decides whether asking is even worth
+        it — a genuinely plain question with none of that vocabulary
+        resolves to "no section intent" here, still free; (3) only then
+        does the LLM classifier actually run. See _SECTION_INTENT_LLM_PROMPT's
+        block comment for why this exists at all.
+
+        skip_hint_prefilter (2026-09-01): bypasses stage (2) entirely and
+        always tries the LLM when stage (1) finds nothing. The hint-word
+        list is a fixed vocabulary ("cover", "claim", "damage", "accident",
+        "compensate", ...) that a genuinely claims/liability-shaped
+        question can still miss completely — confirmed live: "my
+        neighbor's kid broke his arm playing in my backyard, could that
+        end up costing me money" has none of those words anywhere in it,
+        so the pre-filter silently returned "no section intent" without
+        ever asking the LLM, even though the LLM (once actually asked)
+        correctly resolves it. The caller passes this True specifically
+        when the query's policy_type is ALREADY confidently known (from
+        either regex or a properly multi-label-checked LLM call) — at that
+        point the query has already justified paying for one LLM round
+        trip, so skipping this word-list gate to pay for a second one here
+        is the same cost class, not a new one, and lets a query with zero
+        matching hint words still reach _metadata_scoped_retrieval's full
+        funnel instead of silently falling through it.
+
+        Deliberately NOT used by _policy_type_aware_doc_search's own
+        guaranteed-inclusion call to the plain classifier a few lines up —
+        that call runs inside asyncio.to_thread (a worker thread, no
+        running event loop to await into without extra plumbing) and its
+        failure mode is cheap (a possibly-relevant chunk doesn't get
+        force-included, retrieval just falls back to plain similarity
+        ranking for it). The veto's failure mode is the opposite and more
+        expensive — wrongly dropping real, relevant content — so it's the
+        one upgraded to pay for LLM judgment on a miss.
+
+        A successful LLM classification returns (label, False), same
+        as a regex match — it picked from the SAME closed category list
+        _QUERY_SECTION_INTENT_PATTERNS uses, just via LLM judgment instead
+        of a literal phrase match, so it's exactly as trustworthy for a
+        caller that (like the veto) only acts on non-candidate results.
+        """
+        _fast = self._classify_query_section_intent(query)
+        if _fast:
+            return _fast
+        # Semantic tier, before the hint-word prefilter and the LLM call —
+        # see _QUERY_SECTION_PROTOTYPES's own block comment for the full
+        # rationale. Cheap (no network round trip, same embedding model
+        # already loaded for retrieval) and independent of the hint-word
+        # list, so it runs unconditionally: a query the hint-word list
+        # would have silently skipped (no LLM ever asked) still gets a
+        # real classification attempt here.
+        _embed_result = _classify_query_section_by_embedding(query)
+        if _embed_result:
+            return _embed_result
+        q = (query or "").lower()
+        if not skip_hint_prefilter and not _has_section_hint(q):
+            return None
+        label = await _classify_query_section_llm(query)
+        if label:
+            logger.info(
+                "[ask_stream] section-intent LLM fallback fired: label=%r query=%r",
+                label, query[:80],
+            )
+            return (label, False)
+        # The fixed-12-category classifier said "none" — before giving up
+        # entirely, check whether this matches a topic already discovered
+        # during ingestion but outside that closed list (see
+        # _classify_query_candidate_section_llm's own docstring). Keeps
+        # the fixed-category prompt itself small and closed (reliable,
+        # fast) while still giving a genuinely open-vocabulary question a
+        # real LLM judgment call instead of only the cheap keyword-
+        # overlap check _classify_query_section_intent's fast path
+        # already does earlier in this same function.
+        candidate_label = await _classify_query_candidate_section_llm(query)
+        if candidate_label:
+            return (candidate_label, True)
+        return None
+
+    def _policy_type_aware_doc_search(
+        self,
+        query: str,
+        doc_top_k: int,
+        filter_meta: Optional[dict],
+        query_policy_type: Optional[str],
+    ) -> List[Document]:
+        """
+        Wraps the plain vector_store.search() call with a widen-then-
+        reweight-then-cut step, active whenever the query has SOME
+        confident type signal to prefer — either the closed-vocabulary
+        query_policy_type, or (when that's "general") a fast, free,
+        SELF-EXTENDING lookup against candidate_vocab's already-
+        discovered open-vocabulary labels. That lookup requires zero
+        code changes as new policy types get added to the KB over time —
+        it grows automatically through the same promotion pipeline
+        candidate_policy_type tagging already uses elsewhere in this
+        file (_candidate_mismatch), rather than needing a new regex
+        pattern hand-written here for every future type. Deliberately
+        does NOT fall through to the full LLM candidate-type classifier
+        for this — that's an unconditional cost on every single
+        "general"-classified query just to maybe improve retrieval
+        weighting, versus the free dict lookup's zero cost when nothing
+        matches. A brand-new type's very first-ever query still gets
+        plain, unweighted retrieval; every query about it after that
+        first promotion benefits automatically. A truly general query
+        (no signal either way) is untouched — a general-tagged document
+        legitimately winning several of its own chunks on merit there is
+        correct, not an exploit.
+        """
+        _effective_type = query_policy_type if query_policy_type and query_policy_type != "general" else None
+        _use_candidate_field = False
+        if _effective_type is None:
+            from candidate_vocab import match_candidate_vocab
+            _candidate_guess = match_candidate_vocab(query)
+            if _candidate_guess:
+                _effective_type = _candidate_guess
+                _use_candidate_field = True
+
+        def _body_word_count(doc: Document) -> int:
+            text = doc.page_content or ""
+            heading = (doc.metadata.get("section_heading") or "").strip()
+            body = text[len(heading):].lstrip("\n") if heading and text.startswith(heading) else text
+            return len(body.split())
+
+        def _thin_body_discount(doc: Document, base: float) -> float:
+            # Confirmed live (2026-08-25): a chunk's HEADING alone scores
+            # far higher against a query than heading+body together
+            # (0.896 vs 0.728 in a direct measured comparison) — adding
+            # real body content actually pulls similarity DOWN, since the
+            # body's own specific vocabulary rarely repeats the query's
+            # words the way a topic-restating heading does. That's a
+            # structural property of the embedding, not a bug in any one
+            # chunk — but it means a genuinely near-empty chunk (a mis-
+            # split heading that swallowed almost none of its section's
+            # real content, a table-fragment artifact, an answer-key
+            # snippet) rides that same effect to an artificially HIGH
+            # score purely because it has almost nothing BUT its heading
+            # dragging the vector down. Confirmed 45 such chunks exist in
+            # this corpus (<15 words of real body under their own
+            # heading) — table rows, form-field labels, garbled
+            # extraction fragments. Heavily discounted rather than
+            # dropped outright — the rare edge case where one is
+            # genuinely the only relevant match still gets a chance to
+            # surface, just never wins over substantive competition.
+            if _body_word_count(doc) < self._THIN_BODY_WORD_THRESHOLD:
+                return base * self._THIN_BODY_DISCOUNT
+            return base
+
+        if _effective_type is None:
+            # No type signal either way — still apply the thin-body
+            # discount (a near-empty fragment chunk is never a good
+            # answer regardless of query type), which needs some extra
+            # candidates pulled in first to have real competition to
+            # lose against once discounted.
+            candidates = self.doc_pipeline._vector_store.search(
+                query, top_k=doc_top_k * self._RETRIEVAL_WIDEN_FACTOR, use_hybrid=True, use_reranker=False,
+                filter_metadata=filter_meta,
+            )
+            candidates.sort(key=lambda d: _thin_body_discount(d, d.metadata.get("rrf_score", d.metadata.get("similarity", 0))), reverse=True)
+            return candidates[:doc_top_k]
+
+        wide_k = doc_top_k * self._RETRIEVAL_WIDEN_FACTOR
+        candidates = self.doc_pipeline._vector_store.search(
+            query, top_k=wide_k, use_hybrid=True, use_reranker=False,
+            filter_metadata=filter_meta,
+        )
+
+        def _adjusted_score(doc: Document) -> float:
+            base = doc.metadata.get("rrf_score", doc.metadata.get("similarity", 0))
+            is_document = str(doc.metadata.get("source_type", "document")).lower() == "document"
+            if not is_document:
+                return base
+            base = _thin_body_discount(doc, base)
+            chunk_type = str(doc.metadata.get("policy_type", "general")).lower()
+            if _use_candidate_field:
+                # Open-vocab guess only discounts chunks that are
+                # THEMSELVES untyped in the closed vocabulary AND don't
+                # carry the matching open-vocab label — a chunk already
+                # confidently typed some other closed-vocab way is
+                # unrelated to this guess and stays untouched.
+                if chunk_type == "general" and doc.metadata.get("candidate_policy_type") != _effective_type:
+                    return base * self._RETRIEVAL_GENERAL_DISCOUNT
+                return base
+            if chunk_type == "general":
+                return base * self._RETRIEVAL_GENERAL_DISCOUNT
+            return base
+
+        candidates.sort(key=_adjusted_score, reverse=True)
+        _final = candidates[:doc_top_k]
+
+        # Guaranteed inclusion for queries that clearly name ONE section
+        # category, not just a product. Confirmed live (2026-08-25): the
+        # widen-then-reweight step above still lost a real, correctly-
+        # tagged chunk ("What Health Insurance Typically Covers",
+        # policy_type=health, section=benefits) for a broad "explain
+        # health insurance in detail" query — a dense bullet list embeds
+        # further from a broad query than general prose does, no matter
+        # how much reweighting happens among whatever DID make the
+        # similarity-search cut. Reweighting can only reorder candidates
+        # that already survived that cut; it can't rescue one that
+        # didn't. get_all_by_filter finds every chunk matching BOTH the
+        # type and section regardless of embedding distance from the
+        # query, which is the actual guarantee a metadata-filter-shaped
+        # signal is supposed to provide instead of leaving it to pure
+        # similarity-score chance.
+        #
+        # Covers BOTH the closed-vocabulary path (filtering on
+        # policy_type) and the open-vocabulary path (filtering on
+        # candidate_policy_type instead — a chunk about a not-yet-
+        # promoted future type never gets policy_type set to that type,
+        # only candidate_policy_type). Not gating this off for future
+        # types is the whole point: a brand-new policy type promoted
+        # through the existing candidate pipeline gets this same
+        # guarantee automatically, with no new code needed for it, same
+        # self-extension principle as match_candidate_vocab() itself
+        # above.
+        _section_result = self._classify_query_section_intent(query)
+        if _section_result:
+            _section_intent, _section_is_candidate = _section_result
+            _type_field = "candidate_policy_type" if _use_candidate_field else "policy_type"
+            _section_field = "candidate_section" if _section_is_candidate else "section"
+            _guaranteed = self.doc_pipeline._vector_store.get_all_by_filter(
+                {_type_field: _effective_type, _section_field: _section_intent}
+            )
+            if _guaranteed:
+                _seen_hashes = {hash(d.page_content[:200]) for d in _final}
+                _new_guaranteed = [
+                    d for d in _guaranteed if hash(d.page_content[:200]) not in _seen_hashes
+                ]
+                if _new_guaranteed:
+                    if len(_new_guaranteed) > 1:
+                        _embed_model = self.doc_pipeline._vector_store.embed_model
+                        _q_vec = _embed_model.encode([query], normalize_embeddings=True)[0]
+                        _g_vecs = _embed_model.encode(
+                            [d.page_content for d in _new_guaranteed], normalize_embeddings=True
+                        )
+                        _new_guaranteed = [
+                            d for _, d in sorted(
+                                zip((_g_vecs @ _q_vec).tolist(), _new_guaranteed),
+                                key=lambda pair: pair[0], reverse=True,
+                            )
+                        ]
+                    _room = max(0, doc_top_k - len(_final))
+                    _final = _new_guaranteed[:1] + _final[:doc_top_k - 1] if _room == 0 else _final + _new_guaranteed[:_room]
+                    logger.info(
+                            "[ask_stream] section-intent guaranteed inclusion: %s=%s section=%s "
+                            "added %d chunk(s) that similarity search alone would have missed",
+                            _type_field, _effective_type, _section_intent, min(len(_new_guaranteed), max(1, _room)),
+                        )
+
+        # Heading-text guaranteed inclusion — a second, independent check
+        # alongside the section-category one above, for cases where the
+        # query's own wording closely echoes a SPECIFIC chunk's heading
+        # even when no fixed OR candidate section category cleanly
+        # applies. section_heading is free text (see its own field
+        # comment elsewhere in this file) — there's no closed vocabulary
+        # to match against, so this compares the query directly against
+        # every heading's own embedding instead. Scoped to the SAME
+        # _type_field/_effective_type constraint as the section check
+        # above — headings repeat near-identically across products
+        # ("Common Exclusions" in the marine guide reads the same as in
+        # the motor guide), so matching heading text without first
+        # locking in the policy type would reopen exactly the cross-
+        # product mixing this whole mechanism exists to prevent.
+        _type_field_h = "candidate_policy_type" if _use_candidate_field else "policy_type"
+        _typed_pool = self.doc_pipeline._vector_store.get_all_by_filter({_type_field_h: _effective_type})
+        _headed = [d for d in _typed_pool if (d.metadata.get("section_heading") or "").strip()]
+        if _headed:
+            _embed_model = self.doc_pipeline._vector_store.embed_model
+            _q_vec_h = _embed_model.encode([query], normalize_embeddings=True)[0]
+            _h_vecs = _embed_model.encode(
+                [d.metadata["section_heading"] for d in _headed], normalize_embeddings=True
+            )
+            _h_scores = (_h_vecs @ _q_vec_h).tolist()
+            _best_idx = max(range(len(_headed)), key=lambda i: _h_scores[i])
+            _best_heading_lower = _headed[_best_idx].metadata["section_heading"].strip().lower()
+            # Runner-up score among DIFFERENT heading text only — a
+            # document with 2-3 chunks sharing the identical heading
+            # (a long section split across chunks) should never look
+            # like a weak, ambiguous match just because its own
+            # duplicate "competes" with itself for 2nd place.
+            _runner_up = max(
+                (s for d, s in zip(_headed, _h_scores)
+                 if d.metadata["section_heading"].strip().lower() != _best_heading_lower),
+                default=0.0,
+            )
+            # Confirmed live (2026-08-25): a merely topically-related but
+            # WRONG heading can score respectably high on its own
+            # (0.787) — even above a naive 0.75 cutoff — while the
+            # actually-correct heading for that same query scored LOWER
+            # (0.711) purely because generic shared vocabulary ("health
+            # insurance") outweighs the specific intent word in a short
+            # heading's embedding. Absolute score alone can't tell a
+            # confident match from a lucky one. Genuinely confident
+            # matches in that same test clustered at 0.83-0.96 with a
+            # CLEAR margin (0.07-0.19) over their own runner-up; both
+            # false positives found had a near-tied runner-up (~0.02
+            # margin) — a real winner stands out, a coincidental one
+            # barely edges out the field. Requiring both bars is what
+            # actually separates them; either alone let the false
+            # positive through.
+            _HEADING_MATCH_THRESHOLD = 0.80
+            _HEADING_MATCH_MARGIN = 0.05
+            if (
+                _h_scores[_best_idx] >= _HEADING_MATCH_THRESHOLD
+                and (_h_scores[_best_idx] - _runner_up) >= _HEADING_MATCH_MARGIN
+            ):
+                _best_doc = _headed[_best_idx]
+                _seen_hashes_h = {hash(d.page_content[:200]) for d in _final}
+                if hash(_best_doc.page_content[:200]) not in _seen_hashes_h:
+                    if len(_final) < doc_top_k:
+                        _final = _final + [_best_doc]
+                    else:
+                        _final = [_best_doc] + _final[:doc_top_k - 1]
+                    logger.info(
+                        "[ask_stream] heading-match guaranteed inclusion: %s=%s heading=%r score=%.3f",
+                        _type_field_h, _effective_type, _best_doc.metadata.get("section_heading"), _h_scores[_best_idx],
+                    )
+
+        return _final
+
+    async def _metadata_scoped_retrieval(
+        self, retrieval_query: str, policy_type: Union[str, List[str]], section: Optional[str], chunk_limit: int,
+        *, section_field: str = "section",
+    ) -> Optional[List[Document]]:
+        """
+        One unified retrieval pipeline for when the query's policy_type(s)
+        are confidently known — AND, ideally, section too, though section
+        is optional (2026-09-01, see its own paragraph below). Replaces
+        the old design (a
+        fixed 3-slot "protected" reservation, chosen by reranking the full
+        metadata-matched pool, competing against a SEPARATE unscoped open-
+        pool search for the rest of chunk_limit) that was silently losing
+        real, correctly-tagged content to a reranker popularity contest.
+
+        Confirmed live (2026-09-01): 33 chunks genuinely tagged policy_type
+        ='life', section='types_of_insurance' existed for "different types
+        of life insurance," including full, correct definitions of
+        Endowment, Whole Life, Money-back, and ULIP products — but a fixed
+        "keep only the top 3" cutoff after reranking meant only 3 chunks
+        from ONE document (whichever scored closest to the query's own
+        generic phrasing, e.g. "life insurance products can be broadly
+        classified into...") ever won a slot, silently starving the model
+        of the specific per-product content it needed to answer completely.
+        The reranker was doing its job correctly by its own metric — a
+        chunk that echoes the query's own framing words scores higher than
+        one that just states a fact without that framing — the fixed
+        top-3 CUTOFF was the actual bug, not the scoring itself.
+
+        Three-stage funnel, each stage doing only the job it's actually
+        suited for:
+        1. get_all_by_filter — a pure, complete tag-match scan (no
+           approximation, no top-K, no similarity involved at all).
+           Returns EVERY chunk tagged with this exact policy_type+section,
+           whatever that count turns out to be.
+        2. Direct batched cosine similarity — deliberately NOT the ANN
+           index. The ANN index here is quantized/compressed, built for
+           fast approximate search over the WHOLE corpus; reusing it on a
+           candidate set that's already small and already complete would
+           reintroduce approximation error (a real match could score
+           lower than its true similarity, or get missed by a fetch-window
+           limit) for no speed benefit — there's no large haystack left to
+           search efficiently through once metadata has already narrowed
+           things down. A single batched .encode() call against the
+           shared embedding model (the same pattern _pgf_context_for_units
+           already uses successfully elsewhere in this file) scores the
+           whole candidate set exactly, in one shot — this scales fine
+           even if this policy_type+section combination grows into the
+           hundreds later, since cost is one batch call, not a per-chunk
+           loop or a per-chunk model call.
+        3. Cross-encoder rerank — the genuinely expensive, most accurate
+           judge — runs only on the cosine-narrowed shortlist, keeping
+           this step's cost bounded regardless of how large step 1's raw
+           candidate pool grows.
+
+        Then a RELATIVE score threshold (same RELEVANCE_RATIO=0.25-of-top-
+        score ratio this file already uses elsewhere for a similar
+        purpose, not a new invented number) decides how many of the
+        shortlist actually make the final cut — not a fixed count, so a
+        query whose real answer needs 6 distinct sibling chunks isn't
+        capped at an arbitrary 3, and a query where only 1 chunk is
+        genuinely relevant doesn't get padded with 2 weak ones just to
+        fill a quota. Still capped at chunk_limit so this can never itself
+        blow the context/compression budget — if more than chunk_limit
+        clear the threshold, the top chunk_limit by rerank score win.
+
+        Returns None (not []) when there's nothing usable — either no
+        chunks match this policy_type+section at all, or reranking
+        produces nothing — so the caller can fall back to the ordinary
+        open-pool search instead of treating "found nothing here" as
+        "there is nothing to retrieve at all."
+
+        section_field: which chunk metadata field to filter on — "section"
+        (the fixed ~12-category label) by default, or "candidate_section"
+        when the QUERY itself resolved to an open-vocabulary label instead
+        of one of the fixed ones (see _resolve_query_section_intent's
+        is_candidate flag). Confirmed live 2026-09-01: this whole funnel
+        was originally gated to only ever fire for fixed-category queries
+        — a query about a genuinely novel section type (something the
+        closed 12-label list was never going to cover, e.g. "grievance
+        redressal process") fell back to the OLDER, less reliable open-
+        pool search instead, even though the matching CHUNKS already had
+        real open-vocabulary tags waiting to be filtered on
+        (classify_candidate_section already discovers and writes these
+        during ingestion — see rag.py). Everything else about the funnel
+        (complete metadata scan, batched cosine narrowing, rerank,
+        relative threshold) applies identically either way; only the
+        filter field itself changes.
+
+        policy_type: a single type string, OR a list of types (2026-09-01)
+        for a query that genuinely involves more than one — the metadata
+        scan then filters on policy_type $in that whole list, still with
+        no cap ("every matching chunk from EITHER type," not a reserved
+        slice of each), and the cosine/rerank/threshold stages that follow
+        run over that combined pool exactly as they would for one type.
+        This is what makes it safe to widen the caller's confidence bar
+        from "regex only" to "regex or a properly multi-label-checked LLM
+        classification" — a genuinely two-type question no longer has to
+        be force-fit into one guess that then excludes the other type's
+        content; it gets both types' content competing fairly in the same
+        funnel instead.
+
+        section: also optional (2026-09-01) — pass None to filter on
+        policy_type ALONE, skipping the section_field condition entirely.
+        For when policy_type is confidently known but section genuinely
+        isn't (none of the fixed-category checks, the embedding check, or
+        the open-vocabulary candidate check placed it anywhere) — user's
+        own framing of the fix: "we still identified the correct policy
+        type so filter according to the policy type and then run search
+        among them using the same pipeline... cosine similarity and then
+        reranker." Confirmed live this was a real, separate gap: "I am
+        going backpacking through Europe... what should I sort out before
+        I go" correctly resolved policy_type='travel', but section never
+        resolved at all — so the ENTIRE query fell through to the older,
+        weaker, ANN-index-approximate open-pool search, discarding the
+        one confident signal (policy_type) it actually had. Every other
+        stage of this funnel (complete get_all_by_filter scan, cosine
+        narrowing, cross-encoder rerank, relative threshold, and the
+        scenario-rescore rescue above) is identical either way — only the
+        metadata filter's shape changes.
+
+        Scans doc, video, AND webpage stores (2026-09-01), not just doc —
+        video_store/webpage_store both wrap their own TurboVecStore
+        instance (._store) with the SAME get_all_by_filter method the doc
+        store uses — reusing it here directly, same pattern this file
+        already uses for doc_pipeline._vector_store/._summary_store
+        elsewhere. Ingestion already runs doc/video/webpage through the
+        IDENTICAL SectionChunker.split_documents enrichment pipeline
+        (confirmed directly in api.py — not a divergent per-source
+        mechanism), so this alone was NOT what caused the live regression
+        below; it's a real, separate correctness improvement kept anyway.
+
+        Merges in the broader policy_type-ONLY pool whenever the
+        type+section pool is sparse (< _SPARSE_SECTION_POOL_THRESHOLD raw
+        matches), rather than trusting a small pool as if it were the
+        complete answer. Root cause, confirmed live 2026-09-01: "Can I get
+        a loan against my life insurance policy?" resolved to
+        candidate_section='policy_loan' and found only 2 chunks — but the
+        single BEST-matching real chunk in the whole KB ("Loan Against A
+        Life Insurance Policy") is tagged section='how_to' instead, a
+        DIFFERENT label from the SAME shared chunk-classification system
+        that the open-vocabulary discovery path never touches (that
+        classifier already placed it confidently in a fixed category, so
+        it correctly never fell through to candidate-label discovery at
+        all). One real topic split across two valid classification tiers
+        of the SAME mechanism, and a single-field filter can only ever
+        find the tier it happens to match, not both. Confirmed harmless
+        when the section pool ISN'T sparse: a rich, correctly-scoped pool
+        (11+ matches, like the liability/benefits case earlier tonight)
+        never triggers this merge, so a query that's already well served
+        by its section tag doesn't pay for or get diluted by the wider
+        scan.
+        """
+        _policy_type_condition = (
+            {"$in": list(policy_type)} if isinstance(policy_type, (list, tuple, set))
+            else policy_type
+        )
+        _scan_filter = {"policy_type": _policy_type_condition}
+        if section is not None:
+            _scan_filter[section_field] = section
+        _doc_matching, _video_matching, _webpage_matching = await asyncio.gather(
+            asyncio.to_thread(self.doc_pipeline._vector_store.get_all_by_filter, _scan_filter),
+            asyncio.to_thread(self.video_store._store.get_all_by_filter, _scan_filter),
+            asyncio.to_thread(self.webpage_store._store.get_all_by_filter, _scan_filter),
+        )
+        _all_matching = self._merge_chunks(_doc_matching + _video_matching + _webpage_matching)
+
+        _SPARSE_SECTION_POOL_THRESHOLD = 5
+        if section is not None and len(_all_matching) < _SPARSE_SECTION_POOL_THRESHOLD:
+            _type_only_filter = {"policy_type": _policy_type_condition}
+            _doc_wide, _video_wide, _webpage_wide = await asyncio.gather(
+                asyncio.to_thread(self.doc_pipeline._vector_store.get_all_by_filter, _type_only_filter),
+                asyncio.to_thread(self.video_store._store.get_all_by_filter, _type_only_filter),
+                asyncio.to_thread(self.webpage_store._store.get_all_by_filter, _type_only_filter),
+            )
+            _before = len(_all_matching)
+            _all_matching = self._merge_chunks(_all_matching + _doc_wide + _video_wide + _webpage_wide)
+            logger.info(
+                "[_metadata_scoped_retrieval] sparse section pool (%d < %d) — merged in "
+                "policy_type-only pool: %d -> %d candidates",
+                _before, _SPARSE_SECTION_POOL_THRESHOLD, _before, len(_all_matching),
+            )
+
+        if not _all_matching:
+            return None
+
+        _COSINE_SHORTLIST_K = 20
+
+        async def _narrow_and_rank(scoring_query: str):
+            _sl = _all_matching
+            if len(_all_matching) > _COSINE_SHORTLIST_K:
+                try:
+                    _embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+                    _texts = [d.page_content for d in _all_matching]
+
+                    def _encode_all():
+                        return _embed_model.encode([scoring_query] + _texts, normalize_embeddings=True)
+
+                    _vecs = await asyncio.to_thread(_encode_all)
+                    _qvec, _cvecs = _vecs[0], _vecs[1:]
+                    _cos_scores = np.dot(_cvecs, _qvec)
+                    _order = np.argsort(-_cos_scores)[:_COSINE_SHORTLIST_K]
+                    _sl = [_all_matching[i] for i in _order]
+                except Exception as _cos_exc:
+                    logger.debug(
+                        "[_metadata_scoped_retrieval] cosine narrowing failed, reranking "
+                        "full pool instead: %s", _cos_exc,
+                    )
+                    _sl = _all_matching
+            _rk = await asyncio.to_thread(
+                self.doc_pipeline._vector_store.rerank_documents,
+                scoring_query, _sl, len(_sl),
+            )
+            return _sl, _rk
+
+        _shortlist, _ranked = await _narrow_and_rank(retrieval_query)
+        if not _ranked:
+            return None
+
+        # Scenario-question rescue: the reranker may be failing to bridge a
+        # narrative, everyday-language phrasing to the formal policy
+        # language of the correct chunk, rather than the chunk actually
+        # being irrelevant — see _reformulate_scenario_query_for_retrieval's
+        # own docstring for the confirmed-live evidence (the exact same
+        # chunk scored 0.0000 against a scenario question and 0.2320
+        # against the same underlying question phrased in insurance terms
+        # — a real, thousands-of-times difference from rephrasing alone).
+        #
+        # Unconditional as of 2026-09-03 — this used to only fire when the
+        # first-pass score was below a threshold (0.01), on the theory that
+        # a query already scoring reasonably didn't need the rescue.
+        # Confirmed live that this threshold missed a real case: "Someone
+        # tried to scam me out of my pension savings" scored 0.056 — weak,
+        # but comfortably above 0.01 — so the rescue never ran, and a
+        # separate downstream bypass then let that same weak score through
+        # to generation anyway (see the semantic low-score bypass right
+        # below). No score threshold reliably distinguishes "weak because
+        # genuinely nothing fits" from "weak because of scenario phrasing"
+        # — the two look the same by the numbers alone. Running the rescue
+        # on every query costs one reformulation call plus one more rerank
+        # pass, and can't make the result worse: it only replaces the first
+        # pass when the reformulated version scores strictly higher (same
+        # "try an alternative, keep only if it's actually better"
+        # discipline Mode-B already uses elsewhere in this file), so a
+        # query that was already phrased in retrieval-friendly terms just
+        # keeps its own first-pass result.
+        _reformulated = await _reformulate_scenario_query_for_retrieval(
+            retrieval_query, policy_type, section,
+        )
+        if _reformulated:
+            _shortlist_v2, _ranked_v2 = await _narrow_and_rank(_reformulated)
+            if _ranked_v2 and _ranked_v2[0].metadata.get("rerank_score", 0.0) > _ranked[0].metadata.get("rerank_score", 0.0):
+                logger.info(
+                    "[_metadata_scoped_retrieval] scenario rescore improved top "
+                    "score: %.4f -> %.4f",
+                    _ranked[0].metadata.get("rerank_score", 0.0),
+                    _ranked_v2[0].metadata.get("rerank_score", 0.0),
+                )
+                _shortlist, _ranked = _shortlist_v2, _ranked_v2
+
+        _relevance_ratio = float(os.getenv("RELEVANCE_RATIO", "0.25"))
+        _top_score = _ranked[0].metadata.get("rerank_score", 0.0)
+        _floor = _top_score * _relevance_ratio
+        _passing = [d for d in _ranked if d.metadata.get("rerank_score", 0.0) >= _floor]
+        _final = _passing[:chunk_limit]
+
+        logger.info(
+            "[_metadata_scoped_retrieval] policy_type=%r %s=%r candidates=%d "
+            "shortlisted=%d top_score=%.3f floor=%.3f passed_threshold=%d kept=%d",
+            policy_type, section_field, section, len(_all_matching), len(_shortlist),
+            _top_score, _floor, len(_passing), len(_final),
+        )
+        return _final
+
     async def _retrieve_all_sources_combined(
         self,
         retrieval_query: str,
@@ -5474,6 +8162,8 @@ class MultiSourceRAG:
         summary_top_k: int,
         media_top_k: int,
         chunk_limit: int,
+        query_policy_type: Optional[str] = None,
+        protected_chunks: Optional[List[Document]] = None,
     ) -> List[Document]:
         """
         Fetch raw (unreranked) candidates from doc, video, and webpage
@@ -5501,6 +8191,14 @@ class MultiSourceRAG:
         claiming their own fixed number of slots in the final context
         regardless of whether anything in a given source is actually
         useful for this specific question.
+
+        protected_chunks: pre-fetched via a direct policy_type+section
+        metadata filter by the caller (ask_stream), when BOTH are
+        confidently resolved — see ask_stream's own comment at its call
+        site for the full rationale. These get reserved real slots in the
+        final chunk_limit cut below, bypassing the open rerank competition
+        that a chunk needing this kind of rescue would otherwise lose
+        (confirmed live: it did, 3/3 times, before this existed).
         """
         # Sub-phase timing (2026-08-17, parallelized same day): doc/video/
         # webpage/summary search used to be AWAITED SEQUENTIALLY, one after
@@ -5520,9 +8218,8 @@ class MultiSourceRAG:
         async def _timed_doc_search():
             t0 = time.time()
             result = await asyncio.to_thread(
-                self.doc_pipeline._vector_store.search,
-                retrieval_query, top_k=doc_top_k, use_hybrid=True, use_reranker=False,
-                filter_metadata=filter_meta,
+                self._policy_type_aware_doc_search,
+                retrieval_query, doc_top_k, filter_meta, query_policy_type,
             )
             return result, round((time.time() - t0) * 1000)
 
@@ -5639,6 +8336,13 @@ class MultiSourceRAG:
 
         combined = self._merge_chunks(doc_raw + video_raw + webpage_raw)
         if not combined:
+            if protected_chunks:
+                logger.info(
+                    "[_retrieve_all_sources_combined] empty open-search pool — returning "
+                    "%d protected chunk(s) only",
+                    len(protected_chunks[:chunk_limit]),
+                )
+                return protected_chunks[:chunk_limit]
             logger.info(
                 "[_retrieve_all_sources_combined] TIMING sources_parallel=%dms(doc=%dms "
                 "video=%dms webpage=%dms summary=%dms) summary_boost=%dms(%d calls) "
@@ -5656,6 +8360,34 @@ class MultiSourceRAG:
             retrieval_query, combined, chunk_limit,
         )
         _t_rerank_ms = round((time.time() - _t_rerank_start) * 1000)
+
+        # Reserve real slots for protected_chunks in the FINAL cut, rather
+        # than letting them have only competed for a seat in `combined`
+        # above (see this function's own docstring and ask_stream's call
+        # site for why a chunk that needed this rescue predictably loses
+        # the open, all-sources rerank otherwise). Capped at 3 reserved
+        # slots — ranked among themselves first when there are more than
+        # 3, via the SAME reranker, so the reservation still prefers the
+        # most relevant of the confidently-filtered set rather than an
+        # arbitrary 3 — so a section with many chunks can't crowd out
+        # chunk_limit entirely; the rest of chunk_limit still comes from
+        # ordinary open-pool reranking for supplementary content.
+        if protected_chunks:
+            _reserved = protected_chunks
+            if len(_reserved) > 3:
+                _reserved = await asyncio.to_thread(
+                    self.doc_pipeline._vector_store.rerank_documents,
+                    retrieval_query, _reserved, 3,
+                )
+            _reserved_keys = {d.page_content[:200] for d in _reserved}
+            _open_remainder = [d for d in reranked if d.page_content[:200] not in _reserved_keys]
+            _room = max(0, chunk_limit - len(_reserved))
+            reranked = _reserved + _open_remainder[:_room]
+            logger.info(
+                "[_retrieve_all_sources_combined] reserved %d protected chunk(s) in final "
+                "selection (open-pool contributed %d of remaining %d slot(s))",
+                len(_reserved), min(len(_open_remainder), _room), _room,
+            )
 
         logger.info(
             "[_retrieve_all_sources_combined] TIMING sources_parallel=%dms(doc=%dms "
@@ -5677,6 +8409,7 @@ class MultiSourceRAG:
         doc_top_k: int = 30,
         summary_top_k: int = 5,
         rerank_top_k: int = 8,
+        query_policy_type: Optional[str] = None,
     ) -> List[Document]:
         """Run doc-vector search, stage-1 summary-boost loop, and rerank.
 
@@ -5685,9 +8418,8 @@ class MultiSourceRAG:
         *document_filter* is falsy and the SummaryStore is non-empty.
         """
         doc_chunks = await asyncio.to_thread(
-            self.doc_pipeline._vector_store.search,
-            retrieval_query, top_k=doc_top_k, use_hybrid=True, use_reranker=False,
-            filter_metadata=filter_meta
+            self._policy_type_aware_doc_search,
+            retrieval_query, doc_top_k, filter_meta, query_policy_type,
         )
 
         if not document_filter and self.doc_pipeline._summary_store.count() > 0:
@@ -5988,6 +8720,7 @@ class MultiSourceRAG:
         question: str,
         history: str = "",
         document_filter: Optional[List[str]] = None,
+        _is_retry: bool = False,
     ):
         """Async generator — yields text tokens as the LLM produces them.
 
@@ -5998,6 +8731,18 @@ class MultiSourceRAG:
         Yields:
             str tokens as they arrive, then a final JSON line:
             'data: {"sources": [...], "done": true}'
+
+        _is_retry: internal-only, never passed by external callers (the
+        one real call site in api.py always omits it, so it defaults
+        False there). Set True when this call is itself a
+        post-hallucination retry (see the post-generation faithfulness
+        check further down, which recursively calls this SAME method
+        again — user's explicit direction: a retry should genuinely
+        re-run the real pipeline, not a hand-built parallel
+        reimplementation of pieces of it) — this is the ONLY thing this
+        flag does: it stops that retry's own call from attempting yet
+        another retry if it ALSO comes back fully hallucinated, capping
+        recursion at exactly one extra attempt instead of looping.
         """
         # ── Re-use the full retrieval pipeline ───────────────────────────────
         # Build the prompt exactly as ask() does, then stream the LLM response.
@@ -6189,12 +8934,11 @@ class MultiSourceRAG:
 
         # ── User-statement fast path ──────────────────────────────────────────
         # "I have a health plan", "I got term insurance last month" → acknowledge warmly.
-        _stmt = re.match(
-            r"^\s*i\s+(have|got|have\s+got|purchased|bought|own|took|taken|recently\s+got|just\s+got"
-            r"|am\s+covered|am\s+insured|enrolled|signed\s+up)\b",
-            question.lower(),
-        )
-        if _stmt and _is_insurance_related(question):
+        # See _is_genuine_ownership_statement's own comment for why the bare
+        # opener regex alone isn't trusted anymore — it only checks the first
+        # few words, which "I got some concerning test results..." also
+        # matches despite describing a real problem, not an announcement.
+        if await _is_genuine_ownership_statement(question) and _is_insurance_related(question):
             _plan_word = next(
                 (w for w in ("health", "life", "motor", "car", "travel", "home", "term", "ulip", "vehicle")
                  if w in question.lower()), "insurance"
@@ -6565,11 +9309,44 @@ class MultiSourceRAG:
         _filter_meta_no_policy_type = filter_meta
         _regex_policy_scores = _regex_policy_score(retrieval_query)
         _query_policy_type = classify_query_policy_type(retrieval_query)
-        _query_policy_type_from_weak_regex = (
-            _query_policy_type != "general" and _regex_policy_scores.get(_query_policy_type, 0) <= 1
-        )
         if _query_policy_type == "general":
             _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
+        # Weak-or-absent regex evidence for whichever type we ended up
+        # with — computed on the FINAL _query_policy_type (after the LLM
+        # fallback just above), not just the pre-fallback regex guess, so
+        # this one flag covers both "regex found a type on a single weak
+        # hit" AND "regex found nothing at all, the LLM fallback resolved
+        # it alone": a score of 0 or 1 is equally thin evidence either
+        # way, and either way the multi-label check just below deserves a
+        # chance to catch a genuine second type before this result gets
+        # trusted anywhere downstream — including, as of 2026-09-01, the
+        # metadata-first retrieval funnel (see that call site below),
+        # which used to require a DIRECT regex hit specifically because a
+        # single-label LLM guess could be forced onto a genuinely
+        # multi-type query with no way to say "both." Fixing the multi-
+        # label check to actually run for that case removes the need to
+        # distrust the LLM path altogether — an LLM classification that's
+        # been through this same multi-label check is exactly as
+        # trustworthy as a direct regex hit for that funnel now.
+        _query_policy_type_weak_evidence = (
+            _query_policy_type != "general"
+            and _regex_policy_scores.get(_query_policy_type, 0) <= 1
+        )
+
+        # Resolved ONCE here (regex, then hint-gated LLM fallback — see
+        # _resolve_query_section_intent's own docstring) so BOTH the new
+        # metadata-first retrieval gate right below AND the section-intent
+        # mismatch veto much further down can use the SAME result instead
+        # of independently re-classifying (and, for the veto, re-paying for
+        # a second LLM round-trip on the exact same query).
+        _query_section_result = await self._resolve_query_section_intent(
+            retrieval_query, skip_hint_prefilter=_query_policy_type != "general",
+        )
+        # Always defined (even empty) so later code — the SRG
+        # policy_type-aware match veto — can safely reference it
+        # regardless of whether this query ever had a confident type at
+        # all, without an UnboundLocalError for a genuinely general query.
+        _policy_types_for_filter: set = set()
         if _query_policy_type != "general":
             _policy_types_for_filter = {_query_policy_type}
             # A single regex hit is the weakest evidence classify_query_
@@ -6591,7 +9368,7 @@ class MultiSourceRAG:
             # this function's own docstring already relies on staying
             # trusted without a second LLM round-trip; only ever WIDENS the
             # filter, so a genuinely single-topic query is unaffected.
-            if _query_policy_type_from_weak_regex:
+            if _query_policy_type_weak_evidence:
                 _multi_policy_types = await _classify_query_policy_types_multi_llm(retrieval_query)
                 _policy_types_for_filter |= set(_multi_policy_types)
             # Comparison/named-pair questions ("difference between motor
@@ -6926,6 +9703,12 @@ class MultiSourceRAG:
             # allowlist rather than a heuristic, so "Form A"/"Form B" (not
             # in the glossary) still correctly falls through to the single
             # combined retrieval unchanged.
+            # Always defined (even when the named-pair branch below runs
+            # instead) so the Mode-B fallback check further down — which
+            # reads this regardless of which branch actually ran — never
+            # hits an UnboundLocalError for a named-pair query.
+            _metadata_filter_confident = False
+            _used_metadata_scoped_funnel = False
             _np_pair_for_retrieval = _extract_named_pair(retrieval_query, _NAMED_PAIR_QUERY_PATTERNS)
             _np_split_types = None
             _np_split_general_terms = None
@@ -6952,10 +9735,12 @@ class MultiSourceRAG:
                     self._retrieve_all_sources_combined(
                         _expand_abbreviations(_np_retrieval_a), filter_meta, doc_top_k=_doc_top_k,
                         summary_top_k=3, media_top_k=_media_top_k, chunk_limit=_np_per_side_limit,
+                        query_policy_type=_np_type_a if _np_split_types else None,
                     ),
                     self._retrieve_all_sources_combined(
                         _expand_abbreviations(_np_retrieval_b), filter_meta, doc_top_k=_doc_top_k,
                         summary_top_k=3, media_top_k=_media_top_k, chunk_limit=_np_per_side_limit,
+                        query_policy_type=_np_type_b if _np_split_types else None,
                     ),
                 )
                 logger.info(
@@ -6965,14 +9750,210 @@ class MultiSourceRAG:
                 )
                 all_chunks = self._merge_chunks(_chunks_a + _chunks_b)
             else:
-                all_chunks = await self._retrieve_all_sources_combined(
-                    _search_query, filter_meta, doc_top_k=_doc_top_k, summary_top_k=3,
-                    media_top_k=_media_top_k, chunk_limit=_chunk_limit,
+                # ── Metadata-scoped retrieval funnel ─────────────────────────
+                # When policy_type(s) and section-intent are both confidently
+                # resolved, _metadata_scoped_retrieval runs the full pipeline
+                # (get_all_by_filter — every matching chunk, no cap — then
+                # batched cosine narrowing, then cross-encoder rerank, then a
+                # RELATIVE score threshold) and its result becomes the entire
+                # candidate set outright; there is no separate open-pool
+                # search competing against it (see that function's own
+                # docstring — it replaced an earlier fixed-3-slot-reservation
+                # design that DID have that problem). Never applies when
+                # document_filter is set (a user-scoped, explicit-document
+                # query has no use for a KB-wide policy_type/section scope).
+                #
+                # policy_type source no longer matters (2026-09-01) — this
+                # used to require a DIRECT regex hit specifically, distrusting
+                # any LLM-only classification, because of a confirmed live
+                # bug: "does one policy cover both my house and my car if a
+                # storm damages both" had no regex hit for either type, fell
+                # to the single-label LLM classifier, which — forced to pick
+                # ONE type for a question that genuinely names two — guessed
+                # 'motor' alone, and this funnel then returned ONLY motor
+                # content, crowding out the home-insurance content a wider
+                # search would have found (the fabricated "Form B" answer
+                # this produced is the same cross-topic bundling hallucination
+                # [[project_cross_type_bundling_hallucination]] already fixed
+                # once at the prompt level). The actual defect there was never
+                # "the LLM can't be trusted" — _query_policy_type_weak_evidence
+                # above now runs the SAME multi-label classifier
+                # (_classify_query_policy_types_multi_llm, already validated
+                # to correctly return BOTH types for exactly this shape of
+                # question) whenever regex evidence for the resolved type is
+                # weak or absent, regardless of whether that type came from
+                # regex or the LLM fallback — so _policy_types_for_filter
+                # already reflects every type this query is genuinely about
+                # by the time this gate runs. Confirmed live 2026-09-01 this
+                # was the actual reason a narrative liability question ("my
+                # neighbor's kid broke his arm in my backyard, could that
+                # cost me money") never reached liability_insurance_guide.pdf
+                # at all — regex found nothing, the LLM fallback correctly
+                # named 'liability' alone, but this gate refused to trust
+                # that single-source classification and fell through to the
+                # older, weaker open-pool search instead, which never scored
+                # the right document above a fixed refusal floor.
+                # is_candidate (_query_section_result[1]) no longer excludes
+                # this path — see _metadata_scoped_retrieval's own docstring
+                # for why: a query resolving to an open-vocabulary
+                # candidate_section label deserves the SAME reliable funnel
+                # as a fixed-category one, just filtered on the
+                # candidate_section chunk field instead of section. Confirmed
+                # live 2026-09-01 this was previously excluded entirely,
+                # silently falling back to the older, less reliable
+                # unscoped search for every genuinely novel section type —
+                # exactly the case classify_candidate_section (rag.py)
+                # exists to handle in the first place.
+                # Section filtering is deliberately SKIPPED for a multi-
+                # type query (2026-09-01, user's own design call) — only
+                # ever attempted when exactly ONE type is confidently
+                # known. Confirmed live: "the shipment I sent overseas got
+                # damaged when the ship hit rough weather" correctly
+                # widened to policy_type=['marine', 'travel'], but marine
+                # has ZERO chunks tagged section='benefits' (its own
+                # coverage content lives under 'general'/'types_of_
+                # insurance' instead) while travel has plenty — so a
+                # combined type+section filter silently gave travel's
+                # baggage content the entire pool to itself, and the
+                # answer wrongly discussed checked-baggage limits instead
+                # of cargo damage. This isn't the same shape as the
+                # single-type sparse-pool case (see _metadata_scoped_
+                # retrieval's own merge-in-when-sparse logic below) — an
+                # aggregate pool of 17 chunks doesn't LOOK sparse, even
+                # when one whole type contributed zero of them, so that
+                # check can't catch it. Simplest reliable fix: a section
+                # tag's distribution isn't comparable across different
+                # policy types to begin with (each document's own author/
+                # classifier decides its own section boundaries
+                # independently), so for a multi-type query, don't trust
+                # it to narrow the field at all — go straight to the
+                # type-only funnel just below, which scores every type's
+                # FULL content fairly against each other via cosine+
+                # rerank instead of pre-filtering one of them out.
+                _metadata_filter_confident = (
+                    not document_filter
+                    and len(_policy_types_for_filter) == 1
+                    and _query_section_result
                 )
+                all_chunks = None
+                if _metadata_filter_confident:
+                    _section_field = "candidate_section" if _query_section_result[1] else "section"
+                    _metadata_scope_types = sorted(_policy_types_for_filter)
+                    all_chunks = await self._metadata_scoped_retrieval(
+                        _search_query, _metadata_scope_types, _query_section_result[0], _chunk_limit,
+                        section_field=_section_field,
+                    )
+                # policy_type-only funnel (2026-09-01) — user's own design:
+                # when the type IS confidently known but section genuinely
+                # isn't (none of the fixed/embedding/candidate section
+                # checks placed it anywhere), OR there's more than one
+                # confident type (section skipped above, see that block's
+                # own comment), OR section resolved to something real but
+                # that exact (type, section) combination has zero
+                # overlapping chunks (all_chunks came back None above —
+                # confirmed live: a query correctly matched candidate_
+                # section='policy_advice', but every chunk carrying that
+                # label turned out to be from a DIFFERENT document's
+                # policy_type, so the combined filter found nothing) —
+                # still run the SAME complete-scan + cosine + rerank
+                # funnel scoped to just the type(s), rather than
+                # discarding that one confident signal and falling
+                # straight to the weaker, ANN-approximate open-pool search
+                # below. Deliberately a plain `if`, not `elif` — needs to
+                # run as a fallback for all three cases above, not just
+                # the first; an `elif` here would only ever catch that
+                # one. Confirmed live this was the actual gap for
+                # "backpacking through Europe... what should I sort out
+                # before I go" — policy_type='travel' resolved correctly,
+                # and 33 real travel chunks exist (including a "Practical
+                # Tips" section), but were unreachable both times: once
+                # because section never resolved, once because it
+                # resolved to a label that only exists on a different
+                # document's policy_type.
+                if all_chunks is None and not document_filter and bool(_policy_types_for_filter):
+                    all_chunks = await self._metadata_scoped_retrieval(
+                        _search_query, sorted(_policy_types_for_filter), None, _chunk_limit,
+                    )
+                # Read by the Mode-B fallback further down — True whenever
+                # all_chunks came from either metadata-scoped funnel above
+                # (complete scan, no exclusion risk for Mode-B to correct
+                # for), False if it's about to come from the older,
+                # ANN-approximate open-pool search just below instead.
+                _used_metadata_scoped_funnel = all_chunks is not None
+                # Type-agnostic reformulation (2026-09-03), computed once and
+                # shared by BOTH open-pool paths below (the "found nothing at
+                # all" fallback and the wrong-filter rescue further down) —
+                # every retrieval path deserves the same jargon-normalization
+                # benefit the type-scoped funnel already gets internally via
+                # _metadata_scoped_retrieval's own scenario rescue; comparing
+                # a reformulated score against a raw-query score anywhere in
+                # this pipeline is an unfair fight that quietly favors
+                # whichever path happened to get reformulated. No
+                # policy_type needed (unlike _reformulate_scenario_query_
+                # for_retrieval) — both call sites that use this are
+                # explicitly NOT trusting a specific type guess.
+                _open_pool_query = await _reformulate_query_for_policy_type_classification(
+                    _search_query,
+                ) or _search_query
+                if all_chunks is None:
+                    all_chunks = await self._retrieve_all_sources_combined(
+                        _open_pool_query, filter_meta, doc_top_k=_doc_top_k, summary_top_k=3,
+                        media_top_k=_media_top_k, chunk_limit=_chunk_limit,
+                        query_policy_type=_query_policy_type,
+                    )
+                # Wrong-filter rescue: a policy_type filter that's simply
+                # WRONG (the classifier picked the wrong type) looks
+                # identical, by the numbers, to "the filter is right but the
+                # KB genuinely has nothing good" — both show up as a weak
+                # top score. Confirmed live as a real, repeatable failure:
+                # "someone tried to scam me out of my pension savings"
+                # classified confidently to policy_type=pension, and every
+                # rescue INSIDE that filtered pool (query reformulation, the
+                # semantic low-score bypass) only ever found the best-
+                # AVAILABLE match within pension-tagged content, never
+                # questioning whether pension was the right pool to search
+                # in the first place. If the filtered pool's best score is
+                # weak, re-run the exact same search with the policy_type
+                # filter removed entirely and keep whichever comes back
+                # better — same "try an alternative, discard if it's not
+                # actually better" discipline as the scenario-reformulation
+                # rescue, just applied to the FILTER instead of the QUERY
+                # PHRASING. Only fires when a policy_type filter was
+                # actually in play; a query that already resolved to
+                # "general" has nothing to remove here.
+                _WRONG_FILTER_RESCORE_FLOOR = 0.15
+                if (
+                    not document_filter
+                    and bool(_policy_types_for_filter)
+                    and all_chunks
+                    and all_chunks[0].metadata.get("rerank_score", 0.0) < _WRONG_FILTER_RESCORE_FLOOR
+                ):
+                    _unfiltered_chunks = await self._retrieve_all_sources_combined(
+                        _open_pool_query, _filter_meta_no_policy_type, doc_top_k=_doc_top_k, summary_top_k=3,
+                        media_top_k=_media_top_k, chunk_limit=_chunk_limit,
+                        query_policy_type="general",
+                    )
+                    if (
+                        _unfiltered_chunks
+                        and _unfiltered_chunks[0].metadata.get("rerank_score", 0.0)
+                        > all_chunks[0].metadata.get("rerank_score", 0.0)
+                    ):
+                        logger.info(
+                            "[ask_stream] wrong-filter rescue: policy_type=%s filtered "
+                            "top=%.4f -> unfiltered top=%.4f, using unfiltered pool",
+                            sorted(_policy_types_for_filter),
+                            all_chunks[0].metadata.get("rerank_score", 0.0),
+                            _unfiltered_chunks[0].metadata.get("rerank_score", 0.0),
+                        )
+                        all_chunks = _unfiltered_chunks
+                        _used_metadata_scoped_funnel = False
             llm_topics = await _topics_task
         else:
             doc_chunks, llm_topics = await asyncio.gather(
-                self._retrieve_doc_chunks(_search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3),
+                self._retrieve_doc_chunks(
+                    _search_query, filter_meta, document_filter, doc_top_k=_doc_top_k, summary_top_k=3,
+                    query_policy_type=_query_policy_type,
+                ),
                 _extract_intent_topics(question),
             )
             all_chunks = self._merge_chunks(doc_chunks)
@@ -7165,15 +10146,58 @@ class MultiSourceRAG:
                 ),
                 reverse=True,
             )
-            return chunks[:_chunk_limit]
+            chunks = chunks[:_chunk_limit]
 
-        _structural_noise_dropped = [c for c in all_chunks if _is_textbook_structural_noise(c.page_content)]
-        if _structural_noise_dropped:
-            logger.info(
-                "[ask_stream] textbook-structural-noise: dropping %s",
-                [c.metadata.get("source", "") for c in _structural_noise_dropped],
-            )
-            all_chunks = [c for c in all_chunks if c not in _structural_noise_dropped]
+            # Persist the type-mismatch discount into the chunk's own
+            # rerank_score, not just this function's local sort key.
+            # Confirmed live (2026-08-25): "Explain in detail how to claim
+            # home insurance" retrieved a "general"-tagged chunk about
+            # policy-application disclosure obligations (REPRESENTATION,
+            # nothing to do with claims) that raw-scored 0.997 — HIGHER
+            # than the actual "How to File a Home Insurance Claim" chunk
+            # (0.97) — purely on incidental cross-encoder vocabulary
+            # overlap. _effective_sort_score correctly discounted it
+            # (0.3x for a claim-intent query per _TYPE_MISMATCH_DISCOUNT)
+            # for THIS function's own sort/truncate decision, sinking it
+            # below the real claims chunk as intended — but that discount
+            # was only ever a local sort key, never written back to
+            # chunk.metadata["rerank_score"]. Every consumer downstream of
+            # this function (the relative-relevance filter, the section-
+            # intent veto's implicit reliance on the pool's top score, the
+            # context compressor's own score-weighted chunk allocation)
+            # reads metadata["rerank_score"] directly and saw the stale
+            # 0.997 — so the chunk that correctly LOST the ranking fight
+            # here silently WON the compression budget fight two steps
+            # later, crowding out the real answer down to 2 of its 6 real
+            # claim steps. Overwriting it here, once, right after the
+            # discount was already computed for sorting, is the one place
+            # in the pipeline that already knows the correct adjusted
+            # value — every later stage now sees the same number this
+            # function itself already trusted.
+            for c in chunks:
+                if _type_mismatched(c) and not _discount_exempt(c):
+                    c.metadata["rerank_score"] = _effective_sort_score(c)
+
+            return chunks
+
+        # _is_textbook_structural_noise (a regex-based hard veto on TOC
+        # lines/MCQ answer keys/OCR garble/self-referential "this chapter
+        # teaches..." text) removed entirely 2026-09-02, user's explicit
+        # instruction: in the retrieval pipeline, nothing outside cosine
+        # similarity and the reranker should ever exclude a chunk. Confirmed
+        # live this was throwing away real, useful content, not just noise
+        # — a genuinely on-topic, well-scoring (0.697) term-life-insurance
+        # chunk answering "make sure my spouse is taken care of if
+        # something happens to me" was dropped purely for containing one
+        # trailing "In this chapter we will..." sentence, causing a false
+        # "not in KB" refusal even though the real answer was sitting right
+        # there. The regex had no way to weigh "how much of this chunk is
+        # actually noise" against "how much is real content" — a single
+        # matching phrase anywhere in an otherwise-good chunk was enough to
+        # discard the whole thing. Genuine noise (a bare TOC dump, an MCQ
+        # answer key with no real prose) should simply never score well
+        # against a real question in the first place — that judgment now
+        # belongs to cosine similarity and the reranker alone, per policy.
 
         _candidate_dropped = [c for c in all_chunks if _candidate_mismatch(c)]
         if _candidate_dropped:
@@ -7201,7 +10225,7 @@ class MultiSourceRAG:
         # from OTHER sources without reliably promoting the right ones).
         # Only for general (non-document-scoped) queries — a document_filter
         # question already told retrieval exactly where to look.
-        if not document_filter and all_chunks and _TYPES_OF_QUERY_RE.search(retrieval_query.lower()):
+        if not document_filter and all_chunks and await _is_types_enumeration_query(retrieval_query):
             # Page-based neighbor expansion only makes sense for an actual
             # document chunk — video/webpage chunks carry page=0 as a
             # placeholder, not a real page number. Confirmed live: the
@@ -7311,9 +10335,30 @@ class MultiSourceRAG:
         # Scoped the same way the two existing retry tiers below are
         # (not document_filter): a query with an explicit document scope
         # has already told retrieval exactly where to look.
+        #
+        # Also never fires when _used_metadata_scoped_funnel already ran
+        # (all_chunks came from _metadata_scoped_retrieval — either the
+        # full type+section funnel, or the policy_type-only variant) —
+        # confirmed live 2026-09-01: that funnel already does a COMPLETE,
+        # uncapped get_all_by_filter scan of every chunk matching the
+        # resolved policy_type(s) (+section, when known), so there is no
+        # filter-exclusion for this fallback to correct for, unlike the
+        # soft $in filter this mechanism was actually built to work
+        # around. A narrative query can still score low there purely
+        # because the reranker itself doesn't recognize the connection (a
+        # real, separate limitation), and widening to an unfiltered
+        # whole-KB search at that point doesn't rescue anything — it just
+        # dilutes the already-correct, already-complete candidate pool
+        # with unrelated higher-scoring chunks and actively discards a
+        # good result. Confirmed live: a "my neighbor's kid broke his arm
+        # in my backyard, could that cost me money" query correctly found
+        # 5 real liability_insurance_guide.pdf chunks via the funnel, then
+        # Mode-B threw them away for a wider, wrong pool because the
+        # funnel's own top score (like everything else's) was near zero.
         _fallback_threshold = float(os.getenv("RETRIEVAL_FALLBACK_THRESHOLD", "0.01"))
         if (
             not document_filter
+            and not _used_metadata_scoped_funnel
             and _query_policy_type != "general"
             and _top_rerank < _fallback_threshold
         ):
@@ -7414,6 +10459,139 @@ class MultiSourceRAG:
                 c for c in all_chunks
                 if c.metadata.get("rerank_score", _rerank_gate) >= _rerank_gate
             ]
+
+        # ── Relative relevance filter ───────────────────────────────────────
+        # Separate mechanism from the near-zero backstop just above, and NOT
+        # the same threshold — see the "Hard reranker gate" comment a few
+        # lines up for why an ABSOLUTE score floor was already tried here and
+        # reverted (0.2 wrongly refused ~20% of legitimate KB questions;
+        # "no claim bonus" scored 0.0024 and "free look period" scored 0.008
+        # for their own best/correct chunk, both below a genuinely bad case's
+        # 0.062). That finding is about a single global floor with nothing to
+        # compare against, though — it says nothing about a chunk scoring far
+        # below its OWN query's best match in the SAME pool. Confirmed live
+        # for "How to claim a travel insurance?" (doc_top_k=8): only 2 of 8
+        # retrieved chunks were genuinely about filing a claim (rerank_score
+        # 0.997 each); "Types of Travel Insurance Plans" and a Schengen-visa
+        # chunk rode along at 0.09 and 0.07 purely because doc_top_k always
+        # fills every slot, padding with next-best-scoring filler once
+        # genuinely relevant candidates run out.
+        #
+        # Only fires when the pool has a confident top match (>=0.8, matching
+        # this file's existing 0.8/0.9 confidence-bypass calibration a bit
+        # further down) — exactly the regime the reverted absolute floor did
+        # NOT have, since "no claim bonus"'s own best chunk topped out at
+        # 0.0024. A broad "explain X in detail" query legitimately spreads
+        # relevance across many chunks with a lower, gap-free top score
+        # (measured live: 0.157-0.721 across all 8, no real top cluster) —
+        # those stay untouched. Ratio rather than a second absolute value so
+        # it scales with how confident THIS query's retrieval actually is,
+        # instead of re-introducing one fixed number for every query shape.
+        _relevance_ratio_min_top = float(os.getenv("RELEVANCE_RATIO_MIN_TOP", "0.8"))
+        _relevance_ratio = float(os.getenv("RELEVANCE_RATIO", "0.25"))
+        if not document_filter and _top_rerank >= _relevance_ratio_min_top:
+            _relevance_floor = _top_rerank * _relevance_ratio
+            _before_relevance_count = len(all_chunks)
+            all_chunks = [
+                c for c in all_chunks
+                if c.metadata.get("rerank_score", _relevance_floor) >= _relevance_floor
+            ]
+            if len(all_chunks) < _before_relevance_count:
+                logger.info(
+                    "[ask_stream] Relative relevance filter: top=%.3f floor=%.3f dropped %d/%d chunks",
+                    _top_rerank, _relevance_floor,
+                    _before_relevance_count - len(all_chunks), _before_relevance_count,
+                )
+
+        # ── Section-intent mismatch filter ──────────────────────────────────
+        # The ratio filter above only catches chunks far below the pool's OWN
+        # top score — it can't separate a same-vocabulary chunk from a
+        # DIFFERENT section that legitimately scores close to (or above) a
+        # genuinely relevant chunk from a rarer section. Confirmed live for
+        # "How to claim a travel insurance?": both "Common Exclusions" chunks
+        # scored 0.761/0.541 — HIGHER than the real "b. Overseas Claim
+        # Settlement Agent" claims fragment (0.475) — because exclusions and
+        # claims content share the same travel-insurance vocabulary
+        # (insurer, policy, declared, accepted). No score threshold, ratio
+        # or absolute, can pull those apart; this needs the query's own
+        # classified section-intent instead. Reuses
+        # _classify_query_section_intent(), the same closed-vocab classifier
+        # _policy_type_aware_doc_search() already uses to GUARANTEE a
+        # section-matching chunk gets included — this is that mechanism's
+        # mirror image, used to VETO a confidently different-section chunk
+        # instead of to add one.
+        #
+        # Mirrors the SRG policy-type veto's shape built earlier this
+        # session (_srg_match_score's use of _policy_types_for_filter): a
+        # chunk whose OWN section is confidently a different, specific
+        # category than what the query asked for gets dropped, the same way
+        # a wrong-policy-type enum gets vetoed there. Deliberately
+        # conservative in two ways a false drop would be worse than a false
+        # keep for: (1) only a non-candidate result (is_candidate=False) is
+        # trusted to veto — the open-vocab candidate-section fallback is
+        # too new/unproven to risk removing real content over. Both the
+        # regex fast path AND the LLM fallback below produce
+        # is_candidate=False results (see _resolve_query_section_intent) —
+        # they're picking from the same closed, curated category list,
+        # just via different mechanisms, so both are equally trustworthy
+        # here; (2) only fires when the pool still has at least one chunk
+        # confidently matching the query's own section, so a
+        # misclassification can never empty the context. "general"-tagged
+        # chunks (deliberately permissive, cross-cutting reference material)
+        # and chunks with no section tag at all (video/webpage/summary) are
+        # never vetoed, matching the same "general" exemption used
+        # elsewhere in this function.
+        #
+        # A third guard, on the QUERY side: _classify_query_section_intent
+        # returns only the first matching category — it was built to find
+        # ONE section to guarantee-include, not to detect every category a
+        # query touches. "What are the benefits and exclusions of health
+        # insurance?" classifies as just ('exclusions', False) even though
+        # the query explicitly wants BOTH sections; vetoing "benefits"
+        # chunks there would silently drop half of what was asked for.
+        # Confirmed live: the "benefits" pattern requires the contiguous
+        # phrase "benefits of", which "benefits AND exclusions of" doesn't
+        # satisfy, so the strict regex dict alone misses this. Rather than
+        # a second hand-maintained synonym list, this derives a bare-word
+        # fallback straight from the existing dict's own keys (most section
+        # labels already ARE the plain English word — "benefits",
+        # "exclusions", "eligibility", "history", "medical" — so a light
+        # stem-and-search catches a category the strict phrase patterns
+        # miss) and skips the veto entirely when the query is multi-section
+        # this way — narrowing to one section is only safe when the query
+        # is actually about one section.
+        # _query_section_result already resolved once, earlier in this same
+        # function alongside _query_policy_type — reused here rather than
+        # re-classifying (and, on an LLM-fallback miss, re-paying for a
+        # second round-trip on the exact same query).
+        _q_lower_for_section = (retrieval_query or "").lower()
+        _section_categories_hit = {
+            _sec for _sec, _pats in self._QUERY_SECTION_INTENT_PATTERNS.items()
+            if any(re.search(_p, _q_lower_for_section) for _p in _pats)
+            or re.search(r"\b" + re.escape(_sec.replace("_", " ").rstrip("s")) + r"\w*\b", _q_lower_for_section)
+        }
+        if (
+            not document_filter
+            and _query_section_result
+            and not _query_section_result[1]
+            and len(_section_categories_hit) <= 1
+        ):
+            _q_section_label = _query_section_result[0]
+            _section_matches = any(
+                c.metadata.get("section") == _q_section_label for c in all_chunks
+            )
+            if _section_matches:
+                _before_section_count = len(all_chunks)
+                all_chunks = [
+                    c for c in all_chunks
+                    if c.metadata.get("section", "general") in ("general", _q_section_label)
+                ]
+                if len(all_chunks) < _before_section_count:
+                    logger.info(
+                        "[ask_stream] Section-intent mismatch filter: query_section=%r dropped %d/%d chunks",
+                        _q_section_label,
+                        _before_section_count - len(all_chunks), _before_section_count,
+                    )
 
         # Reorder so chunks naming the query's specific insurance type sort
         # first — matters here specifically because _verify_grounding below
@@ -7534,6 +10712,44 @@ class MultiSourceRAG:
                 or (_cq_a.strip().lower() in _GENERAL_VOCAB_TERMS and _cq_b.strip().lower() in _GENERAL_VOCAB_TERMS)
             )
         _retrieval_split_bypass = _cq_is_split_shape and _top_rerank >= 0.9
+        # REMOVED (2026-09-03): a low-score sibling of
+        # _semantic_high_confidence_bypass used to live here, trusting
+        # _semantically_grounded (an LLM judgment call) over the reranker
+        # score whenever the score was low but non-zero (>=0.005, <0.9) —
+        # built for a real failure shape (casual scenario phrasing scoring
+        # poorly against textbook-style KB prose even for genuinely correct
+        # content, e.g. "Our restaurant kitchen caught fire..." scoring
+        # only 0.014) and calibrated against real control queries at the
+        # time.
+        #
+        # Removed for two combined reasons. First, the SAME small model
+        # making this judgment call is confirmed unreliable at comparable
+        # judgment calls elsewhere in this pipeline (policy-type
+        # classification's full-list tie-break) — trusting its semantic
+        # read over a numeric score here is the identical bet on the
+        # identical model. Confirmed live this bypass is exactly what let
+        # a genuinely wrong-topic chunk ("Powers of Appointed Actuary" —
+        # insurer solvency regulation) through to generation for "someone
+        # tried to scam me out of my pension savings": reranker correctly
+        # scored it low (0.056), semantically_grounded wrongly said yes,
+        # and this bypass trusted the wrong signal. Second, the root cause
+        # this bypass was compensating for — casual phrasing scoring
+        # poorly regardless of true relevance — is now addressed more
+        # directly by the scenario-reformulation rescue above, which
+        # became UNCONDITIONAL the same day this was removed (previously
+        # only ran below a 0.01 score threshold that missed real cases,
+        # including this very pension-scam query at 0.056). Re-tested the
+        # kitchen-fire case that originally motivated this bypass with it
+        # removed: reformulation alone now rescues it to a real, correctly-
+        # sourced answer, without needing to trust a low score at all.
+        #
+        # Verified via a 15-query before/after batch (mix of direct jargon
+        # queries, indirect scenario queries, and the pension-scam case)
+        # before removing: only 2 results changed, both improvements — the
+        # pension-scam case correctly moved from a wrong answer to an
+        # honest refusal, and one other case ("what is no claim bonus")
+        # moved from refusal to a real, correctly-sourced answer. Nothing
+        # that was correctly answered became wrongly refused.
         ctx_covered = (
             _grounding_bypass
             or _semantic_high_confidence_bypass
@@ -7558,7 +10774,6 @@ class MultiSourceRAG:
                 "semantically_grounded=True — overriding a False from _lex_ok",
                 _top_rerank,
             )
-
         _dropped_terms_note = None
         _answered_via_standalone_retry = False
         if not ctx_covered and not document_filter and not _pasted_grounds_answer:
@@ -7923,6 +11138,130 @@ class MultiSourceRAG:
         if _relevant_chunks:
             all_chunks = _relevant_chunks
 
+        # ── Decision-query full-policy-type retrieval ───────────────────────
+        # Computed HERE (before compression, not at the prompt_question-
+        # building site further below where this used to live) specifically
+        # so a "yes" merges into `all_chunks` BEFORE compress_to_budget runs
+        # — reusing the real, already-correct compression pipeline instead
+        # of hand-assembling a second, parallel context string (this
+        # session already learned that lesson the hard way once — see
+        # project_post_hallucination_retry.md — a hand-rolled second path
+        # reliably re-introduces bugs the real path already solved).
+        # _is_type_decision is reused verbatim at the later site.
+        #
+        # Confirmed live 2026-08-31 (Pet_Insurance_Guide.pdf): "Which policy
+        # is right for my pet?" retrieved 4 chunks via plain similarity
+        # search, none of them "Accident and Illness Plans" — the one the
+        # guide itself calls out as "chosen by most pet owners" — while a
+        # differently-worded question retrieved 8, including it. Tracing
+        # the document structure showed why: the 4 real plan types
+        # (Accident-Only, Accident and Illness, Wellness Add-Ons,
+        # Comprehensive) are each their own short, correctly-atomic chunk
+        # (a handful of sentences, nowhere near the chunker's own size
+        # cap — split on HEADING boundaries, not length) sitting right next
+        # to each other under one "Types of Coverage Plans" section, but
+        # nothing guarantees plain similarity search retrieves that
+        # complete family together — it can grab any subset, so the model
+        # only ever sees whichever types the wording happened to surface,
+        # never the complete real picture, and can't reliably identify
+        # which one the guide marks as standard.
+        #
+        # General fix, not targeted at this one guide or these four chunks:
+        # once a question is confirmed decision-shaped AND the query's
+        # policy_type is confidently resolved (not "general"), pull EVERY
+        # chunk tagged with that policy_type — not a similarity-ranked
+        # subset — so the model sees the complete real set of options for
+        # THIS product, whatever product that happens to be. Bounded and
+        # cheap in practice: a policy_type maps to one focused product
+        # guide (tens of chunks), never the whole KB — nothing here touches
+        # the "types of life insurance" case from earlier this session,
+        # where the same request would have meant hundreds of chunks from
+        # a mixed multi-topic textbook; that gate (policy_type != general)
+        # already keeps this scoped to exactly the small, single-product
+        # case where "just retrieve all of it" is safe and bounded, the
+        # same reasoning that ruled it OUT for the textbook case and rules
+        # it IN here.
+        _is_type_decision = await _is_type_decision_query(question)
+        # Set below (if at all) by the sub-branch disambiguation call right
+        # after this block — declared here so it's always defined even when
+        # the block is skipped or its try/except swallows an error, since
+        # the prompt-building code downstream reads it unconditionally.
+        _decided_subbranch: Optional[str] = None
+        if _is_type_decision and _query_policy_type and _query_policy_type != "general":
+            try:
+                _all_type_chunks = await asyncio.to_thread(
+                    self.doc_pipeline._vector_store.get_all_by_filter,
+                    {"policy_type": _query_policy_type},
+                )
+                # Confirmed live 2026-08-31: pulling in EVERY chunk for the
+                # policy type (a first version of this fix) genuinely
+                # solved the missing-chunk problem, but a real single-
+                # product guide has ~40 chunks covering history, claims
+                # process, common mistakes, a glossary, etc. — mostly
+                # irrelevant to "which type should I buy." With that much
+                # extra bulk, compress_to_budget had to squeeze everything
+                # so hard the model started filling gaps with a plausible-
+                # sounding but entirely fabricated plan name ("Basic
+                # Coverage" — confirmed absent from the source PDF
+                # entirely). User's fix: only pull in chunks that are
+                # actually DEFINITION-and-coverage content, not the whole
+                # guide.
+                #
+                # Filtered by live-reclassifying each candidate's own text
+                # via classify_chunk_intent (llm=None — pure regex, no
+                # network call, near-zero added latency even across ~40
+                # chunks) rather than trusting each chunk's STORED section
+                # tag — deliberately, because this exact chunk (heading
+                # "Accident and Illness Plans") was independently found to
+                # carry a STALE "general" tag while classify_chunk_intent
+                # confidently reclassifies its actual text as "benefits"
+                # (regex score benefits=1, every other label=0). Trusting
+                # the stored tag here would have silently reproduced the
+                # exact bug being fixed. "types_of_insurance" also kept —
+                # this codebase's own category for "different types or
+                # kinds of a policy", the other natural home for this
+                # content depending on how a given document got tagged.
+                _def_coverage_labels = {"benefits", "types_of_insurance"}
+                _new_type_chunks = []
+                _types_label_chunks = []
+                _seen_prefixes = {c.page_content[:80] for c in all_chunks}
+                for _d in _all_type_chunks:
+                    if _d.page_content[:80] in _seen_prefixes:
+                        continue
+                    _live_label = classify_chunk_intent(
+                        _d.page_content, doc_type="policy_document", llm=None,
+                        heading=_d.metadata.get("section_heading", ""),
+                    )
+                    if _live_label in _def_coverage_labels:
+                        _new_type_chunks.append(_d)
+                        if _live_label == "types_of_insurance":
+                            _types_label_chunks.append(_d)
+                if _new_type_chunks:
+                    all_chunks = all_chunks + _new_type_chunks
+                    logger.info(
+                        "[ask_stream] decision-query full-policy-type retrieval: "
+                        "policy_type=%s added %d definition/coverage chunk(s) (of %d "
+                        "total for this policy_type) beyond the %d similarity search "
+                        "already found",
+                        _query_policy_type, len(_new_type_chunks), len(_all_type_chunks),
+                        len(all_chunks) - len(_new_type_chunks),
+                    )
+                # Sub-branch disambiguation — see _classify_decision_subbranch's
+                # own docstring for the full case this exists for (Hull vs
+                # Cargo). Only worth the extra call when the KB's own
+                # "types_of_insurance"-labeled content for this policy_type
+                # was actually found — genuinely no-ops (None, zero added
+                # latency) for the many policy_types with just one real
+                # product and no such content to disambiguate against.
+                _decided_subbranch = await _classify_decision_subbranch(
+                    question, _query_policy_type, _types_label_chunks,
+                )
+            except Exception as _decision_exc:
+                logger.debug(
+                    "[ask_stream] decision-query full-policy-type retrieval skipped: %s",
+                    _decision_exc,
+                )
+
         # Full, uncompressed chunk text — kept alongside the (possibly
         # compressed) prompt context below specifically for the post-
         # generation grounding checks further down (_point_grounded,
@@ -7953,10 +11292,89 @@ class MultiSourceRAG:
         # deletes the sentence outright — the same underlying gap as the
         # generation-context label fix above, just reached through this
         # separate uncompressed copy of the context instead of full_context.
-        _full_context_uncompressed = "\n\n".join(
-            (f"[{h}]\n{c.page_content}" if (h := c.metadata.get("section_heading", "")) else c.page_content)
+        # Each entry pairs a chunk's text with its own metadata["section"]
+        # tag (e.g. "exclusions", "benefits", "claims") AND its
+        # metadata["policy_type"] — carried through so downstream
+        # consumers (the specificity guard's enumeration matcher) can use
+        # these structured signals instead of guessing which list a point
+        # is about purely from word overlap. policy_type matters
+        # separately from section: "Common Exclusions" is a heading that
+        # appears near-identically across many different products' own
+        # documents (marine, fire, life, motor, ...), so section alone
+        # can't tell two different products' exclusions lists apart when
+        # both happen to be in context together — only policy_type can.
+        # See each field's own comment where it's read.
+        _full_context_uncompressed_chunks = [
+            (
+                (f"[{h}]\n{c.page_content}" if (h := c.metadata.get("section_heading", "")) else c.page_content),
+                c.metadata.get("section", ""),
+                c.metadata.get("policy_type", ""),
+            )
             for c in all_chunks
-        )
+        ]
+        _full_context_uncompressed = "\n\n".join(_t for _t, _s, _pt in _full_context_uncompressed_chunks)
+
+        # ── Same-section duplicate consolidation (generation pool only) ────────
+        # This KB has more than one full guide for some policy types (e.g. two
+        # separate travel_insurance_guide PDFs), so a query routinely retrieves
+        # the SAME section from BOTH — two "How to File a Travel Insurance
+        # Claim" chunks, two "Practical Tips" chunks, two "Common Exclusions"
+        # chunks, each pair scoring almost identically since they're genuinely
+        # about the same thing. compress_to_budget (below) has no way to know
+        # two chunks are near-duplicates — it treats them as two independently
+        # important sources and gives each its own fair share, which HALVES
+        # the effective budget available for that one topic. Confirmed live:
+        # "How to claim a travel insurance?" retrieved both claim-procedure
+        # chunks (959 and 742 chars, rerank_score 0.997 each, describing 4-5
+        # distinct claim scenarios — medical emergency abroad, baggage loss/
+        # delay, trip cancellation, submission, settlement) into a 900-char
+        # budget shared across 4 chunks; each claim chunk was compressed down
+        # to a single sentence, and the two single sentences that survived
+        # happened to be different ones from each duplicate — so the model
+        # never received more than one scenario's worth of real content,
+        # no matter how the generation prompt was worded (verified directly:
+        # the raw completion before any post-processing already lacked the
+        # content, and the assembled full_context sent to the LLM already
+        # lacked the words "baggage" and "trip cancellation" before that).
+        # Keeping only the larger (more complete) chunk per (heading,
+        # policy_type) pair lets that ONE chunk absorb the budget the pair
+        # would have split, without touching the actual compression
+        # algorithm's own carefully-tuned fair-share/viability logic at all.
+        # Scoped narrowly on purpose: requires an EXACT match on both a
+        # non-empty section_heading AND policy_type, not just similar text —
+        # a heading like "Common Exclusions" recurs near-identically across
+        # DIFFERENT products (motor/marine/fire/...) where consolidating
+        # would silently drop a genuinely different product's content: see
+        # this file's own policy_type-carrying comment a few lines up for
+        # why policy_type has to gate this the same way it gates SRG
+        # matching. Runs only on the GENERATION pool (all_chunks) — grounding
+        # checks a few lines above already captured the full, unconsolidated
+        # pool into _full_context_uncompressed_chunks, so nothing here can
+        # cause a real fact to be missed by the post-generation verifiers.
+        if not document_filter:
+            _dedup_groups: dict = {}
+            for c in all_chunks:
+                _h = (c.metadata.get("section_heading") or "").strip().lower()
+                _pt = (c.metadata.get("policy_type") or "").strip().lower()
+                if not _h:
+                    continue
+                _dedup_groups.setdefault((_h, _pt), []).append(c)
+            _drop_ids = set()
+            for _group in _dedup_groups.values():
+                if len(_group) < 2:
+                    continue
+                _keep = max(_group, key=lambda c: len(c.page_content))
+                for c in _group:
+                    if c is not _keep:
+                        _drop_ids.add(id(c))
+            if _drop_ids:
+                _before_dedup_count = len(all_chunks)
+                all_chunks = [c for c in all_chunks if id(c) not in _drop_ids]
+                logger.info(
+                    "[ask_stream] Same-section duplicate consolidation: dropped %d/%d chunks "
+                    "(kept the larger chunk per duplicate heading+policy_type pair)",
+                    _before_dedup_count - len(all_chunks), _before_dedup_count,
+                )
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
@@ -8241,29 +11659,96 @@ class MultiSourceRAG:
 
             # ── Type-of-X decision-vs-enumeration override ─────────────────
             # See _TYPE_DECISION_RE's block comment above for the full case.
-            # Checked against `question` (the user's actual literal wording),
-            # not prompt_question, which may have been rewritten above (a
-            # follow-up's retrieval_query, a point-reference quote, etc.) and
-            # would no longer reliably contain "type of" even when the
-            # user's real question did. _is_type_decision (not re-derived) is
-            # reused below at _enforce_numbered_list_format's call site — that
-            # deterministic reformatter is ALSO gated on _TYPES_OF_QUERY_RE
-            # and, without this, would still turn this prompt fix's own
-            # short, correct prose answer BACK into a numbered list, since it
-            # has no way to know this question isn't a real enumeration
-            # request. One classification, reused, not two independent LLM
-            # round trips reaching different conclusions.
-            _is_type_decision = bool(_TYPES_OF_QUERY_RE.search(question)) and await _is_type_decision_query(question)
+            # _is_type_decision is now computed EARLY (before compression —
+            # see the "Decision-query full-policy-type retrieval" block
+            # above, right after all_chunks is finalized) rather than here,
+            # so a "yes" can merge extra chunks into all_chunks BEFORE
+            # compress_to_budget runs instead of hand-appending raw text to
+            # an already-built full_context string. Reused verbatim below
+            # at _enforce_numbered_list_format's call site too — that
+            # deterministic reformatter has its OWN independent "type of"
+            # check, so this being True for a non-"type of" phrasing is
+            # inert for it, not a regression.
             if _is_type_decision:
+                # Confirmed live 2026-08-31: the original wording here
+                # avoided the numbered-list bug but left escape hatches
+                # open — the model sometimes answered with a clarifying
+                # question back to the user instead of a real answer
+                # ("Let's start by considering your pet's needs and your
+                # budget. Do you have any specific concerns?"), sometimes
+                # gave a factors-to-consider rundown (breed, age, location,
+                # deductibles...) without ever actually NAMING a type, and
+                # even once it DID name one, sometimes stopped at the bare
+                # name instead of explaining what it covers and how it
+                # actually helps — user's explicit ask: "i want all the
+                # points that the kb is covering [about it]", not just the
+                # name. Closing all three paths explicitly.
                 prompt_question = (
-                    f"{prompt_question.rstrip(' .?')}. This question describes the "
-                    "user's own situation or need and asks which ONE type of "
-                    "insurance fits it — it is NOT asking you to list or enumerate "
-                    "every type that exists. Give a short, direct answer naming the "
-                    "single most relevant type and a brief reason why, in plain "
-                    "prose. Do NOT produce a numbered list of unrelated coverage "
-                    "details or other perils the policy happens to cover."
+                    f"{prompt_question.rstrip(' .?')}. STOP — this question describes "
+                    "the user's own situation or need and asks which ONE type of "
+                    "policy or plan fits it. It is NOT asking you to list every type "
+                    "that exists, and it is NOT asking you to list the FACTORS that go "
+                    "into choosing one either — those are two different ways of still "
+                    "not answering. You MUST name ONE specific type/plan by its real "
+                    "name from the KNOWLEDGE BASE, and then explain what it actually "
+                    "covers and how it helps this specific situation, drawing on EVERY "
+                    "relevant point the KNOWLEDGE BASE makes about that type — not just "
+                    "its name and a one-line reason. Plain prose, no numbered list. "
+                    "Never respond with a question back to the user instead of "
+                    "answering (\"what's your budget?\", \"do you have any concerns?\") "
+                    "— commit to the single best answer the KNOWLEDGE BASE actually "
+                    "supports, even a general one, rather than deflecting. If the "
+                    "KNOWLEDGE BASE names a type as the most popular, most common, or "
+                    "standard recommended choice for this kind of need, name THAT one "
+                    "directly and cover everything it says about it."
                 )
+                if _decided_subbranch:
+                    # A dedicated, single-purpose call (see
+                    # _classify_decision_subbranch) already determined which
+                    # named product actually fits this situation — state it
+                    # as an already-settled fact, not an option to weigh
+                    # alongside whatever else is sitting in the context
+                    # below. Confirmed live this needed to be this forceful:
+                    # a softer "consider recommending X" phrasing still let
+                    # the model substitute a different, wrong product it
+                    # found more lexically appealing in the context.
+                    prompt_question = (
+                        f"{prompt_question.rstrip(' .?')}. The correct product for this "
+                        f"specific situation has already been identified as "
+                        f'"{_decided_subbranch}" — write your answer explaining THIS '
+                        f"product specifically, using only what the KNOWLEDGE BASE says "
+                        f"about it. Do not substitute a different product, even if "
+                        f"another one also appears in the context below."
+                    )
+                # DETAILED_GROUNDED_PROMPT's own FORMAT section is
+                # unconditional — "numbered list, plain human sentences...
+                # EVERY point starts with 'N. '" — with no prose branch at
+                # all, unlike STRICT_GROUNDED_PROMPT's own FORMAT (which
+                # genuinely branches: numbered list only when 2+ real
+                # parallel items exist, prose otherwise). Appending "do NOT
+                # produce a numbered list, answer in prose" to the QUESTION
+                # text above was fighting a losing battle against that
+                # prompt's own unconditional, example-reinforced FORMAT
+                # rule — confirmed live 2026-08-31: "what type of policy
+                # should i buy for my pet" (detailed=True) still came back
+                # as "1. The most popular category of pet insurance is
+                # Accident and Illness Plans...", a numbered list, despite
+                # the explicit instruction not to. Same root lesson as
+                # today's comparison-table $/₹ fix and the citation-tag
+                # FORMAT-example fix: a prompt's own FORMAT section and
+                # its worked examples reliably beat a one-off instruction
+                # tacked onto the question. Routing to a genuinely prose-
+                # capable prompt (STRICT_GROUNDED_PROMPT or
+                # CONVERSATIONAL_RAG_PROMPT, both selected below via this
+                # same `detailed` flag) is the only way this instruction
+                # can actually take effect — also correctly shrinks the
+                # output token budget (_VLLM_MAX_TOKENS_BRIEF vs
+                # _DETAILED below) to match the "short, direct answer"
+                # this override itself asks for. Safe to reassign this
+                # late: retrieval already ran with the ORIGINAL detailed
+                # value above, so this only changes prompt selection and
+                # output length, not what got retrieved.
+                detailed = False
                 logger.info(
                     "[ask_stream] type-of-X decision query detected, suppressing enumeration format: %r",
                     question[:80],
@@ -8279,7 +11764,6 @@ class MultiSourceRAG:
                     context=full_context,
                     question=prompt_question,
                 )
-
             # Safety valve (2026-08-04, plan_shallow_answers_context_budget.md
             # — found live, NOT part of the original plan): _context_budget
             # (chars, computed far above from a CHAR estimate of what would
@@ -8304,9 +11788,21 @@ class MultiSourceRAG:
             # gap comes from. 50-token buffer, not 196 (the char-heuristic's
             # margin): this is a real measurement, not an estimate, so it
             # needs far less slack.
+            def _rebuild_prompt_for_budget():
+                if document_filter:
+                    return STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                elif detailed:
+                    return DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                else:
+                    return CONVERSATIONAL_RAG_PROMPT.format(history=history, context=full_context, question=prompt_question)
+
             _desired_max_tokens = _VLLM_MAX_TOKENS_DETAILED if detailed else _VLLM_MAX_TOKENS_BRIEF
-            _real_prompt_tokens_final = _measure_prompt_tokens(prompt)
-            _safe_max_tokens = max(50, min(_desired_max_tokens, 4096 - _real_prompt_tokens_final - 50))
+            _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
+            # 50-token buffer for a real /tokenize measurement; widened to
+            # 196 (the char-heuristic's own known margin of error, see the
+            # comment on _CHARS_PER_TOKEN above) whenever that measurement
+            # fell back to the char/N estimate — see _measure_prompt_tokens_ex.
+            _token_budget_buffer = 50 if _tokens_are_real else 196
 
             # Confirmed live (2026-08-13): for a query whose retrieval pulls
             # several dense, jargon-heavy chunks at once (comparison queries
@@ -8314,35 +11810,90 @@ class MultiSourceRAG:
             # premium" pulled 5 separate source docs), the char/3 slop this
             # safety valve exists to catch can be MUCH larger than the
             # 50-token buffer above assumes — real tokens came in at 5200
-            # against a 4096-token model, driving _safe_max_tokens all the
-            # way down to its 50-token floor. The valve still did its job
-            # (no crash), but 50 tokens is enough to cut a real answer off
-            # mid-sentence ("...you cover the"), which reads as broken to a
-            # user even though nothing errored. Rather than accept a
-            # near-empty answer, trim full_context and rebuild the prompt
-            # once, aiming for enough room that the output is still usable.
+            # against a 4096-token model, driving the available room deep
+            # negative. Rather than accept a near-empty answer, trim
+            # full_context and rebuild the prompt, aiming for enough room
+            # that the output is still usable.
+            #
+            # LOOPED, not one-shot (2026-08-25): a single trim attempt sizes
+            # its cut from one estimate of the overshoot — confirmed live
+            # this isn't always enough in one pass (a detailed-mode
+            # follow-up question, which also carries conversation history
+            # on top of an already-large prompt template, trimmed 3060
+            # chars and still measured 4155-4156 real tokens afterward,
+            # still 60+ tokens over the ceiling even at the 50-token
+            # buffer). Looping re-measures and re-cuts until it's actually
+            # safe or full_context is exhausted, rather than trusting one
+            # estimate to have been enough.
             _MIN_USABLE_OUTPUT_TOKENS = 150
-            if full_context and _safe_max_tokens < min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens):
+            _ABSOLUTE_MIN_OUTPUT_TOKENS = 16
+            _context_trim_rounds = 0
+            _MAX_CONTEXT_TRIM_ROUNDS = 6
+            while (
+                full_context
+                and (4096 - _real_prompt_tokens_final - _token_budget_buffer) < min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens)
+                and _context_trim_rounds < _MAX_CONTEXT_TRIM_ROUNDS
+            ):
+                _context_trim_rounds += 1
                 _target_floor = min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens)
-                _tokens_over = (_real_prompt_tokens_final + 50 + _target_floor) - 4096
+                _tokens_over = (_real_prompt_tokens_final + _token_budget_buffer + _target_floor) - 4096
                 # 2x margin — the same char/3 slop that caused the overshoot
                 # in the first place means a 1x cut based on the estimate
                 # would likely still come up short after re-measuring.
                 _chars_to_cut = max(300, _tokens_over * _CHARS_PER_TOKEN * 2)
-                full_context = full_context[:max(0, len(full_context) - _chars_to_cut)]
-                if document_filter:
-                    prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
-                elif detailed:
-                    prompt = DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
-                else:
-                    prompt = CONVERSATIONAL_RAG_PROMPT.format(history=history, context=full_context, question=prompt_question)
-                _real_prompt_tokens_final = _measure_prompt_tokens(prompt)
-                _safe_max_tokens = max(50, min(_desired_max_tokens, 4096 - _real_prompt_tokens_final - 50))
+                _new_len = max(0, len(full_context) - _chars_to_cut)
+                if _new_len >= len(full_context):
+                    break
+                full_context = full_context[:_new_len]
+                prompt = _rebuild_prompt_for_budget()
+                _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
+                _token_budget_buffer = 50 if _tokens_are_real else 196
                 logger.warning(
-                    "[ask_stream] context-budget gap: trimmed full_context by %d chars to recover "
-                    "output room — real prompt tokens now=%d, safe_max_tokens now=%d/%d",
-                    _chars_to_cut, _real_prompt_tokens_final, _safe_max_tokens, _desired_max_tokens,
+                    "[ask_stream] context-budget gap: trimmed full_context by %d chars (round %d) to "
+                    "recover output room — real prompt tokens now=%d (measured=%s)",
+                    _chars_to_cut, _context_trim_rounds, _real_prompt_tokens_final, _tokens_are_real,
                 )
+
+            # Last resort: even with full_context emptied, the prompt
+            # template plus conversation history still doesn't leave room
+            # for a genuinely usable answer — structurally possible now
+            # that DETAILED_GROUNDED_PROMPT alone measures ~3376 tokens
+            # (see _DETAILED_PROMPT_TOKENS_EST), leaving very little room
+            # for history on a multi-turn follow-up. This is the actual
+            # case that produced a live "Could not generate an answer due
+            # to an internal error": the context-only loop left real
+            # prompt tokens at 4155-4156, the backend rejected the request
+            # outright with an HTTP 400 ("prompt contains at least 4047
+            # input tokens... total of at least 4097"), and that surfaced
+            # to the user as a bare failure instead of any answer at all.
+            # Trimming history is the only lever left once context is
+            # already empty.
+            if history and (4096 - _real_prompt_tokens_final - _token_budget_buffer) < _ABSOLUTE_MIN_OUTPUT_TOKENS:
+                history = ""
+                prompt = _rebuild_prompt_for_budget()
+                _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
+                _token_budget_buffer = 50 if _tokens_are_real else 196
+                logger.warning(
+                    "[ask_stream] context-budget gap: dropped conversation history entirely — "
+                    "prompt template alone left no room even with full_context emptied, "
+                    "real prompt tokens now=%d (measured=%s)",
+                    _real_prompt_tokens_final, _tokens_are_real,
+                )
+
+            # Never let a floor claim a request is safe when the
+            # arithmetic says otherwise. The bug this replaces: an
+            # unconditional max(50, ...) forced safe_max_tokens to 50 even
+            # when 4096 - real_prompt_tokens - 50 was NEGATIVE, silently
+            # sending a request the backend was guaranteed to reject with
+            # an HTTP 400 — exactly the live failure this whole block was
+            # extended to fix. Only fall back to a smaller buffer (10, not
+            # 50) when the primary formula genuinely has no room left, and
+            # still never go below 1.
+            _raw_available = 4096 - _real_prompt_tokens_final - _token_budget_buffer
+            if _raw_available >= _ABSOLUTE_MIN_OUTPUT_TOKENS:
+                _safe_max_tokens = min(_desired_max_tokens, _raw_available)
+            else:
+                _safe_max_tokens = max(1, 4096 - _real_prompt_tokens_final - (10 if _tokens_are_real else 40))
 
             if _safe_max_tokens < _desired_max_tokens:
                 logger.warning(
@@ -8351,6 +11902,41 @@ class MultiSourceRAG:
                     "the estimate and the assembled prompt is larger than accounted for",
                     _real_prompt_tokens_final, _safe_max_tokens, _desired_max_tokens,
                 )
+
+            # A too-small max_tokens doesn't fail — vLLM happily generates
+            # whatever fits and stops. Confirmed live (2026-08-27): once
+            # context trimming and history-dropping have both maxed out and
+            # _safe_max_tokens still lands at single digits (a long template
+            # + a claims-heavy retrieval that legitimately doesn't fit
+            # together in 4096 tokens), the request "succeeds" but returns
+            # garbage cut off mid-sentence ("Sure, here's a detailed
+            # breakdown:\n\n1. So here") — worse than the 400 this whole
+            # budget mechanism exists to prevent, since it looks like a
+            # broken product to the user instead of an honest limitation.
+            # Below this floor there's no realistic way to fit even one
+            # coherent sentence, so degrade to the same "couldn't find
+            # this" handoff already used elsewhere for a genuinely empty
+            # context (line ~9243) — except WITH the real sources that
+            # were actually found, since the content exists, it just
+            # doesn't fit in this turn's context window.
+            _MIN_VIABLE_OUTPUT_TOKENS = 40
+            if _safe_max_tokens < _MIN_VIABLE_OUTPUT_TOKENS:
+                logger.warning(
+                    "[ask_stream] context-budget gap: safe_max_tokens=%d is below the "
+                    "minimum viable output floor (%d) even after trimming context/history — "
+                    "degrading to a handoff instead of generating a doomed, truncated answer",
+                    _safe_max_tokens, _MIN_VIABLE_OUTPUT_TOKENS,
+                )
+                import json as _json_s
+                yield (
+                    "Hmm, this one's a bit too much for me to pull together right now. "
+                    "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                )
+                yield "\n\n" + _json_s.dumps({
+                    "sources": list(dict.fromkeys(sources)), "done": True, "needs_human": True,
+                })
+                return
+
             llm = get_insurance_llm(temperature=0, max_tokens=_safe_max_tokens)
 
         # ── Stream LLM tokens directly via HTTP SSE ───────────────────────────
@@ -8706,6 +12292,49 @@ class MultiSourceRAG:
             logger.debug("[ask_stream] named-pair depth enforcement skipped: %s", _depth_exc)
 
         try:
+            # Same "before the list formatter" ordering as the named-pair
+            # depth block above, and the same reason: _full_context_uncompressed
+            # (not the post-compression all_chunks context) since a longer
+            # future chunk could have this exact sentence trimmed by
+            # compression even when this specific KB chunk currently
+            # doesn't (confirmed: it's short enough to skip compression
+            # entirely today, but that's a property of THIS chunk, not
+            # something this check should assume holds for every future one).
+            _requirement_corrected_text = await _enforce_requirement_type_named(
+                question, _full_context_uncompressed, _corrected_text or _reply_stripped
+            )
+            if _requirement_corrected_text:
+                logger.info("[ask_stream] named a specific requirement type the answer had left generic")
+                _corrected_text = _requirement_corrected_text
+                _kv_reply = _requirement_corrected_text
+        except Exception as _requirement_exc:
+            logger.debug("[ask_stream] requirement-type-named enforcement skipped: %s", _requirement_exc)
+
+        try:
+            # Runs BEFORE _enforce_numbered_list_format (and well before
+            # the dangling they/these opener check and PGF's per-point
+            # grounding check further down) — see _enforce_prose_format's
+            # own docstring for why order matters here: a decision
+            # query's answer that came back as an unwanted numbered list
+            # needs to be back to prose BEFORE any downstream check starts
+            # evaluating its lines as independent, isolated points, not
+            # after damage (a dropped point, lost content) is already
+            # done. The two enforcers can never both fire on the same
+            # answer — this one requires is_type_decision AND an existing
+            # numbered list; the other requires a "types" enumeration
+            # query AND the absence of one — so this always runs first
+            # with no risk of the two fighting each other.
+            _prose_formatted_text = await _enforce_prose_format(
+                question, _corrected_text or _reply_stripped, is_type_decision=_is_type_decision
+            )
+            if _prose_formatted_text:
+                logger.info("[ask_stream] reformatted numbered-list answer into prose for a decision query")
+                _corrected_text = _prose_formatted_text
+                _kv_reply = _prose_formatted_text
+        except Exception as _prose_exc:
+            logger.debug("[ask_stream] prose format enforcement skipped: %s", _prose_exc)
+
+        try:
             _list_formatted_text = await _enforce_numbered_list_format(
                 question, _corrected_text or _reply_stripped, is_type_decision=_is_type_decision
             )
@@ -8803,7 +12432,23 @@ class MultiSourceRAG:
         # (left unnumbered), the closing farewell line as unnumbered too, and
         # numbers everything in between — mirroring the prompt's own intended
         # structure rather than inventing a different one.
-        if _keyword_detailed:
+        # Never fires for a decision query (2026-09-01) — _keyword_detailed
+        # is the ORIGINAL detail classification, untouched by the "type-of-X
+        # decision-vs-enumeration override" above (that override only
+        # reassigns the separate `detailed` local, for prompt selection),
+        # so this block ran unconditionally for a decision query even after
+        # the model correctly produced prose per that override's own "Plain
+        # prose, no numbered list" instruction. Confirmed live: exactly this
+        # forced clean prose into "1. 2. 3." for "what type of policy should
+        # I buy for my pet" — a decision query — and THAT forced numbering
+        # is what the downstream dangling they/these check and PGF's
+        # numbered-list branch then picked apart sentence-by-sentence,
+        # dropping real content that only made sense in its original prose
+        # context. _enforce_numbered_list_format already carries this exact
+        # is_type_decision exemption; this deterministic sibling needed the
+        # same one, since it does the identical prose-to-numbered
+        # transformation through a different code path.
+        if _keyword_detailed and not _is_type_decision:
             try:
                 import re as _re
                 _num_src = (_corrected_text or _reply_stripped).strip()
@@ -10002,12 +13647,25 @@ class MultiSourceRAG:
                                 _dd_overlap = _duplicate_point_word_overlap(
                                     _dd_points[_dd_match_idx], _pt
                                 )
-                                _dd_is_dup = _dd_overlap >= _DUPLICATE_POINT_JACCARD_FLOOR
+                                if _dd_overlap >= _DUPLICATE_POINT_JACCARD_FLOOR:
+                                    # LLM confirmation — see
+                                    # _verify_points_are_duplicate's own
+                                    # docstring for the two confirmed live
+                                    # false positives (different motor
+                                    # policy tiers, different health claim
+                                    # paths) that scored well inside this
+                                    # threshold's own "genuine duplicate"
+                                    # range despite stating different facts.
+                                    _dd_is_dup = await _verify_points_are_duplicate(
+                                        _dd_points[_dd_match_idx], _pt
+                                    )
                         if _dd_is_dup:
                             _dd_dropped += 1
                             logger.info(
-                                "[ask_stream] dropped duplicate point %d (score=%.4f, restates point %d): %r",
-                                _i + 1, _dd_max, _dd_match_idx + 1, _pt[:150],
+                                "[ask_stream] dropped duplicate point %d (score=%.4f, restates point %d): %r\n"
+                                "  KEPT (point %d): %r",
+                                _i + 1, _dd_max, _dd_match_idx + 1, _pt[:200],
+                                _dd_match_idx + 1, _dd_points[_dd_match_idx][:200],
                             )
                             continue
                         _dd_kept_idx.append(_i)
@@ -10051,6 +13709,17 @@ class MultiSourceRAG:
         try:
             import re as _re5
             _CURRENCY_RE = _re5.compile(r'(?:[₹$£€]|\bRs\.?\b|\bINR\b|\bEUR\b)\s?([\d,]+(?:\.\d+)?)', _re5.IGNORECASE)
+            # Confirmed live: a plain, non-"example" question ("What is a
+            # no-claim bonus?") got answered with "the discount starts
+            # around 20%" — a bare percentage, fabricated (the source only
+            # ever says "up to a maximum percentage", no figure at all).
+            # _CURRENCY_RE only ever matched currency-symbol-prefixed
+            # figures, so a bare percentage was never in this filter's
+            # scope in the first place, regardless of the example-request
+            # gate below. Same suppress-unless-example-request policy
+            # (2026-07-30) applies to percentages just as much as currency
+            # — the user's own rule is "no figures", not "no currency".
+            _PERCENTAGE_RE = _re5.compile(r'\b(\d+(?:\.\d+)?)\s?%')
             _num_src = (_corrected_text or _reply_stripped).strip()
             # De-wrapped once, up front, so both the grounding check right
             # below and the qualifier-mismatch windowing further down share
@@ -10410,6 +14079,24 @@ class MultiSourceRAG:
             # catching the confirmed recurring bug, not eliminated.
             _BARE_PLURAL_OPENER_RE = _re5.compile(r'^(?:they|these)\b', _re5.IGNORECASE)
 
+            # Small, closed set of nouns that END in "s" but are singular/
+            # uncountable — the same "closed list, not a growing
+            # vocabulary" discipline already used elsewhere in this file
+            # (e.g. the British/American spelling-variant list). Without
+            # this exclusion, a header like "Third-Party Insurance: These
+            # ..." would wrongly count "Insurance" as a plural antecedent.
+            _FALSE_PLURAL_LAST_WORDS = frozenset({
+                "insurance", "business", "news", "series", "basis",
+                "analysis", "status", "process", "focus", "premises",
+            })
+
+            def _header_is_plural_antecedent(header: str) -> bool:
+                _words = _re5.findall(r"[A-Za-z]+", header)
+                if not _words:
+                    return False
+                _last = _words[-1].lower()
+                return len(_last) > 2 and _last.endswith("s") and _last not in _FALSE_PLURAL_LAST_WORDS
+
             def _dangling_plural_opener(unit: str) -> bool:
                 if not _has_points:
                     return False
@@ -10435,30 +14122,58 @@ class MultiSourceRAG:
                 #
                 # In B and C, a short label ("Types of Coverage") doesn't
                 # itself name the specific plural concept ("Comprehensive
-                # Plans") the pronoun needs — known, accepted residual
-                # risk: a header/label that happens to itself BE the plural
-                # antecedent ("Exotic Pets" followed by "They are less
-                # commonly covered...", or "Exotic Pets: They are less
-                # commonly covered...") would also match here and be a
-                # false positive; not observed in this session's testing
-                # across 11 live runs, but not ruled out either.
+                # Plans") the pronoun needs — UNLESS the label itself IS a
+                # plural noun phrase, in which case it's a perfectly valid
+                # antecedent on its own. This exact residual risk was
+                # flagged in this function's own history as "not observed
+                # ... but not ruled out" — confirmed live 2026-09-01: "2.
+                # Whole Life Insurance Plans: These provide coverage..."
+                # and "3. Unit-Linked Insurance Plans (ULIPs): These
+                # combine..." both got dropped as dangling, even though
+                # "Plans" — the header's own last word — is exactly what
+                # "These" refers to. _header_is_plural_antecedent below
+                # closes this: a header whose last real word ends in "s"
+                # (and isn't one of a small set of uncountable nouns that
+                # merely LOOK plural, like "insurance" or "business") is
+                # treated as a valid antecedent, so the point is kept.
                 _colon_m = _re5.match(r'^\**([^:]{1,60})\**:\s*(.+)$', _first)
                 if _colon_m and not _re5.search(r'[.!?]\s*$', _colon_m.group(1)):
+                    if _header_is_plural_antecedent(_colon_m.group(1)):
+                        return False
                     _content_line = _colon_m.group(2)
                 elif len(_lines) >= 2 and not _re5.search(r'[.!?]\s*$', _first):
+                    if _header_is_plural_antecedent(_first):
+                        return False
                     _content_line = _re5.sub(r'^[-•*]\s*', '', _lines[1])
                 else:
                     _content_line = _first
                 _flagged = bool(_BARE_PLURAL_OPENER_RE.match(_content_line))
                 if _flagged:
+                    # Log-only (2026-09-01) — no longer a drop trigger. See
+                    # this check's own call site for why: whether a point's
+                    # OPENING WORD reads clearly is a readability/grammar
+                    # question, not a groundedness one, and this drop-loop
+                    # otherwise only ever removes a unit for a genuine
+                    # content problem (an invented figure, a mismatched
+                    # artifact/event type, a backreference to an already-
+                    # dropped point). Confirmed live this was actively
+                    # discarding real, correctly-grounded content ("Whole
+                    # Life Insurance Plans: These provide coverage for the
+                    # entire lifetime...") over a pronoun-clarity issue that
+                    # PGF — the actual faithfulness check, running later in
+                    # the pipeline — never even got a chance to judge on
+                    # the content's own merits. A mildly unclear "These" at
+                    # the very start of an otherwise-true, otherwise-useful
+                    # point is a strictly smaller cost than silently
+                    # deleting that point outright.
                     logger.info(
-                        "[ask_stream] dropped numbered point opening (directly, "
-                        "after a header line, or after a header: colon) with a "
-                        "bare they/these and no antecedent established earlier "
-                        "in the answer: %r",
+                        "[ask_stream] numbered point opens with a bare they/these "
+                        "and no antecedent established earlier in the answer "
+                        "(kept, not dropped — grounding is PGF's call, not "
+                        "this check's): %r",
                         unit[:150],
                     )
-                return _flagged
+                return False
 
             # User policy (2026-07-30): don't state specific currency/
             # payment figures at all unless the user explicitly asked for
@@ -10476,11 +14191,30 @@ class MultiSourceRAG:
             _is_example_request = bool(_re5.search(r'\bexamples?\b', question or '', _re5.IGNORECASE))
             for _unit in _units:
                 _found = _CURRENCY_RE.findall(_unit)
+                # An example request is EXEMPT from the grounding
+                # requirement entirely — not just given a softer version
+                # of it. Confirmed live (2026-08-25): the OR-chain below
+                # used to require `any(_currency_grounded(...))` even
+                # when `_is_example_request` was True, but a genuinely
+                # invented illustrative figure ("imagine a ₹20,000
+                # premium...") is BY DEFINITION never going to appear in
+                # the source text — _currency_grounded() naturally
+                # returns False for every invented example number, which
+                # silently defeated the exemption for every single
+                # example query rather than just the ones this check was
+                # meant to catch, dropping 3 of the answer's 4 units for
+                # a request that explicitly asked for an example. The
+                # qualifier-mismatch check still applies either way — an
+                # invented example describing the wrong real-world clause
+                # is still a real error, just a different kind than "not
+                # grounded."
                 _currency_bad = _found and (
-                    not _is_example_request
-                    or not any(_currency_grounded(f) for f in _found)
-                    or _qualifier_mismatched(_unit, _prev_unit_text)
+                    _qualifier_mismatched(_unit, _prev_unit_text) if _is_example_request
+                    else not any(_currency_grounded(f) for f in _found)
                 )
+                _found_pct = _PERCENTAGE_RE.findall(_unit)
+                _percentage_bad = _found_pct and not _is_example_request
+                _currency_bad = _currency_bad or _percentage_bad
                 _dangling_backref = _prev_unit_was_dropped and bool(_BACKREF_RE.search(_unit))
                 if (
                     _currency_bad
@@ -10822,7 +14556,7 @@ class MultiSourceRAG:
             # permissive of a few filler words between the negation and verb
             # rather than requiring exact adjacency.
             _DENIAL_FILLER = r"(?:\s+(?:typically|usually|generally|normally|likely|probably|necessarily|always|certainly|automatically)){0,2}"
-            _DENIAL_RE = _re7.compile(
+            _DENIAL_RE = _re.compile(
                 r"won'?t" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
                 r"will\s+not" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
                 r"would\s?n'?t" + _DENIAL_FILLER + r"\s+(?:get|cover|pay|receive|include|payout|pay\s+out)|"
@@ -10830,12 +14564,12 @@ class MultiSourceRAG:
                 r"does\s?n'?t\s+cover|does\s+not\s+cover|"
                 r"\bexcludes?\b|\bexcluded\b|"
                 r"not\s+covered|no\s+coverage|not\s+payable",
-                _re7.IGNORECASE,
+                _re.IGNORECASE,
             )
-            _EXCLUSION_INDICATOR_RE = _re7.compile(
+            _EXCLUSION_INDICATOR_RE = _re.compile(
                 r"exclu\w*|not\s+cover\w*|does\s?n'?t\s+cover|will\s+not\s+cover|"
                 r"not\s+payable|no\s+coverage",
-                _re7.IGNORECASE,
+                _re.IGNORECASE,
             )
             # Generic insurance vocabulary (already maintained for the
             # hollow-answer detector) plus ordinary English function words —
@@ -10872,7 +14606,7 @@ class MultiSourceRAG:
             }) | frozenset(w.lower() for term in _INSURANCE_VOCAB for w in term.split())
 
             def _denial_scenario_words(text: str) -> set:
-                words = _re7.findall(r"\b[a-zA-Z]{3,}\b", (text or ''))
+                words = _re.findall(r"\b[a-zA-Z]{3,}\b", (text or ''))
                 return {w.lower() for w in words if w.lower() not in _DENIAL_STOPWORDS}
 
             _question_scenario_words = _denial_scenario_words(question)
@@ -10911,7 +14645,7 @@ class MultiSourceRAG:
                 # pervasive topic word, not a scenario-specific signal.
                 _full_ctx_lower = (_full_context_uncompressed or '').lower()
                 _ctx_word_freq = {
-                    w: len(_re7.findall(r'\b' + _re7.escape(w) + r'\b', _full_ctx_lower))
+                    w: len(_re.findall(r'\b' + _re.escape(w) + r'\b', _full_ctx_lower))
                     for w in _question_scenario_words
                 }
                 _rare_scenario_words = {w for w, c in _ctx_word_freq.items() if 0 < c <= 3}
@@ -10956,16 +14690,16 @@ class MultiSourceRAG:
 
             if _denial_claim_mismatch:
                 _dn_src = (_corrected_text or _reply_stripped).strip()
-                _dn_has_points = bool(_re7.search(r'(?:^|\n)\s*\d+\.\s', _dn_src))
+                _dn_has_points = bool(_re.search(r'(?:^|\n)\s*\d+\.\s', _dn_src))
                 if _dn_has_points:
-                    _dn_units = _re7.split(r'\n(?=\s*\d+\.\s)', _dn_src)
+                    _dn_units = _re.split(r'\n(?=\s*\d+\.\s)', _dn_src)
                 else:
-                    _dn_units = _re7.split(r'(?<=[.!?])(?<!\d\.)\s+', _dn_src)
+                    _dn_units = _re.split(r'(?<=[.!?])(?<!\d\.)\s+', _dn_src)
 
                 _dn_kept = [u for u in _dn_units if not _DENIAL_RE.search(u)]
                 if len(_dn_kept) < len(_dn_units) and _dn_kept:
                     if _dn_has_points:
-                        _dn_point_re = _re7.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re7.DOTALL)
+                        _dn_point_re = _re.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re.DOTALL)
                         _dn_renumbered, _dn_next_n = [], 1
                         for _u in _dn_kept:
                             _m = _dn_point_re.match(_u)
@@ -11080,7 +14814,22 @@ class MultiSourceRAG:
         # refusal message and mark needs_human so it escalates properly
         # instead of silently doing nothing.
         _hollow_answer_detected = False
-        if not _keyword_detailed:
+        # Skip entirely when a comparison table exists: _enforce_comparison_
+        # table_format (above) deliberately sets _corrected_text to just the
+        # table's own short intro sentence ("Here's how X and Y compare:")
+        # and stores the REAL content separately in _comparison_table (sent
+        # to the frontend as ui.table, never part of _corrected_text at
+        # all) — see its own comment a few hundred lines up. That intro
+        # sentence is normally under 12 words and often has no
+        # _INSURANCE_VOCAB term of its own, which is exactly this check's
+        # signature for a contentless non-answer. Confirmed live
+        # (2026-08-27): "compare Form A and Form B motor insurance"
+        # produced a genuinely correct, well-balanced table (already passed
+        # through the named-pair depth backstop above), then got entirely
+        # discarded and replaced with a refusal because this check saw only
+        # "here's how Form A and Form B compare:" (9 words) and judged the
+        # WHOLE answer hollow — never looking at the table it introduces.
+        if not _keyword_detailed and not _comparison_table:
             try:
                 import re as _hollow_re
                 _hollow_src = (_corrected_text or _reply_stripped).strip()
@@ -11396,6 +15145,2263 @@ class MultiSourceRAG:
         except Exception as _false_claim_exc:
             logger.debug("[ask_stream] false-claim correction skipped: %s", _false_claim_exc)
 
+        # ── Same always-false-claim check, applied to comparison-table cells ──
+        # _enforce_comparison_table_format (earlier in this function) already
+        # replaced _corrected_text with just the table's own short intro
+        # sentence ("Here's how X and Y compare:") by the time the check
+        # above runs — the real content lives in _comparison_table, a
+        # separate dict never touched by any text-based safety check in this
+        # function, including this one and the post-generation faithfulness
+        # check right below (which explicitly opts out of comparison-table
+        # answers). Confirmed live (2026-08-27): "explain in detail the
+        # difference between third party and comprehensive motor insurance"
+        # produced a table whose Comprehensive column, "Scope" row, said
+        # "Broader coverage including fines, theft, and third-party risks" —
+        # the exact same fabricated "motor insurance covers fines" claim
+        # this file's own always-false-claim check exists to catch in prose,
+        # sailing straight into the visible table with zero safety checks
+        # run on it at all. Reuses the SAME closure defined a few lines up
+        # (still valid here — a `def`/regex assigned inside a `try:` block
+        # is just a normal local variable of this function, not scoped to
+        # the try block) rather than re-deriving the same five regex checks
+        # a second time.
+        try:
+            if _comparison_table and isinstance(_comparison_table.get("rows"), list):
+                for _fc_row in _comparison_table["rows"]:
+                    _fc_values = _fc_row.get("values")
+                    if not isinstance(_fc_values, list):
+                        continue
+                    for _fc_vi, _fc_val in enumerate(_fc_values):
+                        if isinstance(_fc_val, str) and _fc_line_is_always_false_claim(_fc_val):
+                            logger.info(
+                                "[ask_stream] comparison-table cell contained an always-false "
+                                "claim (row=%r, column=%d): %r — replaced",
+                                _fc_row.get("label"), _fc_vi, _fc_val,
+                            )
+                            _fc_values[_fc_vi] = "Not specified"
+        except Exception as _fc_table_exc:
+            logger.debug("[ask_stream] comparison-table always-false-claim check skipped: %s", _fc_table_exc)
+
+        # ── Comparison-table label/content mismatch check ────────────────────
+        # A prompt-only fix (telling the model its label must actually match
+        # the row's own values, not just sound like a plausible comparison
+        # point) did NOT reliably stick — confirmed live 2026-09-01: the
+        # exact same "difference between health insurance and personal
+        # accident insurance" query still produced a row labeled "Cost" for
+        # two values that are both really about the BREADTH of what's
+        # covered ("wider range of coverage for various medical expenses"
+        # vs "focuses on immediate financial needs"), neither of which
+        # states a price, premium, or amount. This is a mechanical,
+        # deterministic backstop instead: a row can only keep a price-
+        # implying label if at least one of its own values actually
+        # contains a price/currency signal — a rupee sign, a digit, or one
+        # of a small closed set of cost-vocabulary words. If neither value
+        # does, the label is demonstrably wrong regardless of what it says,
+        # so it gets replaced with a neutral, always-safe fallback rather
+        # than left actively misleading. Deliberately narrow to price-
+        # implying labels only (the one confirmed-live failure mode) — not
+        # a general "does this label match this content" judgment, which
+        # would need real language understanding this cheap a check can't
+        # safely attempt.
+        try:
+            if _comparison_table and isinstance(_comparison_table.get("rows"), list):
+                _cost_label_re = re.compile(
+                    r"^(cost|price|pricing|premiums?|expenses?)$", re.IGNORECASE
+                )
+                _cost_signal_re = re.compile(
+                    r"₹|\d|\brs\.?\b|\bpremiums?\b|\bpric(?:e|ing)\b|\bexpensive\b|"
+                    r"\bcheaper\b|\baffordable\b|\bafford\b|\bcostly\b",
+                    re.IGNORECASE,
+                )
+                for _lbl_row in _comparison_table["rows"]:
+                    _lbl = (_lbl_row.get("label") or "").strip()
+                    _lbl_values = _lbl_row.get("values")
+                    if not _cost_label_re.match(_lbl) or not isinstance(_lbl_values, list):
+                        continue
+                    if not any(
+                        isinstance(v, str) and _cost_signal_re.search(v) for v in _lbl_values
+                    ):
+                        logger.info(
+                            "[ask_stream] comparison-table row labeled %r but neither value "
+                            "names a price/amount (%r) — relabeled",
+                            _lbl, _lbl_values,
+                        )
+                        _lbl_row["label"] = "Key Difference"
+        except Exception as _cost_label_exc:
+            logger.debug("[ask_stream] comparison-table label/content check skipped: %s", _cost_label_exc)
+
+        # ── Post-generation faithfulness check ──────────────────────────────
+        # Runs BEFORE SRG below, not after — deliberately reordered.
+        # Confirmed live: checking the FINAL, SRG-enriched text caused a
+        # false positive on a well-established, repeatedly-verified-correct
+        # motor-claim answer. Root cause: SRG's own enrichment produces a
+        # mechanically-composited sentence ("This point also includes the
+        # registration certificate, the driving licence..., Emirates ID,
+        # and Mulkiya") stitching facts pulled from TWO different sources —
+        # a harder single-shot verification task for this model than the
+        # plain, single-source prose this check was actually calibrated
+        # against. Checking the RAW pre-SRG answer instead means the model
+        # only ever has to verify natural, un-composited prose — and SRG's
+        # own additions never need re-verification anyway, since SRG's
+        # separate verbatim gate (every appended word is a literal
+        # substring of the retrieved context) already structurally
+        # guarantees they're grounded.
+        #
+        # This ordering also resolves a real risk with running any content-
+        # editing check ahead of SRG: this check only ever does a WHOLE-
+        # ANSWER pass/fail, never a surgical per-sentence edit, so there is
+        # no way it can remove just the one sentence SRG would have
+        # attached its enrichment to. Either the answer passes unchanged
+        # and SRG proceeds exactly as it would have anyway, or it fails and
+        # gets replaced wholesale with the refusal below — SRG then finds
+        # nothing structurally worth enriching in a plain refusal sentence
+        # (no numbered points, no genuine topical overlap with any
+        # retrieved enumeration) and naturally no-ops, same as every other
+        # block further down already does when handed a refusal.
+        #
+        # See _verify_point_faithfulness's own docstring for the fail-open
+        # direction and why it differs from _verify_grounding's fail-closed
+        # default.
+        #
+        # NUMBERED-LIST answers use _verify_point_faithfulness PER POINT,
+        # not the whole-answer check below — confirmed live (2026-08-26)
+        # the whole-answer version reliably misses a real fabrication once
+        # it's diluted among several genuinely-plausible points in the same
+        # list (0 catches across 6 live attempts, and 0/3 in a direct A/B
+        # test that also ruled out prose-vs-list formatting as the cause —
+        # both forms of the SAME content got the SAME wrong "faithful"
+        # verdict). Checking each point individually against the same real
+        # context instead caught 4 of 6 unsupported points in that same
+        # test. Prose (non-numbered) answers still use the whole-answer
+        # check — there are no natural independent units to split a
+        # flowing narrative into without the same per-sentence risk this
+        # session already hit once (a synthesis sentence drawing on
+        # several source sentences at once scores low against any ONE of
+        # them by design, not because it's wrong).
+        #
+        # The closing sign-off is pulled OUT before any point gets
+        # checked, and only ever re-appended once, at the very end, after
+        # every surviving point has individually passed — it never enters
+        # the per-point check/drop loop at all, so it cannot be lost as
+        # collateral damage from dropping a neighboring point (confirmed
+        # live this exact failure mode with an earlier, reverted version
+        # of a similar mechanism: a sign-off glued to the last point on
+        # the same line, with no blank-line separator, got deleted along
+        # with that point when it was dropped).
+        # User's explicit direction: when every point/sentence in a
+        # generated answer fails the faithfulness check below, don't just
+        # refuse — but also don't hand-build a parallel reimplementation
+        # of the retrieval/generation pipeline to retry with. An earlier
+        # version of this function did exactly that (its own simplified
+        # context join, its own max_tokens guess) and reproduced two
+        # already-solved bugs purely from not reusing the real logic:
+        # a stale token budget causing a context-length-overflow 400, and
+        # an uncompressed context leaving no room for output. The correct
+        # retry is the real pipeline, run again, unchanged — this
+        # recursively calls THIS SAME ask_stream method with the same
+        # question, and uses its result if it didn't ALSO come back fully
+        # hallucinated. _is_retry=True on the recursive call is the only
+        # thing preventing infinite recursion — that inner call's own
+        # faithfulness check, if it too finds everything unsupported,
+        # returns its own refusal directly rather than retrying again.
+        #
+        # Consumed internally, never re-yielded to the client — the
+        # client already received (or is past) the first attempt's live
+        # stream; this result only ever surfaces via corrected_text, the
+        # same override mechanism every other post-generation fix in
+        # this function already relies on, so no frontend change is
+        # needed.
+        async def _retry_after_full_hallucination(_shape: str) -> "Optional[tuple[str, list]]":
+            """Returns (answer_text, sources) on a successful retry, or
+            None if the retry also failed — sources come from the
+            RETRY's own fresh retrieval, not the original failed
+            attempt's, so citations shown alongside the retry's answer
+            actually match what it was grounded in.
+            """
+            if _is_retry:
+                return None
+            try:
+                import json as _json_retry
+                _retry_pieces: List[str] = []
+                _retry_final_payload = None
+                async for _piece in self.ask_stream(
+                    question, history=history, document_filter=document_filter, _is_retry=True,
+                ):
+                    if isinstance(_piece, str) and _piece.startswith("\n\n{"):
+                        try:
+                            _retry_final_payload = _json_retry.loads(_piece[2:])
+                        except Exception:
+                            _retry_final_payload = None
+                    else:
+                        _retry_pieces.append(_piece)
+                if _retry_final_payload is None:
+                    logger.warning(
+                        "[ask_stream] post-hallucination retry (%s path): recursive call produced no final payload",
+                        _shape,
+                    )
+                    return None
+                _retry_answer = (_retry_final_payload.get("corrected_text") or "".join(_retry_pieces)).strip()
+                if (
+                    not _retry_answer
+                    or _retry_final_payload.get("needs_human")
+                    or _retry_answer.lower().startswith("hmm, i don't have")
+                ):
+                    logger.warning(
+                        "[ask_stream] post-hallucination retry (%s path): fresh full-pipeline attempt "
+                        "ALSO came back unanswerable — falling through to refusal", _shape,
+                    )
+                    return None
+                logger.info(
+                    "[ask_stream] post-hallucination retry (%s path): fresh full-pipeline attempt "
+                    "succeeded, using it instead of refusing", _shape,
+                )
+                return _retry_answer, (_retry_final_payload.get("sources") or [])
+            except Exception as _retry_exc:
+                logger.warning(
+                    "[ask_stream] post-hallucination retry (%s path) failed with an exception "
+                    "(not a genuine second hallucination): %s", _shape, _retry_exc,
+                )
+                return None
+
+        _pgf_all_points_hallucinated = False
+        try:
+            _pgf_enabled = os.getenv("ENABLE_POSTGEN_FAITHFULNESS_CHECK", "false").strip().lower() in ("1", "true", "yes")
+            _pgf_src = (_corrected_text or _reply_stripped).strip()
+            _pgf_is_refusal = _pgf_src.lower().startswith("hmm, i don't have")
+            if (
+                _pgf_enabled
+                and _pgf_src
+                and not _pgf_is_refusal
+                and not _comparison_table
+                and _full_context_uncompressed
+            ):
+                _PGF_SIGNOFF_RE = re.compile(
+                    r"(Let me know if you want more details! 😊|"
+                    r"Hope that clears it up! Let me know if you want me to dig into any part of this\. 😊)\s*$"
+                )
+
+                # Scope the evidence to the query's own policy_type before
+                # checking any claim against it — same reasoning SRG's own
+                # enumeration matcher already uses (see
+                # _full_context_uncompressed_chunks's own comment above):
+                # a multi-type retrieval can put e.g. a motor chunk and a
+                # marine chunk in the same _full_context_uncompressed blob,
+                # and checking a health-insurance claim against that whole
+                # mixed bag risks a false "entailed" from an unrelated
+                # chunk that just happens to share vocabulary, or a false
+                # "not entailed" for a claim whose real support sits
+                # further down in a differently-typed chunk's noise. Falls
+                # back to the full mixed context when the query has no
+                # specific type (general) or nothing in context actually
+                # matches it — never MORE restrictive than the previous
+                # behavior for an ambiguous query.
+                _pgf_scoped_context = _full_context_uncompressed
+                _pgf_matching_chunks = [_ct for _ct, _cs, _cpt in _full_context_uncompressed_chunks]
+                if _query_policy_type and _query_policy_type != "general":
+                    _pgf_type_matching_chunks = [
+                        _ct for _ct, _cs, _cpt in _full_context_uncompressed_chunks
+                        if _cpt == _query_policy_type
+                    ]
+                    if _pgf_type_matching_chunks:
+                        _pgf_matching_chunks = _pgf_type_matching_chunks
+                        _pgf_scoped_context = "\n\n".join(_pgf_matching_chunks)
+
+                # _verify_point_faithfulness only ever reads the first
+                # _ENTAILMENT_CONTEXT_CHARS (dynamically ~10000+, was a flat
+                # 6000 before 2026-08-31 — see that constant's own comment)
+                # of whatever context string it's handed — confirmed live
+                # this can genuinely hide a true, well-grounded claim: for
+                # "my car got stolen, will I get money back", 5 real motor-tagged chunks all matched
+                # the query's policy_type, but joining them in plain
+                # retrieval-rank order put 4 longer, more tangential chunks
+                # (hit-and-run rules, a long theft writeup, claim
+                # settlement, own-damage claims — 7183 chars combined)
+                # ahead of the SHORT, precisely on-point "(C) Vehicle Theft
+                # Claims" chunk that actually states the Final Police
+                # Report step the generated answer's own sentence named —
+                # pushing it past the 6000-char cutoff entirely, so the
+                # checker never saw the one chunk that would have proven
+                # the sentence true. A single SHARED context blob can't fix
+                # this in general: which chunk is "most relevant" depends
+                # on which SENTENCE is being checked, and different
+                # sentences in the same answer can each need a different
+                # chunk to be the one that survives truncation. Re-sort the
+                # SAME already-scoped candidate chunks per sentence instead.
+                #
+                # Ranked by EMBEDDING similarity (the same shared model used
+                # for retrieval/reranking elsewhere, via _get_shared_embed_model
+                # — same pattern the numbered-point dedup check above this
+                # one already uses), not plain word overlap — an answer
+                # sentence is routinely a paraphrase of the source (this
+                # pipeline's own grounding rules explicitly allow "plainer,
+                # more general wording than the evidence's own"), so a
+                # sentence and its true source chunk can share very few
+                # literal words while still being the same fact. Embeddings
+                # rank by meaning, so a paraphrased sentence still sorts its
+                # real source chunk to the front. Chunk embeddings are
+                # computed ONCE per answer (not once per sentence) and
+                # reused for every sentence's comparison; unit texts for one
+                # call site are embedded together in a single batched call,
+                # matching the dedup check's own "one batched call, not one
+                # per item" latency discipline. Falls back to plain word
+                # overlap (the previous version of this fix) if the
+                # embedding call fails for any reason — still better than no
+                # reordering at all, and keeps this check from hard-failing
+                # the whole faithfulness pass over an unrelated model error.
+                _pgf_chunk_vecs = None
+                if len(_pgf_matching_chunks) > 1:
+                    try:
+                        _pgf_embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+                        _pgf_chunk_vecs = _pgf_embed_model.encode(
+                            _pgf_matching_chunks, normalize_embeddings=True
+                        )
+                    except Exception as _pgf_embed_exc:
+                        logger.debug(
+                            "[ask_stream] PGF chunk embedding failed, falling back to word "
+                            "overlap for evidence ordering: %s", _pgf_embed_exc,
+                        )
+                        _pgf_chunk_vecs = None
+
+                # Confirmed live 2026-08-31: ranking _pgf_matching_chunks by
+                # relevance to a given point and then joining ALL of them
+                # (just reordered) defeats the point of ranking at all — a
+                # real incident traced sentence-by-sentence showed the
+                # genuinely-supporting chunk correctly sorted to position 1
+                # for several points, and the checker STILL said "not
+                # grounded" for them, because it was reading that one
+                # relevant paragraph sitting inside a ~10,000-character
+                # block that also included several other chunks about
+                # different sub-topics (claim settlement, premium factors,
+                # a document introduction). A small model doing a narrow
+                # yes/no entailment check is far more reliable when shown
+                # just the top few candidates than when asked to find the
+                # right paragraph inside a much larger mixed-relevance
+                # pile. Keeping only the top _PGF_TOP_K_CHUNKS (by whichever
+                # ranking — embedding similarity or the word-overlap
+                # fallback) trusts the ranking instead of hedging against
+                # it, while still allowing a LITTLE headroom (2, not 1) for
+                # a case where the true evidence lands just behind the top
+                # match.
+                _PGF_TOP_K_CHUNKS = 2
+
+                # Code-computed citation, not model-reported: an earlier
+                # attempt asked the MODEL to end each point with a "[C2]"-
+                # style tag naming its own source chunk — reverted per
+                # explicit direction ("this model doesn't function well
+                # with prompt instructions"), and even at 6/6 compliance on
+                # a later retest, points still mostly got dropped anyway
+                # (see _PGF_TOP_K_CHUNKS's own history above), so citation
+                # tagging alone was never the fix. This instead reuses the
+                # SAME embedding ranking that already picks each point's
+                # top-K evidence chunks, and just also records which
+                # specific chunk (by index into _pgf_matching_chunks) came
+                # out on top — a byproduct of a ranking step that already
+                # runs, not new classification work, so it costs nothing
+                # extra and can never be wrong about what the CODE picked
+                # (it doesn't attempt to verify the model's OWN claim about
+                # its source, only tells you what the ranking's actual
+                # winner was). Every _pgf_context_for_units caller gets
+                # this back as (context_text, cited_chunk_indices) instead
+                # of a bare string, and logs it — a permanent, always-on
+                # log line instead of a one-off [DEBUG-*] block added and
+                # removed by hand every time this needs inspecting again.
+                def _pgf_word_overlap_order(_unit_text: str) -> tuple:
+                    _unit_words = set(re.findall(r"[a-z]{4,}", _unit_text.lower()))
+                    if not _unit_words:
+                        return (_pgf_scoped_context, [])
+                    def _overlap(_chunk_text: str) -> int:
+                        return len(_unit_words & set(re.findall(r"[a-z]{4,}", _chunk_text.lower())))
+                    _order = sorted(range(len(_pgf_matching_chunks)), key=lambda i: _overlap(_pgf_matching_chunks[i]), reverse=True)
+                    _top = _order[:_PGF_TOP_K_CHUNKS]
+                    return ("\n\n".join(_pgf_matching_chunks[i] for i in _top), _top)
+
+                def _pgf_context_for_units(_unit_texts: list) -> list:
+                    if len(_pgf_matching_chunks) <= 1 or not _unit_texts:
+                        _only = [0] if len(_pgf_matching_chunks) == 1 else []
+                        return [(_pgf_scoped_context, _only)] * len(_unit_texts)
+                    if _pgf_chunk_vecs is None:
+                        return [_pgf_word_overlap_order(u) for u in _unit_texts]
+                    try:
+                        _unit_vecs = _pgf_embed_model.encode(_unit_texts, normalize_embeddings=True)
+                    except Exception as _pgf_unit_embed_exc:
+                        logger.debug(
+                            "[ask_stream] PGF sentence embedding failed, falling back to word "
+                            "overlap for evidence ordering: %s", _pgf_unit_embed_exc,
+                        )
+                        return [_pgf_word_overlap_order(u) for u in _unit_texts]
+                    _results = []
+                    for _uv in _unit_vecs:
+                        _scores = [float(np.dot(_uv, _cv)) for _cv in _pgf_chunk_vecs]
+                        _order = sorted(range(len(_pgf_matching_chunks)), key=lambda i: _scores[i], reverse=True)
+                        _top = _order[:_PGF_TOP_K_CHUNKS]
+                        _results.append(("\n\n".join(_pgf_matching_chunks[i] for i in _top), _top))
+                    return _results
+
+                def _pgf_log_citations(_label: str, _units: list, _ctxs: list, _results: list) -> None:
+                    for _u, (_ctx, _cited), _ok in zip(_units, _ctxs, _results):
+                        _cite_desc = ", ".join(
+                            f"#{_i}:{_pgf_matching_chunks[_i][:60]!r}" for _i in _cited
+                        ) or "none (unscoped fallback)"
+                        logger.info(
+                            "[ask_stream] PGF citation (%s): unit=%r ok=%s cited_chunk(s)=[%s]",
+                            _label, _u[:70], _ok, _cite_desc,
+                        )
+
+                _pgf_has_points = bool(re.search(r'(?:^|\n)\s*\d+\.\s', _pgf_src))
+                if _pgf_has_points:
+                    _pgf_signoff_m = _PGF_SIGNOFF_RE.search(_pgf_src)
+                    _pgf_signoff = _pgf_signoff_m.group(0) if _pgf_signoff_m else ""
+                    _pgf_body = _pgf_src[:_pgf_signoff_m.start()].rstrip() if _pgf_signoff_m else _pgf_src
+
+                    _pgf_units = re.split(r'\n(?=\s*\d+\.\s)|\n\n+', _pgf_body)
+                    _pgf_point_idx = [i for i, u in enumerate(_pgf_units) if re.match(r'\s*\d+\.\s', u)]
+
+                    if _pgf_point_idx:
+                        _pgf_point_ctxs = _pgf_context_for_units([_pgf_units[i] for i in _pgf_point_idx])
+                        _pgf_results = await asyncio.gather(*[
+                            _verify_point_faithfulness(_pgf_units[i], _ctx)
+                            for i, (_ctx, _cited) in zip(_pgf_point_idx, _pgf_point_ctxs)
+                        ])
+                        _pgf_log_citations(
+                            "numbered-list", [_pgf_units[i] for i in _pgf_point_idx],
+                            _pgf_point_ctxs, _pgf_results,
+                        )
+                        _pgf_drop = {i for i, ok in zip(_pgf_point_idx, _pgf_results) if not ok}
+
+                        if _pgf_drop:
+                            _pgf_kept = [u for i, u in enumerate(_pgf_units) if i not in _pgf_drop]
+                            _pgf_kept_points = [u for u in _pgf_kept if re.match(r'\s*\d+\.\s', u)]
+                            if _pgf_kept_points:
+                                _pgf_point_re = re.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', re.DOTALL)
+                                # A point that started life as "First,
+                                # .../Second, .../Third, ..." prose (see the
+                                # Prose→list conversion above, which keeps
+                                # that original wording verbatim inside each
+                                # numbered line) carries its own ordinal
+                                # transition word baked into the text, not
+                                # just the "N." prefix. Confirmed live
+                                # 2026-08-31: dropping points 1-2 of a
+                                # 3-point "First/Second/Third" list left
+                                # "1. Third, you gain peace of mind..." —
+                                # the surviving point's own leading word
+                                # still says "Third" even though it's now
+                                # the ONLY point, contradicting its new "1."
+                                # Strip a stale ordinal lead-in whenever
+                                # renumbering actually shifted a point's
+                                # position (never touches a point whose
+                                # number didn't change, so an intentional
+                                # "1. First, ..." naturally-numbered list is
+                                # left untouched).
+                                _PGF_ORDINAL_LEADIN_RE = re.compile(
+                                    r'^(first|second|third|fourth|fifth|sixth|seventh|'
+                                    r'eighth|ninth|tenth)\b[,:]?\s*',
+                                    re.IGNORECASE,
+                                )
+                                _pgf_renumbered, _pgf_next_n = [], 1
+                                for _u in _pgf_kept:
+                                    _m = _pgf_point_re.match(_u)
+                                    if _m:
+                                        _point_text = _m.group(4)
+                                        if _m.group(2) != str(_pgf_next_n):
+                                            _stripped_text = _PGF_ORDINAL_LEADIN_RE.sub('', _point_text)
+                                            if _stripped_text and _stripped_text != _point_text:
+                                                _point_text = _stripped_text[0].upper() + _stripped_text[1:]
+                                        _pgf_renumbered.append(f"{_m.group(1)}{_pgf_next_n}{_m.group(3)}{_point_text}")
+                                        _pgf_next_n += 1
+                                    else:
+                                        _pgf_renumbered.append(_u)
+                                _pgf_joined = re.sub(r"\n{3,}", "\n\n", "\n".join(_pgf_renumbered)).strip()
+                                # Sign-off re-attached here, unconditionally,
+                                # only once every remaining point has
+                                # individually passed — never touched above.
+                                if _pgf_signoff:
+                                    _pgf_joined = f"{_pgf_joined}\n{_pgf_signoff}"
+                                _corrected_text = _pgf_joined
+                                _kv_reply = _pgf_joined
+                                logger.warning(
+                                    "[ask_stream] post-generation faithfulness check: dropped %d/%d "
+                                    "unsupported point(s) before SRG runs",
+                                    len(_pgf_drop), len(_pgf_point_idx),
+                                )
+                            else:
+                                # EVERY point independently failed — this is
+                                # the opposite of the "don't gut a mostly-
+                                # good answer" case above; a list where not
+                                # one single point survives grounding is the
+                                # strongest signal this mechanism can give
+                                # that the whole answer is fabricated, not a
+                                # reason to trust it more. The previous
+                                # version fell back to showing the original,
+                                # completely unchecked list here specifically
+                                # to avoid ever displaying an empty reply —
+                                # but that meant a worst-case, fully-
+                                # hallucinated list could slip through
+                                # untouched precisely when every one of its
+                                # points had already failed independently.
+                                # Before refusing: one fresh retry (fresh
+                                # retrieval + fresh generation, re-checked
+                                # the same way) — see
+                                # _retry_after_full_hallucination's own
+                                # docstring for why this beats an
+                                # immediate refusal.
+                                _retry_result = await _retry_after_full_hallucination("numbered-list")
+                                if _retry_result:
+                                    _corrected_text, _retry_sources = _retry_result
+                                    _kv_reply = _corrected_text
+                                    if _retry_sources:
+                                        unique_sources = list(dict.fromkeys(_retry_sources))
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d point(s) "
+                                        "failed grounding — rescued by a fresh retry instead of refusing",
+                                        len(_pgf_point_idx),
+                                    )
+                                else:
+                                    # Refuse instead, same message and
+                                    # needs_human escalation as every other
+                                    # discard path in this function.
+                                    _refusal_text = (
+                                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                    )
+                                    _corrected_text = _refusal_text
+                                    _kv_reply = _refusal_text
+                                    _pgf_all_points_hallucinated = True
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d point(s) "
+                                        "failed grounding — refusing instead of showing a fully-unsupported list",
+                                        len(_pgf_point_idx),
+                                    )
+                else:
+                    # PROSE path — per-SENTENCE, not whole-block. A
+                    # whole-block judgment on prose was tried and removed,
+                    # not merely disabled: confirmed live it false-positived
+                    # on a genuinely correct, repeatedly-verified motor-claim
+                    # answer and replaced it with a refusal shown to a real
+                    # user — several distinct sub-facts folded into one
+                    # flowing paragraph hit the SAME whole-block
+                    # unreliability the numbered-list case did, just in the
+                    # opposite direction (one claim the model is slightly
+                    # unsure about can sink a judgment on an otherwise-fine
+                    # answer, instead of one bad claim hiding among good
+                    # ones). Reuses the exact same _verify_point_faithfulness
+                    # call the numbered-list path above uses — a "point" is
+                    # just a sentence here instead of a numbered line.
+                    #
+                    # Sentence splitting is deliberately NOT the bare
+                    # `re.split(r'(?<=[.!?])\s+', text)` pattern used
+                    # elsewhere in this file (SRG/xprod) for source text —
+                    # confirmed live that pattern shatters a very ordinary
+                    # sentence in this KB's own register ("The sum insured
+                    # is Rs. 5.5 lakh...") into meaningless fragments at
+                    # every "Rs." / "e.g." / "Dr." abbreviation, each of
+                    # which would then get individually judged as
+                    # "hallucinated" nonsense. Guards against that with a
+                    # small, closed list of standard abbreviations — same
+                    # closed-class reasoning as the British/American
+                    # spelling-variant list elsewhere in this file, not a
+                    # growing domain vocabulary.
+                    _PGF_ABBREV_RE = re.compile(
+                        r'\b(?:Rs|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|no|vol|'
+                        r'pp|approx|Inc|Ltd|Co|St|Ave|Fig)\.$',
+                        re.IGNORECASE,
+                    )
+
+                    def _pgf_split_sentences(text: str) -> list:
+                        _raw = re.split(r'(?<=[.!?])\s+', text)
+                        _merged = []
+                        for _piece in _raw:
+                            if _merged and _PGF_ABBREV_RE.search(_merged[-1]):
+                                _merged[-1] = f"{_merged[-1]} {_piece}"
+                            else:
+                                _merged.append(_piece)
+                        return _merged
+
+                    _pgf_signoff_m2 = _PGF_SIGNOFF_RE.search(_pgf_src)
+                    _pgf_signoff2 = _pgf_signoff_m2.group(0) if _pgf_signoff_m2 else ""
+                    _pgf_body2 = _pgf_src[:_pgf_signoff_m2.start()].rstrip() if _pgf_signoff_m2 else _pgf_src
+
+                    # Strip the lead-in ("Sure thing," etc.) as its own unit
+                    # BEFORE sentence-splitting, same treatment as the
+                    # sign-off just above — not extracting it here breaks
+                    # the example-marker check below in a specific, real
+                    # way: _pgf_split_sentences only splits on [.!?], never
+                    # on a bare comma, so "Sure thing, Imagine you have a
+                    # $500 copay..." stays ONE sentence, and the marker
+                    # regex (anchored ^, matches "imagine you" etc. at the
+                    # very start) never fires because that combined
+                    # sentence starts with "Sure thing," not "Imagine" —
+                    # confirmed live 2026-08-27: this silently defeated the
+                    # worked-example protection immediately above whenever
+                    # the example was the answer's own first sentence,
+                    # letting genuinely-permitted invented figures
+                    # ($800/$300 etc.) get deleted as if unsupported.
+                    _PGF_LEADIN_RE = re.compile(
+                        r'^(so|good question|sure thing|right|ah)[,.!]\s*', re.IGNORECASE,
+                    )
+                    _pgf_leadin_m2 = _PGF_LEADIN_RE.match(_pgf_body2)
+                    _pgf_leadin2 = _pgf_leadin_m2.group(0).rstrip() if _pgf_leadin_m2 else ""
+                    _pgf_body2_for_split = _pgf_body2[_pgf_leadin_m2.end():] if _pgf_leadin_m2 else _pgf_body2
+
+                    _pgf_sentences = [s for s in _pgf_split_sentences(_pgf_body2_for_split) if s.strip()]
+
+                    # Worked-example protection, same shape as the sign-off
+                    # protection above: when the user explicitly asked for
+                    # an example (_has_example, the same modifier-intent
+                    # flag the prompt itself used to instruct "give a
+                    # concrete example"), the numbers/scenario the model
+                    # invents to illustrate are EXPECTED and permitted —
+                    # that's the whole point of asking for one, per user
+                    # policy (numbers are otherwise suppressed unless the
+                    # query says "example"). But _verify_point_faithfulness
+                    # has no idea the query asked for an example; it just
+                    # sees an invented $500/$1,200/$700 figure with no
+                    # literal match in the retrieved context and correctly
+                    # (by its own, narrower mandate) calls that unsupported.
+                    # Confirmed live 2026-08-27: "what is a deductible, give
+                    # me an example" got a complete, correct worked example,
+                    # then the faithfulness check silently deleted the
+                    # entire worked-out math, leaving only the bare
+                    # definition and a dangling "That's how a deductible
+                    # works!" that no longer explained anything.
+                    #
+                    # Fix: once the example clause starts (first sentence
+                    # matching a closed set of example-introducing phrases),
+                    # everything from there to the sign-off is the example
+                    # — carve it out BEFORE checking, same as the sign-off,
+                    # and never subject it to the faithfulness check at all.
+                    # Only the sentences BEFORE the example (the actual
+                    # factual claims) get checked. If _has_example is False,
+                    # this never triggers — an example-shaped sentence in an
+                    # answer nobody asked to be illustrative still gets
+                    # checked normally, same as today.
+                    _pgf_example_start_idx = None
+                    if _has_example:
+                        # Unanchored (search, not match — no leading ^) so a
+                        # sentence that introduces the example mid-sentence
+                        # ("Let's take car insurance as an example: suppose
+                        # your car gets damaged...") is caught too, not just
+                        # a sentence that OPENS with the marker phrase.
+                        # Confirmed live 2026-08-27: a "definition, then
+                        # Let's take X as an example: ..." answer lost its
+                        # invented $5,000 repair-cost figure because "as an
+                        # example" sat mid-sentence, past where the old
+                        # ^-anchored version could ever match. The trailing
+                        # \b (kept) still stops "imagine yourself" etc. from
+                        # falsely matching "imagine you"; the same \b added
+                        # at the front stops a phrase matching as a
+                        # substring inside a longer word.
+                        _pgf_example_marker_re = re.compile(
+                            r'\b(for example|for instance|as an example|to illustrate|'
+                            r"here'?s an example|let'?s say|let us say|say you|"
+                            r'suppose you|imagine you)\b', re.IGNORECASE,
+                        )
+                        for _i, _s in enumerate(_pgf_sentences):
+                            if _pgf_example_marker_re.search(_s.strip()):
+                                _pgf_example_start_idx = _i
+                                break
+
+                    if _pgf_example_start_idx is not None:
+                        _pgf_example_sentences = _pgf_sentences[_pgf_example_start_idx:]
+                        _pgf_sentences = _pgf_sentences[:_pgf_example_start_idx]
+                    else:
+                        _pgf_example_sentences = []
+
+                    if len(_pgf_sentences) >= 1:
+                        _pgf_sent_ctxs = _pgf_context_for_units(_pgf_sentences)
+                        _pgf_sent_results = await asyncio.gather(*[
+                            _verify_point_faithfulness(s, ctx)
+                            for s, (ctx, _cited) in zip(_pgf_sentences, _pgf_sent_ctxs)
+                        ])
+                        _pgf_log_citations("prose-sentence", _pgf_sentences, _pgf_sent_ctxs, _pgf_sent_results)
+                        _pgf_sent_drop = {i for i, ok in enumerate(_pgf_sent_results) if not ok}
+
+                        # Claim-extraction SALVAGE for sentences that failed
+                        # the whole-sentence check above — see
+                        # _pgf_extract_claims's own docstring for the full
+                        # rationale and the live test data behind it. Only
+                        # runs on the failure path, so the common case
+                        # (a sentence that already passes outright) pays no
+                        # extra cost. A sentence bundling one true claim
+                        # with one fabricated claim gets the fabricated
+                        # part surgically removed here instead of the
+                        # whole sentence — including the correct half —
+                        # being discarded.
+                        _pgf_salvaged = 0
+                        for _i in list(_pgf_sent_drop):
+                            _pgf_orig_sentence = _pgf_sentences[_i]
+                            _claims = await _pgf_extract_claims(_pgf_orig_sentence)
+                            if not _claims:
+                                continue
+                            _claim_ctxs = _pgf_context_for_units(_claims)
+                            _claim_results = await asyncio.gather(*[
+                                _verify_point_faithfulness(c, ctx)
+                                for c, (ctx, _cited) in zip(_claims, _claim_ctxs)
+                            ])
+                            _pgf_log_citations("salvage-claim", _claims, _claim_ctxs, _claim_results)
+                            _surviving = [c for c, ok in zip(_claims, _claim_results) if ok]
+                            logger.info(
+                                "[pgf-salvage-debug] orig=%r claims=%r verdicts=%r surviving=%r",
+                                _pgf_orig_sentence, _claims, _claim_results, _surviving,
+                            )
+                            # Only act on a genuine PARTIAL split — some
+                            # claims survived, some didn't. If every claim
+                            # failed too, the original drop stands as-is.
+                            # If every claim passed despite the whole-
+                            # sentence check saying "drop," that's a
+                            # conflicting signal this salvage step isn't
+                            # meant to resolve — leave the more
+                            # conservative whole-sentence verdict standing
+                            # rather than silently overriding it.
+                            if _surviving and len(_surviving) < len(_claims):
+                                # _pgf_extract_claims returns each claim as
+                                # its own already-punctuated sentence (e.g.
+                                # "It typically covers trip cancellation.")
+                                # — joining those with ". " as a separator
+                                # adds a SECOND period right after the first
+                                # claim's own trailing one. Confirmed live
+                                # 2026-08-28: "It typically covers trip
+                                # cancellation.. It typically covers medical
+                                # emergencies." — strip each claim's own
+                                # trailing sentence punctuation first so the
+                                # join separator is the only period between
+                                # claims.
+                                _stripped_claims = [
+                                    c.strip().rstrip(".!?").strip() for c in _surviving
+                                ]
+                                _pgf_sentences[_i] = ". ".join(c for c in _stripped_claims if c).strip()
+                                if not _pgf_sentences[_i].endswith((".", "!", "?")):
+                                    _pgf_sentences[_i] += "."
+                                _pgf_sent_drop.discard(_i)
+                                _pgf_salvaged += 1
+
+                        if _pgf_sent_drop or _pgf_salvaged:
+                            _pgf_sent_kept = [
+                                s for i, s in enumerate(_pgf_sentences) if i not in _pgf_sent_drop
+                            ]
+                            # Same non-negotiable safety valve as the
+                            # numbered-list path: never let this mechanism
+                            # gut an answer down to nothing — if every
+                            # CHECKED sentence failed, leave the original
+                            # answer completely untouched rather than show
+                            # an empty reply. Checked BEFORE appending the
+                            # protected example clause below — an example
+                            # with no surviving definition to introduce it
+                            # is exactly as unhelpful as an empty reply,
+                            # so it doesn't count as "something survived".
+                            if _pgf_sent_kept:
+                                # The protected example clause (never
+                                # checked, never eligible to be dropped)
+                                # always survives to the end, same as the
+                                # sign-off.
+                                _pgf_sent_kept = _pgf_sent_kept + _pgf_example_sentences
+                                _pgf_joined2 = " ".join(_pgf_sent_kept).strip()
+                                if _pgf_leadin2:
+                                    _pgf_joined2 = f"{_pgf_leadin2} {_pgf_joined2}"
+                                if _pgf_signoff2:
+                                    _pgf_joined2 = f"{_pgf_joined2} {_pgf_signoff2}"
+
+                                # A DECISION query ("which policy should I
+                                # buy") exists purely to name ONE specific
+                                # policy type — if claim-salvage above left
+                                # only a vague survivor that never actually
+                                # names it, that's exactly as unhelpful as
+                                # an empty reply, just via a different
+                                # mechanism (the antecedent-carrying
+                                # sentence, not the surviving fragment
+                                # itself, is what got dropped). Confirmed
+                                # live (2026-09-01): "which policy should I
+                                # buy... large hospital bills incase of
+                                # accident" — the raw generation named "a
+                                # Unit Linked Insurance Plan" (a completely
+                                # wrong, unrelated product) then referred
+                                # back to it next sentence as "This type of
+                                # policy". PGF correctly dropped the wrong
+                                # ULIP sentence; claim-salvage on the NEXT
+                                # sentence correctly kept its second half
+                                # ("This type of policy can help cover
+                                # unexpected medical expenses" — true of
+                                # health insurance on its own) but that half
+                                # inherited a dangling "This type of policy"
+                                # reference whose antecedent no longer
+                                # exists anywhere in the answer. Net result:
+                                # 3 of 4 sentences correctly dropped, yet
+                                # the final answer never names ANY policy
+                                # type, silently failing the one thing a
+                                # decision query needs. Scoped to decision
+                                # queries specifically — only there is
+                                # "never names the type" unambiguously a
+                                # failure; an ordinary "what does health
+                                # insurance cover" answer has no reason to
+                                # repeat a type the question already named.
+                                _pgf_names_type = True
+                                if _is_type_decision and _query_policy_type and _query_policy_type != "general":
+                                    _pgf_names_type = await _pgf_survivor_names_type(
+                                        _pgf_joined2, _query_policy_type,
+                                    )
+
+                                if not _pgf_names_type:
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: decision-query "
+                                        "survivor never names policy_type=%s after dropping %d/%d "
+                                        "sentence(s) (prose, %d salvaged) — treating as hollow, retrying",
+                                        _query_policy_type, len(_pgf_sent_drop), len(_pgf_sentences), _pgf_salvaged,
+                                    )
+                                    _retry_result = await _retry_after_full_hallucination("prose")
+                                    if _retry_result:
+                                        _corrected_text, _retry_sources = _retry_result
+                                        _kv_reply = _corrected_text
+                                        if _retry_sources:
+                                            unique_sources = list(dict.fromkeys(_retry_sources))
+                                    else:
+                                        _refusal_text = (
+                                            "Hmm, I don't have that specific information in my knowledge base right now. "
+                                            "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                        )
+                                        _corrected_text = _refusal_text
+                                        _kv_reply = _refusal_text
+                                        _pgf_all_points_hallucinated = True
+                                else:
+                                    _corrected_text = _pgf_joined2
+                                    _kv_reply = _pgf_joined2
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: dropped %d/%d "
+                                        "unsupported sentence(s) (prose, %d salvaged via claim-splitting) "
+                                        "before SRG runs",
+                                        len(_pgf_sent_drop), len(_pgf_sentences), _pgf_salvaged,
+                                    )
+                            else:
+                                # Same fix as the numbered-list path above,
+                                # same reasoning: every CHECKED sentence
+                                # independently failed grounding (and
+                                # nothing was salvageable), which is the
+                                # strongest signal this mechanism can give
+                                # that the whole answer is fabricated — not
+                                # a reason to fall back to showing it
+                                # unchecked. Confirmed live (2026-08-27): a
+                                # single-sentence brief answer ("the insurer
+                                # will review the policy documents to
+                                # confirm coverage") had all 3 of its
+                                # decomposed claims fail, found nothing
+                                # salvageable, and — before this fix — got
+                                # shown to the user exactly as generated,
+                                # with no indication it was fully
+                                # unsupported.
+                                _retry_result = await _retry_after_full_hallucination("prose")
+                                if _retry_result:
+                                    _corrected_text, _retry_sources = _retry_result
+                                    _kv_reply = _corrected_text
+                                    if _retry_sources:
+                                        unique_sources = list(dict.fromkeys(_retry_sources))
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d checked "
+                                        "sentence(s) (prose) failed grounding — rescued by a fresh retry "
+                                        "instead of refusing",
+                                        len(_pgf_sentences),
+                                    )
+                                else:
+                                    _refusal_text = (
+                                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                    )
+                                    _corrected_text = _refusal_text
+                                    _kv_reply = _refusal_text
+                                    _pgf_all_points_hallucinated = True
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d checked "
+                                        "sentence(s) (prose) failed grounding — refusing instead of showing "
+                                        "a fully-unsupported answer",
+                                        len(_pgf_sentences),
+                                    )
+        except Exception as _pgf_exc:
+            logger.debug("[ask_stream] post-generation faithfulness check skipped: %s", _pgf_exc)
+
+        # ── Specificity Recall Guard (SRG) ──────────────────────────────────
+        # Confirmed live: asked "how to claim motor insurance", the source
+        # states the exact document list ("the registration certificate,
+        # the driving licence of the driver at the time of the incident,
+        # the police report where applicable, and repair estimates") but
+        # the answer said only "any supporting documents required by your
+        # policy" — not wrong, but a lossy abstraction that throws away
+        # real, available detail. A PROMPT rule for this was tried and
+        # reverted the same session: it didn't fix the target case at all
+        # (the vague phrase never changed) and bloated answers from 4-5
+        # points to 7-8 with new filler-shaped lines — telling a 7B model
+        # to "be specific" made it more expansive, not more precise, and
+        # there's no prompt-token budget left to iterate on wording
+        # (STRICT_GROUNDED_PROMPT already sits at ~3900/4096 tokens empty).
+        #
+        # This is a deterministic, structural repair instead — no prompt
+        # tokens, no LLM call, no added latency. Deliberately NOT a list of
+        # "vague phrases" to detect (this codebase has been burned
+        # repeatedly by hand-maintained phrase lists — _EXAMPLE/_SIMPLE/
+        # _DETAIL_SIGNALS, giveaway-term lists, the auto-promoted-vocab
+        # regex bug fixed earlier this session — all needed constant
+        # upkeep). Instead it measures RECALL: find an enumeration (a 3+
+        # item comma list) in the retrieved context, find the answer unit
+        # that's actually ABOUT that same topic (by shared content words,
+        # not a fixed vocabulary), and check whether the enumerated items
+        # made it into the answer. Works on any enumerable content —
+        # documents, exclusions, covered events, claim steps — with no
+        # per-domain maintenance.
+        #
+        # Hallucination is structurally blocked, not just discouraged:
+        # every appended word is a case-insensitive literal substring of
+        # _full_context_uncompressed (checked again explicitly below, even
+        # though every item already came FROM parsing that same text) —
+        # there is no generative step in the repair for anything to invent.
+        #
+        # Feature-flagged, default OFF, until validated against
+        # specificity_corpus_runner.py's before/after comparison (the
+        # harness this plan required be built BEFORE this code, specifically
+        # so "looks right on the query I tested" is never the bar again for
+        # this class of fix — that's exactly how the reverted prompt
+        # attempt's bloat regression slipped through unnoticed the first
+        # time). See PLAN_specificity_recall_guard.md.
+        if os.getenv("ENABLE_SPECIFICITY_GUARD", "false").strip().lower() in ("1", "true", "yes"):
+            try:
+                _srg_src = (_corrected_text or _reply_stripped)
+                # Comparison-table answers reassign _corrected_text to just
+                # the short table-intro caption ("Sure thing, here's how X
+                # and Y compare:") — the real comparable content lives in
+                # _comparison_table's structured rows, not in this prose.
+                # Confirmed live: with no real "point" for an enum to
+                # attach to, SRG matched one onto the bare caption sentence
+                # anyway and glued a nonsensical clause onto it ("...
+                # compare:. This point also includes cancer, a heart
+                # attack, a stroke..."). Skipping SRG entirely here, same
+                # as it already has nothing meaningful to check once the
+                # answer is a caption rather than real prose.
+                if _srg_src and _full_context_uncompressed and not _comparison_table:
+                    _srg_STOPWORDS = frozenset({
+                        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+                        "at", "by", "from", "as", "is", "are", "was", "were", "be", "been",
+                        "this", "that", "these", "those", "your", "you", "it", "its", "their",
+                        "which", "who", "whom", "such", "any", "all", "some", "most", "will",
+                        "can", "may", "must", "should", "would", "also", "not", "no", "if",
+                        "so", "then", "when", "where", "than", "into", "within", "along",
+                        "after", "before", "since", "once", "just", "only", "even", "well",
+                        "insurer", "insurers", "insured", "insureds",
+                        "policy", "policies", "policyholder", "policyholders",
+                        "claim", "claims", "insurance",
+                        # Confirmed live 2026-08-28: "coverage" was missing
+                        # from this list despite the exact same domain-
+                        # generic reasoning already applied to "insurance"/
+                        # "policy"/"claim" above — a grace-period answer
+                        # ("...without losing coverage") and a completely
+                        # unrelated coverage-AMOUNT answer both used
+                        # "coverage", and that word alone (plus the policy
+                        # type name, see below) was enough to cross this
+                        # mechanism's own >=2 topic-overlap threshold and
+                        # wrongly attach an unrelated enumeration. Same
+                        # reasoning _QUERY_STOP_WORDS already applies
+                        # elsewhere in this file for the SAME word, for the
+                        # SAME reason — "coverage" appears in nearly every
+                        # chunk regardless of specific topic.
+                        "cover", "covers", "covered", "coverage",
+                        # Extended 2026-08-31 against real insurance
+                        # glossaries (NAIC, GoDigit, SBI General) to catch
+                        # the rest of this SAME word class: generic
+                        # CONNECTIVE/STRUCTURAL vocabulary that names the
+                        # insurance TRANSACTION ITSELF rather than any one
+                        # specific benefit or mechanism, so it shows up in
+                        # nearly every answer in a single-policy-type
+                        # document regardless of which question is being
+                        # answered — same zero-distinguishing-power
+                        # reasoning as "coverage" above. Deliberately
+                        # stops short of the full glossaries: specific
+                        # benefit/mechanism names from those same sources
+                        # (co-payment, waiting period, cumulative bonus,
+                        # network hospital, TPA, nominee, rider, grace
+                        # period, free look period, sum assured/insured,
+                        # deductible, restoration benefit, portability,
+                        # ...) are exactly the words this mechanism NEEDS
+                        # to keep, since those are what actually let it
+                        # tell two different FAQ answers in the same
+                        # bundled chunk apart — filtering them out would
+                        # blind the matcher to genuine overlap the same
+                        # way missing "coverage" caused a false one, just
+                        # in the opposite direction (verified against the
+                        # car-theft/FIR case, see below).
+                        "premium", "premiums", "benefit", "benefits",
+                        "plan", "plans", "scheme", "schemes",
+                        "product", "products",
+                    }) | frozenset(_valid_policy_types())
+                    # Policy TYPE names (life/health/motor/...) unioned in
+                    # above rather than hand-listed — this mechanism
+                    # already has a SEPARATE, dedicated, more reliable
+                    # policy_type veto earlier in _srg_match_score (checked
+                    # first, unconditionally) that compares the enum's own
+                    # policy_type field directly, not word overlap. Letting
+                    # the bare type NAME also count toward the generic
+                    # word-overlap score is redundant with that veto at
+                    # best, and actively wrong at worst: within a single
+                    # chunk/document that's uniformly one policy type (like
+                    # a "10 Questions About Life Insurance" webpage), every
+                    # single sentence contains that type's name, so it
+                    # carries zero power to distinguish one question in
+                    # that document from another — confirmed live, this
+                    # was exactly HALF of the 2-word match ({"life",
+                    # "coverage"}) that wrongly triggered enrichment above.
+
+                    def _srg_content_words(text: str) -> set:
+                        _words = re.findall(r"[a-zA-Z][a-zA-Z'\-]{2,}", (text or "").lower())
+                        return {w for w in _words if w not in _srg_STOPWORDS}
+
+                    def _srg_split_items(list_span: str) -> list:
+                        # Split ONLY on a comma directly followed by an
+                        # optional and/or — never a bare mid-phrase
+                        # " and "/" or ", which is legitimately part of one
+                        # item ("war and warlike operations").
+                        _raw = re.split(r',\s*(?:and\s+|or\s+)?', list_span.strip())
+                        _items = [it.strip(' .;:') for it in _raw if it.strip(' .;:')]
+                        _items = [it for it in _items if len(it) > 2]
+                        # A well-formed item should never contain a bullet
+                        # marker mid-text — those only ever appear as list
+                        # separators BETWEEN items, never embedded within
+                        # one. Confirmed live: a comma genuinely inside one
+                        # bullet's own sentence ("...accident, collision,
+                        # and overturning") let one of the anchor patterns
+                        # match starting from an EARLIER, unrelated bullet
+                        # ("hired or"), producing a garbled item spanning
+                        # two different bullets ("hired or ■ Damage to the
+                        # insured vehicle caused by accident") — its
+                        # presence is a reliable signal the extraction's
+                        # boundary was wrong, not a real item name, so
+                        # reject it outright rather than let a stray word
+                        # from it coincidentally match an unrelated point.
+                        _items = [it for it in _items if not re.search(r'[■•▪◦]', it)]
+                        # A genuine list item is a standalone noun phrase —
+                        # it never legitimately OPENS with a pronoun,
+                        # preposition, or auxiliary/linking verb, since
+                        # those only make sense continuing an antecedent
+                        # from earlier in the same sentence. Confirmed
+                        # live: "Hull Insurance covers the ship itself,
+                        # including its machinery and equipment, against
+                        # physical loss or damage, and is bought by the
+                        # shipowner..." is ONE description, not a list —
+                        # "including" tripped the intro-anchor above, and
+                        # comma-splitting it produced three fragments
+                        # ("its machinery and equipment", "against
+                        # physical loss or damage", "is bought by the
+                        # shipowner...") that are each just a continuation
+                        # of the ONE preceding clause, not separate items.
+                        # One of those fragments coincidentally shared two
+                        # words ("loss", "damage") with an unrelated
+                        # exclusions-flavored answer point, scoring a real
+                        # _item_hits match and slipping straight past the
+                        # exclusions-vs-wrong-section veto (which requires
+                        # zero item hits to fire) — this rejects the
+                        # fragment at the source instead of trying to
+                        # catch every possible coincidental-overlap
+                        # consequence downstream. Closed, small,
+                        # grammatical word class — matches this same
+                        # function's own bullet-marker filter above and
+                        # _srg_QUALIFIER_BOUNDARY_WORDS elsewhere in this
+                        # block, not a growing domain-vocabulary list.
+                        _srg_ITEM_CONTINUATION_STARTS = frozenset({
+                            "its", "his", "her", "their", "this", "that", "these", "those", "it",
+                            "which", "who", "whom",
+                            "against", "by", "from", "of", "in", "on", "at", "with", "without",
+                            "under", "over", "through", "during", "before", "after", "since",
+                            "unless", "upon", "as", "than", "regardless", "provided",
+                            "is", "was", "are", "were", "has", "have", "had", "being", "been",
+                        })
+                        _items = [
+                            it for it in _items
+                            if (_first_word_match := re.match(r"[a-zA-Z']+", it))
+                            and _first_word_match.group(0).lower() not in _srg_ITEM_CONTINUATION_STARTS
+                        ]
+                        return _items
+
+                    # Three list shapes, tried in priority order (most to
+                    # least explicit anchor) since a sentence can contain
+                    # more than one candidate phrase ("along with X, which
+                    # include Y, Z" — "include" is the real anchor, tried
+                    # before the earlier, less specific "along with").
+                    _srg_INTRO_STRONG = re.compile(
+                        r'(?:\binclude[sd]?\b|\bincluding\b|\bsuch as\b|\bconsisting of\b)\s*'
+                        r'((?:[^,.;:]{3,80},\s*){2,}(?:and|or)\s+[^,.;:]{3,80})[.;]'
+                    )
+                    # A bare ":" is deliberately NOT an anchor here —
+                    # confirmed live: "Form A: Third-Party Only Policy
+                    # (Act Policy) Often called an Act Policy, this is the
+                    # minimum legally required cover..." got matched as a
+                    # 3-item "list" (colon-then-commas) when the colon was
+                    # actually just labelling a heading, not introducing
+                    # an enumeration at all — a real false positive that
+                    # contaminated an unrelated control answer. Colons
+                    # serve too many purposes in English prose (labels,
+                    # definitions, quotes) to be a safe standalone anchor;
+                    # "along with" alone is unambiguous.
+                    _srg_INTRO_WEAK = re.compile(
+                        r'\balong with\b\s*'
+                        r'((?:[^,.;:]{3,80},\s*){2,}(?:and|or)\s+[^,.;:]{3,80})[.;]'
+                    )
+                    _srg_SUBJECT = re.compile(
+                        r'((?:[^,.;:]{3,80},\s*){2,}(?:and|or)\s+[^,.;:]{3,80})\s+'
+                        r'(?:are|is)\s+(?:excluded|covered|included|payable|required)\b'
+                    )
+                    # Confirmed live: matching ANY capitalized word + up
+                    # to 2 more words as the "verb" anchor was far too
+                    # permissive — "Beyond the legal requirement, motor
+                    # insurance protects the policyholder from...repair
+                    # bills, medical costs, and legal claims" got parsed
+                    # as a 3-item list with "requirement" as a bare,
+                    # nonsensical first item, purely because "Beyond the
+                    # legal" happened to precede some commas — ordinary
+                    # prose, not a real enumeration, and it contaminated
+                    # an unrelated control answer. Anchored on an actual,
+                    # small set of genuine list-introducing imperative
+                    # verbs instead — a grammatical distinction, not a
+                    # growing domain-vocabulary list (the plan's own
+                    # "no fixed phrase list" constraint is about
+                    # insurance-topic words, not closed classes of
+                    # English grammar).
+                    _srg_BARE_OBJECT = re.compile(
+                        r'(?:^|\.\s+)(?:Collect|Gather|Submit|Provide|Keep|Include|Bring|Obtain|Retain)\s+'
+                        r'(?:all|any|your|the)?\s*'
+                        r'((?:[^,.;:]{3,80},\s*){2,}(?:and|or)\s+[^,.;:]{3,80})[.;]',
+                        re.IGNORECASE,
+                    )
+                    # Confirmed live (2026-08-25): "If I'm travelling to
+                    # Europe, should I buy travel insurance?" — a general
+                    # leisure-travel question — got enriched with "cover for
+                    # study interruption, sponsor protection if a parent or
+                    # guardian dies..., and loss of study materials." Those
+                    # ARE real KNOWLEDGE BASE items, but they're the Student
+                    # Travel Plan's own specific features, sitting in a
+                    # sentence ("Student Travel Plan Designed for students
+                    # travelling abroad for study...") whose topic_words
+                    # ALSO include generic overlap ("trip", "travel", "plan",
+                    # "leisure") that a general travel-insurance answer
+                    # shares even without ever mentioning "student" at all —
+                    # topic overlap alone can't tell "about travel insurance
+                    # in general" apart from "about ONE specific named plan
+                    # variant of travel insurance."
+                    #
+                    # Rather than hardcoding "student"/"senior citizen"/
+                    # "family" as a special-case word list (which would only
+                    # ever catch THESE names, not the next one), this
+                    # detects the general, content-agnostic STRUCTURAL
+                    # pattern this KB actually uses to name a specific
+                    # product/plan/scheme: a Title-Case multi-word phrase
+                    # ending in a recognizable product-type noun. Matches
+                    # "Student Travel Plan", "Family Travel Plan", "Senior
+                    # Citizen Travel Plan", "Bhagyashree Child Welfare
+                    # Policy" — already the exact naming pattern this
+                    # prompt's own rule 11b/9b calls out ("the Bhagyashree
+                    # Child Welfare Policy covers...") — without needing to
+                    # know any of those names in advance.
+                    _srg_NAMED_PRODUCT_RE = re.compile(
+                        r'\b(?:[A-Z][a-zA-Z\'-]*[\s,]+){1,3}[A-Z][a-zA-Z\'-]*'
+                        r'\s+(?:Plan|Policy|Policies|Cover|Coverage|Scheme|Insurance)\b'
+                    )
+                    # The regex's own trailing anchor word ("Plan"/"Policy"/
+                    # ...) is generic by construction — every variant name
+                    # ends in one, so it can never be what DISTINGUISHES
+                    # "Student Travel Plan" from "Family Travel Plan". The
+                    # policy_type itself ("travel", "motor", ...) is the
+                    # same problem one level up: every variant of a travel
+                    # product's name contains "travel", so requiring it
+                    # would never actually filter anything — a general
+                    # travel-insurance answer already says "travel"
+                    # constantly. Stripped out below (per-enum, using the
+                    # actual policy_type already carried on that enum,
+                    # not a hardcoded list) so what's LEFT is only the
+                    # word(s) that actually distinguish this one named
+                    # variant from its siblings — "student", "family",
+                    # "senior"/"citizen".
+                    _srg_NAMED_PRODUCT_GENERIC_WORDS = frozenset({
+                        "plan", "plans", "policy", "policies", "cover",
+                        "coverage", "scheme", "schemes", "insurance",
+                    })
+
+                    def _srg_find_enumerations_in_chunk(
+                        context_text: str, section: str = "", policy_type: str = "", chunk_idx: Optional[int] = None,
+                    ) -> list:
+                        _enums = []
+                        _sentences = re.split(r'(?<=[.!?])\s+', context_text)
+                        for _i, _sent in enumerate(_sentences):
+                            _padded = _sent if _sent.rstrip().endswith(('.', ';', ':')) else _sent + '.'
+                            _list_span = None
+                            for _pattern in (_srg_INTRO_STRONG, _srg_INTRO_WEAK, _srg_SUBJECT, _srg_BARE_OBJECT):
+                                _m = _pattern.search(_padded)
+                                if _m:
+                                    _list_span = _m.group(1)
+                                    break
+                            if not _list_span:
+                                continue
+                            _items = _srg_split_items(_list_span)
+                            if len(_items) < 3:
+                                continue
+                            _topic_text = _sent.replace(_list_span, ' ')
+                            _topic_words = _srg_content_words(_topic_text)
+                            # Confirmed live: a bare-object list ("Collect
+                            # all X, Y, and Z.") leaves almost nothing
+                            # behind as topic text once the list itself is
+                            # removed — 1-2 words, too sparse to reliably
+                            # recognize a differently-worded answer point
+                            # as being about the same list. Pull in the
+                            # PRECEDING sentence's words too in that case;
+                            # a numbered-step source document's adjacent
+                            # step is legitimately the same topic
+                            # neighbourhood — but ONLY within this same
+                            # retrieved chunk (the caller invokes this once
+                            # per chunk, never on the whole joined context).
+                            # Confirmed live: doing this across the joined
+                            # multi-chunk blob let the fallback pull
+                            # vocabulary from a completely unrelated
+                            # neighbouring chunk (a different source PDF's
+                            # glossary entry) into an actuarial "such as"
+                            # list's topic words, which then coincidentally
+                            # matched a real health-claim answer and got a
+                            # wildly wrong, unrelated clause inserted.
+                            if len(_topic_words) < 3 and _i > 0:
+                                _topic_words = _topic_words | _srg_content_words(_sentences[_i - 1])
+                            # See _srg_NAMED_PRODUCT_RE's own comment — if
+                            # this list's own sentence names a specific
+                            # product/plan ("Student Travel Plan"), record
+                            # it so _srg_match_score can require the
+                            # matching unit to actually be about THAT named
+                            # thing, not just share generic category
+                            # vocabulary with it.
+                            _named_product_m = _srg_NAMED_PRODUCT_RE.search(_sent)
+                            _named_product_words = set()
+                            if _named_product_m:
+                                _named_product_words = (
+                                    _srg_content_words(_named_product_m.group(0))
+                                    - _srg_NAMED_PRODUCT_GENERIC_WORDS
+                                    - {(policy_type or "").lower(), (policy_type or "").lower() + "s"}
+                                )
+                            _enums.append({
+                                "items": _items,
+                                "topic_words": _topic_words,
+                                "section": section,
+                                "policy_type": policy_type,
+                                "named_product_words": _named_product_words,
+                                "chunk_idx": chunk_idx,
+                            })
+                        return _enums
+
+                    def _srg_find_enumerations(context_chunks: list) -> list:
+                        _enums = []
+                        for _idx, (_chunk_text, _chunk_section, _chunk_policy_type) in enumerate(context_chunks):
+                            _enums.extend(_srg_find_enumerations_in_chunk(
+                                _chunk_text, _chunk_section, _chunk_policy_type, chunk_idx=_idx,
+                            ))
+                        return _enums
+
+                    _srg_CATEGORY_NOUNS = (
+                        "documents", "exclusions", "items", "events", "types",
+                        "steps", "requirements", "conditions", "bills", "receipts",
+                    )
+
+                    def _srg_stem(word: str) -> str:
+                        # Deliberately tiny and suffix-only — just enough
+                        # to bridge the ordinary word-form gap between an
+                        # answer's own phrasing and a category noun
+                        # ("documentation" vs "documents"), never a
+                        # general fuzzy-match. Confirmed live: an answer
+                        # point genuinely about receipts/documentation
+                        # ("keep all receipts and documentation related to
+                        # the repairs") shared zero exact words with the
+                        # source topic ("documents"), so it scored 0 and
+                        # got no enrichment at all — safer than the wrong-
+                        # point bug this was fixing, but the point that
+                        # should have been enriched still wasn't. Longer
+                        # suffixes checked first so "documentation" strips
+                        # to "document" in one step, not "document" via
+                        # "ation" then wrongly again via "s".
+                        for _suffix in ("ations", "ation", "ing", "ed", "es", "s"):
+                            if word.endswith(_suffix) and len(word) - len(_suffix) >= 3:
+                                return word[: -len(_suffix)]
+                        return word
+
+                    _srg_CATEGORY_NOUNS_STEMMED = frozenset(_srg_stem(n) for n in _srg_CATEGORY_NOUNS)
+
+                    # Standard British/American English spelling variants —
+                    # a closed, fixed set defined by ordinary English
+                    # orthography, NOT insurance-domain vocabulary, so it
+                    # never needs growing as the KB grows (unlike the
+                    # policy-type word lists elsewhere in this file). A
+                    # blanket suffix rule ("-ce" -> "-se") was tried first
+                    # and rejected: it silently mangled ordinary words that
+                    # merely end in "-ce" but aren't spelling variants at
+                    # all — "insurance" -> "insuranse" in this KB's own
+                    # domain word, of all things. An explicit pair list is
+                    # the linguistically correct tool for a genuinely
+                    # closed phenomenon like this.
+                    _srg_SPELLING_VARIANTS = {
+                        "licence": "license", "licences": "licenses",
+                        "defence": "defense", "defences": "defenses",
+                        "offence": "offense", "offences": "offenses",
+                        "pretence": "pretense",
+                        "practise": "practice", "practising": "practicing",
+                        "colour": "color", "colours": "colors",
+                        "favour": "favor", "favours": "favors",
+                        "honour": "honor", "honours": "honors",
+                        "neighbour": "neighbor", "neighbours": "neighbors",
+                        "centre": "center", "centres": "centers",
+                        "theatre": "theater", "theatres": "theaters",
+                        "metre": "meter", "metres": "meters",
+                        "litre": "liter", "litres": "liters",
+                        "organise": "organize", "organised": "organized",
+                        "organising": "organizing", "organisation": "organization",
+                        "realise": "realize", "realised": "realized", "realising": "realizing",
+                        "recognise": "recognize", "recognised": "recognized",
+                        "recognising": "recognizing",
+                        "analyse": "analyze", "analysed": "analyzed", "analysing": "analyzing",
+                        "catalogue": "catalog", "dialogue": "dialog",
+                        "programme": "program", "programmes": "programs",
+                        "cheque": "check", "cheques": "checks",
+                        "travelling": "traveling", "traveller": "traveler",
+                        "travellers": "travelers",
+                        "cancelled": "canceled", "cancelling": "canceling",
+                        "fulfil": "fulfill", "fulfilment": "fulfillment",
+                        "enrolment": "enrollment", "judgement": "judgment",
+                        "grey": "gray", "tyre": "tire", "tyres": "tires",
+                        "aluminium": "aluminum", "mould": "mold",
+                    }
+                    _srg_SPELLING_RE = re.compile(
+                        r"\b(" + "|".join(re.escape(k) for k in _srg_SPELLING_VARIANTS) + r")\b"
+                    )
+
+                    def _srg_norm_spelling(text: str) -> str:
+                        # Normalizes British/American spelling variants
+                        # purely for coverage COMPARISONS in _srg_repair_answer
+                        # below, never touching the actual answer text.
+                        # Confirmed live: two source chunks each listed the
+                        # same required document under a different regional
+                        # spelling ("the driving licence of the driver at
+                        # the time of the incident" vs a separate enum's
+                        # plain "driving license"); an exact-string coverage
+                        # check treated them as two different items and
+                        # appended both to the same clause.
+                        return _srg_SPELLING_RE.sub(
+                            lambda m: _srg_SPELLING_VARIANTS[m.group(0)], text
+                        )
+
+                    def _srg_item_word_seq(item: str) -> list:
+                        return [
+                            w for w in re.findall(r"[a-zA-Z][a-zA-Z'\-]{2,}", item.lower())
+                            if w not in _srg_STOPWORDS
+                        ]
+
+                    # Closed, small, grammatical set of prepositions/
+                    # relative pronouns/subordinators that typically
+                    # introduce a QUALIFYING clause on a noun phrase — not
+                    # a growing domain-vocabulary list, same reasoning as
+                    # _srg_BARE_OBJECT's own imperative-verb set above.
+                    _srg_QUALIFIER_BOUNDARY_WORDS = frozenset({
+                        "of", "for", "at", "in", "on", "with", "which",
+                        "that", "who", "whom", "from", "by", "during",
+                        "before", "after", "since", "unless", "where",
+                    })
+
+                    def _srg_item_head_words(item: str) -> list:
+                        # Collects the item's content words UP TO the first
+                        # qualifying-clause boundary, not the whole item.
+                        # Confirmed live: "the driving licence OF THE
+                        # DRIVER AT THE TIME OF THE INCIDENT" has its real
+                        # head noun ("licence") right after the leading
+                        # modifier — everything from "of" onward just
+                        # describes WHICH licence, not the item's own
+                        # identity. Without stopping there, the item's
+                        # "last significant word" fell inside that
+                        # trailing qualifier ("incident"), which
+                        # coincidentally also appears in a totally
+                        # unrelated answer point ("...after an incident"),
+                        # pulling this item's whole enrichment onto the
+                        # wrong point entirely instead of the point
+                        # actually about documents/receipts.
+                        _all_tokens = re.findall(r"[a-zA-Z']+", item.lower())
+                        _head_tokens = []
+                        for _tok in _all_tokens:
+                            if _tok in _srg_QUALIFIER_BOUNDARY_WORDS and _head_tokens:
+                                break
+                            if _tok not in _srg_STOPWORDS:
+                                _head_tokens.append(_tok)
+                        return _head_tokens
+
+                    # Confirmed live (2026-08-24, two separate documents):
+                    # an exclusions-flavored answer unit can pick up an
+                    # enumeration from a DIFFERENT, verified section purely
+                    # via coincidental shared vocabulary — "intentional
+                    # damage by the business owner" (a real exclusions
+                    # point) shares only "business"/"damage" with "Physical
+                    # damage to business premises... from insured perils
+                    # such as fire, storm, and burglary" (a BENEFITS-section
+                    # enum listing covered perils, not exclusions), and a
+                    # cyber exclusions point sharing only generic
+                    # cyber/insurance/systems/losses vocabulary pulled in
+                    # "a data breach, a ransomware attack, and an online
+                    # fraud" from a GENERAL-section "what cyber insurance
+                    # covers" sentence — neither wrong enum's own items were
+                    # ever mentioned by the unit (_item_hits=0 both times),
+                    # only bare topic overlap. Phrase-level (not just
+                    # single-stem) detection, mirroring rag.py's own
+                    # _POLICY_SECTION_PATTERNS["exclusions"] vocabulary so
+                    # unit-side detection uses the same definition of
+                    # "exclusions-flavored" as chunk-side classification.
+                    # {0,2} filler-word tolerance between the negation and
+                    # the verb — confirmed live: "doesn't USUALLY include"
+                    # (an adverb between "doesn't" and "include") missed a
+                    # strict adjacent-word version of this same regex
+                    # entirely, letting the fire/storm/burglary false match
+                    # straight through untouched.
+                    _srg_EXCLUSIONS_UNIT_RE = re.compile(
+                        r"exclu\w*|"
+                        r"(?:doesn'?t|does\s+not)\s+(?:\w+\s+){0,2}(?:cover\w*|includ\w*)|"
+                        r"not\s+(?:\w+\s+){0,2}(?:cover\w*|includ\w*|payable)|"
+                        r"no\s+coverage",
+                        re.IGNORECASE,
+                    )
+
+                    # ── Per-unit chunk citation (2026-09-02) ────────────────────
+                    # User's explicit direction: reuse the SAME strategy PGF
+                    # already uses to track which chunk a point is actually
+                    # formed from (_pgf_context_for_units — embedding-rank
+                    # the candidate chunks against each unit, top-K wins),
+                    # and use that as a hard gate here — an enumeration may
+                    # only enrich a unit if the enumeration's own source
+                    # chunk is one of THAT unit's cited chunks. Confirmed
+                    # live this was the real gap the existing topic-word/
+                    # policy_type heuristics below still had: "My factory
+                    # equipment broke down..." (grounded in an ENGINEERING
+                    # chunk) got enriched with "...proximity of houses to a
+                    # riverbank" — genuinely unrelated content pulled from a
+                    # DIFFERENT chunk that merely shared the same broad
+                    # policy_type/topic vocabulary. Deliberately does NOT
+                    # reuse PGF's own _pgf_matching_chunks/_pgf_chunk_vecs
+                    # directly — those are pre-filtered to the query's
+                    # policy_type (see that block's own comment), so their
+                    # index space doesn't line up with _full_context_
+                    # uncompressed_chunks, which is what enum["chunk_idx"]
+                    # is numbered against. Recomputes independently, scoped
+                    # to the SAME index space enums already use, rather
+                    # than risk a silent off-by-one mismatch between two
+                    # differently-filtered chunk lists.
+                    _SRG_CITATION_TOP_K = 2
+
+                    def _srg_word_overlap_citation(_unit_text: str, _chunk_texts: list) -> set:
+                        _unit_words_ov = set(re.findall(r"[a-z]{4,}", _unit_text.lower()))
+                        if not _unit_words_ov or not _chunk_texts:
+                            return set(range(len(_chunk_texts)))
+                        _scores = [
+                            len(_unit_words_ov & set(re.findall(r"[a-z]{4,}", _ct.lower())))
+                            for _ct in _chunk_texts
+                        ]
+                        _order = sorted(range(len(_chunk_texts)), key=lambda i: _scores[i], reverse=True)
+                        return set(_order[:_SRG_CITATION_TOP_K])
+
+                    def _srg_compute_unit_citations(units: list, chunk_texts: list) -> list:
+                        """Returns one set of cited chunk indices per unit,
+                        same length/order as `units`, index space matching
+                        `chunk_texts` (== enum["chunk_idx"]'s own numbering).
+                        Embedding-ranked, mirroring PGF's technique exactly;
+                        falls back to word overlap on any embedding failure
+                        — same fallback shape as _pgf_context_for_units, so
+                        this degrades the same way PGF's own citation does
+                        rather than in some new, unproven way.
+                        """
+                        if not chunk_texts:
+                            return [set() for _ in units]
+                        if len(chunk_texts) <= 1:
+                            return [set(range(len(chunk_texts))) for _ in units]
+                        try:
+                            _srg_embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+                            _srg_chunk_vecs = _srg_embed_model.encode(chunk_texts, normalize_embeddings=True)
+                            _srg_unit_vecs = _srg_embed_model.encode(units, normalize_embeddings=True)
+                        except Exception as _srg_embed_exc:
+                            logger.debug(
+                                "[ask_stream] SRG unit-citation embedding failed, falling back "
+                                "to word overlap: %s", _srg_embed_exc,
+                            )
+                            return [_srg_word_overlap_citation(u, chunk_texts) for u in units]
+                        _citations = []
+                        for _uv in _srg_unit_vecs:
+                            _scores = [float(np.dot(_uv, _cv)) for _cv in _srg_chunk_vecs]
+                            _order = sorted(range(len(chunk_texts)), key=lambda i: _scores[i], reverse=True)
+                            _citations.append(set(_order[:_SRG_CITATION_TOP_K]))
+                        return _citations
+
+                    def _srg_match_score(
+                        unit_words: set, enum: dict, unit_text: str = "",
+                        unit_cited_chunk_idxs: Optional[set] = None,
+                    ) -> int:
+                        # Hard veto, checked first, before any of the
+                        # lexical signals below: an enumeration whose own
+                        # source chunk isn't one of THIS unit's cited
+                        # chunks is never eligible, full stop, regardless
+                        # of how much topic vocabulary it happens to share.
+                        # None means "no citation info available" (e.g. the
+                        # single-chunk-context case) — never restrictive in
+                        # that case, since there's nothing to distinguish.
+                        if (
+                            unit_cited_chunk_idxs is not None
+                            and enum.get("chunk_idx") is not None
+                            and enum["chunk_idx"] not in unit_cited_chunk_idxs
+                        ):
+                            return 0
+                        # Hard veto, checked first and unconditionally:
+                        # section/heading text is shared vocabulary across
+                        # totally different products — "Common Exclusions"
+                        # is the near-identical heading in the motor,
+                        # marine, fire, life, health, ... guides alike, so
+                        # matching on section/heading/word-overlap ALONE
+                        # can never tell two different products' same-
+                        # named lists apart if both ever end up in context
+                        # together. policy_type is the one signal that
+                        # actually distinguishes them. _policy_types_for_
+                        # filter (not the single _query_policy_type) is
+                        # used so a named-pair comparison query ("motor vs
+                        # marine") — which legitimately needs BOTH sides'
+                        # content — doesn't get one side wrongly vetoed
+                        # against the other; it's the same set already
+                        # used to build the retrieval filter itself, so
+                        # enums for every type retrieval was ALLOWED to
+                        # fetch stay eligible here too. An enum with no
+                        # policy_type at all (general content, or the
+                        # empty-string default for the joined-context
+                        # fallback) is never vetoed — there's nothing
+                        # specific to be wrong about.
+                        _enum_policy_type = (enum.get("policy_type") or "").strip().lower()
+                        if (
+                            _enum_policy_type
+                            and _enum_policy_type != "general"
+                            and _policy_types_for_filter
+                            and _enum_policy_type not in _policy_types_for_filter
+                        ):
+                            return 0
+
+                        # Second hard veto, same reasoning one level down:
+                        # policy_type distinguishes different PRODUCTS, but
+                        # can't distinguish different NAMED VARIANTS of the
+                        # SAME product — "Student Travel Plan" and a general
+                        # "should I buy travel insurance for Europe" answer
+                        # are both policy_type=travel, so the veto above
+                        # never fires for them. See _srg_NAMED_PRODUCT_RE's
+                        # comment for the full incident: a general answer
+                        # scored a topic-overlap match against the Student
+                        # Travel Plan's own feature list purely on shared
+                        # generic words ("trip", "travel", "plan", "leisure")
+                        # and got enriched with that ONE variant's specific
+                        # features ("study interruption, sponsor
+                        # protection...") as if they applied universally.
+                        # If this enum's source sentence names a specific
+                        # product/plan, the unit must actually reference
+                        # that same named thing (student/family/senior/...)
+                        # before this enum is eligible at all — bare
+                        # category-vocabulary overlap is exactly the
+                        # insufficient evidence the general veto above
+                        # already distrusts one level up.
+                        _named_product_words = enum.get("named_product_words") or set()
+                        if _named_product_words and not (_named_product_words & unit_words):
+                            return 0
+
+                        _topic_overlap = len(unit_words & enum["topic_words"])
+                        # Stemmed once, up front — confirmed live: an item's
+                        # head word can be a genuine plural/singular
+                        # mismatch away from the answer's own wording ("a
+                        # data BREACH" as the item, "data BREACHES" in a
+                        # unit that already restates it near-verbatim) and
+                        # exact-string comparison alone missed it entirely,
+                        # letting a much weaker, unrelated unit win the
+                        # match instead of the unit that already covers
+                        # this content.
+                        _unit_stems = {_srg_stem(w) for w in unit_words}
+                        _item_hits = 0
+                        for _item in enum["items"]:
+                            _seq = _srg_item_head_words(_item)
+                            if not _seq:
+                                continue
+                            # English noun phrases end in their head noun
+                            # ("original BILLS", "repair ESTIMATES") — the
+                            # leading word is usually a modifier most
+                            # likely to be dropped in a shorter paraphrase
+                            # ("medical bills" for source's "original
+                            # bills"). Confirmed live: requiring the item's
+                            # head noun specifically (or 2+ of its words
+                            # anywhere) catches genuine references while
+                            # still rejecting a coincidental match on a
+                            # leading modifier alone — "repair estimates"
+                            # was wrongly matching an unrelated sentence
+                            # that only shared "repair" (not the head noun
+                            # "estimates" at all). Both signals are scoped
+                            # to the item's HEAD region (see
+                            # _srg_item_head_words), not its full text —
+                            # a coincidental shared word from a trailing
+                            # qualifier clause must never count as a hit.
+                            _head = _srg_stem(_seq[-1]) if len(_seq[-1]) >= 5 else None
+                            _seq_stems = {_srg_stem(w) for w in _seq}
+                            _multi_hit = len(_seq_stems & _unit_stems) >= 2
+                            if (_head and _head in _unit_stems) or _multi_hit:
+                                _item_hits += 1
+                        # A shared CATEGORY noun (documents/exclusions/...)
+                        # between the unit and the enumeration's own topic
+                        # is strong, standalone evidence on its own —
+                        # confirmed live: "keep all relevant documents and
+                        # receipts" shares only the single word "documents"
+                        # with the source topic, too weak for the plain
+                        # topic-overlap threshold alone, yet this is
+                        # exactly the point that should be enriched.
+                        # Category words are a closed, small, structural
+                        # set naming the KIND of enumeration this
+                        # mechanism looks for — not a growing domain
+                        # vocabulary list.
+                        _topic_stems = {_srg_stem(w) for w in enum["topic_words"]}
+                        _category_match = 1 if (_unit_stems & _topic_stems & _srg_CATEGORY_NOUNS_STEMMED) else 0
+                        # Structured metadata beats fuzzy word overlap when
+                        # it's actually available: each retrieved chunk
+                        # carries its own metadata["section"] tag (e.g.
+                        # "exclusions", "documents") from the ingestion
+                        # pipeline — a verified label, not a guess from
+                        # shared vocabulary. Confirmed live: a cyber
+                        # exclusions point wrongly pulled in a "covered
+                        # events" enumeration from a DIFFERENT chunk purely
+                        # because both mentioned similar cyber-insurance
+                        # words — this signal lets a correctly-tagged
+                        # chunk's real section win outright even when word
+                        # overlap alone would point the wrong way. Only
+                        # fires when the section value is itself one of the
+                        # recognized category concepts (not a generic
+                        # section name like "benefits" or "general", which
+                        # carries no useful meaning here) AND the answer
+                        # unit actually names that same category — weighted
+                        # above the word-based category_match since it's a
+                        # verified label rather than an inference.
+                        _section_stem = _srg_stem((enum.get("section") or "").lower())
+                        _section_match = 1 if (
+                            _section_stem
+                            and _section_stem in _srg_CATEGORY_NOUNS_STEMMED
+                            and _section_stem in _unit_stems
+                        ) else 0
+                        # "claims" itself was deliberately left out of
+                        # _srg_CATEGORY_NOUNS — the literal word "claim"
+                        # appearing in a unit doesn't mean it's naming an
+                        # enumerable list the way "documents" does (most
+                        # units in a claims-process answer say "claim"
+                        # somewhere without needing any enrichment at
+                        # all). But a claims-section enum is STRUCTURALLY
+                        # always about what to submit, so when the UNIT
+                        # itself vaguely gestures at "the documents" /
+                        # "documentation" / "paperwork" without naming
+                        # them — the exact shape of a hedged, ungrounded-
+                        # sounding answer — that's the one case a claims-
+                        # section enum should confidently attach to.
+                        # Confirmed live (2026-08-25): "Ensure you have
+                        # the specific supporting documents named for
+                        # this policy ready to submit" scored only 1
+                        # (topic_overlap on "submit" alone — the enum's
+                        # own topic words are sparse, {"submit","form"},
+                        # a known side effect of bare-object list
+                        # extraction) against the real, correctly-tagged
+                        # document list sitting right there in the
+                        # source, missing the >=2 threshold by one point
+                        # and leaving the vague placeholder unfixed.
+                        _claims_documents_match = 1 if (
+                            _section_stem == "claim"
+                            and {"document", "documentation", "paperwork"} & _unit_stems
+                        ) else 0
+                        # Hard veto (see comment on _srg_EXCLUSIONS_UNIT_RE
+                        # above): the unit clearly wants exclusions-type
+                        # content, this enum's own verified section says
+                        # it's something else, and the unit never actually
+                        # references any of this enum's specific items —
+                        # bare topic-word overlap alone is not enough
+                        # evidence to override a real section mismatch.
+                        # Enums with no section metadata at all ("") are
+                        # untouched — this only fires against a POSITIVE,
+                        # known-different label.
+                        _enum_section = (enum.get("section") or "").strip().lower()
+                        if (
+                            _item_hits == 0
+                            and _enum_section
+                            and _enum_section != "exclusions"
+                            and unit_text
+                            and _srg_EXCLUSIONS_UNIT_RE.search(unit_text)
+                        ):
+                            return 0
+                        return _topic_overlap + 2 * _item_hits + 3 * _category_match + 5 * _section_match + 5 * _claims_documents_match
+
+                    # ── SRG weave-rewrite (2026-09-02) ──────────────────────────
+                    # User's explicit ask: "the phrasing should be linked to the
+                    # point on which it is being pasted." The old mechanical
+                    # template ("<sentence>. This point also includes X, Y, and
+                    # Z.") glued RAW items pulled verbatim from a source
+                    # enumeration onto the end of an unrelated sentence — those
+                    # items carry their own capitalization/punctuation from a
+                    # bulleted list in the source ("Loss", "the traveller's own
+                    # serious illness"), which reads jarringly once mechanically
+                    # appended mid-answer rather than woven into the sentence
+                    # it's supposed to belong to. One small rewrite call
+                    # produces a single natural sentence instead of a bolted-on
+                    # second clause. Kept strictly optional: any failure here —
+                    # backend error, empty response, or the rewrite dropping too
+                    # many of the missing items' own core words — falls back to
+                    # the exact old mechanical template, so this can only
+                    # improve phrasing on success, never lose a fact on failure.
+                    # The underlying factual safety net (every appended item is
+                    # a literal substring of the retrieved context) already ran
+                    # before this point and is unaffected either way.
+                    _SRG_WEAVE_PROMPT = """\
+You are given ONE sentence from an insurance chatbot's answer, and a short \
+list of additional items the source material mentions that this sentence's \
+own list is currently missing. Rewrite the sentence so it naturally \
+includes the missing items too — weave them into the sentence's existing \
+list/structure so the whole thing reads as ONE natural sentence, not a \
+separate bolted-on clause.
+
+Do not add, remove, or change any other fact in the sentence. Do not \
+invent anything beyond what is listed below. Keep the sentence's own tone, \
+person (you/your, etc.), and every fact it already states exactly as is — \
+only add the missing items into its existing structure.
+
+Original sentence: {unit}
+
+Missing items to weave in: {items}
+
+Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
+"""
+
+                    async def _srg_weave_items_into_unit(unit_text: str, missing_items: list) -> Optional[str]:
+                        try:
+                            _items_joined = "; ".join(missing_items)
+                            _prompt = _SRG_WEAVE_PROMPT.format(unit=unit_text, items=_items_joined)
+                            _raw = await _backend_completion(_prompt, max_tokens=200, timeout=12)
+                            if not _raw:
+                                return None
+                            _raw = _raw.strip().strip('"')
+                            if not _raw:
+                                return None
+                            # Weaker, paraphrase-tolerant cousin of the
+                            # verbatim gate above — confirms the rewrite kept
+                            # the SAME facts (each missing item's own core
+                            # words still present), not that it copied them
+                            # character-for-character, which is exactly the
+                            # jarring behavior this rewrite exists to fix.
+                            _raw_lower = _raw.lower()
+                            for _mi in missing_items:
+                                _seq = _srg_item_word_seq(_mi)
+                                _core = _seq[:3] or _seq
+                                if not _core:
+                                    continue
+                                _hits = sum(1 for w in _core if w in _raw_lower)
+                                _need = len(_core) if len(_core) <= 2 else 2
+                                if _hits < _need:
+                                    logger.info(
+                                        "[ask_stream] SRG weave-rewrite dropped item %r, "
+                                        "falling back to mechanical template", _mi,
+                                    )
+                                    return None
+                            return _raw
+                        except Exception as _srg_weave_exc:
+                            logger.debug("[ask_stream] SRG weave-rewrite skipped: %s", _srg_weave_exc)
+                            return None
+
+                    async def _srg_repair_answer(
+                        units: list, enums: list, full_context_lower: str,
+                        candidate_indices=None, chunk_texts: Optional[list] = None,
+                    ) -> list:
+                        # Assign each enumeration to AT MOST ONE unit — its
+                        # single best match — so the same missing-items
+                        # clause never gets duplicated across multiple
+                        # points. Confirmed live: independent per-unit
+                        # matching let the same "documents" enrichment get
+                        # appended to two unrelated points (the claim-
+                        # notification point AND an unrelated settlement-
+                        # method point) while the point actually ABOUT
+                        # documents got nothing.
+                        #
+                        # candidate_indices, when given, restricts WHICH
+                        # units are even eligible to win — the caller uses
+                        # this to exclude the generic lead-in/sign-off
+                        # units around a numbered list. Confirmed live: the
+                        # lead-in ("Sure, let's go through how to claim
+                        # motor insurance step by step:") scored higher
+                        # than any real point against a document
+                        # enumeration and got the enrichment appended to
+                        # it directly — a lead-in is never a specific claim
+                        # that could be missing detail, so it must never be
+                        # a valid target regardless of score.
+                        _allowed = set(candidate_indices) if candidate_indices is not None else None
+                        _unit_word_sets = [_srg_content_words(u) for u in units]
+                        _unit_citations = (
+                            _srg_compute_unit_citations(units, chunk_texts) if chunk_texts
+                            else [None] * len(units)
+                        )
+                        logger.info(
+                            "[srg-debug] unit_citations=%r (enum chunk_idxs present=%r)",
+                            _unit_citations, sorted({e.get("chunk_idx") for e in enums if e.get("chunk_idx") is not None}),
+                        )
+                        _enum_to_unit: dict = {}
+                        for _enum in enums:
+                            _best_unit, _best_score = None, 0
+                            for _u_idx, _uw in enumerate(_unit_word_sets):
+                                if not _uw:
+                                    continue
+                                if _allowed is not None and _u_idx not in _allowed:
+                                    continue
+                                _score = _srg_match_score(
+                                    _uw, _enum, units[_u_idx],
+                                    unit_cited_chunk_idxs=_unit_citations[_u_idx],
+                                )
+                                if _score > _best_score:
+                                    _best_score, _best_unit = _score, _u_idx
+                            # Require genuine evidence this unit is about
+                            # the same point: either 2+ shared topic words,
+                            # one shared category noun, or the unit already
+                            # references at least one of the list's own
+                            # items — a coincidental one-word topic match
+                            # alone isn't enough.
+                            if _best_unit is not None and _best_score >= 2:
+                                _enum_to_unit.setdefault(_best_unit, []).append(_enum)
+
+                        _new_units = list(units)
+                        for _u_idx, _assigned in _enum_to_unit.items():
+                            _unit = _new_units[_u_idx]
+                            _unit_lower = _unit.lower()
+                            # "Covered" test runs against the WHOLE answer
+                            # (all units, not just the one this enum got
+                            # assigned to), rebuilt fresh each iteration so
+                            # it also sees clauses appended by earlier
+                            # iterations of this same loop. Confirmed live:
+                            # an enum matched a LATER unit ("submit these
+                            # documents...") via its "documents" category
+                            # word, while the items themselves (registration
+                            # certificate, driving licence, police report)
+                            # were already spelled out in an EARLIER unit —
+                            # checking coverage only within the assigned
+                            # unit missed that and re-stated the same items
+                            # a sentence later. Same fix also stops two
+                            # different enums (e.g. from two source chunks)
+                            # that share an item from each independently
+                            # appending it to two different units.
+                            _full_answer_lower = " ".join(_new_units).lower()
+                            _missing = []
+                            # Items staged into _missing so far in THIS pass
+                            # also count as "covered" for every subsequent
+                            # item — multiple enums can land on the same
+                            # unit (e.g. one enum per source chunk), and two
+                            # differently-worded near-duplicates from two
+                            # DIFFERENT enums ("the driving licence of the
+                            # driver at the time of the incident" vs a
+                            # separate enum's plain "driving license") both
+                            # cleared the full-answer check independently
+                            # since neither was in the answer yet at the
+                            # time each was evaluated — only checking them
+                            # against each other catches that.
+                            _staged_lower = ""
+                            for _enum in _assigned:
+                                for _item in _enum["items"]:
+                                    # "Covered" test uses the item's CORE —
+                                    # its first 1-3 content words, in order
+                                    # — not the whole phrase. Confirmed
+                                    # live: an item with a long trailing
+                                    # qualifier ("the driving licence OF
+                                    # THE DRIVER AT THE TIME OF THE
+                                    # INCIDENT") made a correct, reasonable
+                                    # abbreviation ("driving licence") fail
+                                    # a whole-phrase majority-word check,
+                                    # wrongly re-appending an item the
+                                    # answer already named. Short items
+                                    # (<=2 words) are unaffected — their
+                                    # core IS the whole item.
+                                    _seq = _srg_item_word_seq(_item)
+                                    _core = _seq[:3]
+                                    if not _core:
+                                        continue
+                                    _covered_lower = _srg_norm_spelling(
+                                        _full_answer_lower + " " + _staged_lower
+                                    )
+                                    _core_hits = sum(
+                                        1 for w in _core if _srg_norm_spelling(w) in _covered_lower
+                                    )
+                                    _need = len(_core) if len(_core) <= 2 else 2
+                                    if _srg_norm_spelling(_item.lower()) in _covered_lower or _core_hits >= _need:
+                                        continue
+                                    _missing.append(_item)
+                                    _staged_lower += " " + _item.lower()
+                            # Verbatim gate: every appended item must be a
+                            # literal substring of the retrieved context —
+                            # structurally blocks invention regardless of
+                            # anything above. Every item already came FROM
+                            # parsing that same text, so this should never
+                            # actually trim anything; kept as an explicit,
+                            # independent check rather than trusting that.
+                            _missing = [m for m in _missing if m.lower() in full_context_lower]
+                            if not _missing:
+                                continue
+                            _missing = [re.sub(r'\s+', ' ', m).strip() for m in _missing[:5]]
+                            _woven = await _srg_weave_items_into_unit(_unit, _missing)
+                            if _woven:
+                                _new_units[_u_idx] = _woven
+                                continue
+                            _clause = (
+                                ", ".join(_missing[:-1]) + ", and " + _missing[-1]
+                                if len(_missing) > 1 else _missing[0]
+                            )
+                            _noun = next((n for n in _srg_CATEGORY_NOUNS if n in _unit_lower), None)
+                            _lead = f"The {_noun} also include" if _noun else "This point also includes"
+                            _stripped = _unit.rstrip()
+                            if _stripped and _stripped[-1] not in ".!?":
+                                _stripped += "."
+                            _new_units[_u_idx] = f"{_stripped} {_lead} {_clause}."
+                        return _new_units
+
+                    _srg_context_chunks = _full_context_uncompressed_chunks or [(_full_context_uncompressed, "", "")]
+                    _srg_enums = _srg_find_enumerations(_srg_context_chunks)
+                    if _srg_enums:
+                        _srg_ctx_lower = _full_context_uncompressed.lower()
+                        _srg_has_points = bool(re.search(r'(?:^|\n)\s*\d+\.\s', _srg_src))
+                        # Sign-off extraction reuses the SAME technique
+                        # PGF's own (separate) sign-off detection already
+                        # relies on — an anchored match on the literal
+                        # closing-phrase text itself, not on how many
+                        # newlines happen to precede it. The blank-line
+                        # split below (`\n\n+`) was previously the ONLY
+                        # thing separating the sign-off from the last
+                        # point, and it silently depended on the model
+                        # happening to put a full blank line before the
+                        # sign-off. Confirmed live (2026-09-01): a real
+                        # numbered-list motor-insurance answer had only a
+                        # SINGLE newline there ("...named for this
+                        # policy.\nHope that clears it up!...😊"), so
+                        # neither split alternative fired, the sign-off
+                        # stayed glued to the last point as one unit, and
+                        # the missing-documents enrichment below got
+                        # appended to the END of that glued unit — landing
+                        # after the sign-off instead of inside the point it
+                        # was actually about.
+                        _srg_SIGNOFF_RE = re.compile(
+                            r"\s*(Let me know if you want more details! 😊|"
+                            r"Hope that clears it up! Let me know if you want me to dig into any part of this\. 😊)\s*$"
+                        )
+                        _srg_signoff_m = _srg_SIGNOFF_RE.search(_srg_src) if _srg_has_points else None
+                        _srg_signoff = _srg_signoff_m.group(1) if _srg_signoff_m else ""
+                        _srg_split_src = (
+                            _srg_src[:_srg_signoff_m.start()].rstrip() if _srg_signoff_m else _srg_src
+                        )
+                        _srg_units = (
+                            # Split on a blank-line paragraph break TOO,
+                            # not just the numbered-point boundary —
+                            # confirmed live: without this, a generic
+                            # lead-in ("Sure, let's go through...:") stayed
+                            # glued as its own unit. The sign-off itself is
+                            # now stripped above BEFORE this split runs, so
+                            # it can no longer end up glued to the last
+                            # point regardless of newline count.
+                            re.split(r'\n(?=\s*\d+\.\s)|\n\n+', _srg_split_src)
+                            if _srg_has_points
+                            else re.split(r'(?<=[.!?])(?<!\d\.)\s+', _srg_src)
+                        )
+                        if _srg_signoff:
+                            _srg_units.append(_srg_signoff)
+                        logger.info("[srg-debug] units=%r", _srg_units)
+                        logger.info("[srg-debug] enums=%r", _srg_enums)
+                        # A lead-in/sign-off is never a real point — it's
+                        # generic scaffolding around the numbered list, not
+                        # a specific claim that could be missing detail.
+                        # Confirmed live: a lead-in unit ("Sure, let's go
+                        # through how to claim motor insurance step by
+                        # step:") won the match against a real document
+                        # enumeration and got the enrichment appended to
+                        # it directly, ahead of the numbered list entirely
+                        # — never a valid target regardless of score.
+                        _srg_candidate_idx = (
+                            [i for i, u in enumerate(_srg_units) if re.match(r'\s*\d+\.\s', u)]
+                            if _srg_has_points else None
+                        )
+                        _srg_new_units = await _srg_repair_answer(
+                            _srg_units, _srg_enums, _srg_ctx_lower, candidate_indices=_srg_candidate_idx,
+                            chunk_texts=[_ct for _ct, _cs, _cpt in _srg_context_chunks],
+                        )
+                        if _srg_new_units != _srg_units:
+                            _srg_joined = (
+                                "\n".join(_srg_new_units) if _srg_has_points else " ".join(_srg_new_units)
+                            ).strip()
+                            _corrected_text = _srg_joined
+                            _kv_reply = _srg_joined
+                            logger.info("[ask_stream] specificity guard enriched a unit with missing source items")
+            except Exception as _srg_exc:
+                logger.debug("[ask_stream] specificity guard skipped: %s", _srg_exc)
+
+        # ── Cross-product exclusion misattribution check ────────────────────
+        # Confirmed live: asked about cyber insurance's exclusions, the
+        # model stated "data breaches, ransomware attacks, and online
+        # fraud" as cyber-insurance exclusions. The source sentence really
+        # says these are "generally excluded from a standard COMMERCIAL
+        # property or liability policy" — explaining why CYBER insurance
+        # exists (it's what covers them), not stating cyber insurance's
+        # own exclusions. The model correctly found "excluded" sitting
+        # next to the right words, but didn't track WHICH product that
+        # exclusion is actually scoped to — a genuine model-comprehension
+        # limit (confirmed: an explicit prompt rule telling it to check
+        # this did not fix it, and caused a new over-cautious refusal
+        # elsewhere — reverted). This is a deterministic backstop instead:
+        # for each answer point, check whether ITS OWN grounding sentence
+        # names a DIFFERENT insurance product than the one being asked
+        # about, in the same breath as exclusion language — if so, the
+        # point is misattributed and gets dropped rather than shown wrong.
+        # Disabled by default (2026-08-25) — confirmed live to cause more
+        # harm than benefit: three separate genuinely-correct answers
+        # ("what does marine insurance cover", "what does fire insurance
+        # cover", "what happens if my luggage is lost") got partially or
+        # fully deleted in casual same-day testing, all on coincidental
+        # shared vocabulary between closely-related product categories
+        # (fire/marine/motor/commercial all naturally describe "loss or
+        # damage to property" as core domain language, not evidence of
+        # cross-product misattribution). The one genuine catch this was
+        # built for (cyber exclusions misattributed from commercial) was
+        # found only through deliberate, extensive manual probing, not
+        # normal usage. Gated the same way ENABLE_SPECIFICITY_GUARD is —
+        # code stays in place, opt back in via env var if a future,
+        # better-calibrated version is worth trying rather than needing
+        # to rewrite this from scratch.
+        try:
+            _xprod_enabled = os.getenv("ENABLE_XPROD_EXCLUSION_CHECK", "false").strip().lower() in ("1", "true", "yes")
+            _xprod_src = (_corrected_text or _reply_stripped).strip()
+            if _xprod_enabled and _xprod_src and _full_context_uncompressed_chunks:
+                _xprod_has_points = bool(re.search(r'(?:^|\n)\s*\d+\.\s', _xprod_src))
+                _xprod_units = (
+                    re.split(r'\n(?=\s*\d+\.\s)|\n\n+', _xprod_src)
+                    if _xprod_has_points
+                    else re.split(r'(?<=[.!?])(?<!\d\.)\s+', _xprod_src)
+                )
+                _xprod_query_type = (_query_policy_type or "general").lower()
+                _xprod_vocab = get_active_vocab()
+                _xprod_exclusion_re = re.compile(
+                    r"exclu\w*|not\s+cover\w*|does\s?n'?t\s+cover|will\s+not\s+cover|"
+                    r"not\s+payable|no\s+coverage",
+                    re.IGNORECASE,
+                )
+
+                # Confirmed live (2026-08-25): with no stopword filtering
+                # at all, a completely unrelated HEALTH glossary sentence
+                # ("A span of time at the start of a policy (commonly used
+                # in health insurance) during which certain claims are not
+                # payable...") "overlapped" a correct TRAVEL baggage-loss
+                # answer on exactly {"the", "during", "insurance"} — two
+                # pure grammar words plus the single most generic word in
+                # this entire domain — clearing the >=3 threshold on
+                # meaningless overlap and wrongly dropping the correct
+                # answer's whole first sentence. Same closed stopword set
+                # already used by the SRG block above (deliberately
+                # re-defined here rather than referenced across blocks —
+                # that one lives inside SRG's own try/except, which can
+                # fail before reaching it, so relying on it here would be
+                # a silent cross-block dependency this function's own
+                # separate try/except shouldn't have).
+                _xprod_STOPWORDS = frozenset({
+                    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+                    "at", "by", "from", "as", "is", "are", "was", "were", "be", "been",
+                    "this", "that", "these", "those", "your", "you", "it", "its", "their",
+                    "which", "who", "whom", "such", "any", "all", "some", "most", "will",
+                    "can", "may", "must", "should", "would", "also", "not", "no", "if",
+                    "so", "then", "when", "where", "than", "into", "within", "along",
+                    "after", "before", "since", "once", "just", "only", "even", "well",
+                    "insurer", "insurers", "insured", "policy", "policyholder", "claim",
+                    "claims", "insurance",
+                })
+
+                def _xprod_content_words(text: str) -> set:
+                    return {
+                        w for w in re.findall(r"[a-zA-Z][a-zA-Z'\-]{2,}", (text or "").lower())
+                        if w not in _xprod_STOPWORDS
+                    }
+
+                def _xprod_other_product(sentence: str):
+                    # Multi-word phrases only ("commercial property", "term
+                    # life insurance") — confirmed live: a single-word
+                    # keyword in this shared vocabulary ("older" under
+                    # livestock, "dental" under health) is far more likely
+                    # to appear coincidentally in an unrelated sentence
+                    # than a specific multi-word product phrase is. A
+                    # coincidental single-word hit isn't real evidence the
+                    # sentence is about that other product.
+                    _s_lower = sentence.lower()
+                    for _ptype, _hints in _xprod_vocab.items():
+                        if _ptype == _xprod_query_type or _ptype == "general":
+                            continue
+                        for _kw in _hints.get("keywords", []):
+                            if len(_kw.split()) >= 2 and _kw.lower() in _s_lower:
+                                return _ptype
+                    return None
+
+                _xprod_sentences = []
+                for _chunk_text, _chunk_section, _chunk_policy_type in _full_context_uncompressed_chunks:
+                    _xprod_sentences.extend(re.split(r'(?<=[.!?])\s+', _chunk_text))
+
+                _xprod_drop_idx = set()
+                for _u_idx, _unit in enumerate(_xprod_units):
+                    # Never touch a lead-in/sign-off — same discipline as
+                    # the specificity guard and dedup checks above; those
+                    # are generic scaffolding, never a specific claim that
+                    # could itself be misattributed.
+                    if _xprod_has_points and not re.match(r'\s*\d+\.\s', _unit):
+                        continue
+                    _uw = _xprod_content_words(_unit)
+                    if not _uw:
+                        continue
+                    for _sent in _xprod_sentences:
+                        _sw = _xprod_content_words(_sent)
+                        # Require a real, non-coincidental overlap — a
+                        # single shared word (often just a common noun
+                        # like "losses") was enough to wrongly flag a
+                        # point that was ALREADY correctly grounded in its
+                        # own, right sentence.
+                        if len(_uw & _sw) < 3:
+                            continue
+                        if not _xprod_exclusion_re.search(_sent):
+                            continue
+                        _other = _xprod_other_product(_sent)
+                        if _other:
+                            _xprod_drop_idx.add(_u_idx)
+                            logger.info(
+                                "[ask_stream] cross-product exclusion check: point %d's grounding "
+                                "sentence names a different product (%s), not the asked-about %s "
+                                "— dropped",
+                                _u_idx, _other, _xprod_query_type,
+                            )
+                            break
+
+                if _xprod_drop_idx:
+                    _xprod_kept = [u for i, u in enumerate(_xprod_units) if i not in _xprod_drop_idx]
+                    if _xprod_has_points:
+                        _xprod_point_re = re.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', re.DOTALL)
+                        _xprod_renumbered, _xprod_next_n = [], 1
+                        for _u in _xprod_kept:
+                            _m = _xprod_point_re.match(_u)
+                            if _m:
+                                _xprod_renumbered.append(f"{_m.group(1)}{_xprod_next_n}{_m.group(3)}{_m.group(4)}")
+                                _xprod_next_n += 1
+                            else:
+                                _xprod_renumbered.append(_u)
+                        _xprod_joined = re.sub(r"\n{3,}", "\n\n", "\n".join(_xprod_renumbered)).strip()
+                    else:
+                        _xprod_joined = " ".join(_xprod_kept).strip()
+                    if _xprod_joined:
+                        _corrected_text = _xprod_joined
+                        _kv_reply = _xprod_joined
+        except Exception as _xprod_exc:
+            logger.debug("[ask_stream] cross-product exclusion check skipped: %s", _xprod_exc)
+
+        # ── Semantic point deduplication ────────────────────────────────────
+        # Confirmed live: a detailed-mode NCB answer stated the same
+        # underlying fact twice in different words. A first attempt used the
+        # shared reranker (a cross-encoder, trained for query-vs-document
+        # RETRIEVAL relevance, not sentence-vs-sentence factual equivalence)
+        # as the decision signal — it failed on a real, confirmed case: a
+        # genuinely DIFFERENT point ("the NCB can affect the level of cover
+        # you might choose") scored HIGHER (0.90) against the true
+        # duplicate's target than the true duplicate itself did (0.78), so
+        # no threshold in either direction got both right. Switched to the
+        # bi-encoder embedding model already used for retrieval (cosine
+        # similarity between each point's own embedding) instead — same
+        # underlying model family, but trained to place genuinely
+        # equivalent statements close together rather than just topically-
+        # related ones. Confirmed live: correctly separates every pair in
+        # the exact 7-point NCB answer that broke the reranker (only the
+        # one true duplicate crosses 0.72; the reranker's false positive
+        # sits at 0.67, comfortably below it), and needs only ONE batched
+        # embedding call for all points instead of one model call per pair
+        # — also fixes the earlier version's unacceptable added latency.
+        try:
+            _dedup_src = (_corrected_text or _reply_stripped).strip()
+            _dedup_has_points = bool(re.search(r'(?:^|\n)\s*\d+\.\s', _dedup_src))
+            if _dedup_src and _dedup_has_points:
+                _dedup_units = re.split(r'\n(?=\s*\d+\.\s)|\n\n+', _dedup_src)
+                _dedup_point_idx = [i for i, u in enumerate(_dedup_units) if re.match(r'\s*\d+\.\s', u)]
+                if len(_dedup_point_idx) >= 2:
+                    _dedup_embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+                    _dedup_texts = [_dedup_units[i] for i in _dedup_point_idx]
+                    _dedup_vecs = _dedup_embed_model.encode(_dedup_texts, normalize_embeddings=True)
+                    _dedup_drop = set()
+                    for _pi in range(len(_dedup_point_idx)):
+                        _idx_i = _dedup_point_idx[_pi]
+                        if _idx_i in _dedup_drop:
+                            continue
+                        for _pj in range(_pi + 1, len(_dedup_point_idx)):
+                            _idx_j = _dedup_point_idx[_pj]
+                            if _idx_j in _dedup_drop:
+                                continue
+                            _dedup_score = float(np.dot(_dedup_vecs[_pi], _dedup_vecs[_pj]))
+                            if _dedup_score >= 0.72:
+                                # Confirmed live (2026-08-25): cosine
+                                # similarity alone drops genuinely distinct
+                                # SEQUENTIAL steps in a numbered claims
+                                # procedure, not just true restatements —
+                                # "submit the claim through your insurer's
+                                # app or portal" vs "wait for the claim
+                                # review and reimbursement" scored 0.724
+                                # (comfortably above 0.72) despite describing
+                                # two different, non-redundant actions; they
+                                # just share dense claims-procedure
+                                # vocabulary ("claim", "insurer") the way any
+                                # two steps in the SAME numbered process
+                                # would. This is the exact same failure this
+                                # file already root-caused and fixed for the
+                                # OLDER reranker-based duplicate-point check
+                                # a few hundred lines up — see
+                                # _DUPLICATE_POINT_THRESHOLD's own comment:
+                                # "Score alone isn't reliable... genuine
+                                # duplicates measured 0.22-0.32 overlap,
+                                # every false-positive case measured
+                                # 0.00-0.11." Reusing that SAME proven
+                                # jaccard floor here rather than inventing a
+                                # second one — both observed live false
+                                # positives here measured 0.000 and 0.083
+                                # jaccard, comfortably below it, so this one
+                                # check alone would have kept both.
+                                _dedup_overlap = _duplicate_point_word_overlap(
+                                    _dedup_units[_idx_i], _dedup_units[_idx_j]
+                                )
+                                if _dedup_overlap < _DUPLICATE_POINT_JACCARD_FLOOR:
+                                    continue
+                                # LLM confirmation — see
+                                # _verify_points_are_duplicate's own
+                                # docstring for the two confirmed live
+                                # false positives (different motor policy
+                                # tiers, different health claim paths)
+                                # that scored well inside this same
+                                # cosine+jaccard "genuine duplicate" range
+                                # despite stating genuinely different facts.
+                                if not await _verify_points_are_duplicate(
+                                    _dedup_units[_idx_i], _dedup_units[_idx_j]
+                                ):
+                                    continue
+                                # Keep the FIRST occurrence, drop the later
+                                # restatement — exactly one of each
+                                # duplicate pair survives into the answer.
+                                _dedup_drop.add(_idx_j)
+                                logger.info(
+                                    "[ask_stream] semantic dedup: point %d restates point %d "
+                                    "(cosine=%.3f, jaccard=%.3f) — dropped\n"
+                                    "  KEPT (point %d): %r\n"
+                                    "  DROPPED (point %d): %r",
+                                    _idx_j, _idx_i, _dedup_score, _dedup_overlap,
+                                    _idx_i, _dedup_units[_idx_i],
+                                    _idx_j, _dedup_units[_idx_j],
+                                )
+                    if _dedup_drop:
+                        _dedup_kept = [u for i, u in enumerate(_dedup_units) if i not in _dedup_drop]
+                        # Same renumber-after-drop pattern as the currency-
+                        # suppression block above.
+                        _dedup_point_re = re.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', re.DOTALL)
+                        _dedup_renumbered, _dedup_next_n = [], 1
+                        for _u in _dedup_kept:
+                            _m = _dedup_point_re.match(_u)
+                            if _m:
+                                _dedup_renumbered.append(f"{_m.group(1)}{_dedup_next_n}{_m.group(3)}{_m.group(4)}")
+                                _dedup_next_n += 1
+                            else:
+                                _dedup_renumbered.append(_u)
+                        _dedup_joined = re.sub(r"\n{3,}", "\n\n", "\n".join(_dedup_renumbered)).strip()
+                        _corrected_text = _dedup_joined
+                        _kv_reply = _dedup_joined
+        except Exception as _dedup_exc:
+            logger.debug("[ask_stream] semantic point dedup skipped: %s", _dedup_exc)
+
         # ── Citation-leak strip: internal document/page labels ─────────────────
         # DETAILED_GROUNDED_PROMPT/STRICT_GROUNDED_PROMPT already tell the
         # model never to repeat the "[Document: filename (Page N)]" labels
@@ -11630,10 +17636,10 @@ class MultiSourceRAG:
         )
 
         _final_payload: dict = {
-            "sources": [] if (_rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected or _history_type_contamination_detected or _retrieval_contamination_detected or _false_claim_whole_reply_discarded) else unique_sources,
+            "sources": [] if (_rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected or _history_type_contamination_detected or _retrieval_contamination_detected or _false_claim_whole_reply_discarded or _pgf_all_points_hallucinated) else unique_sources,
             "done": True,
         }
-        if _rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected or _history_type_contamination_detected or _retrieval_contamination_detected or _false_claim_whole_reply_discarded:
+        if _rule4_discarded or _hollow_answer_detected or _tpv_contamination_detected or _history_type_contamination_detected or _retrieval_contamination_detected or _false_claim_whole_reply_discarded or _pgf_all_points_hallucinated:
             _final_payload["needs_human"] = True
         if _corrected_text:
             _final_payload["corrected_text"] = _corrected_text
