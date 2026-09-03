@@ -1652,10 +1652,18 @@ function setFeedback(m, value, btn) {
   const controls = btn.closest('.msg-controls');
   m.feedback = m.feedback === value ? null : value;
 
-  controls.querySelector('.ctrl-up').classList.toggle('is-active up', m.feedback === 'up');
-  controls.querySelector('.ctrl-up').setAttribute('aria-pressed', String(m.feedback === 'up'));
-  controls.querySelector('.ctrl-down').classList.toggle('is-active down', m.feedback === 'down');
-  controls.querySelector('.ctrl-down').setAttribute('aria-pressed', String(m.feedback === 'down'));
+  // classList.toggle() takes exactly one token — 'is-active up' as a single
+  // string throws InvalidCharacterError, which used to abort this whole
+  // function before anything below it ran (the actual cause of like/dislike
+  // silently doing nothing). Toggle each class separately instead.
+  const upBtn = controls.querySelector('.ctrl-up');
+  upBtn.classList.toggle('is-active', m.feedback === 'up');
+  upBtn.classList.toggle('up', m.feedback === 'up');
+  upBtn.setAttribute('aria-pressed', String(m.feedback === 'up'));
+  const downBtn = controls.querySelector('.ctrl-down');
+  downBtn.classList.toggle('is-active', m.feedback === 'down');
+  downBtn.classList.toggle('down', m.feedback === 'down');
+  downBtn.setAttribute('aria-pressed', String(m.feedback === 'down'));
 
   msgEl.querySelector('.feedback-chips')?.remove();
   msgEl.querySelector('.feedback-thanks')?.remove();
