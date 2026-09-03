@@ -14208,9 +14208,20 @@ class MultiSourceRAG:
                 # invented example describing the wrong real-world clause
                 # is still a real error, just a different kind than "not
                 # grounded."
+                # Absolute outside an example request (2026-09-03) — a
+                # currency figure being genuinely grounded/real used to be
+                # enough to let it through even without "example" in the
+                # question (e.g. "should I buy travel insurance for
+                # Europe" surfaced a real, sourced "€30,000 minimum" with
+                # no example asked for). That's a narrower rule than the
+                # user's actual stated policy: no numbers at all unless
+                # "example"/"examples" appears in the question, regardless
+                # of whether the figure is correct. Matches how
+                # _percentage_bad right below already works — no grounding
+                # carve-out there either.
                 _currency_bad = _found and (
                     _qualifier_mismatched(_unit, _prev_unit_text) if _is_example_request
-                    else not any(_currency_grounded(f) for f in _found)
+                    else True
                 )
                 _found_pct = _PERCENTAGE_RE.findall(_unit)
                 _percentage_bad = _found_pct and not _is_example_request
