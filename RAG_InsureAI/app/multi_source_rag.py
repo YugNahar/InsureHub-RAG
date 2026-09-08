@@ -8990,39 +8990,55 @@ class MultiSourceRAG:
         if not _all_matching:
             return None
 
-        # Widened 20 -> 60 (2026-09-08): confirmed live via direct
-        # instrumentation this was silently dropping a genuinely-best
-        # answer before the reranker ever got a vote. "What Marine Cargo
-        # Insurance Typically Covers" scored 0.4256 on the actual
-        # cross-encoder — clearly beating its rival chunk's 0.3042 — but
-        # the CHEAPER cosine pre-filter ranked it 21st-23rd out of 48
-        # candidates (a stable, repeatable rank across 5 traced calls, not
-        # noise), just outside the old top-20 cutoff, so it never reached
-        # the reranker to have that higher score counted at all. Cosine
-        # similarity and cross-encoder relevance don't always agree, and
-        # this pre-filter existing purely as a speed shortcut means it
-        # should only ever discard candidates the reranker would agree are
-        # weak — not act as an independent, less-accurate second opinion
-        # that can override the reranker's own judgment by simply never
-        # showing it the evidence. This funnel already reranks the WHOLE
-        # pool directly with no pre-filter at all when it's small enough
-        # (see the `len(_all_matching) > _COSINE_SHORTLIST_K` gate below) —
-        # that's the actually-correct, most-accurate path; the cosine
-        # narrowing is a fallback for pools too large to rerank in full,
-        # not the norm. A confident single-policy-type pool this session
-        # was observed at 38-48 candidates across several policy types;
-        # 60 gives real headroom above that (not just squeaking past
-        # today's specific 21-23 near-miss) while still bounding cost for
-        # a genuinely large pool (hundreds of chunks) where reranking
-        # everything directly would be too slow.
-        _COSINE_SHORTLIST_K = 60
+        # Reverted to 20 (2026-09-08, same day as the widen attempt above
+        # it briefly replaced): measured live that widening this costs
+        # real, linear latency — the reranker itself runs ~70-110ms/item,
+        # so 20->60 adds ~2-4s per _narrow_and_rank call, and this funnel
+        # can call it TWICE per request (first pass + scenario-rescue
+        # reformulation retry) on a pipeline that already runs slow. Widening
+        # was also the wrong SHAPE of fix regardless of cost — it doesn't
+        # close the actual disagreement between cosine and the reranker, it
+        # just moves the cutoff far enough to dodge today's specific
+        # near-miss (confirmed: "What Marine Cargo Insurance Typically
+        # Covers" ranked 21st-23rd on cosine across 5 traced calls despite
+        # scoring highest on the real reranker, 0.4256 vs 0.3042) — a
+        # DIFFERENT chunk landing at rank 61 next time hits the identical
+        # wall. See _get_shared_embed_model's caller below for the actual
+        # fix: giving cosine the chunk's heading as a weighted signal
+        # (same technique metadata_tagger.classify_by_section_embedding
+        # already uses successfully) so its OWN ranking gets more accurate
+        # at zero extra reranker cost, instead of paying for more reranking.
+        _COSINE_SHORTLIST_K = 20
 
         async def _narrow_and_rank(scoring_query: str):
             _sl = _all_matching
             if len(_all_matching) > _COSINE_SHORTLIST_K:
                 try:
                     _embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
-                    _texts = [d.page_content for d in _all_matching]
+                    # Heading prepended twice, not once (2026-09-08) — same
+                    # technique metadata_tagger.classify_by_section_embedding
+                    # already uses successfully for section classification,
+                    # applied here to fix a real cosine-vs-reranker
+                    # disagreement rather than widening the shortlist to
+                    # dodge it (that approach was tried and reverted — see
+                    # _COSINE_SHORTLIST_K's own comment above for why it's
+                    # the wrong shape of fix). Confirmed live: a chunk whose
+                    # own heading ("What Marine Cargo Insurance Typically
+                    # Covers") is a near-perfect match for the query but
+                    # whose ~500-token body is dominated by specific peril
+                    # vocabulary (fire, stranding, collision...) embedded at
+                    # rank 23 on page_content alone — its heading's own
+                    # framing was present but diluted by the body's sheer
+                    # length. Prepending it once still left it outside the
+                    # top-20; twice moved it to rank 5. Zero extra cost —
+                    # still exactly one batched encode() call, just richer
+                    # input text — unlike widening the shortlist, which
+                    # measured ~70-110ms/item of real added reranker latency.
+                    _texts = [
+                        f"{d.metadata.get('section_heading', '')}\n{d.metadata.get('section_heading', '')}\n{d.page_content}"
+                        if d.metadata.get("section_heading") else d.page_content
+                        for d in _all_matching
+                    ]
 
                     def _encode_all():
                         return _embed_model.encode([scoring_query] + _texts, normalize_embeddings=True)
