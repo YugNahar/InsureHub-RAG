@@ -3666,6 +3666,28 @@ Search query:"""
                 _hist_anchor
                 and not anchor_pattern.search(question)
                 and not anchor_pattern.search(reformulated)
+                # Content gate (2026-09-08): this repair exists to catch a
+                # genuinely content-free follow-up ("How do I claim it?")
+                # losing the type context it needs — but neither raw
+                # question nor reformulation naming an anchor type ALSO
+                # describes a brand-new, fully self-contained scenario
+                # question that simply never uses jargon at all. Confirmed
+                # live: "If I have to protect my family from financial
+                # burden after my death what type of insurance policy
+                # should I buy" (no "life" anywhere) followed a "What is
+                # travel insurance?" turn — the model's own reformulation
+                # was already clean and correctly self-contained, and this
+                # repair then force-appended "for travel insurance?" onto
+                # it, turning a genuine (implied-life) new question into a
+                # wrong-topic one. Same signal already trusted for the same
+                # reason in _select_followup_anchor_turn just above in this
+                # file: a question with real topic content of its own has
+                # no business being silently re-anchored to a DIFFERENT,
+                # stale topic just because that content isn't a jargon
+                # type-word — only a genuinely empty/pronoun-only follow-up
+                # (no _extract_topic_terms survivors at all) still needs
+                # the historical anchor forced back in.
+                and not _extract_topic_terms(question)
             ):
                 logger.info(
                     "[REFORM] topic-anchor repair: %r missing %r from history — appending",
@@ -10907,7 +10929,20 @@ class MultiSourceRAG:
                 # PHRASING. Only fires when a policy_type filter was
                 # actually in play; a query that already resolved to
                 # "general" has nothing to remove here.
-                _WRONG_FILTER_RESCORE_FLOOR = 0.15
+                #
+                # Floor raised 0.15 -> 0.40 (2026-09-08): confirmed live this
+                # was set too low to ever fire on a real misclassification —
+                # "I run a small home-based bakery, what insurance do I need
+                # for the business and what happens if I can't work due to
+                # illness?" scored top=0.335 (a cross-domain, weakly-covered
+                # combo, clearly not a confident match by any reasonable
+                # read) and still cleared the 0.15 bar untouched, so the
+                # rescue never even attempted the unfiltered pool — the
+                # query refused outright instead. Contrast with this
+                # session's own confidently-correct matches, all 0.76-0.99+.
+                # Configurable via env var, same convention as this file's
+                # other tunable thresholds (RELEVANCE_RATIO etc.).
+                _WRONG_FILTER_RESCORE_FLOOR = float(os.getenv("WRONG_FILTER_RESCORE_FLOOR", "0.40"))
                 if (
                     not document_filter
                     and bool(_policy_types_for_filter)
