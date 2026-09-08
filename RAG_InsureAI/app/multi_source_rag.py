@@ -18991,6 +18991,52 @@ Output ONLY the resulting numbered point(s), one per line, nothing else \
         except Exception as _tpb_exc:
             logger.debug("[ask_stream] third-party brand strip skipped: %s", _tpb_exc)
 
+        # ── Verbose numbered-list opener trim (2026-09-08) ─────────────────────
+        # DETAILED_GROUNDED_PROMPT's own FORMAT rule instructs the model to
+        # write "one warm opening sentence to set context" before the numbered
+        # points that follow — but this small model doesn't reliably keep that
+        # promise. Confirmed live: a detailed life-insurance answer's "opening"
+        # was a full, multi-sentence paragraph already stating the substantive
+        # facts ("Term Insurance provides a lump-sum payment to your
+        # beneficiaries if you die within the term of the policy...") — and
+        # numbered points 1-3 below it then restated a subset of those SAME
+        # facts nearly verbatim. The model wrote the real answer twice, once as
+        # prose and once as a list, instead of keeping the opener to genuine
+        # context and putting the substance only in the points. Same "small
+        # model unreliable at honoring a buried prompt instruction, enforce it
+        # in code instead" lesson as every other formatting fix in this file —
+        # confirmed neither SRG nor PGF were involved in this case (checked via
+        # their own debug logs), this is purely a generation-format miss.
+        #
+        # Detected structurally (word count of the opener alone), not via any
+        # content/similarity comparison against the points — a genuinely brief
+        # context sentence is always short regardless of topic, so this needs
+        # no domain knowledge to catch correctly. Replacing an over-long opener
+        # with the SAME fixed lead-in every other numbered-list answer in this
+        # file already uses (_pick_lead_in) can only ever remove duplicated
+        # content, never lose a fact — the numbered points already carry
+        # whatever of the opener's content actually mattered, by the prompt's
+        # own design; the opener existing only to set context was the whole
+        # point of that FORMAT rule.
+        _OPENER_WORD_LIMIT = 20
+        try:
+            _trim_src = (_corrected_text or _reply_stripped).strip()
+            if _trim_src:
+                _ow_opener, _ow_points, _ow_closer = _split_numbered_points(_trim_src)
+                _ow_opener_text = " ".join(_ow_opener).strip()
+                if _ow_points and _ow_opener_text and len(_ow_opener_text.split()) > _OPENER_WORD_LIMIT:
+                    _ow_trimmed = _rebuild_from_points(
+                        [_pick_lead_in(_ow_opener_text)], _ow_points, _ow_closer,
+                    )
+                    logger.info(
+                        "[ask_stream] verbose numbered-list opener trimmed (%d words -> generic lead-in)",
+                        len(_ow_opener_text.split()),
+                    )
+                    _corrected_text = _ow_trimmed
+                    _kv_reply = _ow_trimmed
+        except Exception as _opener_trim_exc:
+            logger.debug("[ask_stream] opener-trim check skipped: %s", _opener_trim_exc)
+
         # ── Buffered-path single yield (after all corrections) ────────────────
         # The non-streaming (buffered) path above stored the raw answer in
         # _kv_reply but did NOT yield it — we waited until after Rule4 strip,
