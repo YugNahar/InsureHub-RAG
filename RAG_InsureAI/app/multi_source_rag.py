@@ -7168,10 +7168,41 @@ Reply with ONLY the missing detail (or "NONE") — no lead-in, no commentary."""
 
     _kb_lower = context_text.lower()
     _answer_lower = answer_text.lower()
+    _kb_joined = " ".join(re.findall(r"[a-z']{3,}", _kb_lower))
 
     def _grounded(phrase: str) -> bool:
-        _words = re.findall(r"[a-z]{4,}", phrase.lower())
-        return not _words or any(w in _kb_lower for w in _words)
+        """True only if *phrase* shares a genuine multi-word span with the
+        real KNOWLEDGE BASE text, not just scattered individual words.
+
+        Confirmed live 2026-09-08: the old any()-over-individual-words
+        version passed the scope check's raw reply straight through for a
+        plain "should I buy travel insurance for Europe?" question with no
+        real gap — the reply was "Valid for the full calendar year
+        regardless of when the fee was paid", which is actually THIS SAME
+        PROMPT'S OWN illustrative "right shape" example (explicitly banned
+        above: "never reuse this wording"), not anything genuinely in the
+        KB. Words like "valid"/"full"/"paid"/"when" trivially appear
+        somewhere in almost any real insurance KB chunk by chance, so
+        single-word overlap — even a majority of them — proves nothing
+        about whether the phrase was actually DERIVED from this source.
+        The prompt explicitly asks the model to answer "using the
+        KNOWLEDGE BASE's own wording", so a genuine, correctly-grounded
+        reply should share a real contiguous phrase with the source, not
+        just its vocabulary. This is a general check, not a hardcoded
+        blocklist of specific example strings — it catches any fabricated
+        or leaked content the same way, including any future prompt's own
+        example elsewhere in this file, without needing to know its exact
+        wording in advance.
+        """
+        _words = re.findall(r"[a-z']{3,}", phrase.lower())
+        if len(_words) < 3:
+            return True
+        for _n in (5, 4, 3):
+            for _i in range(len(_words) - _n + 1):
+                _gram = " ".join(_words[_i:_i + _n])
+                if _gram in _kb_joined:
+                    return True
+        return False
 
     # Confirmed live: the LLM's own "does the EXISTING ANSWER already cover
     # this" judgment (asked directly in the prompt above) isn't reliable
@@ -19008,32 +19039,60 @@ Output ONLY the resulting numbered point(s), one per line, nothing else \
         # confirmed neither SRG nor PGF were involved in this case (checked via
         # their own debug logs), this is purely a generation-format miss.
         #
-        # Detected structurally (word count of the opener alone), not via any
-        # content/similarity comparison against the points — a genuinely brief
-        # context sentence is always short regardless of topic, so this needs
-        # no domain knowledge to catch correctly. Replacing an over-long opener
-        # with the SAME fixed lead-in every other numbered-list answer in this
-        # file already uses (_pick_lead_in) can only ever remove duplicated
-        # content, never lose a fact — the numbered points already carry
-        # whatever of the opener's content actually mattered, by the prompt's
-        # own design; the opener existing only to set context was the whole
-        # point of that FORMAT rule.
+        # Word count alone is NOT sufficient to call an opener "verbose
+        # duplication" — confirmed live 2026-09-08: this check also fires
+        # on numbered lists produced by the SEPARATE "restructured a run-on
+        # enumeration into a numbered list" mechanism (a comma-separated
+        # tail sentence turned into "1. ... 2. ..."), which deliberately
+        # leaves a PRECEDING paragraph untouched. That paragraph is often
+        # genuinely distinct, load-bearing content (e.g. general coverage
+        # types) with nothing to do with the numbered points that follow
+        # (e.g. Schengen-specific requirement details) — trimming it to a
+        # generic "Sure thing," lead-in silently deleted that entire
+        # paragraph's worth of real information, not just a duplicate.
+        # The original bug this check targets (DETAILED_GROUNDED_PROMPT's
+        # FORMAT rule being violated — the model writing a full substantive
+        # "opening sentence" that restates the same facts as the numbered
+        # points below) is real and still needs catching, but "long opener"
+        # is not the same signal as "duplicate opener" — a long opener can
+        # just as easily be long BECAUSE it's carrying real, non-redundant
+        # content. Verify duplication directly: only trim when most of the
+        # opener's own real words already reappear in the points below
+        # (same word-overlap-ratio technique this file already uses for the
+        # identical judgment call elsewhere, e.g. requirement-completeness's
+        # _already_in_answer above) — a genuinely duplicate opener restates
+        # the same facts and clears this bar easily (confirmed against the
+        # original 93-word reproducing case); genuinely distinct content
+        # shares little vocabulary with unrelated points and is now kept.
         _OPENER_WORD_LIMIT = 20
+        _OPENER_DUPLICATE_OVERLAP = 0.35
         try:
             _trim_src = (_corrected_text or _reply_stripped).strip()
             if _trim_src:
                 _ow_opener, _ow_points, _ow_closer = _split_numbered_points(_trim_src)
                 _ow_opener_text = " ".join(_ow_opener).strip()
                 if _ow_points and _ow_opener_text and len(_ow_opener_text.split()) > _OPENER_WORD_LIMIT:
-                    _ow_trimmed = _rebuild_from_points(
-                        [_pick_lead_in(_ow_opener_text)], _ow_points, _ow_closer,
+                    _ow_opener_words = re.findall(r"[a-z]{4,}", _ow_opener_text.lower())
+                    _ow_points_lower = " ".join(_ow_points).lower()
+                    _ow_overlap = (
+                        sum(1 for w in _ow_opener_words if w in _ow_points_lower) / len(_ow_opener_words)
+                        if _ow_opener_words else 0.0
                     )
-                    logger.info(
-                        "[ask_stream] verbose numbered-list opener trimmed (%d words -> generic lead-in)",
-                        len(_ow_opener_text.split()),
-                    )
-                    _corrected_text = _ow_trimmed
-                    _kv_reply = _ow_trimmed
+                    if _ow_overlap >= _OPENER_DUPLICATE_OVERLAP:
+                        _ow_trimmed = _rebuild_from_points(
+                            [_pick_lead_in(_ow_opener_text)], _ow_points, _ow_closer,
+                        )
+                        logger.info(
+                            "[ask_stream] verbose numbered-list opener trimmed (%d words, %.0f%% overlap with points -> generic lead-in)",
+                            len(_ow_opener_text.split()), _ow_overlap * 100,
+                        )
+                        _corrected_text = _ow_trimmed
+                        _kv_reply = _ow_trimmed
+                    else:
+                        logger.debug(
+                            "[ask_stream] long numbered-list opener kept — only %.0f%% overlap with points, not duplication",
+                            _ow_overlap * 100,
+                        )
         except Exception as _opener_trim_exc:
             logger.debug("[ask_stream] opener-trim check skipped: %s", _opener_trim_exc)
 
