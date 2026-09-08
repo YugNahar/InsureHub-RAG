@@ -1119,6 +1119,101 @@ def _describe_llm_failure(exc: Exception) -> tuple[int, str]:
     return 500, "The backend could not generate an answer due to an unexpected internal error."
 
 
+def _retry_pending_policy_type_reclassification(pipeline: "RAGPipeline") -> dict:
+    """
+    Sweeps the vector store for chunks whose policy_type was never actually
+    verified by an LLM — marked "policy_type_pending_reclass" by
+    _ingest_file's background reclassification thread below whenever
+    verify_and_enrich_sections_batch's own "_llm_verified" field came back
+    False for their section. In practice that's almost always because the
+    original upload's background Groq call hit a rate/quota limit at the
+    time (see that function's docstring) — this chunk's policy_type is
+    still just the synchronous, regex-only guess from Step 2 of ingestion,
+    not a considered verdict.
+
+    Re-runs the same verify-and-enrich pass for just those sections; on
+    success the marker is cleared (same write-back rule as the live upload
+    path — see _reclassify_chunks_with_llm below), on repeat failure it
+    stays set for the next sweep. Safe to call anytime, as often as
+    wanted — a store with nothing pending returns immediately, and a
+    section that lands back on the same policy_type it already had is a
+    no-op either way.
+
+    Grouped by section_id rather than by originating document, since
+    pending chunks can come from several different uploads that each hit
+    the limit independently. Deliberately simpler than the live-upload
+    path: no doc_prior re-derivation and no Pass 2 in-document anchor
+    correction — those are refinements on top of an already-verified
+    result, not needed just to get a never-checked chunk its first real
+    pass. A chunk that wants that extra refinement gets it the normal way,
+    on its own next re-upload.
+
+    Returns {"scanned": total pending chunks found, "updated": chunks
+    whose policy_type or pending marker actually changed, "still_pending":
+    chunks whose section failed verification again this sweep}.
+    """
+    from router import get_classification_llm
+    from metadata_tagger import verify_and_enrich_sections_batch
+
+    tvec = pipeline.vector_store._store
+    pending_ids = [
+        cid for cid, meta in tvec._metadatas.items()
+        if meta.get("policy_type_pending_reclass")
+    ]
+    if not pending_ids:
+        return {"scanned": 0, "updated": 0, "still_pending": 0}
+
+    sections: dict = {}
+    for cid in pending_ids:
+        sid = tvec._metadatas[cid].get("section_id") or cid
+        sections.setdefault(sid, []).append(cid)
+
+    section_groups = list(sections.values())
+    section_texts = [
+        "\n\n".join(tvec._docs.get(cid, "") for cid in cids)
+        for cids in section_groups
+    ]
+    section_assigned_types = [
+        tvec._metadatas[cids[0]].get("policy_type", "general")
+        for cids in section_groups
+    ]
+
+    reclass_llm = get_classification_llm(temperature=0)
+    enriched_list = verify_and_enrich_sections_batch(
+        list(zip(section_texts, section_assigned_types)),
+        llm=reclass_llm,
+    )
+
+    updated = 0
+    still_pending = 0
+    for cids, enriched in zip(section_groups, enriched_list):
+        fresh = enriched["policy_type"]
+        verified = enriched.get("_llm_verified", True)
+        for cid in cids:
+            meta = tvec._metadatas.get(cid)
+            if meta is None:
+                continue
+            if meta.get("policy_type") != fresh:
+                meta["policy_type"] = fresh
+                updated += 1
+            if verified:
+                if meta.pop("policy_type_pending_reclass", None) is not None:
+                    updated += 1
+            else:
+                still_pending += 1
+            for field in ("language", "jurisdiction", "document_version", "effective_date", "coverage_category"):
+                if enriched.get(field, "unknown") != "unknown" and meta.get(field) != enriched[field]:
+                    meta[field] = enriched[field]
+                    updated += 1
+    if updated:
+        tvec._save_state()
+    logger.info(
+        "[reclassify-pending] scanned %d pending chunk(s) across %d section(s) — %d updated, %d still pending",
+        len(pending_ids), len(section_groups), updated, still_pending,
+    )
+    return {"scanned": len(pending_ids), "updated": updated, "still_pending": still_pending}
+
+
 def _ingest_file(tmp_path: str, filename: str) -> int:
     from document_loader import load_document
     from metadata_tagger import tag_document, classify_document_type
@@ -1222,6 +1317,30 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
             # the one place in the live pipeline where a real LLM
             # (reclass_llm, below) is actually available post-ingest.
             from rag import classify_candidate_section
+
+            # Opportunistic sweep: any chunk left over from a PAST upload
+            # whose background reclassification hit Groq's limit at the
+            # time (see _retry_pending_policy_type_reclassification's own
+            # docstring) gets another shot here, piggybacking on this
+            # upload's own background thread rather than needing a
+            # separate scheduler — Groq quota resets are time-based, not
+            # event-based, so "the next time anything triggers a
+            # reclassification pass" is a reasonable, low-effort proxy for
+            # "whenever there's room again." Best-effort: a failure here
+            # must never block or affect THIS upload's own reclassification
+            # below.
+            try:
+                _pending_result = _retry_pending_policy_type_reclassification(pipeline)
+                if _pending_result["scanned"]:
+                    logger.info(
+                        "[background reclassify] opportunistic pending sweep before '%s': %r",
+                        filename, _pending_result,
+                    )
+            except Exception as _pending_exc:
+                logger.debug(
+                    "[background reclassify] opportunistic pending sweep failed: %s", _pending_exc,
+                )
+
             reclass_llm = get_classification_llm(temperature=0)
             tvec = pipeline.vector_store._store
 
@@ -1401,6 +1520,22 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                         continue
                     if meta.get("policy_type") != fresh:
                         meta["policy_type"] = fresh
+                        updated += 1
+                    # enriched["_llm_verified"] is False when this section's
+                    # own sub-batch never got a real Groq reply (almost
+                    # always a rate/quota-limit hit in practice — see
+                    # verify_and_enrich_sections_batch's docstring) — "fresh"
+                    # in that case is just the untouched regex fallback, not
+                    # a considered verdict. Mark it so a later sweep (see
+                    # _retry_pending_policy_type_reclassification below) can
+                    # find and re-verify it once Groq has room again,
+                    # instead of it silently looking "done" forever. A
+                    # section that DOES get verified — including one that
+                    # was previously marked pending and just got retried
+                    # successfully — has the marker cleared here.
+                    if not enriched.get("_llm_verified", True):
+                        meta["policy_type_pending_reclass"] = True
+                    elif meta.pop("policy_type_pending_reclass", None) is not None:
                         updated += 1
                     if section_candidate_type:
                         meta["candidate_policy_type"] = section_candidate_type
@@ -2753,6 +2888,18 @@ async def clear_kv_cache(_: str = Depends(require_auth)):
     if not ok:
         raise HTTPException(status_code=503, detail="Cache not available.")
     return {"status": "cleared"}
+
+
+@app.post("/admin/reclassify-pending", tags=["admin"])
+async def reclassify_pending_policy_types(_: str = Depends(require_auth)):
+    """Manually trigger a sweep for chunks whose policy_type was never
+    actually verified by an LLM (see _retry_pending_policy_type_
+    reclassification's docstring) — normally this runs automatically as a
+    byproduct of the next document upload, but this lets it be triggered
+    directly right after a known Groq quota reset, without waiting for
+    unrelated upload activity."""
+    pipeline = _get_pipeline()
+    return await asyncio.to_thread(_retry_pending_policy_type_reclassification, pipeline)
 
 
 @app.delete("/docs/{name:path}")

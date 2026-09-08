@@ -2359,6 +2359,14 @@ def verify_and_enrich_sections_batch(
     "unknown"} for any section whose sub-batch call fails or whose reply
     can't be parsed — same fail-safe behavior as the single-section
     function, just applied per sub-batch rather than one call at a time.
+    Every result also carries "_llm_verified": True only when its own
+    sub-batch actually got a real, parsed Groq reply — False for llm=None,
+    a failed call, or a malformed reply. Callers that persist policy_type
+    (see api.py's background reclassification) use this to tell "verified
+    by the LLM" apart from "still just the regex fallback, never actually
+    checked" — the latter is exactly what gets marked for a later retry
+    once Groq has room again, rather than being mistaken for a considered,
+    final verdict.
 
     Processed as TWO separate passes, not one flat grouping — sections
     whose assigned_type is "general" (the harder, open-ended STEP 1 —
@@ -2371,8 +2379,18 @@ def verify_and_enrich_sections_batch(
     apart, continuously across both passes (never two calls back-to-back
     with no gap, regardless of which pass they belong to).
     """
+    # "_llm_verified": False marks a section whose Groq call never actually
+    # ran (llm=None, the synchronous ingest path's own deliberate choice —
+    # see api.py's Step 2 comment) OR whose sub-batch call raised (almost
+    # always Groq's rate/quota limit in practice, per this function's own
+    # docstring above). Callers use this to distinguish "this policy_type
+    # is a real LLM verification" from "this is still just the regex
+    # fallback because the LLM was never consulted" — the second case is
+    # exactly what api.py's background reclassification marks for a later
+    # retry once Groq's limit has room again, rather than treating a
+    # transient rate-limit hit as if it were a considered, final verdict.
     results = [
-        {"policy_type": assigned_type, **{f: "unknown" for f in _ENRICHMENT_FIELDS}}
+        {"policy_type": assigned_type, **{f: "unknown" for f in _ENRICHMENT_FIELDS}, "_llm_verified": False}
         for _, assigned_type in sections
     ]
     if llm is None or not sections:
@@ -2417,9 +2435,18 @@ def verify_and_enrich_sections_batch(
                         gi + 1, len(groups), "general" if max_per_group == _MAX_GENERAL_SECTIONS_PER_GROUP else "other",
                         len(blocks), len(group),
                     )
+                    # A malformed/short reply is still "never actually
+                    # verified" from the caller's point of view — same
+                    # _llm_verified=False treatment as an outright call
+                    # failure below, so this sub-batch is retried later too
+                    # rather than silently frozen on its regex fallback.
+                    for i in indices[offset:offset + len(group)]:
+                        results[i]["_llm_verified"] = False
                 else:
                     for j, (block, (_, assigned_type)) in enumerate(zip(blocks, group)):
-                        results[indices[offset + j]] = _parse_verify_and_enrich_reply(block, assigned_type)
+                        parsed = _parse_verify_and_enrich_reply(block, assigned_type)
+                        parsed["_llm_verified"] = True
+                        results[indices[offset + j]] = parsed
 
             except Exception as exc:
                 logger.warning(
@@ -2427,6 +2454,8 @@ def verify_and_enrich_sections_batch(
                     "%s — keeping first-pass assignment for this sub-batch",
                     gi + 1, len(groups), "general" if max_per_group == _MAX_GENERAL_SECTIONS_PER_GROUP else "other", exc,
                 )
+                for i in indices[offset:offset + len(group)]:
+                    results[i]["_llm_verified"] = False
 
             offset += len(group)
 

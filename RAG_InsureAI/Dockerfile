@@ -28,6 +28,12 @@ RUN if [ "$TORCH_DEVICE" = "cuda" ]; then \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Small English model for spaCy's dependency parser — used by
+# semantic_chunker.py's finite-verb check (is a candidate sub-heading
+# list item a real clause with a predicate, or just a bare label/form-
+# field prompt with nothing to say beyond its own name).
+RUN python -m spacy download en_core_web_sm
+
 # Copy application code
 # /app/app/  — Yug's production chat API modules (api.py, conversation_agent.py, etc.)
 # /app/      — teammate's evaluation entry point (eval_api.py, eval_frontend.html)

@@ -3,6 +3,7 @@ Unified RAG with strict grounding – no hallucinations.
 Supports document filtering with substring matching.
 """
 import asyncio
+import itertools
 import logging
 import os
 import random
@@ -1291,8 +1292,28 @@ def _pick_lead_in(check_text: str) -> str:
 # genuinely ambiguous phrasing, same two-tier shape as
 # _resolve_modifier_intent above), then tell the model explicitly which
 # shape this specific question is.
+# Confirmed live 2026-09-07: "should I" alone is a generic modal-verb
+# construction that appears just as naturally in a PROCESS question
+# ("what should I DO about the damages?" — a claims-process question)
+# as in a genuine policy-CHOICE question ("what type should I BUY?") —
+# the bare \bshould\s+i\b/\bshould\s+you\b alternatives below had no way
+# to tell those apart and fired on the process question too, short-
+# circuiting past the LLM fallback (which correctly distinguishes the
+# two per _TYPE_SHAPE_PROMPT's own worked examples) before it ever got a
+# chance to run. Restricted the same way the "need to"/"want to"
+# alternatives below already were: require an actual acquisition/choice
+# verb IMMEDIATELY after "should I/you", not just the modal phrase
+# alone. Deliberately zero-gap (no filler-word tolerance like
+# _srg_EXCLUSIONS_UNIT_RE's "{0,2}" elsewhere in this file) — a filler-
+# word allowance here would let something like "what should I do to GET
+# my claim processed" jump back into a false match on "get"; the rarer
+# legitimate phrasing with an adverb in between ("should I really
+# buy...") just falls through to the LLM fallback instead, which is the
+# same safe degrade every other unmatched case here already relies on.
 _TYPE_DECISION_RE = re.compile(
-    r"\bshould\s+i\b|\bshould\s+you\b|\bdo\s+i\s+need\b|\bdoes\s+one\s+need\b|"
+    r"\bshould\s+i\s+(?:buy|get|purchase|choose|opt|go|select|pick|take)\b|"
+    r"\bshould\s+you\s+(?:buy|get|purchase|choose|opt|go|select|pick|take)\b|"
+    r"\bdo\s+i\s+need\b|\bdoes\s+one\s+need\b|"
     r"\bwhich\s+(?:one\s+)?(?:should|do)\s+i\b|"
     r"\bneed\s+to\s+(?:buy|get|purchase|choose|take|pick)\b|"
     r"\bwant\s+to\s+(?:buy|get|purchase)\b|"
@@ -1365,7 +1386,7 @@ async def _classify_type_query_shape_llm(question: str) -> bool:
         return False
 
 
-async def _is_type_decision_query(question: str) -> bool:
+async def _is_type_decision_query(question: str, section_hint: Optional[str] = None) -> bool:
     """True when a question is asking for a recommendation of ONE
     insurance type/plan for the user's own situation, rather than a
     request to enumerate every type that exists — see _TYPE_DECISION_RE
@@ -1379,7 +1400,29 @@ async def _is_type_decision_query(question: str) -> bool:
     False/ENUMERATION for anything that isn't actually a decision
     question at all (a coverage question, a claims question, etc.), so
     this naturally no-ops for the large majority of unrelated queries.
+
+    section_hint (2026-09-07): the caller's OWN already-resolved, already-
+    trusted section-intent classification (_query_section_result, only
+    passed when confident — not a weaker "candidate" match), reused here
+    as a hard structural veto rather than adding yet another standalone
+    guess. User's explicit push-back on the earlier _TYPE_DECISION_RE
+    narrowing fix: tightening one regex alternative doesn't help anything
+    that still falls through to _classify_type_query_shape_llm — that
+    fallback is itself just another small-model judgment call, exactly
+    the kind of check this whole session has repeatedly found unreliable
+    on its own. A CONFIRMED "claims" section is definitionally never a
+    "which type should I buy" decision question — a claims-process
+    question and a policy-choice question are mutually exclusive by
+    definition, not just usually different — so this hint short-circuits
+    straight to False before either the regex or the LLM ever runs,
+    closing the whole failure class (any phrasing a claims question might
+    take) rather than one more phrasing of it. Scoped to "claims"
+    specifically since that's the section this was actually confirmed
+    live against; extend to other unambiguously-process sections
+    (documents, etc.) only once a real case proves the same gap there.
     """
+    if section_hint == "claims":
+        return False
     q = question.lower()
     if _TYPE_DECISION_RE.search(q):
         return True
@@ -2273,6 +2316,20 @@ _TYPE_GIVEAWAY_TERMS = {
     "crop": ("crop insurance", "agriculturist", "crop failure", "sowing/planting", "loanee"),
     "fidelity": ("fidelity insurance", "employee dishonesty", "embezzlement"),
     "transit": ("transit insurance", "import covers by sea", "inland transit clause"),
+    # Added 2026-09-07 (project_marine_fire_chunk_contamination): "fire" had
+    # NO entry at all here despite being a recognized type in
+    # _TYPE_ATTRIBUTION_RE — confirmed live, a marine-insurance claim query
+    # quoted "the insured must lodge the claim form within 15 days of the
+    # fire to claim compensation" verbatim as if it were a marine deadline.
+    # The source chunk is real (CLAIM SETTLING PROCESS (FIRE AND MARINE
+    # INSURANCE), one combined section covering both types), but that "15
+    # days" deadline is stated only for fire claims in the source text —
+    # the model misattributed a fire-specific fact to marine because the
+    # chunk's heading names both. Terms below are genuine multi-word fire
+    # jargon pulled directly from this KB's own fire-insurance chunks
+    # (docker exec query against policy_type='fire'), same "real KB-sourced
+    # phrase, not a bare word" discipline the other entries here follow.
+    "fire": ("fire insurance", "fire insurance policy", "fire brigade", "fire and special perils", "fire and allied perils", "of the fire", "spontaneous combustion", "standard fire policy"),
     "motor": (
         "motor insurance", "vehicles plying on public roads",
         "vehicle", "owner-driver", "driving record", "driving history",
@@ -3366,7 +3423,10 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     return sorted(chunks, key=_rank)
 
 
-async def _reformulate_query(question: str, history: str, anchor_pattern: re.Pattern = _ANCHOR_TYPE_RE) -> Optional[str]:
+async def _reformulate_query(
+    question: str, history: str, anchor_pattern: re.Pattern = _ANCHOR_TYPE_RE,
+    selected_recent: Optional[str] = None,
+) -> Optional[str]:
     """Rewrite a follow-up question as a standalone, natural-language question
     using conversation history — used both for retrieval and, for detected
     follow-ups, as the literal question text shown to the generation prompt.
@@ -3418,7 +3478,19 @@ async def _reformulate_query(question: str, history: str, anchor_pattern: re.Pat
     # anchoring on an earlier, more salient-sounding topic instead. This
     # matches _contextualize_query's existing narrower window for the same
     # reason.
-    recent = '\n'.join(_split_history_turns(history)[-2:])
+    #
+    # selected_recent (2026-09-07): an optional override from
+    # _select_followup_anchor_turn's code-side, embedding-similarity
+    # decision — used ONLY when that mechanism found clear, threshold-
+    # gated evidence the follow-up is actually about an EARLIER retained
+    # turn (not the most recent one), for genuinely indirect/scenario
+    # follow-ups with no pronoun/keyword signal at all. Still only ever
+    # ONE turn's text — never more — so this does not reintroduce the
+    # regression documented above; it only changes, by a fixed rule
+    # computed in code before this prompt is ever built, WHICH one turn.
+    # None (the default for every existing caller) reproduces the
+    # unconditional most-recent-turn behavior above exactly.
+    recent = selected_recent if selected_recent is not None else '\n'.join(_split_history_turns(history)[-2:])
     # Output a complete, natural-language QUESTION — not a terse keyword
     # string. The old prompt asked for compact "textbook vocabulary" phrases
     # (e.g. "term insurance detailed explanation example"), which is exactly
@@ -4606,13 +4678,113 @@ _PGF_CLAIMS_PROMPT = (
 )
 
 
-async def _detect_unjustified_recommendation(question: str, answer: str) -> Optional[str]:
+def _looks_like_runon_enumeration(text: str) -> bool:
+    """Cheap regex pre-filter: does *text* contain a sentence chaining 3+
+    comma-separated segments together with a trailing "and"/"or" — the
+    "list crammed into one run-on sentence" shape confirmed live 2026-09-07
+    (repeatedly, on identical retries of the same question): a prompt rule
+    telling the model to switch to a numbered list when the CONTEXT
+    genuinely supports 2+ separate items did NOT reliably change its
+    behavior — 2/2 test runs still produced e.g. "This plan covers
+    emergency medical treatment and hospitalization, trip cancellation or
+    curtailment due to a covered reason like your own serious illness,
+    loss, theft, or delay of checked baggage, and emergency medical
+    evacuation or repatriation to your home country." — a small local
+    model reliably following a CONDITIONAL formatting judgment made
+    together with primary generation is a harder ask than the same model
+    just restructuring already-written text afterward (the same "verify
+    and repair after the fact" shape that already works well for SRG/PGF
+    elsewhere in this file). This is only the CHEAP gate deciding whether
+    that repair call below is worth attempting — never used to decide the
+    actual restructuring, since reliably SPLITTING a comma-chained
+    sentence into the right items needs real language understanding, not
+    regex (a nested list-within-an-item like "loss, theft, or delay of
+    checked baggage" would naively over-split into 3 fake items instead
+    of the 1 real one a human reads it as).
     """
-    Catches an answer that settles on and recommends ONE specific named
-    option (a particular plan/product/type) as clearly the right choice,
-    when the QUESTION itself provides no basis to prefer that option over
-    other valid alternatives the source material lists. Confirmed live,
-    reproduced identically on this same local machine (not a backend/Groq
+    for sentence in re.split(r'(?<=[.!?])\s+', text):
+        if sentence.count(',') >= 3 and re.search(r',\s*(?:and|or)\s+\S', sentence):
+            return True
+    return False
+
+
+async def _restructure_runon_as_list(answer: str) -> Optional[str]:
+    """Rewrites a comma-chained run-on sentence (flagged by
+    _looks_like_runon_enumeration above) into a short numbered list,
+    leaving every other sentence in *answer* untouched in its original
+    position. A dedicated, focused post-generation repair step — asking
+    the model to ONLY restructure already-written text, not simultaneously
+    generate new content AND make a structural judgment call the way the
+    original prompt-rule attempt required — the same principle behind
+    every other "verify and repair after the fact" mechanism in this file
+    (SRG's weave, PGF's claim-salvage rewrite) succeeding where getting it
+    right in one generation pass did not.
+
+    Verified the same word-survival way _pgf_rewrite_surviving_claims and
+    _srg_weave_items_into_unit verify their own rewrites elsewhere in this
+    file: every content word (4+ letters) in the original answer must
+    still appear in the rewrite, within a small tolerance for natural
+    rephrasing of connecting words — catches the model silently dropping
+    or inventing content while "restructuring". Returns None (caller keeps
+    the original answer untouched) on any failure, empty response, or a
+    rewrite that fails this check — never risks losing content for the
+    sake of better formatting.
+    """
+    try:
+        prompt = f"""The ANSWER below may contain a sentence that crams 3 or more separate,
+parallel items (distinct coverage types, steps, or options) together with commas into one
+run-on sentence, instead of a clear list. If so, rewrite ONLY that sentence as a short
+numbered list ("1. ... 2. ... 3. ..."), one complete sentence per item, keeping every OTHER
+sentence in the ANSWER exactly as it already is, in its original position (before/after the
+list). Do not add, remove, or change any fact — only restructure the run-on sentence's own
+items into separate numbered points. If the ANSWER does NOT contain this shape at all,
+output it EXACTLY AS-IS, character for character, changing nothing.
+
+ANSWER: {answer}
+
+Output ONLY the (possibly restructured) answer, nothing else — no preamble, no quotes."""
+        # timeout=40, not the usual short ~12-15s budget most auxiliary
+        # calls in this file use — confirmed live 2026-09-07: this call
+        # rewrites a WHOLE answer (max_tokens=400), and this backend has
+        # measured throughput as low as ~7-8 tok/s under real load, which
+        # a 15s timeout structurally cannot survive for anything near a
+        # full-length response — 2/2 real runs failed with an empty error
+        # (httpx's own timeout exceptions often stringify to nothing),
+        # while a trivial 5-token call on the same backend at the same
+        # moment succeeded instantly, confirming this was a timeout
+        # mismatch, not a genuine backend outage. This step only ever
+        # runs on the minority of answers the cheap regex gate flags, so
+        # the extra latency headroom costs nothing on the common path.
+        raw = await _backend_completion(prompt, max_tokens=400, timeout=40)
+        if not raw:
+            return None
+        raw = raw.strip().strip('"')
+        if not raw:
+            return None
+        orig_words = set(re.findall(r"[a-zA-Z]{4,}", answer.lower()))
+        new_words = set(re.findall(r"[a-zA-Z]{4,}", raw.lower()))
+        missing = orig_words - new_words
+        if len(missing) > max(2, len(orig_words) * 0.05):
+            logger.debug(
+                "[ask_stream] run-on restructure dropped too many words (%d missing), skipping",
+                len(missing),
+            )
+            return None
+        return raw
+    except Exception as exc:
+        logger.debug("[ask_stream] run-on restructure failed: %s", exc)
+        return None
+
+
+async def _detect_unjustified_recommendation(
+    question: str, answer: str, context_chunks: Optional[list] = None,
+) -> Optional[list]:
+    """
+    Catches an answer that settles on and recommends one or more specific
+    named options (a particular plan/product/type) as clearly the right
+    choice, when the QUESTION itself provides no basis to prefer that
+    option over other valid alternatives the source material lists.
+    Confirmed live, reproduced identically on this same local machine (not a backend/Groq
     quality fluke): "What should travel insurance cover before I buy it?"
     — a plain coverage-checklist question, no recommendation asked for —
     got "let's focus on a Single-Trip Plan... designed specifically for
@@ -4632,29 +4804,113 @@ async def _detect_unjustified_recommendation(question: str, answer: str) -> Opti
     case (nothing flagged) — the caller only pays for a second call when
     this one actually finds something.
 
-    Returns the specific recommended item's own name (e.g. "Single-Trip
-    Plan") if flagged, so the rewrite step below knows exactly what to
-    remove without re-deriving it. Returns None on no-flag or on any
-    failure — fails toward leaving the answer untouched, same fail-safe
-    direction as every other best-effort check in this file.
+    context_chunks (2026-09-07, revised same day): confirmed live this
+    check was ALSO false-positiving the opposite way — flagging a
+    genuinely correct, information-grounded recommendation ("Comprehensive
+    Policy" for "what type of insurance should I buy to protect MYSELF
+    from huge bills in a road accident") purely because it judged from the
+    question's wording in isolation, with no way to check what the source
+    material actually says each option covers. A prompt-only fix (adding a
+    worked counter-example) did NOT reliably resolve this — 3/3 repeat
+    tests still flagged it.
+
+    First attempt at a real fix embedded `answer` against the retrieved
+    chunk texts and narrowed to the top few by cosine similarity — this
+    was WRONG and still confirmed live flagging 3/3 genuinely-justified
+    recommendations the same afternoon ("Term life insurance", "Building
+    or Structure Cover", "Comprehensive Policy" — all correct, all
+    flagged). The bug: embedding the ANSWER and ranking chunks by
+    similarity TO THE ANSWER is circular — it surfaces more chunks
+    confirming the option the answer already picked, not chunks about the
+    ALTERNATIVES that would let the model judge whether picking this one
+    was actually justified over them. It can confirm the pick is real,
+    never whether it was justified.
+
+    Fixed by dropping the narrowing entirely: `context_chunks` is now
+    expected to be the exact POST-COMPRESSION chunk pool (same scope SRG
+    uses, see that mechanism's own chunk-scoping comment) — i.e. everything
+    the model actually saw when generating the answer, already sized to
+    fit a generation prompt's own budget, so no additional narrowing is
+    needed for a judgment call over the same material. Joined into the
+    prompt in full, unranked, so alternative options genuinely present in
+    what the model saw are visible to the judge too, not just corroborating
+    evidence for the one option already chosen. Optional and defaults to
+    None so this still works (falling back to the original context-free
+    prompt) if a caller can't supply chunks.
+
+    Returns a list of the recommended items' own names (e.g. ["Single-Trip
+    Plan"], or ["Term life insurance", "Critical Illness Rider"] when an
+    answer makes more than one separate unjustified pick) if flagged, so
+    the rewrite step below knows exactly what to remove without
+    re-deriving it. Returns None on no-flag or on any failure — fails
+    toward leaving the answer untouched, same fail-safe direction as
+    every other best-effort check in this file.
+
+    is_type_decision (2026-09-07): callers should skip calling this
+    function entirely — not pass a flag into it — when the question is
+    already a confirmed type-decision query (_is_type_decision_query(),
+    already computed once per request and reused elsewhere in ask_stream
+    for exactly this reason). Confirmed live: "If my house catches fire,
+    what type of insurance should I buy?" got its correct, sole answer
+    ("Building or Structure Cover") flagged and hedged even WITH the
+    context-grounding fix above, because the detection prompt judges any
+    single-name answer the same way regardless of whether the question
+    itself explicitly asked for exactly one pick. A question that IS
+    asking "which one type should I buy" makes a single named answer
+    inherently justified by definition — there is no "unsolicited" pick to
+    catch here, so the right fix is not calling this check at all for that
+    question shape, not asking the judge to somehow reason its way to the
+    same exemption every time.
     """
     try:
-        prompt = f"""Does the ANSWER below settle on and recommend ONE specific named option
-(e.g. one particular plan, product, or type) as clearly the right choice, even though the
-QUESTION doesn't specify anything that would justify preferring that one option over other
-valid alternatives the source material might offer? This is about an UNSOLICITED, UNJUSTIFIED
-single pick — not about a genuinely correct answer to a question that actually asked for
-one, and not about simply naming an option as an EXAMPLE among several mentioned side by
+        # No narrowing — context_chunks is already the post-compression
+        # pool (see this function's own docstring for why narrowing by
+        # similarity-to-the-ANSWER was actively wrong: it only surfaces
+        # more evidence for the option already picked, never the
+        # alternatives needed to judge whether picking it was justified).
+        context = "\n\n".join(context_chunks) if context_chunks else ""
+
+        _context_block = (
+            f"\nSOURCE CONTEXT (what the material actually says about the relevant options):\n{context}\n"
+            if context else ""
+        )
+        prompt = f"""Does the ANSWER below settle on and recommend one or more SPECIFIC named
+options (e.g. a particular plan, product, or type) as clearly the right choice, even though
+the QUESTION doesn't specify anything that would justify preferring that option over other
+valid alternatives the source material might offer? An answer can make MORE THAN ONE separate
+unjustified pick — e.g. recommending one specific plan for the main need AND a separate
+specific rider/add-on for something else, each with its own invented justification — check
+the WHOLE answer for every such pick, not just the first one. This is about UNSOLICITED,
+UNJUSTIFIED picks — not about a genuinely correct answer to a question that actually asked
+for one, and not about simply naming an option as an EXAMPLE among several mentioned side by
 side.
 
+This also has to tell an UNJUSTIFIED pick apart from a GENUINELY CORRECT one, not just check
+whether the question named the option explicitly. "What should travel insurance cover before
+I buy it?" recommending "Single-Trip Plan" IS unjustified — the question gives no basis to
+assume a single, occasional trip over an annual multi-trip, family, student, or senior-citizen
+need; nothing in the source context ties "protect against X" to specifically the Single-Trip
+Plan over the others. But if the SOURCE CONTEXT below shows that one option is defined as
+covering something the QUESTION specifically asks to be covered, while another option
+mentioned is defined as NOT covering that — e.g. the question asks about protecting the
+policyholder's OWN losses, and the context says one option (e.g. third-party-only cover)
+never covers the policyholder's own vehicle or medical costs while another option does —
+then recommending the option the context says actually covers it is a real, information-
+grounded answer, not an arbitrary pick, even though it names one specific option. Flag only
+when picking the one option requires assuming some UNSTATED detail (trip length, family
+status, budget, and similar) that the source context doesn't resolve either; never flag when
+the question's own stated need, checked against what the SOURCE CONTEXT says each option
+actually covers, already points to one specific correct answer.
+{_context_block}
 QUESTION: {question}
 
 ANSWER: {answer}
 
-If the ANSWER does this, reply with ONLY the exact name of the specific option it recommended
-(e.g. "Single-Trip Plan"), nothing else. If it does not do this — including if the QUESTION
-itself provided enough information to justify a specific recommendation, or the ANSWER just
-neutrally describes options without picking one — reply with exactly: NONE"""
+If the ANSWER does this, reply with each such option's exact name on its own line (e.g.
+"Single-Trip Plan" alone on one line; two lines if there are two separate unjustified picks),
+nothing else — no numbering, no extra commentary. If it does not do this at all — including if
+the QUESTION itself provided enough information to justify a specific recommendation, or the
+ANSWER just neutrally describes options without picking one — reply with exactly: NONE"""
         # Pinned to Groq first (2026-09-03) — confirmed live this specific
         # judgment call is genuinely beyond the small local vLLM model, not
         # a prompt-phrasing problem: 8/8 identical "NONE" on a confirmed
@@ -4669,33 +4925,46 @@ neutrally describes options without picking one — reply with exactly: NONE"""
         # low enough volume to be worth the quota. Falls back to whatever
         # backend is active if Groq is unavailable, same as every other
         # Groq-preferring call in this file.
-        raw = await _backend_completion(prompt, max_tokens=20, timeout=12, backend_override="groq")
+        raw = await _backend_completion(prompt, max_tokens=60, timeout=12, backend_override="groq")
         if not raw:
-            raw = await _backend_completion(prompt, max_tokens=20, timeout=12)
+            raw = await _backend_completion(prompt, max_tokens=60, timeout=12)
         if not raw:
             return None
-        flagged = raw.strip().strip('"')
-        if not flagged or flagged.upper().startswith("NONE"):
-            return None
-        if len(flagged) > 80:
-            return None
-        return flagged
+        # One item per line — cap at 5 (an answer making more than 5
+        # separate unjustified picks is far more likely a parsing
+        # artifact than a real finding) and drop anything that's clearly
+        # not a short option name (e.g. the model echoing "NONE" on its
+        # own line alongside real picks, or a stray blank).
+        flagged_items = []
+        for _line in raw.strip().splitlines():
+            _item = _line.strip().strip('"').lstrip("-*0123456789. )")
+            if not _item or _item.upper() == "NONE":
+                continue
+            if len(_item) > 80:
+                continue
+            flagged_items.append(_item)
+            if len(flagged_items) >= 5:
+                break
+        return flagged_items or None
     except Exception as exc:
         logger.debug("[ask_stream] unjustified-recommendation detection failed (%s)", exc)
         return None
 
 
-async def _neutralize_unjustified_recommendation(question: str, answer: str, flagged_item: str) -> Optional[str]:
+async def _neutralize_unjustified_recommendation(
+    question: str, answer: str, flagged_items: list, context_chunks: Optional[list] = None,
+) -> Optional[str]:
     """
     Rewrites an answer flagged by _detect_unjustified_recommendation above
-    — removes the unsolicited specific recommendation and any invented
-    assumption used to justify it, while preserving every other real fact
-    in the answer unchanged. Same "try an LLM rewrite, fall back to the
-    original on any failure or suspicious output" discipline already used
-    for _srg_weave_items_into_unit elsewhere in this file — this can only
-    improve the answer on success, never make it worse on failure, since
-    the caller keeps the original untouched unless this returns a real
-    rewrite.
+    — removes every unsolicited specific recommendation in *flagged_items*
+    (there may be more than one — see that function's own docstring) and
+    any invented assumption used to justify each, while preserving every
+    other real fact in the answer unchanged. Same "try an LLM rewrite,
+    fall back to the original on any failure or suspicious output"
+    discipline already used for _srg_weave_items_into_unit elsewhere in
+    this file — this can only improve the answer on success, never make
+    it worse on failure, since the caller keeps the original untouched
+    unless this returns a real rewrite.
 
     No length-ratio or word-overlap validation here (unlike the SRG weave
     check) — removing a whole sentence's worth of unjustified content is
@@ -4703,16 +4972,42 @@ async def _neutralize_unjustified_recommendation(question: str, answer: str, fla
     would just fight the very thing this function is meant to do. The
     prompt's own explicit "keep every other fact exactly as stated"
     instruction is the safeguard instead.
+
+    context_chunks (2026-09-07): this used to rewrite completely blind —
+    question, answer, and the flagged item's bare name, nothing about what
+    the source material actually says. Confirmed live this produced a real
+    loss, not just a neutral rephrase: "Term life insurance" got
+    genericized down to bare "Life insurance" — losing the one distinction
+    (term vs. whole vs. endowment) that actually matters, since "life
+    insurance" alone isn't a real product. Same context_chunks the
+    detector above now receives (the post-compression pool, unnarrowed —
+    see that function's own docstring) is passed here too, so a rewrite
+    that needs to describe what the OTHER real options are can draw on
+    what the source genuinely states about them, instead of guessing at a
+    vaguer, less useful generalization.
     """
     try:
-        prompt = f"""The ANSWER below recommends "{flagged_item}" specifically, but the QUESTION
-doesn't provide enough information to justify that specific choice over other valid
-alternatives. Rewrite the ANSWER to remove that specific recommendation and any invented
-assumption used to justify it (don't say "you should buy X" or invent details about the
-user's own situation/trip) — but keep every OTHER real fact in the ANSWER exactly as stated,
-just presented neutrally rather than tied to the one recommended option. Don't add any new
-fact that wasn't already in the ANSWER.
+        _context_block = (
+            f"\nSOURCE CONTEXT (what the material actually says about the relevant options):\n"
+            f"{chr(10).join(context_chunks)}\n"
+            if context_chunks else ""
+        )
+        _items_quoted = ", ".join(f'"{i}"' for i in flagged_items)
+        _plural = len(flagged_items) > 1
+        prompt = f"""The ANSWER below recommends {_items_quoted} specifically, but the QUESTION
+doesn't provide enough information to justify {"those specific choices" if _plural else "that specific choice"}
+over other valid alternatives. Rewrite the ANSWER to remove {"those specific recommendations" if _plural else "that specific recommendation"}
+and any invented assumption used to justify {"them" if _plural else "it"} (don't say "you should buy X" or
+invent details about the user's own situation/trip) — but keep every OTHER real fact in the
+ANSWER exactly as stated, just presented neutrally rather than tied to the recommended
+option(s). Don't add any new fact that wasn't already in the ANSWER or in the SOURCE CONTEXT
+below.
 
+If removing {_items_quoted} leaves a gap where naming what the OTHER real alternatives are
+(not recommending one, just naming them) would make the answer more useful, and the SOURCE
+CONTEXT below actually names those alternatives, you may add them neutrally, side by side,
+with no preference expressed. Do not invent alternatives that aren't in the SOURCE CONTEXT.
+{_context_block}
 QUESTION: {question}
 
 ANSWER: {answer}
@@ -4803,6 +5098,93 @@ async def _pgf_extract_claims(text: str) -> list:
         return _cleaned if len(_cleaned) >= 2 else []
     except Exception:
         return []
+
+
+_PGF_STOPWORDS = frozenset({
+    "the", "a", "an", "this", "that", "these", "those", "it", "its", "of",
+    "to", "in", "on", "at", "for", "with", "by", "from", "as", "is", "are",
+    "was", "were", "and", "or", "also", "such", "typically", "which",
+})
+
+
+def _pgf_claim_core_words(claim: str) -> list:
+    """First 1-3 content words of *claim* (stopwords filtered) — used only
+    to VERIFY a rewrite actually contains this claim's substance, the same
+    word-overlap-tolerant technique _srg_weave_items_into_unit uses
+    elsewhere in this file for the identical "did the LLM rewrite keep
+    what it was supposed to" problem. Reimplemented locally (not a shared
+    call) since that SRG closure is defined much later in ask_stream, well
+    after this salvage path already needs to run.
+    """
+    words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z'\-]{2,}", claim.lower()) if w not in _PGF_STOPWORDS]
+    return words[:3]
+
+
+async def _pgf_rewrite_surviving_claims(original_sentence: str, surviving_claims: list) -> Optional[str]:
+    """Rewrites the VERIFIED-TRUE claims that survived _pgf_extract_claims'
+    salvage split into one natural, smoothly-flowing sentence — used
+    instead of a plain ". ".join() of the leftover claim fragments.
+
+    Confirmed live 2026-09-07: a sentence bundling one true claim ("a
+    policy typically includes third-party insurance") with a fabricated
+    one ("...and also covers your own medical expenses") correctly had
+    the fabrication dropped by per-claim verification, but naively joining
+    the two TRUE leftover fragments back in — right after a DIFFERENT
+    sentence about protecting the user's own losses — created a
+    misleading juxtaposition: it read as if third-party insurance were
+    part of protecting the user's own losses, which it structurally never
+    covers. Each kept word was independently true; the SHAPE of gluing
+    fragments back together is what was misleading.
+
+    Same "can only shrink/rephrase already-verified-true content, never
+    add scope" safety argument _neutralize_unjustified_recommendation's
+    own docstring already relies on — the prompt is given ONLY the
+    surviving claims and told to add nothing beyond them. Verified the
+    same word-overlap-tolerant way _srg_weave_items_into_unit verifies its
+    own rewrites elsewhere in this file: each surviving claim's own core
+    content words (_pgf_claim_core_words) must appear in the rewrite, or
+    this returns None and the caller falls back (see the call site's own
+    comment for the exact fallback tiers — this function never decides
+    the fallback itself, only whether ITS rewrite is safe to use).
+    """
+    try:
+        _claims_joined = "; ".join(surviving_claims)
+        _prompt = f"""You are given the original version of a sentence, and a list of ONLY the \
+facts from it that have been independently verified as accurate. Rewrite those verified \
+facts into ONE natural, smoothly-flowing sentence that reads as if it was written this way \
+originally — not a list, not choppy fragments glued together.
+
+Do not add, invent, or imply any fact beyond what is listed below — only rephrase and \
+connect the facts given. Keep the same tone and person (you/your, etc.) as the original.
+
+Original sentence (for tone/context only — do not restate anything from it that isn't \
+also in the verified facts list): {original_sentence}
+
+Verified facts (the ONLY things allowed in your rewrite): {_claims_joined}
+
+Output ONLY the rewritten sentence, nothing else — no preamble, no quotes."""
+        _raw = await _backend_completion(_prompt, max_tokens=150, timeout=12)
+        if not _raw:
+            return None
+        _raw = _raw.strip().strip('"')
+        if not _raw:
+            return None
+        _raw_lower = _raw.lower()
+        for _claim in surviving_claims:
+            _core = _pgf_claim_core_words(_claim)
+            if not _core:
+                continue
+            _hits = sum(1 for w in _core if w in _raw_lower)
+            _need = len(_core) if len(_core) <= 2 else 2
+            if _hits < _need:
+                logger.debug(
+                    "[PGF-SALVAGE] rewrite dropped claim %r, falling back", _claim,
+                )
+                return None
+        return _raw
+    except Exception as exc:
+        logger.debug("[PGF-SALVAGE] rewrite failed: %s", exc)
+        return None
 
 
 async def _verify_grounding_any_chunk(
@@ -6939,6 +7321,165 @@ def _history_last_assistant_turn(history: str) -> str:
     return ""
 
 
+def _split_history_turn_pairs(history: str) -> list:
+    """Pairs up _split_history_turns()'s flat turn list into chronological
+    (user_text, assistant_text) tuples, "User:"/"Assistant:" prefixes
+    stripped. Conversation history is always saved as strict [user,
+    assistant] alternating pairs (see api.py's _save_conversation_history),
+    so this just walks the flat list two at a time — skipping (not mis-
+    pairing) a turn that doesn't match the expected User-then-Assistant
+    alternation, as cheap insurance against malformed history rather than
+    a load-bearing check.
+    """
+    turns = _split_history_turns(history)
+    pairs = []
+    i = 0
+    while i < len(turns) - 1:
+        if turns[i].startswith("User:") and turns[i + 1].startswith("Assistant:"):
+            pairs.append((turns[i][len("User:"):].strip(), turns[i + 1][len("Assistant:"):].strip()))
+            i += 2
+        else:
+            i += 1
+    return pairs
+
+
+# Similarity-comparison target text per history turn — capped short
+# deliberately, same reasoning as _REFORMULATE_TOPIC_SNIPPET_CHARS below:
+# a full, detailed answer routinely mentions multiple insurance types in
+# passing (e.g. explaining term insurance while contrasting it against
+# whole life), and embedding the WHOLE answer lets an incidental mention
+# dominate the vector — the same "long, multi-topic content drowns out the
+# real subject" failure already confirmed live twice in this file (see
+# _reformulate_query's own 3-turn-window regression comment below, and
+# _reformulate_with_history's policy-document-contents comment). Sized a
+# little more generously than that constant since a similarity comparison
+# tolerates extra context better than a literal retrieval string does.
+_TURN_SIM_SNIPPET_CHARS = 200
+
+# Detection-gate floor: "is this question plausibly continuing history AT
+# ALL" — checked against the BEST-scoring turn including the most recent
+# one. Deliberately looser than the override thresholds below: a false
+# positive here just costs one extra, cheap LLM call (_reformulate_query's
+# own prompt already handles an already-self-contained question by echoing
+# it back unchanged) — the same asymmetric-cost tradeoff _is_likely_
+# followup's existing 12-word gate already makes elsewhere in this file.
+_FOLLOWUP_SIM_GATE = 0.42
+
+# Override floor + margin: "is an EARLIER turn clearly, not just
+# marginally, the better match than the most recent one." Both required
+# together specifically to fail the documented takaful-vs-term-insurance
+# regression (see _reformulate_query's comment) — a more "distinctive"-
+# sounding earlier topic scoring only slightly higher than the true
+# current topic must not win. An override is not cheap like a detection
+# false-positive: it substitutes the wrong turn's content into the
+# reformulation input, so this pair is intentionally stricter.
+_TURN_OVERRIDE_MIN_SIM = 0.50
+_TURN_OVERRIDE_MARGIN = 0.08
+
+
+def _turn_similarity_text(user_text: str, assistant_text: str) -> str:
+    return f"{user_text} {assistant_text[:_TURN_SIM_SNIPPET_CHARS]}".strip()
+
+
+def _rank_history_turns_by_similarity(question: str, history: str) -> Optional[dict]:
+    """Code-based (embedding, not LLM) ranking of which retained history
+    turn *question* most resembles — same pattern PGF/SRG already use
+    elsewhere in this file (_get_shared_embed_model + cosine similarity via
+    np.dot) for "which of several candidates does X relate to" problems,
+    applied here to conversation turns instead of retrieved chunks.
+
+    Returns None when there are fewer than 2 turn-pairs (nothing to
+    disambiguate — with only one turn, the existing default is already
+    unambiguous) or on any embedding failure, so callers degrade to
+    today's exact behavior with zero special-casing needed.
+    """
+    pairs = _split_history_turn_pairs(history)
+    if len(pairs) < 2:
+        return None
+    try:
+        candidates = [_turn_similarity_text(u, a) for u, a in pairs]
+        embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+        vecs = embed_model.encode(candidates + [question], normalize_embeddings=True)
+        turn_vecs, q_vec = vecs[:-1], vecs[-1]
+        scores = [float(np.dot(q_vec, tv)) for tv in turn_vecs]
+        best_idx = max(range(len(scores)), key=lambda i: scores[i])
+        return {
+            "pairs": pairs, "scores": scores, "question": question,
+            "best_idx": best_idx, "most_recent_idx": len(pairs) - 1,
+        }
+    except Exception as exc:
+        logger.debug("[TURN-SELECT] similarity ranking failed, skipping: %s", exc)
+        return None
+
+
+def _followup_similarity_gate(ranked: Optional[dict]) -> bool:
+    """True if *question* (already ranked into *ranked*) is similar enough
+    to ANY retained turn to count as plausibly continuing the conversation
+    — the detection-side signal, independent of _is_likely_followup's own
+    keyword/pattern gate. Exists specifically for indirect/scenario-phrased
+    follow-ups about the MOST RECENT turn that carry no pronoun or generic
+    follow-up keyword at all (e.g. "what if it happened while commuting to
+    work instead?") — _select_followup_anchor_turn below correctly declines
+    to override for exactly this case (best_idx == most_recent_idx), so
+    detecting it at all has to happen here, not there.
+    """
+    return ranked is not None and max(ranked["scores"]) >= _FOLLOWUP_SIM_GATE
+
+
+def _select_followup_anchor_turn(ranked: Optional[dict]) -> Optional[tuple]:
+    """Decision function over an already-computed _rank_history_turns_by_
+    similarity() result — never recomputes. Returns the (user, assistant)
+    turn to anchor reformulation on INSTEAD of the most recent turn, only
+    when ALL of: the CURRENT question carries real topic content of its
+    own, the best-scoring turn isn't the most recent one, its score clears
+    an absolute floor on its own merits, AND it beats the most-recent
+    turn's own score by a real margin. Returns None (keep today's default,
+    most-recent-turn behavior) otherwise — including the common case where
+    the most recent turn is itself the best match.
+
+    Confirmed live 2026-09-07: a content-free follow-up ("How to claim
+    it?" after a motor-insurance claims turn, then again after an
+    unrelated marine-insurance turn) scored 0.701 against the OLDER motor
+    turn vs only 0.540 against the actual most-recent marine turn — a
+    0.161 margin, comfortably clearing the threshold below — and
+    incorrectly overrode recency. Not because the phrasing coincidentally
+    repeated (it's a routine, generic follow-up shape a user can ask
+    about any topic), but because the similarity comparison is between
+    the CURRENT QUESTION and each turn's (question + answer-snippet)
+    text: "claim" is a real, repeated signal throughout the motor turn's
+    own claims-process answer, and genuinely absent from the marine
+    turn's purely definitional answer — so a bare "claim" mention alone
+    was treated as strong topical evidence, when the word carries no
+    entity/topic information at all ("claim" is already in
+    _QUERY_STOP_WORDS for exactly this domain-generic reason). A follow-
+    up whose own text has no real content word to begin with has no
+    legitimate basis to point anywhere other than the most recent turn —
+    "it" resolves by recency, not by which past turn happens to share
+    incidental vocabulary with the CURRENT phrasing. A genuinely
+    content-bearing topic-jump ("what about takaful instead?") still
+    reaches this check fine, since "takaful" survives the same filter.
+    """
+    if ranked is None:
+        return None
+    if not _extract_topic_terms(ranked.get("question", "")):
+        return None
+    best_idx, most_recent_idx = ranked["best_idx"], ranked["most_recent_idx"]
+    if best_idx == most_recent_idx:
+        return None
+    scores = ranked["scores"]
+    if scores[best_idx] < _TURN_OVERRIDE_MIN_SIM:
+        return None
+    if scores[best_idx] - scores[most_recent_idx] < _TURN_OVERRIDE_MARGIN:
+        return None
+    logger.info(
+        "[TURN-SELECT] override: anchoring on turn %d (score=%.3f) over most-recent turn %d "
+        "(score=%.3f, margin=%.3f) — %r",
+        best_idx, scores[best_idx], most_recent_idx, scores[most_recent_idx],
+        scores[best_idx] - scores[most_recent_idx], ranked["pairs"][best_idx][0][:80],
+    )
+    return ranked["pairs"][best_idx]
+
+
 # A generic "elaborate on whatever we were just discussing" follow-up, as
 # opposed to a follow-up that names its own specific new content ("how do I
 # claim it?", "is it tax deductible?"). Only THIS class of follow-up is
@@ -6961,6 +7502,25 @@ _ELABORATION_FOLLOWUP_RE = re.compile(
 _BOTH_REPLY_RE = re.compile(
     r"^\s*(both\b|all of them\b|everything\b|"
     r"(?:give|answer|tell)\s+me\s+both\b|i\s+want\s+both\b)",
+    re.IGNORECASE,
+)
+
+# QA-confirmed 2026-09-07: a bare "yes" typed right after the model's OWN
+# generic sign-off ("Let me know if you want more details! 😊") got caught
+# by ask_stream's earlier "pure conversational reply, zero retrieval
+# value" fast-path (_PURE_CONV) and answered with a canned "Great! Let me
+# know if you have any other questions." instead of actually elaborating —
+# that fast-path already special-cases an affirmative reply to a HANDOFF
+# offer (_wants_handoff below) but had no equivalent for a "want more
+# details" offer. Used together with the existing _HANDOFF_AFFIRM set
+# (same short-affirmative vocabulary, already defined at that call site)
+# to detect this case and route it into elaboration instead of a dead-end
+# canned reply — only fires when the LAST ASSISTANT TURN actually ended
+# with an offer, same sign-off phrase vocabulary _SIGNOFF_START_RE already
+# uses elsewhere in this file, so a bare "yes" with no such offer ahead of
+# it (e.g. answering an actual yes/no question) is untouched.
+_SIGNOFF_OFFER_TAIL_RE = re.compile(
+    r"(hope that|let me know|feel free|hang tight|glad to|dig into any part)",
     re.IGNORECASE,
 )
 
@@ -7071,7 +7631,7 @@ async def _split_compound_question(question: str) -> Optional[tuple[str, str]]:
 _REFORMULATE_TOPIC_SNIPPET_CHARS = 120
 
 
-def _reformulate_with_history(question: str, history: str) -> str:
+def _reformulate_with_history(question: str, history: str, selected_assistant: Optional[str] = None) -> str:
     """Merge a short follow-up with the last assistant turn from *history*.
 
     The returned string is used **only** for the retrieval query — the original
@@ -7093,16 +7653,55 @@ def _reformulate_with_history(question: str, history: str) -> str:
     pronouns against the established subject (the scenario this function
     exists for — see the call site's docstring) without drowning out a
     substantive follow-up's own words.
+
+    selected_assistant (2026-09-07): an optional override from _select_
+    followup_anchor_turn's embedding-similarity decision (see
+    _reformulate_query's own matching parameter) — when the caller already
+    decided the follow-up anchors on an EARLIER turn than the most recent
+    one, this fallback must honor that same decision rather than silently
+    reverting to the literal last assistant turn. None (the default) keeps
+    today's exact lookup below unchanged.
     """
-    lines = history.strip().split("\n")
-    last_assistant = ""
-    for line in reversed(lines):
-        if line.startswith("Assistant:"):
-            last_assistant = line[len("Assistant:"):].strip()
-            break
+    last_assistant = selected_assistant
+    if last_assistant is None:
+        lines = history.strip().split("\n")
+        for line in reversed(lines):
+            if line.startswith("Assistant:"):
+                last_assistant = line[len("Assistant:"):].strip()
+                break
     if last_assistant:
         topic_snippet = last_assistant[:_REFORMULATE_TOPIC_SNIPPET_CHARS]
-        return f"{topic_snippet} {question}"
+        # Confirmed live 2026-09-07: the hard character cut above lands
+        # mid-word whenever the true boundary doesn't happen to fall on a
+        # space ("...while you're traveling, as wel" for "...as well") —
+        # trim back to the last complete word instead. The bare
+        # `f"{topic_snippet} {question}"` join below it was ALSO gluing
+        # the (already truncated) snippet directly onto the next question
+        # with nothing but a space between them ("...as wel What are the
+        # exclusions..."), which the downstream scenario-reformulation
+        # step then read as one continuous, garbled framing instead of
+        # two separate things — a real period as the join, not a space,
+        # keeps them two distinct sentences the way they actually are.
+        if len(last_assistant) > _REFORMULATE_TOPIC_SNIPPET_CHARS:
+            topic_snippet = topic_snippet.rsplit(" ", 1)[0]
+        topic_snippet = topic_snippet.rstrip(" ,;:")
+        # A whole-word trim can still dangle on a connective with nothing
+        # after it ("...traveling, as." for "...as well as...") — drop
+        # trailing prepositions/conjunctions/articles the same truncation
+        # can land on, same closed-class spirit as this file's other
+        # dangling-word checks (e.g. _SUSPECT_LIST_MARKER_CORRUPTION_RE's
+        # own word set), repeating since removing one can expose another
+        # ("...covers medical and" -> drop "and" -> "...covers medical").
+        _dangling_tail_words = frozenset({
+            "a", "an", "the", "as", "and", "or", "but", "if", "of", "to",
+            "in", "on", "at", "for", "with", "by", "from", "that", "which",
+        })
+        while True:
+            _tail_match = re.search(r"\b(\w+)$", topic_snippet)
+            if not _tail_match or _tail_match.group(1).lower() not in _dangling_tail_words:
+                break
+            topic_snippet = topic_snippet[:_tail_match.start()].rstrip(" ,;:")
+        return f"{topic_snippet}. {question}" if topic_snippet else question
     return question
 
 
@@ -7383,6 +7982,150 @@ logger.info(
 _VLLM_MAX_TOKENS_DETAILED = int(os.getenv("VLLM_MAX_TOKENS", "900"))
 _VLLM_MAX_TOKENS_BRIEF = int(os.getenv("VLLM_MAX_TOKENS_BRIEF", "300"))
 
+# Shared by every caller that assembles a context+history prompt against
+# this model (4096 real ceiling; 3900 leaves a small standing margin before
+# even the char-estimate stage below runs).
+_MAX_INPUT_TOKENS = 3900
+
+
+def _dynamic_context_char_budget(
+    prompt_template_tokens: int, history: str, output_reserve: int,
+) -> "tuple[str, int]":
+    """First-pass (char-estimate) context sizing, extracted 2026-09-07 from
+    ask_stream so ask() can share the exact same real-tokenizer-informed
+    budget instead of the separate, stale LLM_CONTEXT_WINDOW_CHARS char cap
+    it used to use (sized off a comment that assumed a ~300-token prompt
+    template — the real ones measure 1,500-3,400+ tokens; see
+    _measure_prompt_tokens above). Any prompt this codebase assembles from
+    context+history should size its first-pass retrieval/compression budget
+    through this function, not a hand-picked char constant, so a future
+    prompt-template change is automatically accounted for everywhere at
+    once rather than needing each call site remembered and re-tuned by hand.
+
+    Trims `history` from the OLDEST turns first (keep the most recent —
+    they matter most for follow-ups) if the template + history + output
+    reserve alone would already leave no room for a context floor.
+
+    Returns (possibly-trimmed history, context budget in chars). This is
+    only the FIRST pass — it does not see the fully-assembled prompt (per-
+    chunk source labels, a "[Related prior answers]" block, etc. all add
+    real tokens this char estimate can't know about), so callers that need
+    a hard guarantee against exceeding the model's real ceiling must also
+    run the assembled prompt through _finalize_prompt_within_token_budget
+    below.
+    """
+    _history_tokens_est = len(history) // _CHARS_PER_TOKEN if history else 0
+    _min_reserve_without_history = prompt_template_tokens + 300 + output_reserve
+    _max_history_tokens = max(0, _MAX_INPUT_TOKENS - _min_reserve_without_history)
+    _max_history_chars = _max_history_tokens * _CHARS_PER_TOKEN
+    if history and len(history) > _max_history_chars:
+        history = history[-_max_history_chars:]
+        _first_newline = history.find("\n")
+        if _first_newline != -1:
+            history = history[_first_newline + 1:]
+        _history_tokens_est = len(history) // _CHARS_PER_TOKEN
+
+    _context_token_budget = max(
+        300,  # always keep at least a bit of context
+        _MAX_INPUT_TOKENS - prompt_template_tokens - _history_tokens_est - output_reserve,
+    )
+    _context_budget = min(6000, _context_token_budget * _CHARS_PER_TOKEN)  # tokens → chars
+    return history, _context_budget
+
+
+def _finalize_prompt_within_token_budget(
+    build_prompt_fn, full_context: str, history: str, desired_max_tokens: int, log_tag: str,
+) -> "tuple[str, str, str, int]":
+    """Real-tokenizer safety valve, extracted 2026-09-07 from ask_stream (see
+    the git history / plan_shallow_answers_context_budget.md for the full
+    incident chain this generalizes — the char-estimate budget above always
+    has some slop against the ASSEMBLED prompt: per-chunk source labels,
+    _rerank_windows() returning a different span than what was trimmed to,
+    a "[Related prior answers]" block, etc. — confirmed live to be large
+    enough by itself to cause a real 400 even right after the char-estimate
+    pass above ran).
+
+    Measures the REAL token count of the fully-assembled prompt via vLLM's
+    own /tokenize endpoint and, if there isn't room for a usable answer,
+    loops trimming `full_context` (up to 6 rounds) and re-measuring — then,
+    if context alone isn't enough, drops `history` entirely as a last
+    resort — until the arithmetic guarantees prompt_tokens + max_tokens
+    cannot exceed the model's real ceiling, regardless of where the slop
+    actually came from. This is the mechanism that gives the hard
+    guarantee; the char-estimate budget above only avoids over-retrieving
+    in the common case.
+
+    `build_prompt_fn(full_context, history) -> str` lets each caller supply
+    its own template selection (strict/detailed/conversational) without
+    this function needing to know about any of them.
+
+    Returns (final_prompt, final_full_context, final_history, safe_max_tokens).
+    safe_max_tokens is always >= 1 and never claims more room than the
+    arithmetic actually supports — never trust a floor when the real
+    numbers say there isn't room, since that's exactly what silently sent
+    a doomed request in the incident this replaced.
+    """
+    prompt = build_prompt_fn(full_context, history)
+    _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
+    _token_budget_buffer = 50 if _tokens_are_real else 196
+    _MIN_USABLE_OUTPUT_TOKENS = 150
+    _ABSOLUTE_MIN_OUTPUT_TOKENS = 16
+    _context_trim_rounds = 0
+    _MAX_CONTEXT_TRIM_ROUNDS = 6
+    while (
+        full_context
+        and (4096 - _real_prompt_tokens_final - _token_budget_buffer) < min(_MIN_USABLE_OUTPUT_TOKENS, desired_max_tokens)
+        and _context_trim_rounds < _MAX_CONTEXT_TRIM_ROUNDS
+    ):
+        _context_trim_rounds += 1
+        _target_floor = min(_MIN_USABLE_OUTPUT_TOKENS, desired_max_tokens)
+        _tokens_over = (_real_prompt_tokens_final + _token_budget_buffer + _target_floor) - 4096
+        # 2x margin — the same char/3 slop that caused the overshoot in the
+        # first place means a 1x cut based on the estimate would likely
+        # still come up short after re-measuring.
+        _chars_to_cut = max(300, _tokens_over * _CHARS_PER_TOKEN * 2)
+        _new_len = max(0, len(full_context) - _chars_to_cut)
+        if _new_len >= len(full_context):
+            break
+        full_context = full_context[:_new_len]
+        prompt = build_prompt_fn(full_context, history)
+        _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
+        _token_budget_buffer = 50 if _tokens_are_real else 196
+        logger.warning(
+            "[%s] context-budget gap: trimmed full_context by %d chars (round %d) to "
+            "recover output room — real prompt tokens now=%d (measured=%s)",
+            log_tag, _chars_to_cut, _context_trim_rounds, _real_prompt_tokens_final, _tokens_are_real,
+        )
+
+    if history and (4096 - _real_prompt_tokens_final - _token_budget_buffer) < _ABSOLUTE_MIN_OUTPUT_TOKENS:
+        history = ""
+        prompt = build_prompt_fn(full_context, history)
+        _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
+        _token_budget_buffer = 50 if _tokens_are_real else 196
+        logger.warning(
+            "[%s] context-budget gap: dropped conversation history entirely — "
+            "prompt template alone left no room even with full_context emptied, "
+            "real prompt tokens now=%d (measured=%s)",
+            log_tag, _real_prompt_tokens_final, _tokens_are_real,
+        )
+
+    _raw_available = 4096 - _real_prompt_tokens_final - _token_budget_buffer
+    if _raw_available >= _ABSOLUTE_MIN_OUTPUT_TOKENS:
+        _safe_max_tokens = min(desired_max_tokens, _raw_available)
+    else:
+        _safe_max_tokens = max(1, 4096 - _real_prompt_tokens_final - (10 if _tokens_are_real else 40))
+
+    if _safe_max_tokens < desired_max_tokens:
+        logger.warning(
+            "[%s] context-budget gap: real prompt tokens=%d left only %d/%d "
+            "of the intended output budget — some source of char-vs-token slop between "
+            "the estimate and the assembled prompt is larger than accounted for",
+            log_tag, _real_prompt_tokens_final, _safe_max_tokens, desired_max_tokens,
+        )
+
+    return prompt, full_context, history, _safe_max_tokens
+
+
 # _verify_point_faithfulness's own evidence-char budget, kept separate from
 # _GROUNDING_CONTEXT_CHARS (a DIFFERENT, shorter prompt template used by
 # _build_grounding_context's pre-generation relevance check) rather than
@@ -7458,7 +8201,6 @@ class MultiSourceRAG:
         self.doc_pipeline = doc_pipeline if doc_pipeline is not None else RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = LLM_CONTEXT_WINDOW_CHARS  # kept in sync with compress_to_budget budget
         # Share the embed model already loaded by doc_pipeline — no duplicate memory.
         self._compressor = ContextCompressor(
             embed_model=self.doc_pipeline.vector_store.embed_model,
@@ -8694,16 +9436,36 @@ class MultiSourceRAG:
             )
         # ── Context compression (only when needed) ────────────────────────────
         # Skip compression entirely when the chunks already fit in the LLM's
-        # input window — with 500-char chunks this will usually be the case.
-        # Only compress when the aggregate exceeds LLM_CONTEXT_WINDOW_CHARS.
+        # input window. Confirmed live 2026-09-07: the old LLM_CONTEXT_WINDOW_CHARS
+        # constant this used to compress against (9000 chars) was sized off a
+        # comment assuming a ~300-token prompt template — the real
+        # CONVERSATIONAL_RAG_PROMPT/STRICT_GROUNDED_PROMPT measure 1,500-2,500+
+        # tokens (see _measure_prompt_tokens above) — so this method could
+        # compress "successfully" to a budget that was already, on its own,
+        # close to or over the model's real 4096-token ceiling once the actual
+        # prompt template and the 512-token output reserve were added on top,
+        # producing a live vLLM 400 ("...3585 input tokens... 512 requested
+        # output... 4097...") for a perfectly ordinary broad question. Sharing
+        # _dynamic_context_char_budget with ask_stream (see its own docstring)
+        # means this budget is now sized from the SAME real, measured prompt-
+        # token counts, and automatically stays correct if either prompt
+        # template's size ever changes — the same durability principle
+        # _measure_prompt_tokens itself exists for. The real per-request
+        # guarantee against overflow (not just this first-pass sizing) comes
+        # from _finalize_prompt_within_token_budget right before the LLM call
+        # below, which measures the actual assembled prompt.
+        _ask_prompt_template_tokens = _STRICT_PROMPT_TOKENS_EST if document_filter else _CONVERSATIONAL_PROMPT_TOKENS_EST
+        history, _ask_context_budget = _dynamic_context_char_budget(
+            _ask_prompt_template_tokens, history, _VLLM_MAX_TOKENS_DETAILED,
+        )
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
-        if total_retrieved_chars > LLM_CONTEXT_WINDOW_CHARS:
+        if total_retrieved_chars > _ask_context_budget:
             logger.info(
                 "[MultiSourceRAG] Context too large (%d chars > %d limit) — compressing",
-                total_retrieved_chars, LLM_CONTEXT_WINDOW_CHARS,
+                total_retrieved_chars, _ask_context_budget,
             )
             all_chunks = self._compressor.compress_to_budget(
-                question, all_chunks, max_total_chars=LLM_CONTEXT_WINDOW_CHARS
+                question, all_chunks, max_total_chars=_ask_context_budget
             )
 
         # Build context
@@ -8738,8 +9500,12 @@ class MultiSourceRAG:
                 label = f"{label} — Section: {_section_heading}"
             context_parts.append(f"[{label}]\n{chunk.page_content}")
         full_context = "\n\n".join(context_parts)
-        if len(full_context) > self.max_context_chars:
-            full_context = full_context[:self.max_context_chars] + "... (truncated)"
+        # No hard char-cap here — this used to blind-truncate full_context at
+        # self.max_context_chars regardless of the actual assembled prompt
+        # size, mid-word, with no real guarantee it left room for the model's
+        # output. The real guarantee now comes from
+        # _finalize_prompt_within_token_budget right before the LLM call
+        # below, which measures the fully-assembled prompt for real.
 
         # Calculation
         calc_answer, is_calc = compute_insurance_benefits(question, full_context)
@@ -8804,16 +9570,46 @@ class MultiSourceRAG:
                 is_off_topic,
             )
 
-        if document_filter:
-            prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=question)
-            llm = get_insurance_llm(temperature=0)
-        else:
-            prompt = CONVERSATIONAL_RAG_PROMPT.format(
-                history=history,
-                context=full_context,
-                question=question,
+        # Real-tokenizer safety valve (2026-09-07) — see
+        # _finalize_prompt_within_token_budget's own docstring. This is what
+        # actually guarantees the assembled prompt can't exceed the model's
+        # real ceiling (the _dynamic_context_char_budget call above is only a
+        # first-pass estimate); this is the fix for the live "3585 input
+        # tokens... 512 requested... 4097" 400 on a perfectly ordinary broad
+        # question — that request never went through any real-token
+        # measurement before hitting the backend.
+        def _build_ask_prompt(_ctx: str, _hist: str) -> str:
+            if document_filter:
+                return STRICT_GROUNDED_PROMPT.format(history=_hist, context=_ctx, question=question)
+            return CONVERSATIONAL_RAG_PROMPT.format(history=_hist, context=_ctx, question=question)
+
+        prompt, full_context, history, _ask_safe_max_tokens = _finalize_prompt_within_token_budget(
+            _build_ask_prompt, full_context, history, _VLLM_MAX_TOKENS_DETAILED, "ask",
+        )
+
+        # Same floor as ask_stream: below this there's no realistic way to
+        # fit even one coherent sentence, so degrade to the same handoff
+        # already used for a genuinely empty context, with the real sources
+        # that were actually found (the content exists, it just doesn't fit
+        # in this turn's window) rather than sending a request doomed to
+        # come back truncated mid-sentence or rejected outright.
+        _ASK_MIN_VIABLE_OUTPUT_TOKENS = 40
+        if _ask_safe_max_tokens < _ASK_MIN_VIABLE_OUTPUT_TOKENS:
+            logger.warning(
+                "[ask] context-budget gap: safe_max_tokens=%d is below the minimum viable "
+                "output floor (%d) even after trimming context/history — degrading to a "
+                "handoff instead of generating a doomed, truncated answer",
+                _ask_safe_max_tokens, _ASK_MIN_VIABLE_OUTPUT_TOKENS,
             )
-            llm = get_insurance_llm(temperature=0)
+            return (
+                "Hmm, this one's a bit too much for me to pull together right now. "
+                "Let me get one of our agents on it, they'll be able to help you better! 😊",
+                list(dict.fromkeys(sources)),
+                True,
+                False,
+            )
+
+        llm = get_insurance_llm(temperature=0, max_tokens=_ask_safe_max_tokens)
 
         # ── LLM invocation with backend-error guard ───────────────────────────
         # When the context does NOT cover the query (out-of-KB question) and the
@@ -8940,7 +9736,35 @@ class MultiSourceRAG:
         })
         _HANDOFF_AFFIRM = frozenset({"yes", "sure", "ok", "okay", "yeah", "yep", "please", "yes please"})
         _q_stripped = question.strip().lower().strip("!.,?;:")
-        if _q_stripped in _PURE_CONV:
+        # QA-confirmed 2026-09-07: a bare "yes" typed right after the
+        # model's own generic sign-off ("Let me know if you want more
+        # details!") used to fall straight into the _PURE_CONV canned-reply
+        # branch below (same affirmative-word set as the handoff-affirm
+        # case just below it) and answer with "Great! Let me know if you
+        # have any other questions" instead of actually elaborating —
+        # a dead end for a user who was genuinely accepting the offer.
+        # Checked BEFORE _PURE_CONV so a genuine match skips that whole
+        # block (via the elif below) rather than entering it: rewriting the
+        # question and falling through into ask_stream's normal follow-up/
+        # elaboration pipeline lets every existing, already-tuned
+        # downstream mechanism handle it exactly as if the user had typed
+        # "explain in detail" themselves — no parallel path needed. Mirrors
+        # the handoff-affirm case immediately below (same _HANDOFF_AFFIRM
+        # vocabulary), just for a "more details" offer instead of a human-
+        # handoff offer — checked first so a reply to an ACTUAL handoff
+        # offer still goes through _wants_handoff, not this.
+        _wants_elaboration_after_signoff = (
+            _q_stripped in _HANDOFF_AFFIRM
+            and _SIGNOFF_OFFER_TAIL_RE.search(_last_assistant_turn[-150:])
+            and not any(p in _last_assistant_turn.lower() for p in (
+                "connect you with one",
+                "let me get one of our agents",
+                "let me get a human agent",
+            ))
+        )
+        if _wants_elaboration_after_signoff:
+            question = "Yes, please explain that in more detail."
+        elif _q_stripped in _PURE_CONV:
             # ── Handoff-affirm fast path (Part 4) ─────────────────────────
             # If the last assistant message was a handoff offer and the user
             # says "yes"/"sure"/etc., acknowledge the handoff request with
@@ -9234,13 +10058,41 @@ class MultiSourceRAG:
         # Also catches longer pure acknowledgments ("oh okay that makes sense...")
         # that _is_likely_followup's word-count gate would otherwise treat as a
         # self-contained new question — see _is_conversational_reaction.
+        #
+        # _turn_ranking / _followup_similarity_gate (2026-09-07): a THIRD,
+        # independent OR-condition — code-based (embedding similarity, not
+        # LLM), never modifying _is_likely_followup's own keyword logic.
+        # Catches indirect/scenario-phrased follow-ups about the MOST
+        # RECENT turn that carry no pronoun or generic follow-up keyword at
+        # all (e.g. "what if it happened while commuting to work instead?"
+        # after an accident-coverage turn) — the two existing checks are
+        # purely current-message pattern matching and can miss exactly this
+        # shape. Computed once here and reused below for turn selection too.
+        _turn_ranking = _rank_history_turns_by_similarity(question, history) if history else None
         _detected_as_followup = bool(
-            history and (_is_likely_followup(question) or _is_conversational_reaction(question))
+            history and (
+                _is_likely_followup(question)
+                or _is_conversational_reaction(question)
+                or _followup_similarity_gate(_turn_ranking)
+            )
         )
         _is_followup = False
         if _detected_as_followup:
             _anchor_pattern = _get_dynamic_anchor_pattern(self.doc_pipeline.vector_store)
-            _reformulated = await _reformulate_query(question, history, anchor_pattern=_anchor_pattern)
+            # _select_followup_anchor_turn (2026-09-07): code-side decision
+            # over the SAME ranking above — overrides the most-recent-turn
+            # default only on clear, threshold-gated evidence the follow-up
+            # is actually about an earlier retained turn (see that
+            # function's own docstring for the exact floor+margin rule).
+            # None in the common case, reproducing today's behavior exactly.
+            _anchor_override = _select_followup_anchor_turn(_turn_ranking)
+            _selected_recent = (
+                f"User: {_anchor_override[0]}\nAssistant: {_anchor_override[1]}"
+                if _anchor_override is not None else None
+            )
+            _reformulated = await _reformulate_query(
+                question, history, anchor_pattern=_anchor_pattern, selected_recent=_selected_recent,
+            )
             if _reformulated is None:
                 # Genuine failure (backend call errored/timed out, or returned
                 # degenerate output) — distinct from the model correctly
@@ -9264,7 +10116,10 @@ class MultiSourceRAG:
                 # last answer, so it degrades gracefully for both cases
                 # instead of only the generic-modifier one.
                 retrieval_query = question
-                _merged = _reformulate_with_history(question, history)
+                _merged = _reformulate_with_history(
+                    question, history,
+                    selected_assistant=(_anchor_override[1] if _anchor_override is not None else None),
+                )
                 if _merged and _merged.lower() != question.lower():
                     retrieval_query = _merged
                     _is_followup = True
@@ -9471,11 +10326,12 @@ class MultiSourceRAG:
         _query_section_result = await self._resolve_query_section_intent(
             retrieval_query, skip_hint_prefilter=_query_policy_type != "general",
         )
-        # Always defined (even empty) so later code — the SRG
-        # policy_type-aware match veto — can safely reference it
+        # Always defined (even empty/False) so later code — the SRG
+        # policy_type-aware match vetoes — can safely reference these
         # regardless of whether this query ever had a confident type at
         # all, without an UnboundLocalError for a genuinely general query.
         _policy_types_for_filter: set = set()
+        _is_named_pair_query = False
         if _query_policy_type != "general":
             _policy_types_for_filter = {_query_policy_type}
             # A single regex hit is the weakest evidence classify_query_
@@ -9526,6 +10382,7 @@ class MultiSourceRAG:
             # `$in` list), so this can't reduce what a non-comparison
             # query retrieves or reopen any single-type contamination gap.
             _np_pair = _extract_named_pair(retrieval_query, _NAMED_PAIR_QUERY_PATTERNS)
+            _is_named_pair_query = bool(_np_pair)
             if _np_pair:
                 for _np_name in _np_pair:
                     _np_probe = (
@@ -11170,9 +12027,11 @@ class MultiSourceRAG:
 
         # Dynamic context budget — scale back when history is long so the total
         # prompt (template + history + context + answer) stays within the model's
-        # context window (~4096 tokens for Qwen2.5-7B; use 3900 as safe ceiling).
-        # 4 chars ≈ 1 token (Qwen SentencePiece approximation).
-        _MAX_INPUT_TOKENS = 3900
+        # context window. See _dynamic_context_char_budget's own docstring for
+        # the full incident history this generalizes (2026-09-07: extracted
+        # here from what used to be this method's own inline copy, so ask()
+        # shares the exact same real-tokenizer-informed sizing instead of a
+        # separate, stale char constant).
         # Picks the estimate for whichever prompt template this request will
         # actually use (same document_filter/detailed branching as the
         # prompt-selection block further down) — was a single flat 700-token
@@ -11186,33 +12045,9 @@ class MultiSourceRAG:
         else:
             _PROMPT_TEMPLATE_TOKENS = _CONVERSATIONAL_PROMPT_TOKENS_EST
         _output_reserve = _VLLM_MAX_TOKENS_DETAILED if detailed else _VLLM_MAX_TOKENS_BRIEF
-        _history_tokens_est = len(history) // _CHARS_PER_TOKEN if history else 0
-
-        # If template + history + output_reserve alone already leave no
-        # room even for the 300-token context floor below, the floor stops
-        # context from shrinking further but does NOT stop the total from
-        # exceeding the model's window — confirmed live: this is exactly
-        # what crashed a real, long-running user conversation (session
-        # continued well past a few turns) with an "internal error" on a
-        # point-reference follow-up. Truncate history from the OLDEST
-        # turns (keep the most recent ones — history is used for context on
-        # follow-ups, and the most recent turns matter most for that) until
-        # there's guaranteed room, rather than trusting the floor alone.
-        _min_reserve_without_history = _PROMPT_TEMPLATE_TOKENS + 300 + _output_reserve
-        _max_history_tokens = max(0, _MAX_INPUT_TOKENS - _min_reserve_without_history)
-        _max_history_chars = _max_history_tokens * _CHARS_PER_TOKEN
-        if history and len(history) > _max_history_chars:
-            history = history[-_max_history_chars:]
-            _first_newline = history.find("\n")
-            if _first_newline != -1:
-                history = history[_first_newline + 1:]
-            _history_tokens_est = len(history) // _CHARS_PER_TOKEN
-
-        _context_token_budget = max(
-            300,  # always keep at least a bit of context
-            _MAX_INPUT_TOKENS - _PROMPT_TEMPLATE_TOKENS - _history_tokens_est - _output_reserve,
+        history, _context_budget = _dynamic_context_char_budget(
+            _PROMPT_TEMPLATE_TOKENS, history, _output_reserve,
         )
-        _context_budget = min(6000, _context_token_budget * _CHARS_PER_TOKEN)  # tokens → chars
 
         # Drop near-zero-relevance VIDEO/WEBPAGE chunks before fair-share
         # compression gives every SURVIVING chunk a guaranteed slice of the
@@ -11310,7 +12145,14 @@ class MultiSourceRAG:
         # case where "just retrieve all of it" is safe and bounded, the
         # same reasoning that ruled it OUT for the textbook case and rules
         # it IN here.
-        _is_type_decision = await _is_type_decision_query(question)
+        _is_type_decision = await _is_type_decision_query(
+            question,
+            section_hint=(
+                _query_section_result[0]
+                if _query_section_result and not _query_section_result[1]
+                else None
+            ),
+        )
         # Set below (if at all) by the sub-branch disambiguation call right
         # after this block — declared here so it's always defined even when
         # the block is skipped or its try/except swallows an error, since
@@ -11514,6 +12356,33 @@ class MultiSourceRAG:
         # from the earlier call — the generation prompt should see
         # topic-specific content first too, not just the grounding check.
         all_chunks = _prioritize_topic_chunks(retrieval_query, all_chunks)
+
+        # Same shape as _full_context_uncompressed_chunks above, but taken
+        # from all_chunks AFTER compression — i.e. exactly the chunks that
+        # actually feed the generation prompt and the sources list built
+        # just below. User's explicit direction 2026-09-07: the specificity
+        # guard (SRG) should only ever be able to add content the model
+        # itself actually had a chance to see and that ends up properly
+        # cited — confirmed live it was pulling real, correctly-tagged
+        # facts (an "Emirates ID / Mulkiya" documents list) from a chunk
+        # that was part of the WIDER pre-compression retrieval pool but
+        # hadn't necessarily survived into this turn's actual generation
+        # context or its cited sources. PGF's own grounding/faithfulness
+        # checks deliberately keep using the wider _full_context_
+        # uncompressed_chunks pool (see that variable's own comment) —
+        # their job is verifying whether an EXISTING claim is true, which
+        # a budget cut for an unrelated reason shouldn't affect. SRG's job
+        # is different: it ADDS new content to the answer, so it must be
+        # scoped to only what the model actually saw and what's already
+        # traceable in this turn's own sources.
+        _srg_compressed_chunks = [
+            (
+                (f"[{h}]\n{c.page_content}" if (h := c.metadata.get("section_heading", "")) else c.page_content),
+                c.metadata.get("section", ""),
+                c.metadata.get("policy_type", ""),
+            )
+            for c in all_chunks
+        ]
 
         _VIDEO_SOURCE_TYPES = {"video", "youtube_transcript", "youtube"}
         _WEBPAGE_SOURCE_TYPES = {"webpage", "web"}
@@ -11883,154 +12752,28 @@ class MultiSourceRAG:
                     question[:80],
                 )
 
-            if document_filter:
-                prompt = STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
-            elif detailed:
-                prompt = DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
-            else:
-                prompt = CONVERSATIONAL_RAG_PROMPT.format(
-                    history=history,
-                    context=full_context,
-                    question=prompt_question,
-                )
             # Safety valve (2026-08-04, plan_shallow_answers_context_budget.md
-            # — found live, NOT part of the original plan): _context_budget
-            # (chars, computed far above from a CHAR estimate of what would
-            # go into `context=`) does not account for everything that ends
-            # up in the ASSEMBLED `prompt` string above — per-chunk
-            # "[Document: file (Page N)]\n" labels, _rerank_windows()
-            # potentially returning a different span than what
-            # compress_to_budget trimmed to, the "[Related prior answers]"
-            # block, etc. Confirmed live: this real gap produced an actual
-            # vLLM 400 ("3797 input tokens" against a 300-token output
-            # request, 4097 total) on a genuinely fresh, single-turn,
-            # brief-mode query — the exact production crash the whole
-            # dynamic-budget mechanism exists to prevent, reappearing
-            # because Phases C0/C3 removed the phantom prompt/output-reserve
-            # slack that had been silently absorbing this gap the whole
-            # time. Rather than trying to account for every source of
-            # char-vs-token slop in the estimate (fragile, will drift again
-            # the next time any of those pieces changes), measure the REAL
-            # token count of the fully-assembled prompt right before
-            # sending and cap max_tokens so the total structurally cannot
-            # exceed the model's ceiling — correct regardless of WHERE the
-            # gap comes from. 50-token buffer, not 196 (the char-heuristic's
-            # margin): this is a real measurement, not an estimate, so it
-            # needs far less slack.
-            def _rebuild_prompt_for_budget():
+            # — found live, NOT part of the original plan; extracted into
+            # _finalize_prompt_within_token_budget 2026-09-07 so ask() can
+            # share the exact same guarantee instead of the stale char-cap
+            # it used to use): _context_budget above (chars, from a CHAR
+            # estimate of what would go into `context=`) does not account
+            # for everything that ends up in the ASSEMBLED `prompt` string
+            # — per-chunk "[Document: file (Page N)]" labels, a "[Related
+            # prior answers]" block, etc. See that function's own docstring
+            # for the full incident history this generalizes.
+            def _build_prompt_for_budget(_ctx: str, _hist: str) -> str:
                 if document_filter:
-                    return STRICT_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                    return STRICT_GROUNDED_PROMPT.format(history=_hist, context=_ctx, question=prompt_question)
                 elif detailed:
-                    return DETAILED_GROUNDED_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                    return DETAILED_GROUNDED_PROMPT.format(history=_hist, context=_ctx, question=prompt_question)
                 else:
-                    return CONVERSATIONAL_RAG_PROMPT.format(history=history, context=full_context, question=prompt_question)
+                    return CONVERSATIONAL_RAG_PROMPT.format(history=_hist, context=_ctx, question=prompt_question)
 
             _desired_max_tokens = _VLLM_MAX_TOKENS_DETAILED if detailed else _VLLM_MAX_TOKENS_BRIEF
-            _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
-            # 50-token buffer for a real /tokenize measurement; widened to
-            # 196 (the char-heuristic's own known margin of error, see the
-            # comment on _CHARS_PER_TOKEN above) whenever that measurement
-            # fell back to the char/N estimate — see _measure_prompt_tokens_ex.
-            _token_budget_buffer = 50 if _tokens_are_real else 196
-
-            # Confirmed live (2026-08-13): for a query whose retrieval pulls
-            # several dense, jargon-heavy chunks at once (comparison queries
-            # are the worst case — "difference between a deductible and a
-            # premium" pulled 5 separate source docs), the char/3 slop this
-            # safety valve exists to catch can be MUCH larger than the
-            # 50-token buffer above assumes — real tokens came in at 5200
-            # against a 4096-token model, driving the available room deep
-            # negative. Rather than accept a near-empty answer, trim
-            # full_context and rebuild the prompt, aiming for enough room
-            # that the output is still usable.
-            #
-            # LOOPED, not one-shot (2026-08-25): a single trim attempt sizes
-            # its cut from one estimate of the overshoot — confirmed live
-            # this isn't always enough in one pass (a detailed-mode
-            # follow-up question, which also carries conversation history
-            # on top of an already-large prompt template, trimmed 3060
-            # chars and still measured 4155-4156 real tokens afterward,
-            # still 60+ tokens over the ceiling even at the 50-token
-            # buffer). Looping re-measures and re-cuts until it's actually
-            # safe or full_context is exhausted, rather than trusting one
-            # estimate to have been enough.
-            _MIN_USABLE_OUTPUT_TOKENS = 150
-            _ABSOLUTE_MIN_OUTPUT_TOKENS = 16
-            _context_trim_rounds = 0
-            _MAX_CONTEXT_TRIM_ROUNDS = 6
-            while (
-                full_context
-                and (4096 - _real_prompt_tokens_final - _token_budget_buffer) < min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens)
-                and _context_trim_rounds < _MAX_CONTEXT_TRIM_ROUNDS
-            ):
-                _context_trim_rounds += 1
-                _target_floor = min(_MIN_USABLE_OUTPUT_TOKENS, _desired_max_tokens)
-                _tokens_over = (_real_prompt_tokens_final + _token_budget_buffer + _target_floor) - 4096
-                # 2x margin — the same char/3 slop that caused the overshoot
-                # in the first place means a 1x cut based on the estimate
-                # would likely still come up short after re-measuring.
-                _chars_to_cut = max(300, _tokens_over * _CHARS_PER_TOKEN * 2)
-                _new_len = max(0, len(full_context) - _chars_to_cut)
-                if _new_len >= len(full_context):
-                    break
-                full_context = full_context[:_new_len]
-                prompt = _rebuild_prompt_for_budget()
-                _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
-                _token_budget_buffer = 50 if _tokens_are_real else 196
-                logger.warning(
-                    "[ask_stream] context-budget gap: trimmed full_context by %d chars (round %d) to "
-                    "recover output room — real prompt tokens now=%d (measured=%s)",
-                    _chars_to_cut, _context_trim_rounds, _real_prompt_tokens_final, _tokens_are_real,
-                )
-
-            # Last resort: even with full_context emptied, the prompt
-            # template plus conversation history still doesn't leave room
-            # for a genuinely usable answer — structurally possible now
-            # that DETAILED_GROUNDED_PROMPT alone measures ~3376 tokens
-            # (see _DETAILED_PROMPT_TOKENS_EST), leaving very little room
-            # for history on a multi-turn follow-up. This is the actual
-            # case that produced a live "Could not generate an answer due
-            # to an internal error": the context-only loop left real
-            # prompt tokens at 4155-4156, the backend rejected the request
-            # outright with an HTTP 400 ("prompt contains at least 4047
-            # input tokens... total of at least 4097"), and that surfaced
-            # to the user as a bare failure instead of any answer at all.
-            # Trimming history is the only lever left once context is
-            # already empty.
-            if history and (4096 - _real_prompt_tokens_final - _token_budget_buffer) < _ABSOLUTE_MIN_OUTPUT_TOKENS:
-                history = ""
-                prompt = _rebuild_prompt_for_budget()
-                _real_prompt_tokens_final, _tokens_are_real = _measure_prompt_tokens_ex(prompt)
-                _token_budget_buffer = 50 if _tokens_are_real else 196
-                logger.warning(
-                    "[ask_stream] context-budget gap: dropped conversation history entirely — "
-                    "prompt template alone left no room even with full_context emptied, "
-                    "real prompt tokens now=%d (measured=%s)",
-                    _real_prompt_tokens_final, _tokens_are_real,
-                )
-
-            # Never let a floor claim a request is safe when the
-            # arithmetic says otherwise. The bug this replaces: an
-            # unconditional max(50, ...) forced safe_max_tokens to 50 even
-            # when 4096 - real_prompt_tokens - 50 was NEGATIVE, silently
-            # sending a request the backend was guaranteed to reject with
-            # an HTTP 400 — exactly the live failure this whole block was
-            # extended to fix. Only fall back to a smaller buffer (10, not
-            # 50) when the primary formula genuinely has no room left, and
-            # still never go below 1.
-            _raw_available = 4096 - _real_prompt_tokens_final - _token_budget_buffer
-            if _raw_available >= _ABSOLUTE_MIN_OUTPUT_TOKENS:
-                _safe_max_tokens = min(_desired_max_tokens, _raw_available)
-            else:
-                _safe_max_tokens = max(1, 4096 - _real_prompt_tokens_final - (10 if _tokens_are_real else 40))
-
-            if _safe_max_tokens < _desired_max_tokens:
-                logger.warning(
-                    "[ask_stream] context-budget gap: real prompt tokens=%d left only %d/%d "
-                    "of the intended output budget — some source of char-vs-token slop between "
-                    "the estimate and the assembled prompt is larger than accounted for",
-                    _real_prompt_tokens_final, _safe_max_tokens, _desired_max_tokens,
-                )
+            prompt, full_context, history, _safe_max_tokens = _finalize_prompt_within_token_budget(
+                _build_prompt_for_budget, full_context, history, _desired_max_tokens, "ask_stream",
+            )
 
             # A too-small max_tokens doesn't fail — vLLM happily generates
             # whatever fits and stops. Confirmed live (2026-08-27): once
@@ -14429,6 +15172,27 @@ class MultiSourceRAG:
         except Exception as _num_exc:
             logger.debug("[ask_stream] ungrounded-currency filter skipped: %s", _num_exc)
 
+        # ── Run-on enumeration restructure (2026-09-07) ───────────────────────
+        # See _looks_like_runon_enumeration/_restructure_runon_as_list's own
+        # docstrings for the full story — a prompt rule alone did not
+        # reliably stop brief-mode answers from cramming 3+ genuinely
+        # separate coverage items into one comma-chained run-on sentence,
+        # so this repairs it after the fact instead. Placed BEFORE the
+        # recommendation check and PGF below so a successful restructure
+        # into "1. ... 2. ..." shape is picked up by PGF's own numbered-
+        # points branch afterward (more precise per-point verification
+        # than the prose-sentence branch) rather than fighting it.
+        try:
+            _runon_src = (_corrected_text or _reply_stripped).strip()
+            if _runon_src and _looks_like_runon_enumeration(_runon_src):
+                _restructured_runon = await _restructure_runon_as_list(_runon_src)
+                if _restructured_runon and _restructured_runon != _runon_src:
+                    logger.info("[ask_stream] restructured a run-on enumeration into a numbered list")
+                    _corrected_text = _restructured_runon
+                    _kv_reply = _restructured_runon
+        except Exception as _runon_exc:
+            logger.debug("[ask_stream] run-on restructure check skipped: %s", _runon_exc)
+
         # ── Unsolicited single-option recommendation check (2026-09-03) ──────
         # See _detect_unjustified_recommendation's own docstring for the
         # confirmed live failure this targets. Runs on the FULL current
@@ -14439,15 +15203,38 @@ class MultiSourceRAG:
         # (like the currency loop above) isn't the right shape for it.
         try:
             _reco_src = (_corrected_text or _reply_stripped).strip()
-            if _reco_src and len(_reco_src) > 40:
-                _flagged_reco = await _detect_unjustified_recommendation(question, _reco_src)
+            # _is_type_decision (already computed once, early in this
+            # method — see its own assignment comment) exempts this whole
+            # check: a question that IS explicitly asking "which one type
+            # should I buy" makes a single named answer inherently
+            # justified by definition, so there is nothing unsolicited to
+            # catch. Confirmed live even the context-grounded check above
+            # still flagged and hedged "Building or Structure Cover" for
+            # "If my house catches fire, what type of insurance should I
+            # buy?" — see _detect_unjustified_recommendation's own
+            # docstring for the full story. Skipping the call entirely
+            # (not passing a flag into the judge) is both cheaper and more
+            # reliable than asking the judge to reason its way to the same
+            # exemption every time.
+            if _reco_src and len(_reco_src) > 40 and not _is_type_decision:
+                # Post-compression pool (_srg_compressed_chunks, same scope
+                # SRG uses — see that variable's own comment), NOT the wider
+                # _full_context_uncompressed_chunks: this check and its
+                # rewrite both need exactly what the model actually saw when
+                # it generated the recommendation, unnarrowed (see
+                # _detect_unjustified_recommendation's own docstring for why
+                # narrowing by similarity-to-the-answer was actively wrong).
+                _reco_context = [_ct for _ct, _cs, _cpt in _srg_compressed_chunks]
+                _flagged_reco = await _detect_unjustified_recommendation(
+                    question, _reco_src, context_chunks=_reco_context,
+                )
                 if _flagged_reco:
                     _rewritten_reco = await _neutralize_unjustified_recommendation(
-                        question, _reco_src, _flagged_reco,
+                        question, _reco_src, _flagged_reco, context_chunks=_reco_context,
                     )
                     if _rewritten_reco:
                         logger.info(
-                            "[ask_stream] unjustified recommendation neutralized: %r -> %r",
+                            "[ask_stream] unjustified recommendation(s) neutralized: %r -> %r",
                             _flagged_reco, _rewritten_reco[:150],
                         )
                         _corrected_text = _rewritten_reco
@@ -16019,26 +16806,66 @@ class MultiSourceRAG:
                             # conservative whole-sentence verdict standing
                             # rather than silently overriding it.
                             if _surviving and len(_surviving) < len(_claims):
-                                # _pgf_extract_claims returns each claim as
-                                # its own already-punctuated sentence (e.g.
-                                # "It typically covers trip cancellation.")
-                                # — joining those with ". " as a separator
-                                # adds a SECOND period right after the first
-                                # claim's own trailing one. Confirmed live
-                                # 2026-08-28: "It typically covers trip
-                                # cancellation.. It typically covers medical
-                                # emergencies." — strip each claim's own
-                                # trailing sentence punctuation first so the
-                                # join separator is the only period between
-                                # claims.
-                                _stripped_claims = [
-                                    c.strip().rstrip(".!?").strip() for c in _surviving
-                                ]
-                                _pgf_sentences[_i] = ". ".join(c for c in _stripped_claims if c).strip()
-                                if not _pgf_sentences[_i].endswith((".", "!", "?")):
-                                    _pgf_sentences[_i] += "."
-                                _pgf_sent_drop.discard(_i)
-                                _pgf_salvaged += 1
+                                # Confirmed live 2026-09-07: naively gluing
+                                # surviving fragments back together (the
+                                # old unconditional join below) can create
+                                # a misleading juxtaposition even when
+                                # every kept word is independently true —
+                                # see _pgf_rewrite_surviving_claims' own
+                                # docstring for the exact reproducing case.
+                                # Three tiers, safest-when-uncertain: try a
+                                # verified natural rewrite first; if that
+                                # fails but MOST of the sentence was true,
+                                # the plain join is low-risk and matches
+                                # this mechanism's original behavior; if
+                                # the rewrite fails AND most of the
+                                # sentence was FALSE, that's exactly the
+                                # highest-risk shape for a misleading
+                                # leftover — drop the whole unit rather
+                                # than guess at a safe phrasing for it.
+                                _rewritten = await _pgf_rewrite_surviving_claims(
+                                    _pgf_orig_sentence, _surviving,
+                                )
+                                if _rewritten:
+                                    _pgf_sentences[_i] = _rewritten
+                                    _pgf_sent_drop.discard(_i)
+                                    _pgf_salvaged += 1
+                                    logger.info(
+                                        "[PGF-SALVAGE] rewrite used for sentence %d: %r",
+                                        _i, _rewritten[:150],
+                                    )
+                                elif len(_surviving) >= len(_claims) / 2:
+                                    # _pgf_extract_claims returns each claim
+                                    # as its own already-punctuated sentence
+                                    # (e.g. "It typically covers trip
+                                    # cancellation.") — joining those with
+                                    # ". " as a separator adds a SECOND
+                                    # period right after the first claim's
+                                    # own trailing one. Confirmed live
+                                    # 2026-08-28: "It typically covers trip
+                                    # cancellation.. It typically covers
+                                    # medical emergencies." — strip each
+                                    # claim's own trailing punctuation first
+                                    # so the join separator is the only
+                                    # period between claims.
+                                    _stripped_claims = [
+                                        c.strip().rstrip(".!?").strip() for c in _surviving
+                                    ]
+                                    _pgf_sentences[_i] = ". ".join(c for c in _stripped_claims if c).strip()
+                                    if not _pgf_sentences[_i].endswith((".", "!", "?")):
+                                        _pgf_sentences[_i] += "."
+                                    _pgf_sent_drop.discard(_i)
+                                    _pgf_salvaged += 1
+                                    logger.info(
+                                        "[PGF-SALVAGE] fallback join used for sentence %d "
+                                        "(rewrite unavailable, majority of claims survived)", _i,
+                                    )
+                                else:
+                                    logger.info(
+                                        "[PGF-SALVAGE] dropped sentence %d entirely — rewrite "
+                                        "unavailable and majority of claims were false (%d/%d survived)",
+                                        _i, len(_surviving), len(_claims),
+                                    )
 
                         if _pgf_sent_drop or _pgf_salvaged:
                             _pgf_sent_kept = [
@@ -16291,6 +17118,35 @@ class MultiSourceRAG:
                         "premium", "premiums", "benefit", "benefits",
                         "plan", "plans", "scheme", "schemes",
                         "product", "products",
+                        # Confirmed live 2026-09-07: a real, working hard
+                        # veto exists just below (_srg_match_score) for
+                        # exactly the "exclusions unit picks up a
+                        # different-section enum" shape — but it only
+                        # fires when _item_hits == 0 for that enum, and
+                        # these two purely grammatical/connective words
+                        # defeated it. A "benefits"-section item ("...
+                        # meaning treatment taken at home... subject to
+                        # specific conditions.") shared ONLY "meaning" and
+                        # "conditions" with an exclusions unit ("Pre-
+                        # existing conditions... meaning any illness...")
+                        # — two words that mean something completely
+                        # different in each sentence — and that
+                        # coincidental 2-word overlap alone was enough to
+                        # clear the >=2 threshold and disable the veto,
+                        # letting two genuine coverage items ("In-patient
+                        # hospitalisation expenses...", "Pre-
+                        # hospitalisation expenses...") get pasted into an
+                        # exclusions list as if they were exclusions.
+                        # "meaning" is a pure connector (introduces a
+                        # clarification, same job as "i.e." — never
+                        # names a topic) so it's unconditionally safe to
+                        # drop. "conditions" is genuinely polysemous in
+                        # this domain (medical conditions vs. policy
+                        # conditions vs. weather conditions) and, like
+                        # "coverage"/"policy"/"claim" above, appears in
+                        # nearly every section regardless of specific
+                        # topic — same reasoning, same fix.
+                        "meaning", "conditions", "condition",
                     }) | frozenset(_valid_policy_types())
                     # Policy TYPE names (life/health/motor/...) unioned in
                     # above rather than hand-listed — this mechanism
@@ -16549,12 +17405,100 @@ class MultiSourceRAG:
                             })
                         return _enums
 
+                    # Confirmed live 2026-09-05: 205/1541 chunks across 13 of
+                    # this KB's ~17 policy guides (travel, motor, marine,
+                    # liability, home, crop, personal accident, fire, life,
+                    # health, cyber, commercial, plus the law/practice doc)
+                    # store their "what's covered"/"exclusions" lists as ONE
+                    # BULLET ITEM PER CHUNK, not a comma-joined sentence —
+                    # e.g. a chunk's whole content is literally "What Travel
+                    # Insurance Typically Covers\n\n■ Emergency medical
+                    # treatment...", with the NEXT covered item in a
+                    # separate chunk carrying the same section heading.
+                    # _srg_find_enumerations_in_chunk (above) can never see
+                    # this as a list — from inside any ONE chunk there is
+                    # only ever a single "■ ..." line, never the run of 3+
+                    # markers it requires. The enumeration only exists as a
+                    # GROUP of separately-retrieved chunks that share a
+                    # section, so _srg_find_bullet_enumerations below scans
+                    # across the whole retrieved set at once (unlike every
+                    # other pattern here, which is called per-chunk) and
+                    # reconstructs each such group as one enumeration, one
+                    # item per contributing chunk. Moved above
+                    # _srg_find_enumerations (originally defined after it)
+                    # so that function can also use it — see the comment
+                    # inside _srg_find_enumerations below for why.
+                    _srg_BULLET_ITEM_RE = re.compile(r'\n\n[■•▪◦]\s*(.+)', re.DOTALL)
+
                     def _srg_find_enumerations(context_chunks: list) -> list:
                         _enums = []
                         for _idx, (_chunk_text, _chunk_section, _chunk_policy_type) in enumerate(context_chunks):
+                            # Confirmed live 2026-09-07: this per-chunk
+                            # comma-list detector correctly finds a real
+                            # "including X, Y, Z" pattern INSIDE a bullet-
+                            # per-chunk item ("In-patient hospitalisation
+                            # expenses, including room rent, nursing
+                            # charges, doctor's fees, and the cost of
+                            # medicines...") — but that item is itself
+                            # already just ONE entry in the OUTER bullet
+                            # enumeration _srg_find_bullet_enumerations
+                            # reconstructs below. Treating its own internal
+                            # detail as a SEPARATE, sibling top-level list
+                            # flattens a nested "category: sub-details"
+                            # structure into fake independent items (room
+                            # rent / nursing charges / doctor's fees each
+                            # standing alone, as if they were their own
+                            # coverage types rather than sub-details of
+                            # ONE category). A chunk matching the bullet-
+                            # per-chunk shape is reliably meant to be read
+                            # as one cohesive item, never re-parsed as its
+                            # own flat list, so skip it here entirely —
+                            # _srg_find_bullet_enumerations below is what
+                            # owns this chunk's content instead.
+                            if _srg_BULLET_ITEM_RE.search(_chunk_text):
+                                continue
                             _enums.extend(_srg_find_enumerations_in_chunk(
                                 _chunk_text, _chunk_section, _chunk_policy_type, chunk_idx=_idx,
                             ))
+                        return _enums
+
+                    def _srg_find_bullet_enumerations(context_chunks: list) -> list:
+                        _groups: dict = {}
+                        for _idx, (_chunk_text, _chunk_section, _chunk_policy_type) in enumerate(context_chunks):
+                            _m = _srg_BULLET_ITEM_RE.search(_chunk_text)
+                            if not _m:
+                                continue
+                            _item_text = _m.group(1).strip()
+                            if len(_item_text) < 5:
+                                continue
+                            _groups.setdefault((_chunk_section, _chunk_policy_type), []).append((_idx, _item_text))
+                        _enums = []
+                        for (_section, _policy_type), _members in _groups.items():
+                            # Same >=3 floor _srg_find_enumerations_in_chunk
+                            # uses — below that it's not reliably a "list"
+                            # worth checking coverage of. Also requires a
+                            # real section label to group on, so unrelated
+                            # bullet chunks that merely lack metadata never
+                            # get lumped together.
+                            if len(_members) < 3 or not _section:
+                                continue
+                            _enums.append({
+                                "items": [t for _, t in _members],
+                                "topic_words": _srg_content_words(_section),
+                                "section": _section,
+                                "policy_type": _policy_type,
+                                "named_product_words": set(),
+                                # A set, not a single int — this enum is
+                                # backed by MULTIPLE chunks, one per bullet
+                                # item, not one. _srg_match_score's citation
+                                # veto below is built to accept either shape.
+                                "chunk_idx": {i for i, _ in _members},
+                                # Tells _srg_match_score's item-hits loop to
+                                # skip _srg_item_head_words' qualifier-
+                                # boundary cutoff for these items — see that
+                                # branch's own comment for why.
+                                "full_sentence_items": True,
+                            })
                         return _enums
 
                     _srg_CATEGORY_NOUNS = (
@@ -16747,7 +17691,28 @@ class MultiSourceRAG:
                     # to the SAME index space enums already use, rather
                     # than risk a silent off-by-one mismatch between two
                     # differently-filtered chunk lists.
-                    _SRG_CITATION_TOP_K = 2
+                    #
+                    # Tightened from 2 to 1 (2026-09-07): PGF's own TOP_K=2
+                    # exists for verification headroom — a claim just needs
+                    # to be entailed by SOME candidate among the top few,
+                    # so a little slop there only costs recall. SRG's job
+                    # is the opposite: it ADDS new content, so a wrong
+                    # SECOND candidate slipping in as "cited" is actively
+                    # harmful, not just imprecise. Confirmed live: "I broke
+                    # my leg in a bike accident... income" (personal_
+                    # accident) had its claims-process sentence's own
+                    # citation set include BOTH the correct personal-
+                    # accident chunk (rank 1) AND a motor chunk (rank 2,
+                    # generically similar boilerplate claims phrasing) —
+                    # the motor-specific document enumeration then passed
+                    # this gate (motor's chunk_idx was technically "cited")
+                    # and got woven into the personal-accident answer. PGF's
+                    # OWN ranking for this exact sentence already put the
+                    # correct chunk first and motor second — restricting to
+                    # rank 1 only uses evidence already there, not new
+                    # computation, and removes the exact slop that let the
+                    # wrong type in.
+                    _SRG_CITATION_TOP_K = 1
 
                     def _srg_word_overlap_citation(_unit_text: str, _chunk_texts: list) -> set:
                         _unit_words_ov = set(re.findall(r"[a-z]{4,}", _unit_text.lower()))
@@ -16803,12 +17768,20 @@ class MultiSourceRAG:
                         # None means "no citation info available" (e.g. the
                         # single-chunk-context case) — never restrictive in
                         # that case, since there's nothing to distinguish.
-                        if (
-                            unit_cited_chunk_idxs is not None
-                            and enum.get("chunk_idx") is not None
-                            and enum["chunk_idx"] not in unit_cited_chunk_idxs
-                        ):
-                            return 0
+                        # chunk_idx is a single int for the per-chunk
+                        # patterns, but a SET of ints for
+                        # _srg_find_bullet_enumerations (one enumeration
+                        # backed by several chunks, one per bullet item) —
+                        # accept either shape and veto only if there's no
+                        # overlap at all with the unit's own cited chunks.
+                        _enum_chunk_idx = enum.get("chunk_idx")
+                        if unit_cited_chunk_idxs is not None and _enum_chunk_idx is not None:
+                            _enum_chunk_idxs = (
+                                _enum_chunk_idx if isinstance(_enum_chunk_idx, (set, frozenset))
+                                else {_enum_chunk_idx}
+                            )
+                            if not (_enum_chunk_idxs & unit_cited_chunk_idxs):
+                                return 0
                         # Hard veto, checked first and unconditionally:
                         # section/heading text is shared vocabulary across
                         # totally different products — "Common Exclusions"
@@ -16837,6 +17810,46 @@ class MultiSourceRAG:
                             and _enum_policy_type != "general"
                             and _policy_types_for_filter
                             and _enum_policy_type not in _policy_types_for_filter
+                        ):
+                            return 0
+
+                        # Tighter follow-on veto (2026-09-07): the check
+                        # above uses _policy_types_for_filter, which is
+                        # deliberately WIDER than the query's own single
+                        # resolved type — retrieval intentionally widens it
+                        # (weak-regex-evidence multi-label classification,
+                        # or a genuine named-pair query) so a query with
+                        # real but ambiguous vocabulary doesn't miss
+                        # relevant content. That breadth is right for
+                        # RETRIEVAL (recall-oriented) but wrong for SRG
+                        # (precision-oriented: it's adding new content to
+                        # one specific sentence, not casting a recall net).
+                        # Confirmed live: "I broke my leg in a bike
+                        # accident... is there something that helps replace
+                        # my lost income?" — a personal_accident question —
+                        # had 'motor' widened into _policy_types_for_filter
+                        # purely because the word "accident" gave weak
+                        # regex evidence, and SRG then wove a MOTOR claim-
+                        # document list ("the driving licence of the driver
+                        # at the time of the incident", "repair estimates")
+                        # into a personal-accident income-loss answer. The
+                        # veto above didn't fire — 'motor' genuinely was in
+                        # the (intentionally broad) retrieval set — but
+                        # nothing here should ever answer a personal-
+                        # accident question with motor-specific documents.
+                        # Require the enum's own type to match the query's
+                        # SINGLE primary type unless this is a genuine
+                        # named-pair/comparison query (_is_named_pair_query)
+                        # that legitimately needs both sides' content — the
+                        # one case _policy_types_for_filter's own breadth
+                        # was built for (see that variable's own comment).
+                        if (
+                            _enum_policy_type
+                            and _enum_policy_type != "general"
+                            and _query_policy_type
+                            and _query_policy_type != "general"
+                            and _enum_policy_type != _query_policy_type
+                            and not _is_named_pair_query
                         ):
                             return 0
 
@@ -16877,32 +17890,60 @@ class MultiSourceRAG:
                         # this content.
                         _unit_stems = {_srg_stem(w) for w in unit_words}
                         _item_hits = 0
-                        for _item in enum["items"]:
-                            _seq = _srg_item_head_words(_item)
-                            if not _seq:
-                                continue
-                            # English noun phrases end in their head noun
-                            # ("original BILLS", "repair ESTIMATES") — the
-                            # leading word is usually a modifier most
-                            # likely to be dropped in a shorter paraphrase
-                            # ("medical bills" for source's "original
-                            # bills"). Confirmed live: requiring the item's
-                            # head noun specifically (or 2+ of its words
-                            # anywhere) catches genuine references while
-                            # still rejecting a coincidental match on a
-                            # leading modifier alone — "repair estimates"
-                            # was wrongly matching an unrelated sentence
-                            # that only shared "repair" (not the head noun
-                            # "estimates" at all). Both signals are scoped
-                            # to the item's HEAD region (see
-                            # _srg_item_head_words), not its full text —
-                            # a coincidental shared word from a trailing
-                            # qualifier clause must never count as a hit.
-                            _head = _srg_stem(_seq[-1]) if len(_seq[-1]) >= 5 else None
-                            _seq_stems = {_srg_stem(w) for w in _seq}
-                            _multi_hit = len(_seq_stems & _unit_stems) >= 2
-                            if (_head and _head in _unit_stems) or _multi_hit:
-                                _item_hits += 1
+                        # _srg_find_bullet_enumerations' items are full
+                        # sentences ("Losses arising from participation in
+                        # adventure sports..., unless a specific adventure
+                        # sports add-on has been purchased."), not short
+                        # noun phrases like "the driving licence of the
+                        # driver...". _srg_item_head_words' cutoff at the
+                        # FIRST qualifying-clause boundary word assumes the
+                        # head noun sits right at the start — true for "the
+                        # driving licence OF...", but these sentences open
+                        # with a generic framing clause ("Losses arising
+                        # FROM...", "Any claim arising FROM...", "Claims
+                        # WHERE..."), so the cutoff fires almost immediately
+                        # and discards everything, including the one part
+                        # that actually names the topic (confirmed live:
+                        # every travel-exclusions bullet item scored 0
+                        # against its own near-verbatim answer sentence
+                        # until this branch was added). There's no short
+                        # head noun to isolate in a full sentence anyway —
+                        # compare on its whole content-word set instead.
+                        if enum.get("full_sentence_items"):
+                            for _item in enum["items"]:
+                                _seq = _srg_item_word_seq(_item)
+                                if not _seq:
+                                    continue
+                                _seq_stems = {_srg_stem(w) for w in _seq}
+                                if len(_seq_stems & _unit_stems) >= 2:
+                                    _item_hits += 1
+                        else:
+                            for _item in enum["items"]:
+                                _seq = _srg_item_head_words(_item)
+                                if not _seq:
+                                    continue
+                                # English noun phrases end in their head noun
+                                # ("original BILLS", "repair ESTIMATES") — the
+                                # leading word is usually a modifier most
+                                # likely to be dropped in a shorter paraphrase
+                                # ("medical bills" for source's "original
+                                # bills"). Confirmed live: requiring the item's
+                                # head noun specifically (or 2+ of its words
+                                # anywhere) catches genuine references while
+                                # still rejecting a coincidental match on a
+                                # leading modifier alone — "repair estimates"
+                                # was wrongly matching an unrelated sentence
+                                # that only shared "repair" (not the head noun
+                                # "estimates" at all). Both signals are scoped
+                                # to the item's HEAD region (see
+                                # _srg_item_head_words), not its full text —
+                                # a coincidental shared word from a trailing
+                                # qualifier clause must never count as a hit.
+                                _head = _srg_stem(_seq[-1]) if len(_seq[-1]) >= 5 else None
+                                _seq_stems = {_srg_stem(w) for w in _seq}
+                                _multi_hit = len(_seq_stems & _unit_stems) >= 2
+                                if (_head and _head in _unit_stems) or _multi_hit:
+                                    _item_hits += 1
                         # A shared CATEGORY noun (documents/exclusions/...)
                         # between the unit and the enumeration's own topic
                         # is strong, standalone evidence on its own —
@@ -17030,11 +18071,81 @@ Missing items to weave in: {items}
 Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
 """
 
-                    async def _srg_weave_items_into_unit(unit_text: str, missing_items: list) -> Optional[str]:
+                    # Numbered-list variant (2026-09-07) — user's explicit
+                    # direction after the mechanical numbered-list template
+                    # (which gave every missing item its own top-level
+                    # numbered line unconditionally) produced nonsense for a
+                    # motor-claims process list: bare document names
+                    # ("Emirates ID", "Mulkiya", "the registration
+                    # certificate") each became their own numbered "step",
+                    # when they actually belong together inside ONE
+                    # "gather these documents" step. A mechanical template
+                    # can't make that call — it has no way to know a short
+                    # noun phrase is a sub-item of one step rather than its
+                    # own step. The LLM can, given the actual point and
+                    # items to judge, so numbered-mode enrichment is fully
+                    # LLM-driven now too, same as prose mode, instead of
+                    # being template-driven — explicitly told it MAY either
+                    # weave items into the existing point's own sentence or
+                    # add them as new points after it, and to decide which
+                    # based on whether the items actually belong with this
+                    # point's own content.
+                    #
+                    # Exact numbering doesn't need to be correct relative to
+                    # the REST of the list — every numbered line this
+                    # produces gets picked up by the existing global
+                    # renumbering pass further down (which just resequences
+                    # every line starting with a digit, in order, regardless
+                    # of what number is actually written there) — so this
+                    # prompt only needs the model to number consistently
+                    # relative to ITSELF, not to know what surrounds it.
+                    _SRG_WEAVE_NUMBERED_PROMPT = """\
+You are given ONE numbered point from a numbered list in an insurance \
+chatbot's answer, and a short list of additional items the source \
+material mentions that this point is currently missing.
+
+This point is currently numbered {number}. The list has more numbered \
+points after this one that you don't need to see — whatever numbers you \
+use below will be automatically corrected afterward to fit the whole \
+list, as long as every line you output starts with a number.
+
+Decide the most natural way to include the missing items:
+- If they belong together with this point's own content (for example, \
+several required documents that all belong in the same "gather these \
+documents" step), weave them into this ONE point's own sentence, still \
+numbered {number}.
+- If they are genuinely separate steps or facts that don't belong inside \
+this point's own sentence, add them as their own new numbered points \
+immediately after this one, continuing the numbering upward from {number} \
+(e.g. {number_plus_1}, {number_plus_2}, ...).
+
+Do not add, remove, or change any other fact. Do not invent anything \
+beyond what is listed below. Keep the same tone, person (you/your, etc.), \
+and every fact already stated exactly as is — only add the missing items.
+
+Original point: {unit}
+
+Missing items to include: {items}
+
+Output ONLY the resulting numbered point(s), one per line, nothing else \
+— no preamble, no extra commentary.
+"""
+
+                    async def _srg_weave_items_into_unit(
+                        unit_text: str, missing_items: list, is_numbered: bool = False,
+                    ) -> Optional[str]:
                         try:
                             _items_joined = "; ".join(missing_items)
-                            _prompt = _SRG_WEAVE_PROMPT.format(unit=unit_text, items=_items_joined)
-                            _raw = await _backend_completion(_prompt, max_tokens=200, timeout=12)
+                            if is_numbered:
+                                _num_match = re.match(r'^\s*(\d+)[.)]\s', unit_text)
+                                _number = int(_num_match.group(1)) if _num_match else 1
+                                _prompt = _SRG_WEAVE_NUMBERED_PROMPT.format(
+                                    unit=unit_text, items=_items_joined, number=_number,
+                                    number_plus_1=_number + 1, number_plus_2=_number + 2,
+                                )
+                            else:
+                                _prompt = _SRG_WEAVE_PROMPT.format(unit=unit_text, items=_items_joined)
+                            _raw = await _backend_completion(_prompt, max_tokens=300, timeout=15)
                             if not _raw:
                                 return None
                             _raw = _raw.strip().strip('"')
@@ -17057,9 +18168,28 @@ Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
                                 if _hits < _need:
                                     logger.info(
                                         "[ask_stream] SRG weave-rewrite dropped item %r, "
-                                        "falling back to mechanical template", _mi,
+                                        "discarding this rewrite", _mi,
                                     )
                                     return None
+                            if is_numbered:
+                                # Structural check, not a word/content check:
+                                # every resulting line must itself start
+                                # with a number, or the renumbering pass
+                                # further down can't find it — the exact
+                                # "invisible gap" failure this whole
+                                # numbering-aware prompt exists to prevent.
+                                # Checked directly rather than trusted,
+                                # since asking an LLM to always comply with
+                                # a formatting rule has repeatedly proven
+                                # unreliable elsewhere this same session.
+                                _lines = [l.strip() for l in _raw.splitlines() if l.strip()]
+                                if not _lines or not all(re.match(r'^\d+[.)]\s', l) for l in _lines):
+                                    logger.info(
+                                        "[ask_stream] SRG numbered weave-rewrite missing point "
+                                        "number(s), discarding: %r", _raw[:120],
+                                    )
+                                    return None
+                                return "\n".join(_lines)
                             return _raw
                         except Exception as _srg_weave_exc:
                             logger.debug("[ask_stream] SRG weave-rewrite skipped: %s", _srg_weave_exc)
@@ -17096,9 +18226,26 @@ Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
                             _srg_compute_unit_citations(units, chunk_texts) if chunk_texts
                             else [None] * len(units)
                         )
+                        # chunk_idx is a single int for the per-chunk
+                        # patterns but a set for _srg_find_bullet_enumerations
+                        # (one enumeration backed by several chunks) — flatten
+                        # rather than nest, since a set of sets isn't
+                        # hashable and would crash this debug line outright
+                        # (confirmed live: it silently aborted the WHOLE
+                        # _srg_repair_answer call via the caller's blanket
+                        # except, before any real matching ever ran).
+                        _srg_debug_chunk_idxs_seen: set = set()
+                        for _e in enums:
+                            _e_ci = _e.get("chunk_idx")
+                            if _e_ci is None:
+                                continue
+                            if isinstance(_e_ci, (set, frozenset)):
+                                _srg_debug_chunk_idxs_seen.update(_e_ci)
+                            else:
+                                _srg_debug_chunk_idxs_seen.add(_e_ci)
                         logger.info(
                             "[srg-debug] unit_citations=%r (enum chunk_idxs present=%r)",
-                            _unit_citations, sorted({e.get("chunk_idx") for e in enums if e.get("chunk_idx") is not None}),
+                            _unit_citations, sorted(_srg_debug_chunk_idxs_seen),
                         )
                         _enum_to_unit: dict = {}
                         for _enum in enums:
@@ -17173,8 +18320,35 @@ Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
                                     # answer already named. Short items
                                     # (<=2 words) are unaffected — their
                                     # core IS the whole item.
+                                    #
+                                    # _srg_find_bullet_enumerations' items
+                                    # are full sentences that open with
+                                    # generic framing ("Losses arising
+                                    # from...", "Any claim arising
+                                    # from..."), so their first 3 content
+                                    # words are exactly as uninformative as
+                                    # _srg_match_score's same-shaped problem
+                                    # above — using them as the "core" would
+                                    # make an item the answer has already
+                                    # restated in its own words (e.g. the
+                                    # adventure-sports exclusion, paraphrased)
+                                    # look uncovered and get woven back in as
+                                    # a near-duplicate. A full sentence has
+                                    # enough content words that requiring a
+                                    # real MAJORITY of them to already be
+                                    # present is a reliable "already said"
+                                    # signal on its own — confirmed live:
+                                    # this correctly recognized the
+                                    # paraphrased adventure-sports item as
+                                    # covered while still flagging the 4
+                                    # genuinely unmentioned items as missing.
                                     _seq = _srg_item_word_seq(_item)
-                                    _core = _seq[:3]
+                                    if _enum.get("full_sentence_items"):
+                                        _core = _seq
+                                        _need = max(3, (len(_seq) + 1) // 2) if _seq else 0
+                                    else:
+                                        _core = _seq[:3]
+                                        _need = len(_core) if len(_core) <= 2 else 2
                                     if not _core:
                                         continue
                                     _covered_lower = _srg_norm_spelling(
@@ -17183,7 +18357,6 @@ Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
                                     _core_hits = sum(
                                         1 for w in _core if _srg_norm_spelling(w) in _covered_lower
                                     )
-                                    _need = len(_core) if len(_core) <= 2 else 2
                                     if _srg_norm_spelling(_item.lower()) in _covered_lower or _core_hits >= _need:
                                         continue
                                     _missing.append(_item)
@@ -17198,27 +18371,84 @@ Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
                             _missing = [m for m in _missing if m.lower() in full_context_lower]
                             if not _missing:
                                 continue
-                            _missing = [re.sub(r'\s+', ' ', m).strip() for m in _missing[:5]]
-                            _woven = await _srg_weave_items_into_unit(_unit, _missing)
+                            # Defensive cleanup — not yet reachable on Layla's
+                            # own corpus (its only item source is
+                            # _srg_split_items, which splits ON the comma
+                            # delimiter and so never leaves one trailing), but
+                            # ported from rag_site_1 2026-09-05 after that
+                            # sibling's numbered/lettered-clause enumeration
+                            # pattern (an extraction shape Layla doesn't have)
+                            # turned out to hand this same join code items
+                            # that DO carry their own trailing comma/semicolon
+                            # from the source enumeration — doubling up when
+                            # joined with ", " below ("...India,, the
+                            # cedant..."). Stripping it here up front means
+                            # this join can never repeat that failure if a
+                            # future extraction pattern here ever has the same
+                            # shape.
+                            _missing = [
+                                re.sub(r'\s+', ' ', m).strip().rstrip(' ,;:.')
+                                for m in _missing[:5]
+                            ]
+                            _missing = [m for m in _missing if m]
+                            if not _missing:
+                                continue
+                            # LLM-driven enrichment only — user's explicit
+                            # direction 2026-09-07, after BOTH mechanical
+                            # templates that used to live here caused real,
+                            # confirmed live failures: the comma-joined
+                            # clause fallback ("This point also includes X,
+                            # Y, and Z") — the same fragile join shape
+                            # already found broken once in rag_site_1 and
+                            # ported-fixed here defensively, but never
+                            # actually removed — and the numbered/dash
+                            # per-item template, which gave every missing
+                            # item its own top-level line unconditionally
+                            # and, for a motor-claims process list, turned
+                            # bare document names ("Emirates ID", "Mulkiya")
+                            # into their own nonsensical numbered "steps"
+                            # instead of one "gather these documents" step.
+                            # Neither mechanical shape can make the
+                            # judgment call an LLM can: whether a missing
+                            # item belongs folded into the existing point
+                            # or deserves its own new one. _srg_weave_items_
+                            # into_unit now handles both prose mode (fold
+                            # into one sentence, unchanged) and numbered-
+                            # list mode (its own prompt variant, explicitly
+                            # allowed to add new numbered points as well as
+                            # weave into the existing one — see that
+                            # prompt's own comment for why the numbering
+                            # doesn't need to be globally correct, just
+                            # internally consistent, since the pass further
+                            # down resequences every numbered line
+                            # regardless of what number is written there).
+                            # No mechanical fallback on failure: if the
+                            # rewrite fails verification (dropped a fact,
+                            # or — numbered mode — didn't number every
+                            # resulting line), this unit's real, source-
+                            # verified missing items just don't get added
+                            # on this pass, rather than being force-fit
+                            # into a shape already proven to read worse
+                            # than leaving them out.
+                            _woven = await _srg_weave_items_into_unit(
+                                _unit, _missing, is_numbered=_srg_has_points,
+                            )
                             if _woven:
                                 _new_units[_u_idx] = _woven
-                                continue
-                            _clause = (
-                                ", ".join(_missing[:-1]) + ", and " + _missing[-1]
-                                if len(_missing) > 1 else _missing[0]
-                            )
-                            _noun = next((n for n in _srg_CATEGORY_NOUNS if n in _unit_lower), None)
-                            _lead = f"The {_noun} also include" if _noun else "This point also includes"
-                            _stripped = _unit.rstrip()
-                            if _stripped and _stripped[-1] not in ".!?":
-                                _stripped += "."
-                            _new_units[_u_idx] = f"{_stripped} {_lead} {_clause}."
                         return _new_units
 
-                    _srg_context_chunks = _full_context_uncompressed_chunks or [(_full_context_uncompressed, "", "")]
-                    _srg_enums = _srg_find_enumerations(_srg_context_chunks)
+                    # Scoped to the POST-compression pool (_srg_compressed_
+                    # chunks, built right after compression — see its own
+                    # comment) — never the wider _full_context_uncompressed_
+                    # chunks PGF and other verification checks legitimately
+                    # use. SRG adds NEW content, so it must be limited to
+                    # what the model actually saw and what's already
+                    # traceable in this turn's own cited sources.
+                    _srg_compressed_ctx_joined = "\n\n".join(_t for _t, _s, _pt in _srg_compressed_chunks)
+                    _srg_context_chunks = _srg_compressed_chunks or [(_srg_compressed_ctx_joined, "", "")]
+                    _srg_enums = _srg_find_enumerations(_srg_context_chunks) + _srg_find_bullet_enumerations(_srg_context_chunks)
                     if _srg_enums:
-                        _srg_ctx_lower = _full_context_uncompressed.lower()
+                        _srg_ctx_lower = _srg_compressed_ctx_joined.lower()
                         _srg_has_points = bool(re.search(r'(?:^|\n)\s*\d+\.\s', _srg_src))
                         # Sign-off extraction reuses the SAME technique
                         # PGF's own (separate) sign-off detection already
@@ -17286,6 +18516,29 @@ Output ONLY the rewritten sentence, nothing else — no preamble, no quotes.
                             _srg_joined = (
                                 "\n".join(_srg_new_units) if _srg_has_points else " ".join(_srg_new_units)
                             ).strip()
+                            # Confirmed live 2026-09-07: more than one unit
+                            # can independently qualify for numbered-list
+                            # repair within the SAME answer (one via the
+                            # mechanical template, another via _srg_weave_
+                            # items_into_unit's own LLM rewrite choosing
+                            # numbers on its own) — each restarts its OWN
+                            # local "1." sequence, and once every unit is
+                            # joined back together the result has multiple
+                            # competing, overlapping sequences ("1...6.
+                            # ...2...4." in one real answer) instead of one
+                            # coherent list. Fixing every possible SOURCE
+                            # of a numbered fragment individually is
+                            # fragile — this instead fixes the actual
+                            # user-visible symptom directly: find every
+                            # numbered line in the FINAL joined text,
+                            # wherever it came from, and renumber them all
+                            # into one consistent sequence in the order
+                            # they actually appear.
+                            _srg_joined = re.sub(
+                                r'^\d+([.)])\s+',
+                                lambda _m, _n=itertools.count(1): f"{next(_n)}{_m.group(1)} ",
+                                _srg_joined, flags=re.MULTILINE,
+                            )
                             _corrected_text = _srg_joined
                             _kv_reply = _srg_joined
                             logger.info("[ask_stream] specificity guard enriched a unit with missing source items")

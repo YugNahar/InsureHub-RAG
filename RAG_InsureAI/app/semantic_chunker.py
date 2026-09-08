@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, List
+from typing import Any, List, Optional
 
 import numpy as np
 from langchain_core.documents import Document
@@ -307,7 +307,7 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+")
 # pymupdf4llm markdown output: "## 7. **<u>LIFE INSURANCE</u>**" leaves
 # "7. **<u>LIFE INSURANCE</u>**" as the raw heading text once the "##" is
 # stripped, decoration and all, unless removed separately.
-_HEADING_DECORATION_RE = re.compile(r"\*\*|__|<u>|</u>|<b>|</b>")
+_HEADING_DECORATION_RE = re.compile(r"\*\*|__|<u>|</u>|<b>|</b>|<sup>|</sup>|<sub>|</sub>")
 
 
 def _clean_heading_text(text: str) -> str:
@@ -316,21 +316,42 @@ def _clean_heading_text(text: str) -> str:
 # ── Sub-headings within a section's own body ─────────────────────────────────────
 # A real markdown "#" heading marks a genuine SECTION boundary — but a
 # section can itself enumerate several distinct sub-items, each with its
-# own bold, numbered/lettered lead-in immediately followed by its own
-# definition, e.g. (confirmed live 2026-09-01, pymupdf4llm markdown output
-# of a real insurance textbook): "- **1) Term insurance** \n\n A term
-# insurance product provides..." / "- **2) Whole life insurance** \n\n
-# Whole life insurance product provides...". pymupdf4llm itself does NOT
-# promote these to real "#"/"##" headers (confirmed: they render as bold
-# list items, one level below its own heading threshold) — but they are
-# still genuine, visually-distinct sub-topic boundaries in the source
-# PDF's own formatting (that's WHY they're bold at all), and multiple
-# such items were previously getting bundled into one oversized chunk,
-# with only the FIRST item's content reliably surviving retrieval and the
-# rest silently unavailable. Bold + a short marker immediately inside it
-# is a deliberately narrow, high-precision pattern (not "any bold text")
-# — ordinary emphasis on a word or two mid-sentence never matches this
-# because it lacks the leading marker.
+# own numbered/lettered/Roman-numeral lead-in immediately followed by its
+# own definition. FOUR real markdown shapes cover this, confirmed against
+# real documents:
+#
+#   1. BOLD_MARKER — a bold numbered/lettered lead-in immediately inside
+#      its own body text (confirmed live 2026-09-01, pymupdf4llm markdown
+#      output of a real insurance textbook): "- **1) Term insurance**
+#      \n\n A term insurance product provides..." / "- **2) Whole life
+#      insurance** \n\n Whole life insurance product provides...".
+#   2. BOLD_BULLET — same shape as (1) but with a bullet glyph
+#      (■•●▪‣◦) instead of a number/letter, e.g. "■ Term insurance".
+#   3. BULLET_MARKER — a markdown BULLET-LIST item whose own text starts
+#      with a numbered/lettered/Roman-numeral marker, e.g. "- a) The
+#      collateral shall be..." / "   - i. the LC shall be...", nested
+#      sub-bullets at deeper indentation for nested clauses. Added
+#      2026-09-04, ported back from rag_site_1 (a downstream fork) after
+#      confirming live against a real, independently-downloaded IRDAI
+#      regulatory-circular PDF that pymupdf4llm renders lettered/Roman-
+#      numeral CLAUSE lists (as opposed to this file's own originally-
+#      observed named-item lists) as plain bulleted list items, NOT bold
+#      spans — the original version of this regex (shapes 1-2 only) was
+#      a complete no-op against that document shape. Confirmed via the
+#      SAME real, independent PDF this codebase's own pymupdf4llm output
+#      was tested against, not a self-constructed case built to pass this
+#      regex.
+#   4. BARE_BULLET — a markdown bullet-list item with NO embedded
+#      number/letter marker at all, just a bullet and its own lead text
+#      (e.g. "- Term insurance ... " with no "1)"/"a)" prefix) — some
+#      source documents enumerate sub-items this way instead of
+#      numbering them. The bullet's own first few words stand in for the
+#      marker, since there's no separate label to pull.
+#
+# Bold/bullet + a short marker immediately inside it is a deliberately
+# narrow, high-precision pattern (not "any bold text") — ordinary
+# emphasis on a word or two mid-sentence never matches this because it
+# lacks the leading marker.
 #
 # Covers every enumeration style actually seen across this KB's PDFs, not
 # just plain digits — confirmed live 2026-09-01 in this SAME document
@@ -346,13 +367,57 @@ def _clean_heading_text(text: str) -> str:
 # bullet glyph doesn't, since that's its own complete, self-punctuating
 # marker in normal usage (e.g. "■ Term insurance").
 _ROMAN_NUMERAL_FRAGMENT = r"(?=[MDCLXVI])M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})"
+_CLAUSE_MARKER_FRAGMENT = r"\(?(?:" + _ROMAN_NUMERAL_FRAGMENT + r"|\d{1,3}|[a-zA-Z])[.)]"
+_BULLET_GLYPH_FRAGMENT = r"[-*■•●▪‣◦]"
 _SUBHEADING_RE = re.compile(
-    r"\*\*\(?(?:" + _ROMAN_NUMERAL_FRAGMENT + r"|\d{1,3}|[a-zA-Z])[.)]\s*([^*\n]{2,80}?)\*\*"
-    r"|\*\*[■•●▪‣◦]\s*([^*\n]{2,80}?)\*\*"
+    r"\*\*" + _CLAUSE_MARKER_FRAGMENT + r"\s*(?P<bold_marker>[^*\n]{2,80}?)\*\*"
+    r"|\*\*" + _BULLET_GLYPH_FRAGMENT + r"\s*(?P<bold_bullet>[^*\n]{2,80}?)\*\*"
+    r"|^[ \t]*" + _BULLET_GLYPH_FRAGMENT + r"[ \t]+(?P<bullet_marker>" + _CLAUSE_MARKER_FRAGMENT + r")\s"
+    r"|^[ \t]*" + _BULLET_GLYPH_FRAGMENT + r"[ \t]+(?P<bare_bullet>(?:[^\s,\n]+[ \t]+){0,6}[^\s,\n]+)",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 
-_MIN_SUBHEADING_BODY_WORDS = 15
+# Bare-minimum length floor kept ONLY to skip spaCy entirely on trivially
+# short bodies — NOT the real gate anymore. Confirmed live 2026-09-04 (on
+# a downstream fork's corpus, then verified the same principle applies
+# here): word count alone can't separate a bare label from a real short
+# clause — "Present Residential Address:" (4 words) and "whether the
+# applicant has ever been declared bankrupt" (8 words) can be nearly the
+# same length, so no length threshold reliably tells them apart.
+_MIN_SUBHEADING_WORDS_FLOOR = 3
+
+# spaCy's dependency parser gives a real linguistic signal a length
+# threshold can't: does this body text have a finite verb at its root (a
+# real predicate), or is it just a noun phrase with nothing asserted
+# about it? The first is genuine elaboration worth a sub-heading split;
+# the second is a bare enumerated name with nothing behind it — exactly
+# the "Term insurance & Health Insurance plans" case this gate was
+# originally built for, just detected by what the text actually IS
+# rather than how long it happens to be.
+try:
+    import spacy
+    _SUBHEADING_NLP: Optional["spacy.language.Language"] = spacy.load(
+        "en_core_web_sm", disable=["ner", "lemmatizer"],
+    )
+except Exception as _spacy_import_exc:  # pragma: no cover - defensive only
+    logger.warning(
+        "[semantic_chunker] spaCy unavailable (%s) — sub-heading bodies "
+        "fall back to the bare word-count floor only",
+        _spacy_import_exc,
+    )
+    _SUBHEADING_NLP = None
+
+
+def _is_meaningful_clause(text: str) -> bool:
+    """True if *text* has a finite verb at the root of its dependency
+    parse — i.e. is a real clause with something asserted, not just a
+    bare label/noun phrase. Fails open (True) if spaCy is unavailable.
+    """
+    if _SUBHEADING_NLP is None:
+        return True
+    doc = _SUBHEADING_NLP(text[:300])
+    return any(tok.dep_ == "ROOT" and tok.pos_ in ("VERB", "AUX") for tok in doc)
 
 
 def _split_by_subheadings(text: str) -> List[tuple]:
@@ -364,15 +429,15 @@ def _split_by_subheadings(text: str) -> List[tuple]:
     The marker itself is stripped from the piece text; the piece runs
     from just after one marker to just before the next (or end of text).
 
-    A matched marker only counts as a genuine sub-heading boundary if it
-    is followed by at least _MIN_SUBHEADING_BODY_WORDS words of its own
-    body text before the next marker (or end of text) — confirmed live
-    2026-09-01: a BARE enumerated name list, where every item is bold and
-    numbered but has ZERO elaboration before the next item starts (e.g.
-    "- **I. Term insurance & Health Insurance plans** - **II. Endowment &
-    Money-back plans** - **III. Whole life plans**..."), is structurally
-    just an index/summary list, not a set of self-contained definitions
-    — the real definitions of these types live in a COMPLETELY DIFFERENT
+    A matched marker only counts as a genuine sub-heading boundary if its
+    own body clears _MIN_SUBHEADING_WORDS_FLOOR (cheap pre-filter) AND is
+    a real clause per _is_meaningful_clause — confirmed live 2026-09-01: a
+    BARE enumerated name list, where every item is bold and numbered but
+    has ZERO elaboration before the next item starts (e.g. "- **I. Term
+    insurance & Health Insurance plans** - **II. Endowment & Money-back
+    plans** - **III. Whole life plans**..."), is structurally just an
+    index/summary list, not a set of self-contained definitions — the
+    real definitions of these types live in a COMPLETELY DIFFERENT
     section of the same document. Splitting a bare list like this would
     only produce empty, useless chunks (just a name, nothing else) —
     worse than not splitting at all, since real content that already
@@ -381,16 +446,43 @@ def _split_by_subheadings(text: str) -> List[tuple]:
     its own text flows through as ordinary body content of whichever
     section/sub-section it falls inside, exactly as if it had never
     matched _SUBHEADING_RE at all.
+
+    A text that's already a genuine FLAT bulleted list (>= _MIN_BULLET_
+    ITEMS plain bullet-glyph markers, the same signal _split_bullet_items
+    downstream uses to detect one) is left untouched by the BOLD_BULLET/
+    BARE_BULLET shapes specifically — those key off the exact same glyph
+    set, and have no way to tell "a bullet acting as a short inline
+    label" (their intended target) apart from "an ordinary bullet in a
+    flat list whose own first few words simply don't contain a comma
+    yet." Confirmed live 2026-09-05: "■ Losses arising from participation
+    in adventure sports, unless a specific add-on has been purchased."
+    had its first 7 words cut off as a bogus sub-heading — losing the
+    bullet glyph and lead-in entirely — purely because no comma appears
+    within them, even though the whole thing is one ordinary, complete
+    descriptive sentence with no heading/body structure at all.
+    _split_bullet_items already gives every item in a genuine flat list
+    its own complete, correctly-formed chunk; nothing here needs to (or
+    should) pre-split it first. BOLD_MARKER/BULLET_MARKER (the two
+    numbered/lettered-clause shapes) are unaffected — they name a
+    genuinely different structure (nested regulatory sub-clauses) that a
+    plain glyph-only bullet list never matches anyway.
     """
+    _is_genuine_bullet_list = len(_BULLET_MARKER_RE.findall(text)) >= _MIN_BULLET_ITEMS
     all_matches = list(_SUBHEADING_RE.finditer(text))
+    if _is_genuine_bullet_list:
+        all_matches = [
+            m for m in all_matches
+            if m.group("bare_bullet") is None and m.group("bold_bullet") is None
+        ]
     if not all_matches:
         return [("", text)]
 
     matches = []
     for i, m in enumerate(all_matches):
         body_end = all_matches[i + 1].start() if i + 1 < len(all_matches) else len(text)
-        body_word_count = len(text[m.end():body_end].split())
-        if body_word_count >= _MIN_SUBHEADING_BODY_WORDS:
+        body_text = text[m.end():body_end]
+        body_word_count = len(body_text.split())
+        if body_word_count >= _MIN_SUBHEADING_WORDS_FLOOR and _is_meaningful_clause(body_text):
             matches.append(m)
     if not matches:
         return [("", text)]
@@ -400,10 +492,11 @@ def _split_by_subheadings(text: str) -> List[tuple]:
     if lead_in:
         pieces.append(("", lead_in))
     for i, m in enumerate(matches):
-        # group(1) = numbered/lettered/Roman marker; group(2) = bullet-glyph
-        # marker — exactly one is non-None depending on which alternative
-        # in _SUBHEADING_RE matched.
-        raw_sub_heading = m.group(1) if m.group(1) is not None else m.group(2)
+        # Exactly one named group is non-None depending on which
+        # alternative in _SUBHEADING_RE matched (see its own comment for
+        # what each of the four shapes covers).
+        raw_sub_heading = m.group("bold_marker") or m.group("bold_bullet") or \
+            m.group("bullet_marker") or m.group("bare_bullet")
         sub_heading = _clean_heading_text(raw_sub_heading).rstrip(":;,.")
         body_start = m.end()
         body_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
