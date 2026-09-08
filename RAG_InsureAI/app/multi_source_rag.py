@@ -8990,7 +8990,32 @@ class MultiSourceRAG:
         if not _all_matching:
             return None
 
-        _COSINE_SHORTLIST_K = 20
+        # Widened 20 -> 60 (2026-09-08): confirmed live via direct
+        # instrumentation this was silently dropping a genuinely-best
+        # answer before the reranker ever got a vote. "What Marine Cargo
+        # Insurance Typically Covers" scored 0.4256 on the actual
+        # cross-encoder — clearly beating its rival chunk's 0.3042 — but
+        # the CHEAPER cosine pre-filter ranked it 21st-23rd out of 48
+        # candidates (a stable, repeatable rank across 5 traced calls, not
+        # noise), just outside the old top-20 cutoff, so it never reached
+        # the reranker to have that higher score counted at all. Cosine
+        # similarity and cross-encoder relevance don't always agree, and
+        # this pre-filter existing purely as a speed shortcut means it
+        # should only ever discard candidates the reranker would agree are
+        # weak — not act as an independent, less-accurate second opinion
+        # that can override the reranker's own judgment by simply never
+        # showing it the evidence. This funnel already reranks the WHOLE
+        # pool directly with no pre-filter at all when it's small enough
+        # (see the `len(_all_matching) > _COSINE_SHORTLIST_K` gate below) —
+        # that's the actually-correct, most-accurate path; the cosine
+        # narrowing is a fallback for pools too large to rerank in full,
+        # not the norm. A confident single-policy-type pool this session
+        # was observed at 38-48 candidates across several policy types;
+        # 60 gives real headroom above that (not just squeaking past
+        # today's specific 21-23 near-miss) while still bounding cost for
+        # a genuinely large pool (hundreds of chunks) where reranking
+        # everything directly would be too slow.
+        _COSINE_SHORTLIST_K = 60
 
         async def _narrow_and_rank(scoring_query: str):
             _sl = _all_matching
