@@ -2839,6 +2839,55 @@ async def _verify_points_are_duplicate(point_a: str, point_b: str) -> bool:
         return False
 
 
+async def _verify_chunks_are_duplicate(chunk_a: str, chunk_b: str) -> bool:
+    """LLM confirmation gate for the same-section chunk-dedup consolidation
+    in ask_stream (see that block's own comment) — same two-signal-then-
+    LLM shape as _verify_points_are_duplicate just above, adapted for raw
+    retrieved source chunks rather than an answer's own numbered points.
+
+    Confirmed live (2026-09-09): the (heading, policy_type)-only gate this
+    supports was silently collapsing 5 genuinely different "Common
+    Exclusions" chunks from health_insurance_guide.pdf (pre-existing
+    diseases, cosmetic surgery, dental, infertility, self-inflicted injury,
+    waiting period, treatment abroad — one bullet item per chunk) down to
+    just 1, because a KB shape the original consolidation wasn't designed
+    for — several chunks legitimately SHARING one heading as siblings of
+    the SAME list, not two different guides duplicating the same content —
+    looks identical to a true duplicate pair under a heading+policy_type-
+    only check. That silent drop starved both the generation prompt (the
+    model only ever saw 1 exclusion) and SRG's own cross-chunk bullet-
+    enumeration repair (which needs 3+ surviving sibling chunks to even
+    recognize a list is there). Fail-open toward KEEPING both chunks on
+    any doubt/failure — same reasoning as _verify_points_are_duplicate:
+    the risk here is silently losing a real, distinct fact from the
+    context the model and SRG both depend on, not showing mildly
+    redundant source content twice.
+    """
+    if not chunk_a or not chunk_a.strip() or not chunk_b or not chunk_b.strip():
+        return False
+    prompt = (
+        "Do these two chunks retrieved from an insurance knowledge base "
+        "state the SAME underlying fact/content (e.g. two different guides "
+        "describing the same thing), or are they genuinely DIFFERENT facts "
+        "— such as two different sibling items from the same list (two "
+        "different exclusions, two different required documents, two "
+        "different steps in a process) that merely share the same section "
+        "heading? Different sibling items under one shared heading are "
+        "DIFFERENT facts, not the same one restated.\n"
+        f'"chunk A": {chunk_a[:600]} '
+        f'"chunk B": {chunk_b[:600]} "same fact":'
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=15.0)
+        if not raw:
+            return False
+        cleaned = re.sub(r"[^a-z\s]", "", raw.strip().lower())
+        words = set(cleaned.split())
+        return "yes" in words and "no" not in words
+    except Exception:
+        return False
+
+
 def _score_points_against_query(query: str, points: List[str]) -> List[float]:
     """Score each point in *points* for query-relevance via the shared
     cross-encoder reranker, in a single batched .predict() call — reused
@@ -12466,6 +12515,30 @@ class MultiSourceRAG:
         # checks a few lines above already captured the full, unconsolidated
         # pool into _full_context_uncompressed_chunks, so nothing here can
         # cause a real fact to be missed by the post-generation verifiers.
+        #
+        # Body-aware (2026-09-09): the (heading, policy_type) key ALONE is
+        # not sufficient to call two chunks duplicates — it also matches
+        # this KB's "one bullet item per chunk" shape (see
+        # _srg_find_bullet_enumerations' own comment for the full list of
+        # affected guides), where several chunks legitimately SHARE one
+        # heading as separate SIBLING items of the same list (e.g. 7
+        # different "Common Exclusions" chunks in health_insurance_guide.pdf,
+        # one exclusion each) rather than two guides duplicating the same
+        # content. Confirmed live: the old heading-only check collapsed
+        # those 7 down to 1, so the model — and SRG's own cross-chunk
+        # repair, which needs 3+ surviving siblings to recognize a list at
+        # all — only ever saw a single exclusion. Now each candidate is
+        # only dropped if its BODY is also confirmed a genuine duplicate of
+        # an already-kept chunk in its group: cheap word-overlap floor,
+        # then the shared cross-encoder reranker, then an LLM confirmation
+        # — same three-signal shape _verify_points_are_duplicate/
+        # _DUPLICATE_POINT_THRESHOLD already use for the analogous "is this
+        # the same fact restated" call on answer points, reused here rather
+        # than inventing a separate heuristic. Fails open toward KEEPING
+        # both chunks (see _verify_chunks_are_duplicate's own docstring) —
+        # the risk of silently losing a real, distinct fact from the pool
+        # the model and SRG both depend on outweighs the cost of an
+        # occasional genuine duplicate surviving.
         if not document_filter:
             _dedup_groups: dict = {}
             for c in all_chunks:
@@ -12475,19 +12548,62 @@ class MultiSourceRAG:
                     continue
                 _dedup_groups.setdefault((_h, _pt), []).append(c)
             _drop_ids = set()
+            _dd_chunk_reranker = _get_shared_reranker() if any(
+                len(_g) >= 2 for _g in _dedup_groups.values()
+            ) else None
             for _group in _dedup_groups.values():
                 if len(_group) < 2:
                     continue
-                _keep = max(_group, key=lambda c: len(c.page_content))
-                for c in _group:
-                    if c is not _keep:
+                # Largest-first so the biggest (most complete) chunk in
+                # each cluster of genuine duplicates is the one kept — same
+                # "keep the larger chunk" outcome as before for a TRUE
+                # duplicate pair, just no longer applied blindly to
+                # siblings that aren't duplicates at all.
+                _sorted_group = sorted(_group, key=lambda c: len(c.page_content), reverse=True)
+                _kept_in_group: list = []
+                for c in _sorted_group:
+                    # Cheap local floor first — usually leaves nothing to
+                    # score at all for genuinely different sibling items,
+                    # so the group's typical case (5-7 distinct bullet
+                    # items) never reaches the reranker or the LLM.
+                    _jaccard_candidates = [
+                        _k for _k in _kept_in_group
+                        if _duplicate_point_word_overlap(c.page_content, _k.page_content)
+                        >= _DUPLICATE_POINT_JACCARD_FLOOR
+                    ]
+                    _dup_of = None
+                    if _jaccard_candidates:
+                        # ONE batched predict() call across every surviving
+                        # candidate in this group, not one call per pair —
+                        # same batching this file's numbered-point dedup
+                        # already relies on (see its own predict() call a
+                        # few hundred lines below) rather than a slow
+                        # per-pair loop.
+                        try:
+                            _rr_scores = [float(_s) for _s in _dd_chunk_reranker.predict(
+                                [(_k.page_content[:600], c.page_content[:600]) for _k in _jaccard_candidates]
+                            )]
+                        except Exception:
+                            _rr_scores = [0.0] * len(_jaccard_candidates)
+                        _best_pos = max(range(len(_rr_scores)), key=lambda _i: _rr_scores[_i])
+                        if _rr_scores[_best_pos] >= _DUPLICATE_POINT_THRESHOLD:
+                            # Only the single best-matching pair ever reaches
+                            # the LLM — same "cheap heuristic flags one
+                            # candidate, LLM confirms just that one" shape
+                            # as _verify_points_are_duplicate's own call site.
+                            _best_kept = _jaccard_candidates[_best_pos]
+                            if await _verify_chunks_are_duplicate(_best_kept.page_content, c.page_content):
+                                _dup_of = _best_kept
+                    if _dup_of is not None:
                         _drop_ids.add(id(c))
+                    else:
+                        _kept_in_group.append(c)
             if _drop_ids:
                 _before_dedup_count = len(all_chunks)
                 all_chunks = [c for c in all_chunks if id(c) not in _drop_ids]
                 logger.info(
                     "[ask_stream] Same-section duplicate consolidation: dropped %d/%d chunks "
-                    "(kept the larger chunk per duplicate heading+policy_type pair)",
+                    "(kept the larger chunk per confirmed-duplicate heading+policy_type cluster)",
                     _before_dedup_count - len(all_chunks), _before_dedup_count,
                 )
 
