@@ -3495,6 +3495,74 @@ def _prioritize_topic_chunks(retrieval_query: str, chunks: list) -> list:
     return sorted(chunks, key=_rank)
 
 
+async def _question_presupposes_history_type(question: str, history: str) -> bool:
+    """Narrow, 3-way LLM classification used by _reformulate_query's own
+    topic-anchor repair below: does *question* PRESUPPOSE the insurance
+    type already established in *history* (its answer depends on
+    inheriting that type), is it asking to DISCOVER/CHOOSE a type from
+    scratch, or is it GENERIC (same answer regardless of type)? Only the
+    first case should get the historical type force-appended.
+
+    Deliberately given the FULL retained history (up to
+    _MAX_HISTORY_TURNS exchanges, api.py), not narrowed to the single
+    most recent turn the way _reformulate_query's own rewrite prompt
+    below is (see that prompt's own comment for why narrowing helps
+    there specifically — it's an open-ended generation task where extra
+    turns risk the model borrowing vocabulary from a stale, unrelated
+    topic). This is a different, narrower judgment: "what type is this
+    conversation ABOUT," which is exactly the kind of question a wider
+    window should improve, not hurt — the type may have been established
+    several turns back and never restated since, and this app now
+    deliberately retains a much larger window (bumped 3 -> 15 exchanges)
+    specifically so a longer-running conversation doesn't lose that
+    context turn by turn.
+
+    Deliberately a narrow yes/no-shaped question, not an open-ended
+    rewrite — confirmed live (2026-09-09) this small local model reliably
+    echoes a pronoun-free, content-bearing follow-up back unchanged even
+    when explicitly instructed about type-dependency and given a matching
+    example (i.e. _reformulate_query's own prompt genuinely cannot be
+    trusted to catch this on its own for this exact question shape), but
+    the SAME model correctly classifies the narrower 3-way question most
+    of the time. Routed through Groq specifically (backend_override, a
+    much larger hosted model than this app's default local vLLM one) —
+    confirmed live it got all 3 of the following test cases right where
+    the local model missed one: (1) "Does treatment received while
+    abroad get paid for too?" after a health-coverage turn -> correctly
+    PRESUPPOSES health; (2) "what type of insurance should I buy [for
+    family protection after death]" after a travel-insurance turn ->
+    correctly DISCOVERS, not anchored to travel; (3) "How can relatives
+    be informed about the policy?" after a health-coverage turn ->
+    correctly GENERIC (the local model wrongly said PRESUPPOSES here,
+    which would have appended an unneeded "for health insurance").
+
+    Fails toward True (presupposes -> append the type) on any error/
+    timeout/empty response: the risk this repair exists to prevent
+    (silently answering the wrong insurance type entirely) is worse than
+    its own failure mode (an occasional unneeded type qualifier appended
+    to a genuinely type-independent question).
+    """
+    prompt = (
+        f"Conversation so far:\n{history}\n\n"
+        f"New question: {question}\n\n"
+        "Does this new question PRESUPPOSE a specific insurance type/policy "
+        "already established in the conversation above (i.e. its answer "
+        "would depend on inheriting that same type)? Or is it asking the "
+        "user to DISCOVER/CHOOSE a type from scratch (e.g. \"what type of "
+        "insurance should I buy\"), independent of what was discussed "
+        "before? Or is it a GENERIC question whose answer is the same no "
+        "matter which insurance type is involved? Answer with exactly one "
+        "word: PRESUPPOSES, DISCOVERS, or GENERIC."
+    )
+    try:
+        raw = await _backend_completion(prompt, max_tokens=10, timeout=10, backend_override="groq")
+        if not raw:
+            return True
+        return raw.strip().upper().startswith("PRESUPPOSES")
+    except Exception:
+        return True
+
+
 async def _reformulate_query(
     question: str, history: str, anchor_pattern: re.Pattern = _ANCHOR_TYPE_RE,
     selected_recent: Optional[str] = None,
@@ -3587,6 +3655,19 @@ character, changing nothing. Do not add hedging words ("typically",
 sound more natural — an unnecessary rewrite is not an improvement, and
 different wording of an already-fine question can retrieve worse results
 than the original. Only rewrite when something genuinely needs resolving.
+"Reads as a grammatically complete sentence" is NOT the same as "self-
+contained" — a question with no pronoun can still silently depend on
+context. Before deciding a follow-up needs no rewrite, ask yourself: would
+the ANSWER to this question actually differ depending on which specific
+insurance type/product is being discussed (e.g. would health, travel, and
+motor insurance genuinely answer this differently)? If YES, and the
+follow-up itself does not already name a type, it is NOT self-contained —
+you must add the type from the conversation even though the sentence
+parses fine on its own. Only treat a follow-up as self-contained when
+either it already names its own type, or the answer to it genuinely does
+not depend on which type is involved at all (a generic administrative/
+process question like "how can relatives be informed about the policy" —
+that answer is the same regardless of policy type, so it stays unchanged).
 The conversation below is ONLY the single most recent exchange — always ground
 the follow-up in that topic, never in anything outside what's shown here.
 Do NOT add a specific regulation, act, section, jurisdiction, or authority
@@ -3609,7 +3690,10 @@ Output ONLY the rewritten question — no quotes, no explanation, nothing else.
 
 Examples:
   Context: "User: what does the policy document include?\nLayla: The policy document includes the name and address of the insured, sum insured, period of insurance..."
-  Follow-up: "How can relatives be informed about the policy?" → "How can relatives be informed about the policy?" (already self-contained — output unchanged)
+  Follow-up: "How can relatives be informed about the policy?" → "How can relatives be informed about the policy?" (already self-contained — this answer is the same no matter what type of policy it is, so no type needs adding)
+
+  Context: "User: what is covered under a health insurance policy?\nLayla: treatment for illness or injury, including hospitalisation, diagnostic tests, and medicines, are typically covered under a health insurance policy."
+  Follow-up: "Does treatment received while abroad get paid for too?" → "Does health insurance pay for treatment received while abroad?" (NOT self-contained despite having no pronoun — whether this is covered depends entirely on which insurance type is being asked about, so the type must be carried over from the conversation, not left out just because the sentence reads fine on its own)
 
   Context: "User: tell me about life insurance\nLayla: Life insurance pays out..."
   Follow-up: "what about premiums?" → "What is the premium amount for life insurance?"
@@ -3733,33 +3817,49 @@ Search query:"""
                     reformulated, _invented.group(0), _stripped,
                 )
                 reformulated = _stripped
-            _hist_anchor = _last_anchor_type_match(recent, pattern=anchor_pattern)
+            # Searches the FULL retained history (not just `recent`, the
+            # single-most-recent-turn slice the rewrite prompt above
+            # deliberately narrows to) — the established type may sit
+            # several turns back and never get restated since, and this
+            # app now deliberately retains up to _MAX_HISTORY_TURNS
+            # exchanges (api.py) specifically so that context survives a
+            # longer conversation. _last_anchor_type_match already always
+            # returns the MOST RECENT mention regardless of window size,
+            # so widening this is safe — it can only find a real anchor
+            # it would otherwise have missed, never pick a stale one over
+            # a newer one.
+            _hist_anchor = _last_anchor_type_match(history, pattern=anchor_pattern)
             if (
                 _hist_anchor
                 and not anchor_pattern.search(question)
                 and not anchor_pattern.search(reformulated)
-                # Content gate (2026-09-08): this repair exists to catch a
-                # genuinely content-free follow-up ("How do I claim it?")
-                # losing the type context it needs — but neither raw
-                # question nor reformulation naming an anchor type ALSO
-                # describes a brand-new, fully self-contained scenario
-                # question that simply never uses jargon at all. Confirmed
-                # live: "If I have to protect my family from financial
-                # burden after my death what type of insurance policy
-                # should I buy" (no "life" anywhere) followed a "What is
-                # travel insurance?" turn — the model's own reformulation
-                # was already clean and correctly self-contained, and this
-                # repair then force-appended "for travel insurance?" onto
-                # it, turning a genuine (implied-life) new question into a
-                # wrong-topic one. Same signal already trusted for the same
-                # reason in _select_followup_anchor_turn just above in this
-                # file: a question with real topic content of its own has
-                # no business being silently re-anchored to a DIFFERENT,
-                # stale topic just because that content isn't a jargon
-                # type-word — only a genuinely empty/pronoun-only follow-up
-                # (no _extract_topic_terms survivors at all) still needs
-                # the historical anchor forced back in.
-                and not _extract_topic_terms(question)
+                # Content gate (2026-09-08, replaced 2026-09-09): this
+                # repair exists to catch a follow-up losing the type
+                # context it needs — but naively re-anchoring ANY
+                # question missing a type word, even one with real
+                # content of its own, risks the exact regression this
+                # gate was originally built to prevent: "If I have to
+                # protect my family from financial burden after my death
+                # what type of insurance policy should I buy" (no "life"
+                # anywhere) after a "What is travel insurance?" turn is a
+                # genuine NEW question, not a travel follow-up, and must
+                # not get "for travel insurance" appended. The original
+                # fix was a blunt content-word check (_extract_topic_
+                # terms) — safe, but it meant ANY follow-up with its own
+                # content words never reached this repair at all, which is
+                # exactly what let "Does treatment received while abroad
+                # get paid for too?" (real content words, but genuinely
+                # still about the established health-insurance topic)
+                # fall through unrepaired. Replaced with a narrow LLM
+                # classification of the actual distinction that matters —
+                # does this question PRESUPPOSE the established type, or
+                # is it asking to DISCOVER a new one / genuinely type-
+                # independent — see _question_presupposes_history_type's
+                # own docstring for the three confirmed live test cases
+                # (including this exact regression case, still correctly
+                # left unanchored) this was verified against before
+                # replacing the cruder check.
+                and await _question_presupposes_history_type(question, history)
             ):
                 logger.info(
                     "[REFORM] topic-anchor repair: %r missing %r from history — appending",
@@ -5373,7 +5473,18 @@ async def _contextualize_query(question: str, history: str) -> str:
         "e.g. 'What are the exclusions?' or 'What is the premium?' "
         "right after a conversation about a specific insurance type "
         "implicitly means the exclusions/premium OF THAT SAME TYPE, "
-        "even though it has no literal pronoun at all.\n"
+        "even though it has no literal pronoun at all. This also covers "
+        "a question with NO pronoun and NO obviously missing subject "
+        "that still implicitly depends on context — e.g. 'Does treatment "
+        "received while abroad get paid for too?' right after a health-"
+        "insurance conversation is really asking about HEALTH insurance "
+        "specifically, even though the sentence reads as grammatically "
+        "complete on its own. The real test is not whether the sentence "
+        "parses fine alone — it's whether the ANSWER would differ "
+        "depending on which insurance type is involved (health vs travel "
+        "vs motor, etc.). If the answer would differ by type and the "
+        "question doesn't name one, that's an implicit reference needing "
+        "resolution, same as a literal pronoun would be.\n"
         "If YES, rewrite the question to resolve that reference, "
         "replacing the pronoun/reference with the specific thing it "
         "refers to. If the reference is to an ordinal position in a "
@@ -7529,13 +7640,32 @@ def _rank_history_turns_by_similarity(question: str, history: str) -> Optional[d
     np.dot) for "which of several candidates does X relate to" problems,
     applied here to conversation turns instead of retrieved chunks.
 
-    Returns None when there are fewer than 2 turn-pairs (nothing to
-    disambiguate — with only one turn, the existing default is already
-    unambiguous) or on any embedding failure, so callers degrade to
-    today's exact behavior with zero special-casing needed.
+    Returns None when there is no history at all, or on any embedding
+    failure, so callers degrade to today's exact behavior with zero
+    special-casing needed.
+
+    Computes a real score even with only 1 retained turn-pair (2026-09-09,
+    fixed from an earlier "< 2 pairs -> None" gate). That gate was correct
+    for _select_followup_anchor_turn's own job — disambiguating WHICH of
+    several past turns to anchor on has nothing to disambiguate with only
+    one candidate — but this same ranking also feeds
+    _followup_similarity_gate, whose job is different: "is this even a
+    follow-up at all." For THAT job, a 1-turn history is the single most
+    common real case (a session's very first follow-up message), and
+    returning None there means the gate could never fire for it —
+    confirmed live: "Does treatment received while abroad get paid for
+    too?" right after a health-coverage turn had no pronoun and no listed
+    _GENERIC_PROCESS_RE word, ranked=None (only 1 pair existed), the gate
+    never got a real score to check, and the question was answered with
+    wrong-domain travel-insurance content. Safe to loosen: with exactly 1
+    pair, best_idx and most_recent_idx are both necessarily 0, so
+    _select_followup_anchor_turn's own `best_idx == most_recent_idx`
+    check already no-ops correctly on its own — this change only ever
+    gives _followup_similarity_gate a real score to work with, it cannot
+    change anchor-turn overriding behavior at all.
     """
     pairs = _split_history_turn_pairs(history)
-    if len(pairs) < 2:
+    if not pairs:
         return None
     try:
         candidates = [_turn_similarity_text(u, a) for u, a in pairs]
@@ -10285,6 +10415,27 @@ class MultiSourceRAG:
         # purely current-message pattern matching and can miss exactly this
         # shape. Computed once here and reused below for turn selection too.
         _turn_ranking = _rank_history_turns_by_similarity(question, history) if history else None
+        # A short (<=6 word) unconditional OR-condition briefly lived here
+        # (2026-09-09) to patch a real gap: a short follow-up naming a
+        # generic, type-agnostic policy aspect not in _GENERIC_PROCESS_RE's
+        # word list (grace period, nominee, network hospitals, ...) could
+        # clear all three checks below and fall through. Root cause turned
+        # out to be one level deeper, though: _followup_similarity_gate's
+        # embedding ranking was returning None outright (not a low score)
+        # whenever history had only 1 retained turn-pair — a gate built for
+        # a DIFFERENT job (disambiguating WHICH of several past turns to
+        # anchor on, where 1 candidate really is unambiguous) that also
+        # happened to gate this detection signal, silently disabling it for
+        # a session's very first follow-up specifically. Fixed at the
+        # source in _rank_history_turns_by_similarity (now scores even a
+        # single retained turn). Confirmed live afterward: every one of the
+        # original motivating short cases ("What is the grace period?",
+        # "What are the exclusions?", "What is the premium?", "Are there
+        # any co-pays?", "Is there a waiting period?") now clears
+        # _followup_similarity_gate on its own (scores 0.47-0.61, well
+        # above _FOLLOWUP_SIM_GATE), making the blunt length-based
+        # OR-condition redundant on top of the real fix — removed rather
+        # than kept as unnecessary extra surface area.
         _detected_as_followup = bool(
             history and (
                 _is_likely_followup(question)
