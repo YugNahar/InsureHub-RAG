@@ -20,7 +20,7 @@ except ImportError:
 
 import numpy as np
 from rapidfuzz import fuzz, process
-from turbovec_store import _rerank_windows, _get_shared_reranker, _get_shared_embed_model, EMBED_MODEL_NAME
+from turbovec_store import _rerank_windows, _get_shared_reranker, _get_shared_embed_model, EMBED_MODEL_NAME, _rerank_metadata_prefix
 from metadata_tagger import (
     classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
     _is_duplicate_of_existing_type, _regex_policy_score, classify_chunk_intent,
@@ -9015,28 +9015,32 @@ class MultiSourceRAG:
             if len(_all_matching) > _COSINE_SHORTLIST_K:
                 try:
                     _embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
-                    # Heading prepended twice, not once (2026-09-08) — same
-                    # technique metadata_tagger.classify_by_section_embedding
-                    # already uses successfully for section classification,
-                    # applied here to fix a real cosine-vs-reranker
-                    # disagreement rather than widening the shortlist to
-                    # dodge it (that approach was tried and reverted — see
-                    # _COSINE_SHORTLIST_K's own comment above for why it's
-                    # the wrong shape of fix). Confirmed live: a chunk whose
-                    # own heading ("What Marine Cargo Insurance Typically
-                    # Covers") is a near-perfect match for the query but
-                    # whose ~500-token body is dominated by specific peril
-                    # vocabulary (fire, stranding, collision...) embedded at
-                    # rank 23 on page_content alone — its heading's own
-                    # framing was present but diluted by the body's sheer
-                    # length. Prepending it once still left it outside the
-                    # top-20; twice moved it to rank 5. Zero extra cost —
-                    # still exactly one batched encode() call, just richer
-                    # input text — unlike widening the shortlist, which
-                    # measured ~70-110ms/item of real added reranker latency.
+                    # Prefixed with _rerank_metadata_prefix (2026-09-09) —
+                    # the SAME prefix rerank_documents already prepends for
+                    # the cross-encoder call further down (turbovec_store.py
+                    # — "[Policy Type: X Insurance] [Section: Y]"), reused
+                    # here rather than inventing a second, weaker scheme.
+                    # An earlier version of this fix duplicated just the
+                    # chunk's own section_heading text instead — real
+                    # improvement for a heading that already names its own
+                    # topic ("What Marine Cargo Insurance Typically
+                    # Covers"), but confirmed live it does nothing for a
+                    # GENERIC heading reused across every policy type
+                    # ("Common Exclusions", "Definitions", "Claims
+                    # Process") — nothing in that chunk's own text, heading
+                    # included, ever says which type it belongs to, so
+                    # duplicating the heading duplicates a signal that was
+                    # never there. That's a metadata fact (policy_type,
+                    # section), not something rephrasing the text can
+                    # surface — confirmed live: a marine "Common
+                    # Exclusions" chunk cosine-ranked 35th (outside the
+                    # top-20) on bare text, 11th with this prefix. Fixing
+                    # ONLY the reranker step (already prefixed) couldn't
+                    # help here either way — cosine narrowing runs first
+                    # and was cutting the chunk before the reranker ever
+                    # saw it, prefixed or not.
                     _texts = [
-                        f"{d.metadata.get('section_heading', '')}\n{d.metadata.get('section_heading', '')}\n{d.page_content}"
-                        if d.metadata.get("section_heading") else d.page_content
+                        _rerank_metadata_prefix(d.metadata) + d.page_content
                         for d in _all_matching
                     ]
 
