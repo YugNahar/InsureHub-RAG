@@ -9060,50 +9060,49 @@ class MultiSourceRAG:
             )
             return _sl, _rk
 
-        _shortlist, _ranked = await _narrow_and_rank(retrieval_query)
-        if not _ranked:
-            return None
-
-        # Scenario-question rescue: the reranker may be failing to bridge a
-        # narrative, everyday-language phrasing to the formal policy
-        # language of the correct chunk, rather than the chunk actually
-        # being irrelevant — see _reformulate_scenario_query_for_retrieval's
-        # own docstring for the confirmed-live evidence (the exact same
-        # chunk scored 0.0000 against a scenario question and 0.2320
-        # against the same underlying question phrased in insurance terms
-        # — a real, thousands-of-times difference from rephrasing alone).
+        # Reformulate FIRST, then score ONCE (2026-09-09) — replaces a
+        # two-pass design (raw query first, reformulated query second,
+        # keep whichever scored higher on the SAME candidate pool) that
+        # had two real problems. (1) It cost a full extra reformulation
+        # LLM call plus a second complete cosine+rerank pass on every
+        # single query through this funnel, confirmed-unconditional as of
+        # 2026-09-03. (2) A confidence gate added to skip the second pass
+        # when the first pass already scored high (2026-09-09, briefly
+        # shipped, reverted same day) turned out to be UNSAFE: confirmed
+        # live that the reranker can be confidently WRONG on the raw
+        # phrasing — a marine-insurance query's raw first pass scored a
+        # clearly-confident 0.9491 against a coarser, less-accurate chunk
+        # while the SAME candidate pool's genuinely best chunk (a precise
+        # peril list) was sitting right there, unscored by the reranker in
+        # that pass at all. High first-pass confidence measures "the
+        # reranker is sure about SOMETHING," not "the reranker saw the
+        # best candidate" — so gating on it is unsound in either
+        # direction, not just imprecise.
         #
-        # Unconditional as of 2026-09-03 — this used to only fire when the
-        # first-pass score was below a threshold (0.01), on the theory that
-        # a query already scoring reasonably didn't need the rescue.
-        # Confirmed live that this threshold missed a real case: "Someone
-        # tried to scam me out of my pension savings" scored 0.056 — weak,
-        # but comfortably above 0.01 — so the rescue never ran, and a
-        # separate downstream bypass then let that same weak score through
-        # to generation anyway (see the semantic low-score bypass right
-        # below). No score threshold reliably distinguishes "weak because
-        # genuinely nothing fits" from "weak because of scenario phrasing"
-        # — the two look the same by the numbers alone. Running the rescue
-        # on every query costs one reformulation call plus one more rerank
-        # pass, and can't make the result worse: it only replaces the first
-        # pass when the reformulated version scores strictly higher (same
-        # "try an alternative, keep only if it's actually better"
-        # discipline Mode-B already uses elsewhere in this file), so a
-        # query that was already phrased in retrieval-friendly terms just
-        # keeps its own first-pass result.
+        # The actual fix: the reranker should always see the reformulated,
+        # jargon-phrased query, never the raw one — see
+        # _reformulate_scenario_query_for_retrieval's own docstring for why
+        # a cross-encoder scores scenario phrasing as near-noise (0.0000)
+        # against the exact correct chunk, and the same chunk 0.2320
+        # against a jargon-phrased version of the identical question, a
+        # real, thousands-of-times difference from rephrasing alone. One
+        # pass, correctly phrased, costs exactly the same as the OLD first
+        # pass (raw phrasing) did, and strictly beats it — no need to run
+        # both and compare when the reformulated one already wins by
+        # design. This also removes the whole "is this confident enough to
+        # skip the rescue" question — there's only one pass now, so nothing
+        # to gate. A genuinely low-confidence result (weak even after
+        # correct phrasing) still gets caught downstream by ask_stream's
+        # own wrong-filter rescue (WRONG_FILTER_RESCORE_FLOOR, currently
+        # 0.40) — that mechanism already exists specifically for "even the
+        # best-phrased query doesn't fit this policy_type filter, search
+        # the whole KB unfiltered instead" and needs no duplicate here.
         _reformulated = await _reformulate_scenario_query_for_retrieval(
             retrieval_query, policy_type, section,
         )
-        if _reformulated:
-            _shortlist_v2, _ranked_v2 = await _narrow_and_rank(_reformulated)
-            if _ranked_v2 and _ranked_v2[0].metadata.get("rerank_score", 0.0) > _ranked[0].metadata.get("rerank_score", 0.0):
-                logger.info(
-                    "[_metadata_scoped_retrieval] scenario rescore improved top "
-                    "score: %.4f -> %.4f",
-                    _ranked[0].metadata.get("rerank_score", 0.0),
-                    _ranked_v2[0].metadata.get("rerank_score", 0.0),
-                )
-                _shortlist, _ranked = _shortlist_v2, _ranked_v2
+        _shortlist, _ranked = await _narrow_and_rank(_reformulated or retrieval_query)
+        if not _ranked:
+            return None
 
         _relevance_ratio = float(os.getenv("RELEVANCE_RATIO", "0.25"))
         _top_score = _ranked[0].metadata.get("rerank_score", 0.0)
