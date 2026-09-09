@@ -9739,6 +9739,7 @@ class MultiSourceRAG:
         history: str = "",
         document_filter: Optional[List[str]] = None,
         _is_retry: bool = False,
+        _force_general_policy_type: bool = False,
     ):
         """Async generator — yields text tokens as the LLM produces them.
 
@@ -9761,6 +9762,33 @@ class MultiSourceRAG:
         flag does: it stops that retry's own call from attempting yet
         another retry if it ALSO comes back fully hallucinated, capping
         recursion at exactly one extra attempt instead of looping.
+
+        _force_general_policy_type: internal-only, same as _is_retry —
+        set True on the post-hallucination retry call (2026-09-09, see
+        _retry_after_full_hallucination below) so that retry gets the
+        SAME kind of do-over the wrong-filter rescue already gives a
+        weak RETRIEVAL score, extended to a weak CONTENT-CHECK verdict
+        too. Explicit user request: a policy_type guess can be wrong in
+        a way that scores confidently on retrieval — the reranker leans
+        heavily on literal vocabulary overlap, so a wrong-type chunk
+        that happens to share wording with the question can clear the
+        wrong-filter rescue's own score floor even though it's the
+        wrong content — and PGF/the giveaway-term check are what
+        actually catch that, downstream of retrieval entirely. Before
+        this flag existed, catching it there meant refusing outright,
+        even when the KB may well have had a genuinely correct answer
+        sitting in a different, untried policy_type the whole time.
+        Simply short-circuits policy_type CLASSIFICATION to "general" —
+        every downstream consumer of _query_policy_type already has a
+        fully-supported, well-tested "general" path (an ordinary query
+        that never resolved to a specific type takes it every day), so
+        this reuses that existing path rather than threading a new
+        bypass through the many separate places this file reads
+        _query_policy_type (SRG/PGF scoping, giveaway-term checks, the
+        metadata-scoped funnel's own type filter, and more) — safer than
+        trying to override each one individually, and exactly matches
+        the user's own instruction: retry it "in the exact same manner"
+        as the reranker's own general-fallback already works.
         """
         # ── Re-use the full retrieval pipeline ───────────────────────────────
         # Build the prompt exactly as ask() does, then stream the LLM response.
@@ -10385,9 +10413,12 @@ class MultiSourceRAG:
         # shot at the raw question, not the primary attempt's filter.
         _filter_meta_no_policy_type = filter_meta
         _regex_policy_scores = _regex_policy_score(retrieval_query)
-        _query_policy_type = classify_query_policy_type(retrieval_query)
-        if _query_policy_type == "general":
-            _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
+        if _force_general_policy_type:
+            _query_policy_type = "general"
+        else:
+            _query_policy_type = classify_query_policy_type(retrieval_query)
+            if _query_policy_type == "general":
+                _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
         # Weak-or-absent regex evidence for whichever type we ended up
         # with — computed on the FINAL _query_policy_type (after the LLM
         # fallback just above), not just the pre-fallback regex guess, so
@@ -16376,6 +16407,25 @@ class MultiSourceRAG:
             RETRY's own fresh retrieval, not the original failed
             attempt's, so citations shown alongside the retry's answer
             actually match what it was grounded in.
+
+            Forces policy_type=general on this retry (2026-09-09, explicit
+            user request) rather than just re-classifying `question` fresh
+            and hoping for a different result. Reaching this point at all
+            means retrieval scored confidently enough to clear the
+            wrong-filter rescue's own floor, yet the CONTENT checks (PGF,
+            the giveaway-term check) still rejected every claim — the
+            single shape that combination points to is a policy_type
+            filter that's wrong in a way retrieval-side scoring can't see
+            (a wrong-type chunk sharing enough wording with the question to
+            score well on the reranker, which leans heavily on literal
+            vocabulary overlap). A same-question reclassification would
+            likely just repeat the same guess. Forcing general and
+            searching the whole KB unfiltered is the SAME rescue the
+            wrong-filter mechanism already does for a weak retrieval score,
+            extended to a weak CONTENT verdict — giving this retry a real
+            chance to find genuinely correct content elsewhere instead of
+            refusing outright when the KB may have had a good answer under
+            a different type the whole time.
             """
             if _is_retry:
                 return None
@@ -16384,7 +16434,8 @@ class MultiSourceRAG:
                 _retry_pieces: List[str] = []
                 _retry_final_payload = None
                 async for _piece in self.ask_stream(
-                    question, history=history, document_filter=document_filter, _is_retry=True,
+                    question, history=history, document_filter=document_filter,
+                    _is_retry=True, _force_general_policy_type=True,
                 ):
                     if isinstance(_piece, str) and _piece.startswith("\n\n{"):
                         try:
