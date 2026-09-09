@@ -930,14 +930,29 @@ IMPORTANT:
   "benefit" while still being more precisely "types_of_insurance", not "benefits").
   Weigh the FULL MEANING of each section's text and which label it is REALLY about,
   not just which label has the most matches.
-- A label with no matches listed is not disqualified — pick the most appropriate
-  label based on the text's actual meaning even when nothing matched at all
-  (common for conversational or YouTube-style text).
+- A label with no matches listed is not disqualified — a section can genuinely belong
+  to a label even when nothing matched at all (common for conversational or YouTube-
+  style text). Judge by meaning, not by which label happened to get keyword hits.
+- "general" is not a fallback to avoid — it is the CORRECT answer whenever a section
+  is about insurance procedure, mechanics, or terminology WITHOUT clearly being one of
+  the specific things a label above actually describes. For example: a clause about how
+  long coverage lasts, or a description of a policy ARRANGEMENT (who can buy it, how
+  it's structured) is not automatically "benefits" just because it mentions being
+  covered or uses the word "cover" — benefits means it states what the policy actually
+  PAYS FOR OR PROTECTS AGAINST. Only pick a specific label when the section is genuinely,
+  centrally about that label's own subject — a plausible-sounding guess is worse than
+  "general" here: a wrong specific label actively misleads retrieval into treating this
+  content as authoritative for a category it doesn't really belong to, while "general"
+  keeps it visible everywhere without misrepresenting it. When genuinely torn between a
+  specific label and general, choose general.
 - If a section heading is given, weigh it heavily — it is the document's own label for
   that content and is often the clearest signal available, especially when the body text
   itself never repeats the heading's own words (e.g. a heading "Common Exclusions"
   followed by a bullet list phrased entirely as "X, unless Y has been declared..." with
   no literal "excluded"/"not covered" anywhere in the body — that is still an exclusions list).
+  But a heading merely CONTAINING a label-adjacent word (e.g. "Open Cover", "Duration of
+  Cover Clause") is not the same as the heading being ABOUT that label — read what the
+  heading is actually naming, not just whether it shares a word with a label's own name.
 - Judge each section entirely independently — do not let one section's content
   influence another section's label.
 {"".join(blocks)}

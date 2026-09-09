@@ -8957,35 +8957,38 @@ class MultiSourceRAG:
         by its section tag doesn't pay for or get diluted by the wider
         scan.
         """
+        # section is no longer used as a hard scan filter (2026-09-09,
+        # explicit user decision) — policy_type alone determines the
+        # candidate pool now; section still matters, but only as SCORING
+        # CONTEXT (via _rerank_metadata_prefix in the cosine/rerank steps
+        # below, which reads each chunk's own section metadata directly),
+        # never as a gate that can silently exclude a chunk before the
+        # reranker gets a vote. This removes the entire class of bug this
+        # session spent hours on: a chunk correctly tagged policy_type but
+        # tagged section='general' (regex/embedding near-miss on a real
+        # heading — confirmed live, e.g. "Common Exclusions" scored 0.58
+        # against a 0.65 confidence bar) was previously invisible to any
+        # section-scoped query outright, no matter how the query was
+        # phrased or how well the reranker would have scored it given the
+        # chance. Per-policy-type pools are small enough for this to cost
+        # nothing in practice — confirmed live, no type in this KB exceeds
+        # ~100 chunks, and the reranker (with the same metadata-prefix
+        # context) already proved highly accurate at picking the right
+        # chunk out of a full, unscoped pool once it actually gets to see
+        # every candidate (0.995 for the correct chunk once properly
+        # prefixed, vs. 0.16 unprefixed — the disambiguation power was
+        # always in the reranker, not in pre-filtering).
         _policy_type_condition = (
             {"$in": list(policy_type)} if isinstance(policy_type, (list, tuple, set))
             else policy_type
         )
         _scan_filter = {"policy_type": _policy_type_condition}
-        if section is not None:
-            _scan_filter[section_field] = section
         _doc_matching, _video_matching, _webpage_matching = await asyncio.gather(
             asyncio.to_thread(self.doc_pipeline._vector_store.get_all_by_filter, _scan_filter),
             asyncio.to_thread(self.video_store._store.get_all_by_filter, _scan_filter),
             asyncio.to_thread(self.webpage_store._store.get_all_by_filter, _scan_filter),
         )
         _all_matching = self._merge_chunks(_doc_matching + _video_matching + _webpage_matching)
-
-        _SPARSE_SECTION_POOL_THRESHOLD = 5
-        if section is not None and len(_all_matching) < _SPARSE_SECTION_POOL_THRESHOLD:
-            _type_only_filter = {"policy_type": _policy_type_condition}
-            _doc_wide, _video_wide, _webpage_wide = await asyncio.gather(
-                asyncio.to_thread(self.doc_pipeline._vector_store.get_all_by_filter, _type_only_filter),
-                asyncio.to_thread(self.video_store._store.get_all_by_filter, _type_only_filter),
-                asyncio.to_thread(self.webpage_store._store.get_all_by_filter, _type_only_filter),
-            )
-            _before = len(_all_matching)
-            _all_matching = self._merge_chunks(_all_matching + _doc_wide + _video_wide + _webpage_wide)
-            logger.info(
-                "[_metadata_scoped_retrieval] sparse section pool (%d < %d) — merged in "
-                "policy_type-only pool: %d -> %d candidates",
-                _before, _SPARSE_SECTION_POOL_THRESHOLD, _before, len(_all_matching),
-            )
 
         if not _all_matching:
             return None

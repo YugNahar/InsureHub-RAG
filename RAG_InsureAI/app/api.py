@@ -1299,6 +1299,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 verify_and_enrich_sections_batch,
                 classify_candidate_type,
                 derive_document_topic_prior,
+                classify_chunk_intents_batch,
             )
             from candidate_vocab import upsert_candidate
             # classify_candidate_section (rag.py) is the SECTION-side sibling
@@ -1407,6 +1408,7 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
 
             _section_pass1 = []
             _section_candidate_sections = []
+            _section_llm_fixes = []
             for section_items, section_text, enriched in zip(
                 _section_items_list, _section_texts, _enriched_list,
             ):
@@ -1428,22 +1430,64 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                     )
                 _section_pass1.append((section_items, section_text, fresh, section_candidate_type, enriched))
 
-                # Same open-vocabulary fallback, one axis over: section
-                # (benefits/exclusions/claims/...) instead of policy_type.
-                # A completely separate axis from Pass 2 below (which only
-                # ever revisits policy_type), so this is computed once here
-                # and never needs to participate in that later rewrite —
-                # kept as its own parallel list, same order/length as
-                # _section_items_list, rather than threaded through
-                # _section_pass1's own tuple shape.
+                # One axis over: section (benefits/exclusions/claims/...)
+                # instead of policy_type. A completely separate axis from
+                # Pass 2 below (which only ever revisits policy_type), so
+                # this is computed once here and never needs to participate
+                # in that later rewrite — kept as its own parallel list,
+                # same order/length as _section_items_list, rather than
+                # threaded through _section_pass1's own tuple shape.
+                #
+                # 2026-09-09 — real gap, not just a tuning issue: this used
+                # to go STRAIGHT to the open-vocabulary classify_candidate_
+                # section() fallback below, which only ever writes a
+                # separate `candidate_section` hint field, never the real
+                # `section` field itself. That meant the CLOSED 13-category
+                # vocabulary (the field _metadata_scoped_retrieval actually
+                # filters on) had NO LLM correction anywhere in the live
+                # pipeline at all — the synchronous ingest step runs with
+                # llm=None by design (Step 4 above), so "general" from
+                # regex+embedding alone was PERMANENT, with nothing ever
+                # revisiting it, unlike policy_type just above (which this
+                # same background pass already verifies/corrects with a
+                # real LLM). Confirmed live this isn't rare: a real,
+                # correctly-worded "Common Exclusions" heading only scored
+                # 0.58 on the embedding check (below the 0.65 confidence
+                # bar — dilution from ~100 words of dense legal body text
+                # pulling the score down, not the heading being unclear),
+                # and 36 more genuine chunks across this same KB were
+                # caught the same way in one manual audit. Re-running
+                # classify_chunk_intents_batch here — same regex-then-
+                # embedding-then-LLM function the synchronous path already
+                # uses, just with a REAL llm this time instead of None —
+                # gives the closed vocabulary the same rescue policy_type
+                # already gets, instead of only ever attaching an open-
+                # vocabulary hint that a different retrieval path reads.
+                # Single-item list, not batched: matches the existing
+                # classify_candidate_type/classify_candidate_section calls
+                # in this same loop, which are already per-section by
+                # design ("only fires for general sections, a small
+                # minority, so it isn't a rate-limit driver").
                 _existing_section = section_items[0][1].metadata.get("section", "general")
+                section_llm_fix = None
                 section_candidate_section = None
                 if _existing_section == "general":
                     _section_heading = section_items[0][1].metadata.get("section_heading", "")
-                    section_candidate_section = classify_candidate_section(
-                        section_text, heading=_section_heading, llm=reclass_llm, source=filename,
+                    _section_llm_result = classify_chunk_intents_batch(
+                        [section_text], llm=reclass_llm, headings=[_section_heading],
                     )
+                    if _section_llm_result and _section_llm_result[0] != "general":
+                        section_llm_fix = _section_llm_result[0]
+                        logger.info(
+                            "[background reclassify] '%s': section corrected general -> %r "
+                            "(heading=%r)", filename, section_llm_fix, _section_heading,
+                        )
+                    else:
+                        section_candidate_section = classify_candidate_section(
+                            section_text, heading=_section_heading, llm=reclass_llm, source=filename,
+                        )
                 _section_candidate_sections.append(section_candidate_section)
+                _section_llm_fixes.append(section_llm_fix)
 
             # Pass 2 — in-document open-vocabulary anchor correction.
             # derive_document_topic_prior() only scores the CLOSED 12-type
@@ -1511,15 +1555,23 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 for section_items, _, fresh, section_candidate_type, enriched in _section_pass1
             ]
 
-            for (section_items, fresh, section_candidate_type, enriched), section_candidate_section in zip(
-                _final_sections, _section_candidate_sections,
-            ):
+            for (
+                (section_items, fresh, section_candidate_type, enriched),
+                section_candidate_section,
+                section_llm_fix,
+            ) in zip(_final_sections, _section_candidate_sections, _section_llm_fixes):
                 for cid, _ in section_items:
                     meta = tvec._metadatas.get(cid)
                     if meta is None:
                         continue
                     if meta.get("policy_type") != fresh:
                         meta["policy_type"] = fresh
+                        updated += 1
+                    # The real fix, not just a candidate hint (see this
+                    # section's own comment above) — write straight to the
+                    # field _metadata_scoped_retrieval actually filters on.
+                    if section_llm_fix and meta.get("section") != section_llm_fix:
+                        meta["section"] = section_llm_fix
                         updated += 1
                     # enriched["_llm_verified"] is False when this section's
                     # own sub-batch never got a real Groq reply (almost
