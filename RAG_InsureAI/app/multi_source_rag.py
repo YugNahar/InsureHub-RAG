@@ -3022,11 +3022,34 @@ def _is_likely_followup(question: str) -> bool:
     # retrieval ran on the bare, topic-less phrase, returning confident
     # motor-insurance claim content (roadside assistance, police report)
     # instead of anything about life insurance, or a refusal.
+    #
+    # Same bug class, same fix (2026-09-09): "What are the exclusions?"
+    # asked right after a health-insurance coverage answer fell through
+    # this exact list for the identical reason — "exclusions" wasn't in
+    # it — and was treated as a fresh, standalone question. Confirmed
+    # live: retrieval ran on the bare phrase with no policy-type anchor,
+    # matched a generic property-insurance "Exclusions" clause instead,
+    # and answered a health-insurance follow-up with home-insurance
+    # content (war, burglary, earthquake, unoccupied dwelling). Every
+    # other word below names a policy ASPECT that exists identically
+    # across every insurance type in this KB — exactly the same
+    # "generic, not type-specific" shape as claim/premium/documents —
+    # so a short question naming only one of these, with no specific
+    # type noun, is added here per the standing instruction to fix the
+    # whole bug class rather than just the one reported word.
     if len(words) <= 10:
         _GENERIC_PROCESS_RE = re.compile(
             r"\b(claim|claims|premium|premiums|deductible|deductibles|"
             r"policy|policies|documents?|paperwork|process|renew|renewal|"
-            r"cancel|cancellation|cost|price|apply|application)\b"
+            r"cancel|cancellation|cost|price|apply|application|"
+            r"exclusion|exclusions|benefit|benefits|coverage|"
+            r"eligibility|eligible|"
+            r"waiting\s*period|sum\s*insured|sum\s*assured|"
+            r"terms?|conditions?|"
+            r"co.pay|copay|co.payment|"
+            r"limits?|sub.limits?|"
+            r"discount|discounts|no.claim\s*bonus|ncb|"
+            r"add.on|add.ons|rider|riders)\b"
         )
         if _GENERIC_PROCESS_RE.search(q_lower) and not _SPECIFIC_TYPE_RE.search(q_lower):
             return True
@@ -5308,11 +5331,22 @@ async def _contextualize_query(question: str, history: str) -> str:
     ConversationAgent._build_history_string(). Uses only the last 1-2
     turns via _split_history_turns().
 
-    Fast-path: if the question contains no reference token at all, it's
-    structurally standalone — skip the LLM call entirely. This is a
-    latency optimization only; the LLM prompt below is what actually
-    enforces correctness (a false-positive regex match just costs one
-    extra LLM call that correctly returns the question unchanged).
+    Fast-path: skip the LLM call entirely only when the question has no
+    reference token AND is longer than ~6 words — a longer question with
+    no pronoun/ordinal is reliably self-contained, but a SHORT one can
+    still carry an implicit reference with no literal pronoun at all (a
+    bare topic noun like "the exclusions", "the premium"), the same
+    "definite article + generic policy-aspect noun" shape confirmed live
+    2026-09-09: "What are the exclusions?" right after a health-insurance
+    coverage answer had no pronoun to match, skipped this function's LLM
+    check entirely, and (compounded by the same gap in
+    _is_likely_followup, fixed separately — see _GENERIC_PROCESS_RE's own
+    comment) retrieval ran on the bare phrase and answered with unrelated
+    home-insurance exclusions instead. This is a latency optimization
+    only for the genuinely-safe case (a long question with nothing to
+    resolve); the LLM prompt below is what actually enforces correctness
+    — a false-positive here just costs one extra LLM call that correctly
+    returns the question unchanged.
 
     Fail-safe: on any exception, timeout, or empty response, return the
     original question unchanged.
@@ -5320,7 +5354,7 @@ async def _contextualize_query(question: str, history: str) -> str:
     if not history or not history.strip():
         return question
 
-    if not _REFERENCE_TOKENS.search(question.strip().lower()):
+    if not _REFERENCE_TOKENS.search(question.strip().lower()) and len(question.split()) > 6:
         return question
 
     lines = _split_history_turns(history)
@@ -5334,7 +5368,12 @@ async def _contextualize_query(question: str, history: str) -> str:
         f"New question: {question}\n\n"
         "Does the new question contain a pronoun or implicit reference "
         "(e.g. 'it', 'that', 'those', 'their', 'the second one') that "
-        "depends on the conversation above to be understood?\n"
+        "depends on the conversation above to be understood? This "
+        "includes a bare topic noun with no product/subject named — "
+        "e.g. 'What are the exclusions?' or 'What is the premium?' "
+        "right after a conversation about a specific insurance type "
+        "implicitly means the exclusions/premium OF THAT SAME TYPE, "
+        "even though it has no literal pronoun at all.\n"
         "If YES, rewrite the question to resolve that reference, "
         "replacing the pronoun/reference with the specific thing it "
         "refers to. If the reference is to an ordinal position in a "
