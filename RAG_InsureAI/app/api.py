@@ -49,7 +49,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
-_MAX_HISTORY_TURNS = 3  # keep last 3 exchanges to stay within token limit
+_MAX_HISTORY_TURNS = 15  # keep last 15 exchanges to stay within token limit
 _UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 
 
