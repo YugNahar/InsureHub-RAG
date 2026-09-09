@@ -26,7 +26,6 @@ from metadata_tagger import (
     build_metadata_filter,
     classify_document_type,
     classify_chunk_intents_batch,
-    regex_first_pass_policy_type,
     verify_and_enrich_sections_batch,
     classify_candidate_type,
     derive_document_topic_prior,
@@ -479,32 +478,60 @@ class SectionChunker:
             # the prompt already truncates to a safe upper bound.
             section_text = "\n\n".join(c.page_content for c in section_chunks)
 
-            # First pass: fast, free heading-then-body regex guess (see
-            # regex_first_pass_policy_type — checks the section HEADING
-            # first, a much cleaner signal than scanning the full body,
-            # falling back to the body only if the heading itself doesn't
-            # confidently resolve). The LLM verify/enrich batch call below
-            # then verifies/corrects that guess (cheaper and more reliable
-            # than reclassifying from scratch — a targeted yes/no-with-
-            # confidence question, not an open "pick 1 of 12" one) and
-            # separately extracts metadata the structural pass has no way to
-            # determine (jurisdiction, document_version, language,
-            # effective_date, coverage_category — "unknown" is the correct,
-            # expected answer when a fixed-KB section doesn't state these).
+            # No regex first-pass (removed 2026-09-09, user's explicit
+            # direction): the per-chunk keyword guess (regex_first_pass_
+            # policy_type) used to seed assigned_type, which routed the LLM
+            # call through the weaker VERIFY framing ("does this text
+            # discuss {assigned_type}?") — a yes/no question anchored on the
+            # regex's own guess, not a real, unbiased read of the content.
+            # Confirmed live this misfires exactly the way a keyword match
+            # would: a general insurance-law textbook's "Fire Policies"
+            # section, which merely NAMES "Marine Cargo Insurance" and
+            # "Marine Hull Insurance" in passing while surveying several
+            # different property-insurance types side by side, got
+            # confidently regex-tagged policy_type="marine" — and that tag
+            # then leaked "Aviation Insurance" (also just named in the same
+            # survey sentence) into a real marine-insurance answer as if it
+            # were a marine coverage type, verified as "grounded" by PGF
+            # since the sentence IS literally present in a chunk correctly
+            # tagged... incorrectly.
+            #
+            # first_pass_type = regex_first_pass_policy_type(section_heading, section_text)
+            #
             section_heading = first.metadata.get("section_heading", "")
-            first_pass_type = regex_first_pass_policy_type(section_heading, section_text)
-            # For a confidently single-topic document, doc_prior itself is
-            # the starting assignment fed to the LLM verify step, not the
-            # per-section regex first-pass. Confirmed live (2026-07-31): a
-            # razor-thin regex call on an isolated section (e.g. health=3 vs
-            # travel=1) anchors the VERIFY question on the WRONG type, and
-            # persuasive doc-context text alone doesn't reliably overcome an
-            # anchor already baked into the question. Starting from doc_prior
-            # instead reframes VERIFY around the type that's actually
-            # correct; the LLM can still override to a different,
-            # self-contained type when a section genuinely warrants it (see
-            # _build_verify_and_enrich_prompt's DOCUMENT CONTEXT rules).
-            assigned_type = doc_prior if doc_prior and doc_prior != "general" else first_pass_type
+            # assigned_type is always "general" now, regardless of doc_prior
+            # too — this forces _verify_enrich_step1_fields' IDENTIFY framing
+            # (open "what type, if any, clearly applies" classification)
+            # for EVERY section, not just the ones a regex first-pass failed
+            # to place. doc_prior is NOT removed — it's still passed through
+            # to verify_and_enrich_sections_batch below and still shown to
+            # the LLM as DOCUMENT CONTEXT, exactly as before; the difference
+            # is it's now presented as advisory information for the LLM's
+            # own open judgment, never as a starting "assigned_type" answer
+            # the LLM is just asked to confirm or deny.
+            #
+            # This also directly satisfies the "quota reached -> general"
+            # requirement for free: verify_and_enrich_sections_batch's own
+            # documented fail-safe returns {"policy_type": assigned_type,
+            # ...} for any section whose LLM call fails or is never made
+            # (llm=None) — with assigned_type now always "general", that
+            # fallback is exactly "general", never a stale regex guess.
+            # Confirmed no further change is needed for the retry side: the
+            # background pass (_reclassify_chunks_with_llm in api.py,
+            # started per-upload with a REAL llm) already re-verifies every
+            # chunk from this upload regardless of what policy_type the
+            # synchronous llm=None pass above landed on, and already marks
+            # policy_type_pending_reclass=True whenever ITS OWN call fails
+            # (enriched["_llm_verified"] is False) rather than only for
+            # chunks that happened to land on "general" — see
+            # _retry_pending_policy_type_reclassification's docstring, which
+            # sweeps and re-verifies exactly those chunks the next time
+            # anything triggers a reclassification pass (opportunistically
+            # on the next upload, or via the manual
+            # /admin/reclassify-pending-policy-types endpoint). This was
+            # already comprehensive before this change and needs no
+            # extension.
+            assigned_type = "general"
 
             section_texts.append(section_text)
             section_doc_types.append(effective_doc_type)
