@@ -4786,6 +4786,15 @@ async def _verify_point_faithfulness(point: str, context: str) -> bool:
         "entailed when the evidence discusses one of them without ever "
         "stating they are combined — the evidence does not need to "
         "explicitly say \"these are separate\" for that to be true.\n"
+        "Some evidence passages start with a bracketed label such as "
+        "\"[Policy Type: Marine Insurance]\" naming the policy type that "
+        "passage is actually about. If the hypothesis claims something is "
+        "a coverage type, branch, or product OF one specific policy type "
+        "(e.g. \"X is a type of marine insurance\"), and the only passage "
+        "naming X carries a label for a DIFFERENT policy type, answer no — "
+        "that passage merely mentions X in passing, it is not evidence X "
+        "belongs to the claimed type. Ignore the label entirely for a "
+        "hypothesis that does not itself claim a specific policy type.\n"
         f'Answer with yes/no. "evidence": {context[:_ENTAILMENT_CONTEXT_CHARS]} '
         f'"hypothesis": {point[:800]} "entails":'
     )
@@ -9230,10 +9239,70 @@ class MultiSourceRAG:
         # already uses successfully) so its OWN ranking gets more accurate
         # at zero extra reranker cost, instead of paying for more reranking.
         _COSINE_SHORTLIST_K = 20
+        # Cap on how many raw candidates ever reach the expensive neural
+        # embed step below (2026-09-09). _all_matching normally stays
+        # well under this — a single policy_type's own tagged chunk count,
+        # confirmed live around 50-60 — so this almost never fires. But a
+        # genuinely multi-type query (retrieval scoped to an OR-filter
+        # across 2+ types, e.g. health+life for a compound decision
+        # question) can roughly double or triple that pool, and the
+        # _encode_all() call just below embeds the WHOLE pool in one shot
+        # regardless of size. Confirmed live: a 2-type query's 233-
+        # candidate pool took 143 seconds for that one encode() call alone
+        # on this CPU-only backend — reproduced clean, with no concurrent
+        # load, so not a contention artifact.
+        _BM25_PREFILTER_CAP = 80
 
         async def _narrow_and_rank(scoring_query: str):
-            _sl = _all_matching
-            if len(_all_matching) > _COSINE_SHORTLIST_K:
+            _pool = _all_matching
+            if len(_pool) > _BM25_PREFILTER_CAP:
+                # Cheap keyword pre-filter before the neural step — same
+                # ad-hoc sub-corpus technique turbovec_store.py's own
+                # _bm25_search already uses for a metadata-filtered scope,
+                # reused here rather than inventing a second scheme.
+                # Deliberately NOT "reuse the vector store's own stored
+                # embeddings instead of re-encoding" — that index is
+                # quantized/bit-width-reduced for compact storage (see
+                # _ensure_tvec_index's bit_width), so pulling those back
+                # would reintroduce real approximation error into the
+                # exact-scoring step this function's own docstring already
+                # goes out of its way to avoid. BM25 only ever decides what
+                # SURVIVES to the exact cosine + cross-encoder stages
+                # below, never the final ranking itself — capped generously
+                # (80, roughly a normal single-type pool's own scale) so a
+                # genuinely relevant chunk with weak keyword overlap still
+                # has real room to survive alongside the ones BM25 favors.
+                _pool_before_bm25 = len(_pool)
+                try:
+                    from rank_bm25 import BM25Okapi
+                    # Inlined rather than borrowed from TurboVecStore._tokenize
+                    # (2026-09-09, fixed same day): self.doc_pipeline._vector_store
+                    # is a ChromaVectorStore here, not a TurboVecStore — confirmed
+                    # live the borrowed-method version raised AttributeError on
+                    # every call, silently falling back to the full unfiltered
+                    # pool every time (caught by this same try/except, so the
+                    # fix looked deployed but never actually ran). Same tiny
+                    # tokenization TurboVecStore._tokenize itself uses (lowercase
+                    # + strip punctuation, so 'ulip?' matches 'ulip') — inlined
+                    # instead of depending on which concrete vector-store class
+                    # happens to be configured.
+                    def _tokenize(text: str) -> list:
+                        return [w for w in (re.sub(r'[^\w]', '', t) for t in text.lower().split()) if w]
+                    _tokenized_docs = [_tokenize(d.page_content) for d in _pool]
+                    _bm25_scores = BM25Okapi(_tokenized_docs).get_scores(_tokenize(scoring_query))
+                    _bm25_order = np.argsort(-_bm25_scores)[:_BM25_PREFILTER_CAP]
+                    _pool = [_pool[i] for i in _bm25_order]
+                    logger.info(
+                        "[_metadata_scoped_retrieval] BM25 pre-filter: %d -> %d candidates",
+                        _pool_before_bm25, len(_pool),
+                    )
+                except Exception as _bm25_exc:
+                    logger.info(
+                        "[_metadata_scoped_retrieval] BM25 pre-filter failed, "
+                        "using full pool (%d) for cosine narrowing: %r", _pool_before_bm25, _bm25_exc,
+                    )
+            _sl = _pool
+            if len(_pool) > _COSINE_SHORTLIST_K:
                 try:
                     _embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
                     # Prefixed with _rerank_metadata_prefix (2026-09-09) —
@@ -9262,7 +9331,7 @@ class MultiSourceRAG:
                     # saw it, prefixed or not.
                     _texts = [
                         _rerank_metadata_prefix(d.metadata) + d.page_content
-                        for d in _all_matching
+                        for d in _pool
                     ]
 
                     def _encode_all():
@@ -9272,13 +9341,13 @@ class MultiSourceRAG:
                     _qvec, _cvecs = _vecs[0], _vecs[1:]
                     _cos_scores = np.dot(_cvecs, _qvec)
                     _order = np.argsort(-_cos_scores)[:_COSINE_SHORTLIST_K]
-                    _sl = [_all_matching[i] for i in _order]
+                    _sl = [_pool[i] for i in _order]
                 except Exception as _cos_exc:
                     logger.debug(
                         "[_metadata_scoped_retrieval] cosine narrowing failed, reranking "
                         "full pool instead: %s", _cos_exc,
                     )
-                    _sl = _all_matching
+                    _sl = _pool
             _rk = await asyncio.to_thread(
                 self.doc_pipeline._vector_store.rerank_documents,
                 scoring_query, _sl, len(_sl),
@@ -12540,81 +12609,109 @@ class MultiSourceRAG:
         # after this block — declared here so it's always defined even when
         # the block is skipped or its try/except swallows an error, since
         # the prompt-building code downstream reads it unconditionally.
-        _decided_subbranch: Optional[str] = None
-        if _is_type_decision and _query_policy_type and _query_policy_type != "general":
-            try:
-                _all_type_chunks = await asyncio.to_thread(
-                    self.doc_pipeline._vector_store.get_all_by_filter,
-                    {"policy_type": _query_policy_type},
-                )
-                # Confirmed live 2026-08-31: pulling in EVERY chunk for the
-                # policy type (a first version of this fix) genuinely
-                # solved the missing-chunk problem, but a real single-
-                # product guide has ~40 chunks covering history, claims
-                # process, common mistakes, a glossary, etc. — mostly
-                # irrelevant to "which type should I buy." With that much
-                # extra bulk, compress_to_budget had to squeeze everything
-                # so hard the model started filling gaps with a plausible-
-                # sounding but entirely fabricated plan name ("Basic
-                # Coverage" — confirmed absent from the source PDF
-                # entirely). User's fix: only pull in chunks that are
-                # actually DEFINITION-and-coverage content, not the whole
-                # guide.
-                #
-                # Filtered by live-reclassifying each candidate's own text
-                # via classify_chunk_intent (llm=None — pure regex, no
-                # network call, near-zero added latency even across ~40
-                # chunks) rather than trusting each chunk's STORED section
-                # tag — deliberately, because this exact chunk (heading
-                # "Accident and Illness Plans") was independently found to
-                # carry a STALE "general" tag while classify_chunk_intent
-                # confidently reclassifies its actual text as "benefits"
-                # (regex score benefits=1, every other label=0). Trusting
-                # the stored tag here would have silently reproduced the
-                # exact bug being fixed. "types_of_insurance" also kept —
-                # this codebase's own category for "different types or
-                # kinds of a policy", the other natural home for this
-                # content depending on how a given document got tagged.
-                _def_coverage_labels = {"benefits", "types_of_insurance"}
-                _new_type_chunks = []
-                _types_label_chunks = []
-                _seen_prefixes = {c.page_content[:80] for c in all_chunks}
-                for _d in _all_type_chunks:
-                    if _d.page_content[:80] in _seen_prefixes:
-                        continue
-                    _live_label = classify_chunk_intent(
-                        _d.page_content, doc_type="policy_document", llm=None,
-                        heading=_d.metadata.get("section_heading", ""),
+        #
+        # A dict keyed by policy_type, not a single Optional[str]
+        # (2026-09-09): this whole block used to run ONLY for
+        # _query_policy_type, the original single-label classification
+        # result — but a genuinely compound decision question ("what
+        # should I buy for hospital bills, and what for my family if I
+        # die") gets correctly classified as TWO types by
+        # _classify_query_policy_types_multi_llm earlier in this function
+        # (_policy_types_for_filter), and this block was silently ignoring
+        # that and only ever expanding/deciding for the first type —
+        # confirmed live: "health" got its full definition-chunk expansion
+        # and a decided sub-branch ("Individual Health Plan"), "life" got
+        # neither, and the sub-branch prompt injection below then forced
+        # the model toward a SINGLE named product overall. Looping over
+        # every type in _policy_types_for_filter (falling back to the
+        # single classified type when that set is empty, e.g. a query
+        # detected as decision-shaped via a path that never built the
+        # multi-type set) makes each type's own expansion+decision
+        # independent and additive — a genuinely single-type decision
+        # query still gets exactly one entry in this dict, unchanged
+        # behavior from before.
+        _decided_subbranches: dict[str, str] = {}
+        _decision_types = (
+            _policy_types_for_filter
+            or ({_query_policy_type} if _query_policy_type and _query_policy_type != "general" else set())
+        )
+        if _is_type_decision and _decision_types:
+            for _decision_type in _decision_types:
+                try:
+                    _all_type_chunks = await asyncio.to_thread(
+                        self.doc_pipeline._vector_store.get_all_by_filter,
+                        {"policy_type": _decision_type},
                     )
-                    if _live_label in _def_coverage_labels:
-                        _new_type_chunks.append(_d)
-                        if _live_label == "types_of_insurance":
-                            _types_label_chunks.append(_d)
-                if _new_type_chunks:
-                    all_chunks = all_chunks + _new_type_chunks
-                    logger.info(
-                        "[ask_stream] decision-query full-policy-type retrieval: "
-                        "policy_type=%s added %d definition/coverage chunk(s) (of %d "
-                        "total for this policy_type) beyond the %d similarity search "
-                        "already found",
-                        _query_policy_type, len(_new_type_chunks), len(_all_type_chunks),
-                        len(all_chunks) - len(_new_type_chunks),
+                    # Confirmed live 2026-08-31: pulling in EVERY chunk for the
+                    # policy type (a first version of this fix) genuinely
+                    # solved the missing-chunk problem, but a real single-
+                    # product guide has ~40 chunks covering history, claims
+                    # process, common mistakes, a glossary, etc. — mostly
+                    # irrelevant to "which type should I buy." With that much
+                    # extra bulk, compress_to_budget had to squeeze everything
+                    # so hard the model started filling gaps with a plausible-
+                    # sounding but entirely fabricated plan name ("Basic
+                    # Coverage" — confirmed absent from the source PDF
+                    # entirely). User's fix: only pull in chunks that are
+                    # actually DEFINITION-and-coverage content, not the whole
+                    # guide.
+                    #
+                    # Filtered by live-reclassifying each candidate's own text
+                    # via classify_chunk_intent (llm=None — pure regex, no
+                    # network call, near-zero added latency even across ~40
+                    # chunks) rather than trusting each chunk's STORED section
+                    # tag — deliberately, because this exact chunk (heading
+                    # "Accident and Illness Plans") was independently found to
+                    # carry a STALE "general" tag while classify_chunk_intent
+                    # confidently reclassifies its actual text as "benefits"
+                    # (regex score benefits=1, every other label=0). Trusting
+                    # the stored tag here would have silently reproduced the
+                    # exact bug being fixed. "types_of_insurance" also kept —
+                    # this codebase's own category for "different types or
+                    # kinds of a policy", the other natural home for this
+                    # content depending on how a given document got tagged.
+                    _def_coverage_labels = {"benefits", "types_of_insurance"}
+                    _new_type_chunks = []
+                    _types_label_chunks = []
+                    _seen_prefixes = {c.page_content[:80] for c in all_chunks}
+                    for _d in _all_type_chunks:
+                        if _d.page_content[:80] in _seen_prefixes:
+                            continue
+                        _live_label = classify_chunk_intent(
+                            _d.page_content, doc_type="policy_document", llm=None,
+                            heading=_d.metadata.get("section_heading", ""),
+                        )
+                        if _live_label in _def_coverage_labels:
+                            _new_type_chunks.append(_d)
+                            if _live_label == "types_of_insurance":
+                                _types_label_chunks.append(_d)
+                    if _new_type_chunks:
+                        all_chunks = all_chunks + _new_type_chunks
+                        logger.info(
+                            "[ask_stream] decision-query full-policy-type retrieval: "
+                            "policy_type=%s added %d definition/coverage chunk(s) (of %d "
+                            "total for this policy_type) beyond the %d similarity search "
+                            "already found",
+                            _decision_type, len(_new_type_chunks), len(_all_type_chunks),
+                            len(all_chunks) - len(_new_type_chunks),
+                        )
+                    # Sub-branch disambiguation — see _classify_decision_subbranch's
+                    # own docstring for the full case this exists for (Hull vs
+                    # Cargo). Only worth the extra call when the KB's own
+                    # "types_of_insurance"-labeled content for this policy_type
+                    # was actually found — genuinely no-ops (None, zero added
+                    # latency) for the many policy_types with just one real
+                    # product and no such content to disambiguate against.
+                    _subbranch = await _classify_decision_subbranch(
+                        question, _decision_type, _types_label_chunks,
                     )
-                # Sub-branch disambiguation — see _classify_decision_subbranch's
-                # own docstring for the full case this exists for (Hull vs
-                # Cargo). Only worth the extra call when the KB's own
-                # "types_of_insurance"-labeled content for this policy_type
-                # was actually found — genuinely no-ops (None, zero added
-                # latency) for the many policy_types with just one real
-                # product and no such content to disambiguate against.
-                _decided_subbranch = await _classify_decision_subbranch(
-                    question, _query_policy_type, _types_label_chunks,
-                )
-            except Exception as _decision_exc:
-                logger.debug(
-                    "[ask_stream] decision-query full-policy-type retrieval skipped: %s",
-                    _decision_exc,
-                )
+                    if _subbranch:
+                        _decided_subbranches[_decision_type] = _subbranch
+                except Exception as _decision_exc:
+                    logger.debug(
+                        "[ask_stream] decision-query full-policy-type retrieval skipped "
+                        "for policy_type=%s: %s", _decision_type, _decision_exc,
+                    )
 
         # Full, uncompressed chunk text — kept alongside the (possibly
         # compressed) prompt context below specifically for the post-
@@ -13131,43 +13228,95 @@ class MultiSourceRAG:
                 # actually helps — user's explicit ask: "i want all the
                 # points that the kb is covering [about it]", not just the
                 # name. Closing all three paths explicitly.
-                prompt_question = (
-                    f"{prompt_question.rstrip(' .?')}. STOP — this question describes "
-                    "the user's own situation or need and asks which ONE type of "
-                    "policy or plan fits it. It is NOT asking you to list every type "
-                    "that exists, and it is NOT asking you to list the FACTORS that go "
-                    "into choosing one either — those are two different ways of still "
-                    "not answering. You MUST name ONE specific type/plan by its real "
-                    "name from the KNOWLEDGE BASE, and then explain what it actually "
-                    "covers and how it helps this specific situation, drawing on EVERY "
-                    "relevant point the KNOWLEDGE BASE makes about that type — not just "
-                    "its name and a one-line reason. Plain prose, no numbered list. "
-                    "Never respond with a question back to the user instead of "
-                    "answering (\"what's your budget?\", \"do you have any concerns?\") "
-                    "— commit to the single best answer the KNOWLEDGE BASE actually "
-                    "supports, even a general one, rather than deflecting. If the "
-                    "KNOWLEDGE BASE names a type as the most popular, most common, or "
-                    "standard recommended choice for this kind of need, name THAT one "
-                    "directly and cover everything it says about it."
-                )
-                if _decided_subbranch:
-                    # A dedicated, single-purpose call (see
-                    # _classify_decision_subbranch) already determined which
-                    # named product actually fits this situation — state it
-                    # as an already-settled fact, not an option to weigh
-                    # alongside whatever else is sitting in the context
-                    # below. Confirmed live this needed to be this forceful:
-                    # a softer "consider recommending X" phrasing still let
-                    # the model substitute a different, wrong product it
-                    # found more lexically appealing in the context.
+                #
+                # Branches on how many types this decision actually spans
+                # (2026-09-09): "what should I buy for hospital bills, and
+                # what for my family if I die" is genuinely TWO separate
+                # decisions (health, life), each with its own single right
+                # answer — the original wording's "name ONE specific type"
+                # instruction, applied to a question like that, actively
+                # fights answering the second half at all. Only fires the
+                # multi-decision wording when _policy_types_for_filter
+                # actually has 2+ entries; a genuinely single-type decision
+                # question keeps the exact original wording, unchanged.
+                if len(_policy_types_for_filter) > 1:
                     prompt_question = (
-                        f"{prompt_question.rstrip(' .?')}. The correct product for this "
-                        f"specific situation has already been identified as "
-                        f'"{_decided_subbranch}" — write your answer explaining THIS '
-                        f"product specifically, using only what the KNOWLEDGE BASE says "
-                        f"about it. Do not substitute a different product, even if "
-                        f"another one also appears in the context below."
+                        f"{prompt_question.rstrip(' .?')}. STOP — this question describes "
+                        f"{len(_policy_types_for_filter)} DISTINCT needs or situations "
+                        "(one per policy type this question involves), and asks which "
+                        "ONE type of policy or plan fits EACH of them. Answer EVERY "
+                        "distinct need the question raises — do not merge them into one "
+                        "answer that only addresses one, and do not drop any of them. "
+                        "For EACH need, name ONE specific type/plan by its real name "
+                        "from the KNOWLEDGE BASE, and explain what it actually covers "
+                        "and how it helps THAT specific need, drawing on EVERY relevant "
+                        "point the KNOWLEDGE BASE makes about that type — not just its "
+                        "name and a one-line reason. It is NOT asking you to list every "
+                        "type that exists for any one need, and it is NOT asking you to "
+                        "list the FACTORS that go into choosing one either. Plain prose, "
+                        "no numbered list. Never respond with a question back to the "
+                        "user instead of answering — commit to the single best answer "
+                        "the KNOWLEDGE BASE actually supports for each need, even a "
+                        "general one, rather than deflecting."
                     )
+                    if _decided_subbranches:
+                        # Same "state it as an already-settled fact" discipline
+                        # the single-type branch below already relies on
+                        # (confirmed live there that a softer phrasing let the
+                        # model substitute a different product) — just listing
+                        # one settled product per type instead of one overall.
+                        _subbranch_lines = "; ".join(
+                            f'for the {_pt} need, "{_sb}"'
+                            for _pt, _sb in _decided_subbranches.items()
+                        )
+                        prompt_question = (
+                            f"{prompt_question.rstrip(' .?')}. The correct products for "
+                            f"these situations have already been identified: "
+                            f"{_subbranch_lines} — write your answer explaining EACH of "
+                            f"these products specifically for its own need, using only "
+                            f"what the KNOWLEDGE BASE says about it. Do not substitute a "
+                            f"different product for either need, even if another one "
+                            f"also appears in the context below."
+                        )
+                else:
+                    prompt_question = (
+                        f"{prompt_question.rstrip(' .?')}. STOP — this question describes "
+                        "the user's own situation or need and asks which ONE type of "
+                        "policy or plan fits it. It is NOT asking you to list every type "
+                        "that exists, and it is NOT asking you to list the FACTORS that go "
+                        "into choosing one either — those are two different ways of still "
+                        "not answering. You MUST name ONE specific type/plan by its real "
+                        "name from the KNOWLEDGE BASE, and then explain what it actually "
+                        "covers and how it helps this specific situation, drawing on EVERY "
+                        "relevant point the KNOWLEDGE BASE makes about that type — not just "
+                        "its name and a one-line reason. Plain prose, no numbered list. "
+                        "Never respond with a question back to the user instead of "
+                        "answering (\"what's your budget?\", \"do you have any concerns?\") "
+                        "— commit to the single best answer the KNOWLEDGE BASE actually "
+                        "supports, even a general one, rather than deflecting. If the "
+                        "KNOWLEDGE BASE names a type as the most popular, most common, or "
+                        "standard recommended choice for this kind of need, name THAT one "
+                        "directly and cover everything it says about it."
+                    )
+                    _decided_subbranch = next(iter(_decided_subbranches.values()), None)
+                    if _decided_subbranch:
+                        # A dedicated, single-purpose call (see
+                        # _classify_decision_subbranch) already determined which
+                        # named product actually fits this situation — state it
+                        # as an already-settled fact, not an option to weigh
+                        # alongside whatever else is sitting in the context
+                        # below. Confirmed live this needed to be this forceful:
+                        # a softer "consider recommending X" phrasing still let
+                        # the model substitute a different, wrong product it
+                        # found more lexically appealing in the context.
+                        prompt_question = (
+                            f"{prompt_question.rstrip(' .?')}. The correct product for this "
+                            f"specific situation has already been identified as "
+                            f'"{_decided_subbranch}" — write your answer explaining THIS '
+                            f"product specifically, using only what the KNOWLEDGE BASE says "
+                            f"about it. Do not substitute a different product, even if "
+                            f"another one also appears in the context below."
+                        )
                 # DETAILED_GROUNDED_PROMPT's own FORMAT section is
                 # unconditional — "numbered list, plain human sentences...
                 # EVERY point starts with 'N. '" — with no prose branch at
@@ -16818,11 +16967,51 @@ class MultiSourceRAG:
                 # specific type (general) or nothing in context actually
                 # matches it — never MORE restrictive than the previous
                 # behavior for an ambiguous query.
-                _pgf_scoped_context = _full_context_uncompressed
-                _pgf_matching_chunks = [_ct for _ct, _cs, _cpt in _full_context_uncompressed_chunks]
+                # Tag each chunk with its own policy_type (2026-09-09, same
+                # "[Policy Type: X Insurance]" prefix _rerank_metadata_prefix
+                # already gives the cosine/rerank steps — turbovec_store.py)
+                # before it ever becomes PGF evidence text. Without this,
+                # _verify_point_faithfulness only ever judges whether the
+                # hypothesis is literally TRUE against the evidence, never
+                # whether the evidence is actually the policy type the
+                # hypothesis claims it for — confirmed live: a chunk
+                # genuinely says "there are specialized policies available
+                # such as Aviation Insurance Policy for insurance of planes
+                # and helicopters," so "Aviation Insurance – covers airplanes
+                # and helicopters" presented as a MARINE coverage type passed
+                # entailment 2/2 live reproductions even though the source
+                # names aviation as a sibling category, not a marine
+                # sub-type — PGF had no type signal at all to catch that
+                # mismatch with. Prefixing every chunk (not just the ones
+                # that match the query's own type) lets the entailment
+                # prompt below reason about a MIX of differently-tagged
+                # evidence in the same context, not just an already-filtered
+                # single-type pile.
+                _pgf_matching_chunks = [
+                    _rerank_metadata_prefix({"policy_type": _cpt}) + _ct
+                    for _ct, _cs, _cpt in _full_context_uncompressed_chunks
+                ]
+                _pgf_scoped_context = "\n\n".join(_pgf_matching_chunks)
+
+                # Scope the evidence to the query's own policy_type before
+                # checking any claim against it — same reasoning SRG's own
+                # enumeration matcher already uses (see
+                # _full_context_uncompressed_chunks's own comment above):
+                # a multi-type retrieval can put e.g. a motor chunk and a
+                # marine chunk in the same _full_context_uncompressed blob,
+                # and checking a health-insurance claim against that whole
+                # mixed bag risks a false "entailed" from an unrelated
+                # chunk that just happens to share vocabulary, or a false
+                # "not entailed" for a claim whose real support sits
+                # further down in a differently-typed chunk's noise. Falls
+                # back to the full mixed context when the query has no
+                # specific type (general) or nothing in context actually
+                # matches it — never MORE restrictive than the previous
+                # behavior for an ambiguous query.
                 if _query_policy_type and _query_policy_type != "general":
                     _pgf_type_matching_chunks = [
-                        _ct for _ct, _cs, _cpt in _full_context_uncompressed_chunks
+                        _rerank_metadata_prefix({"policy_type": _cpt}) + _ct
+                        for _ct, _cs, _cpt in _full_context_uncompressed_chunks
                         if _cpt == _query_policy_type
                     ]
                     if _pgf_type_matching_chunks:
