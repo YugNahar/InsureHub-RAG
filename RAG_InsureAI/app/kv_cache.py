@@ -32,12 +32,22 @@ each put() now touches exactly the one key that changed instead of
 rewriting every cached entry (including every entry's 768-float embedding
 list) to one JSON file on every single cache write.
 
-TTL: configurable, default 3600 s (1 hour) — set as each key's native Redis
-TTL (a real backstop: an entry can't outlive it even if this process never
-restarts) AND still re-checked in-process on every read exactly as before,
-since Redis expiring a key doesn't retroactively evict it from the
-in-memory mirror the moment it happens.
-Eviction: lazy on read + LRU when max_entries is reached.
+TTL: configurable, default 86400 s (24 hours) — SLIDING on last access, not
+fixed from creation. Every entry in this cache is shared across every user
+(make_key() has no session/user component at all — see its own docstring),
+so "this entry is inactive" can only coherently mean "nobody, from any
+session, has hit it in 24h" — not tied to any one user's own activity.
+Each read that counts as a real hit (get()/semantic_get(), which is the
+direct-serve path — semantic_get_related() deliberately does NOT count,
+same as before, since it only pulls supplementary context, not a served
+answer) pushes ts_last_hit forward and re-issues the key's native Redis TTL
+via EXPIRE, so a frequently-reused shared answer can live indefinitely
+while one nobody asks about again for a full day gets reclaimed — "no space
+should be left idle" without evicting content that's still actually in use
+by anyone.
+Eviction: lazy expiry (by last-hit, not creation) on read/write, plus
+proactive LRU eviction starting at 90% of max_entries (not only once
+completely full) — see _evict_if_needed.
 """
 import hashlib
 import json
@@ -66,6 +76,13 @@ _CACHE_VERSION = 2          # bumped because entry schema changed (added query_e
 # OLD answer verbatim — that path should require very high confidence.
 _SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.94"))
 
+# Proactive eviction starts once the shared pool is this full, instead of
+# only exactly at max_entries — so a burst of puts never has to hard-stall
+# evicting one entry per put right at the ceiling; there's already headroom
+# reclaimed before that point. 2026-09-09, user's explicit spec ("90%
+# capacity").
+_EVICT_THRESHOLD_FRACTION = 0.90
+
 
 class QueryKVCache:
     """
@@ -76,15 +93,17 @@ class QueryKVCache:
     Parameters
     ----------
     redis_url     : Redis connection URL (redis://host:port/db).
-    ttl_seconds   : entry lifetime (default 3600 s).
-    max_entries   : LRU eviction threshold (default 500).
+    ttl_seconds   : entry lifetime since its LAST hit, not creation — sliding
+                    window (default 86400 s / 24h).
+    max_entries   : proactive LRU eviction begins at
+                    _EVICT_THRESHOLD_FRACTION of this (default 500).
     sem_threshold : cosine similarity threshold for semantic hits (0–1).
     """
 
     def __init__(
         self,
         redis_url: str,
-        ttl_seconds: int = 3600,
+        ttl_seconds: int = 86400,
         max_entries: int = 500,
         sem_threshold: float = _SEMANTIC_THRESHOLD_DEFAULT,
     ):
@@ -151,17 +170,52 @@ class QueryKVCache:
     # Public API — exact
     # ──────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _last_active(entry: Dict[str, Any]) -> float:
+        """Sliding-window anchor — last hit if this entry has ever been hit,
+        else its creation time. Every expiry check in this class reads
+        through this one helper so "TTL" consistently means "since last
+        use", not "since creation", everywhere at once."""
+        return entry.get("ts_last_hit", entry["ts"])
+
+    def _is_expired(self, entry: Dict[str, Any], now: Optional[float] = None) -> bool:
+        return (now if now is not None else time.time()) - self._last_active(entry) > self._ttl
+
+    def _touch(self, key: str, entry: Dict[str, Any]) -> None:
+        """Register a real hit: advance the sliding window in-process AND
+        in Redis. Without a Redis-side refresh here, Redis's own native TTL
+        (set once, on put()) would still hard-delete the physical key
+        exactly ttl_seconds after creation regardless of how recently this
+        process has served it — silently discarding a still-actively-used
+        shared answer out from under the in-memory mirror the next time
+        this process restarts and reloads from Redis.
+
+        Re-persists the FULL entry (_save_entry, a real SET ... EX) rather
+        than a bare EXPIRE — confirmed live this matters, not just
+        theoretical: EXPIRE on a key Redis no longer has (evicted under
+        Redis's own memory pressure, or removed by something outside this
+        app) is a silent no-op, leaving an entry that still serves hits
+        correctly from the in-memory mirror while its Redis-persisted copy
+        has quietly vanished, only surfacing on the next process restart
+        when _load() can't find it. A full re-SET recreates the key either
+        way."""
+        entry["hits"] += 1
+        entry["ts_last_hit"] = time.time()
+        self._save_entry(key, entry)
+
     def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """Return cached value or None if missing / expired."""
+        """Return cached value or None if missing / expired. A hit here
+        slides this entry's 24h window forward (see _touch) — the entry
+        stays alive as long as ANYONE keeps asking for it, not just for a
+        fixed window from when it was first cached."""
         entry = self._data.get(key)
         if entry is None:
             return None
-        if time.time() - entry["ts"] > self._ttl:
+        if self._is_expired(entry):
             del self._data[key]
             self._emb_dirty = True
             return None
-        entry["hits"] += 1
-        entry["ts_last_hit"] = time.time()
+        self._touch(key, entry)
         return entry["value"]
 
     def put(
@@ -185,6 +239,72 @@ class QueryKVCache:
         self._data[key] = entry
         self._emb_dirty = True
         self._save_entry(key, entry)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API — cache-stampede protection (single-flight)
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2026-09-09, user's explicit request: a cache MISS today costs a full
+    # retrieval+generation pass — 60-160s of mostly CPU-bound work on this
+    # deployment (embeddings, reranking, PGF, LLM calls). Several concurrent
+    # requests missing on the exact same not-yet-cached query each pay that
+    # cost independently today; a burst of them is a real server-overload
+    # risk, not a hypothetical one. These two methods let the caller (see
+    # ask_stream in multi_source_rag.py) make exactly one of them the
+    # "leader" that actually generates, while any others "follow" — wait
+    # briefly for the leader's own put() to land, then serve that instead
+    # of redoing the same work.
+    #
+    # Deliberately does NOT track an explicit release tied to the leader's
+    # completion — ask_stream is a large function with many early-exit
+    # paths (refusals, errors, grounding failures, non-cacheable answer
+    # shapes), and threading a guaranteed release call through all of them
+    # would be its own source of bugs (a missed path leaves the lock stuck
+    # for its full TTL). Instead the lock is purely TTL-bound: if the
+    # leader dies or errors before ever calling put(), the lock silently
+    # expires on its own and the next request just becomes a fresh leader
+    # — self-healing, nothing to clean up. This doesn't cost followers
+    # extra wait time either: they poll the actual cache entry via get(),
+    # not the lock's own expiry, so a leader that finishes in 20s is found
+    # by a follower almost immediately regardless of the lock's TTL.
+
+    def try_acquire_generation_lock(self, key: str, lock_ttl: int = 150) -> bool:
+        """True if THIS caller should proceed as the leader (generate for
+        real); False if another request already holds the lock for this
+        exact key. lock_ttl (default 150s) is sized with headroom over
+        this deployment's observed worst-case generation latency — it's
+        only a crash/error backstop, not something a follower actually
+        waits out (see wait_for_generation). Fails OPEN (returns True) on
+        any Redis error, matching this file's existing "never let the
+        caching layer block a real request" posture — worst case on a
+        Redis hiccup is a duplicate generation, not a stuck or failed one.
+        """
+        try:
+            return bool(self._redis.set(f"lock:{key}", "1", nx=True, ex=lock_ttl))
+        except Exception as exc:
+            logger.warning(
+                "[KVCache] lock acquire failed for key=%s...: %s — proceeding without coordination",
+                key[:12], exc,
+            )
+            return True
+
+    def wait_for_generation(
+        self, key: str, max_wait: float = 150.0, poll_interval: float = 0.5,
+    ) -> Optional[Dict[str, Any]]:
+        """Poll for the lock-holding leader's cache write instead of
+        duplicating its work. Returns the cached value as soon as it
+        appears, or None once max_wait elapses — the leader may have hit
+        a path that never calls put() at all (a refusal, a comparison-
+        table answer, a handoff — see this class's callers for which
+        shapes skip caching), so a follower must never wait forever; on
+        timeout the caller falls back to generating its own answer, same
+        as if no coordination had happened."""
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            hit = self.get(key)
+            if hit is not None:
+                return hit
+            time.sleep(poll_interval)
+        return None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API — semantic
@@ -279,7 +399,7 @@ class QueryKVCache:
                 break           # sorted descending — nothing below this matters
             key = self._emb_keys[idx]
             entry = self._data.get(key)
-            if entry is None or now - entry["ts"] > self._ttl:
+            if entry is None or self._is_expired(entry, now):
                 continue
             value = entry["value"]
             results.append({
@@ -309,8 +429,8 @@ class QueryKVCache:
     def flush(self) -> int:
         now = time.time()
         before = len(self._data)
-        expired_keys = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
-        self._data = {k: v for k, v in self._data.items() if now - v["ts"] <= self._ttl}
+        expired_keys = [k for k, v in self._data.items() if self._is_expired(v, now)]
+        self._data = {k: v for k, v in self._data.items() if not self._is_expired(v, now)}
         removed = before - len(self._data)
         if removed:
             self._emb_dirty = True
@@ -327,7 +447,7 @@ class QueryKVCache:
 
     def stats(self) -> Dict[str, Any]:
         now = time.time()
-        live    = sum(1 for v in self._data.values() if now - v["ts"] <= self._ttl)
+        live    = sum(1 for v in self._data.values() if not self._is_expired(v, now))
         expired = len(self._data) - live
         total_hits = sum(v.get("hits", 0) for v in self._data.values())
         sem_entries = sum(1 for v in self._data.values() if "query_embedding" in v)
@@ -353,7 +473,7 @@ class QueryKVCache:
         now = time.time()
         keys, vecs = [], []
         for k, entry in self._data.items():
-            if now - entry["ts"] > self._ttl:
+            if self._is_expired(entry, now):
                 continue
             emb = entry.get("query_embedding")
             if emb is None:
@@ -371,21 +491,30 @@ class QueryKVCache:
         self._emb_dirty = False
 
     def _evict_if_needed(self) -> None:
-        if len(self._data) < self._max:
+        """Two-stage, matching the user's explicit spec: reclaim genuinely
+        stale (24h-unused-by-anyone) entries first — cheap, no real content
+        loss — and only then, if the pool is still at/above
+        _EVICT_THRESHOLD_FRACTION of max_entries, start dropping the
+        LEAST-RECENTLY-USED live entries one at a time until back under
+        that threshold. Runs proactively at 90% full rather than waiting
+        for the pool to be completely saturated, so a burst of new queries
+        never has to evict once per put right at the ceiling — there's
+        already headroom by the time that happens."""
+        _threshold = int(self._max * _EVICT_THRESHOLD_FRACTION)
+        if len(self._data) < _threshold:
             return
         now = time.time()
-        expired = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
+        expired = [k for k, v in self._data.items() if self._is_expired(v, now)]
         for k in expired:
             del self._data[k]
         if expired:
             self._delete_entries(expired)
-        if len(self._data) < self._max:
             self._emb_dirty = True
-            return
-        oldest = min(self._data, key=lambda k: self._data[k].get("ts_last_hit", self._data[k]["ts"]))
-        del self._data[oldest]
-        self._delete_entries([oldest])
-        self._emb_dirty = True
+        while len(self._data) >= _threshold:
+            oldest = min(self._data, key=lambda k: self._last_active(self._data[k]))
+            del self._data[oldest]
+            self._delete_entries([oldest])
+            self._emb_dirty = True
 
     def _redis_key(self, key: str) -> str:
         return f"{_KEY_PREFIX}{key}"
@@ -441,7 +570,7 @@ class QueryKVCache:
             if entry.pop("_v", None) != _CACHE_VERSION:
                 stale.append(redis_key[len(_KEY_PREFIX):])
                 continue
-            if now - entry.get("ts", 0) > self._ttl:
+            if "ts" not in entry or self._is_expired(entry, now):
                 stale.append(redis_key[len(_KEY_PREFIX):])
                 continue
             self._data[redis_key[len(_KEY_PREFIX):]] = entry

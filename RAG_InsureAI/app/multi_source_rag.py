@@ -11039,6 +11039,35 @@ class MultiSourceRAG:
             logger.info("[ask_stream] bypassing cache hit for clarify-chip click: %r", retrieval_query[:80])
             _kv_hit = None
 
+        # ── Cache-stampede protection (2026-09-09, user's explicit request) ──
+        # Every request that reaches here with _kv_hit still None is about to
+        # pay for a full retrieval+generation pass — 60-160s of mostly
+        # CPU-bound work on this deployment. Several concurrent requests for
+        # the exact same not-yet-cached query would otherwise each pay that
+        # cost independently; single-flight makes only the first one (the
+        # "leader") actually generate, while concurrent duplicates ("
+        # followers") wait briefly for the leader's own cache write instead.
+        # Skipped for a chip-click bypass — that path exists specifically to
+        # FORCE fresh generation even when a cache entry already exists (see
+        # the block just above), so it must never wait for or adopt anyone
+        # else's cached answer. See QueryKVCache.try_acquire_generation_lock
+        # / wait_for_generation for the fail-open and self-healing behavior.
+        if _kv_hit is None and not _disable_query_cache and not _bypass_cache_for_chip_click:
+            if await asyncio.to_thread(_kv.try_acquire_generation_lock, _kv_key):
+                logger.info("[ask_stream] cache-lock acquired, generating: %r", retrieval_query[:80])
+            else:
+                logger.info("[ask_stream] cache-lock held by another request, waiting: %r", retrieval_query[:80])
+                _kv_hit = await asyncio.to_thread(_kv.wait_for_generation, _kv_key)
+                if _kv_hit is not None:
+                    logger.info(
+                        "[ask_stream] served from concurrent request's cache write: %r", retrieval_query[:80],
+                    )
+                else:
+                    logger.info(
+                        "[ask_stream] wait for concurrent request timed out, generating independently: %r",
+                        retrieval_query[:80],
+                    )
+
         if _kv_hit is not None:
             import json as _json_s
             logger.info("[ask_stream] KV cache hit  query=%r detailed=%s", retrieval_query[:80], _keyword_detailed)
