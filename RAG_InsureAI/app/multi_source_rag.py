@@ -17112,26 +17112,6 @@ class MultiSourceRAG:
                 # computed ONCE per answer (not once per sentence) and
                 # reused for every sentence's comparison; unit texts for one
                 # call site are embedded together in a single batched call,
-                # matching the dedup check's own "one batched call, not one
-                # per item" latency discipline. Falls back to plain word
-                # overlap (the previous version of this fix) if the
-                # embedding call fails for any reason — still better than no
-                # reordering at all, and keeps this check from hard-failing
-                # the whole faithfulness pass over an unrelated model error.
-                _pgf_chunk_vecs = None
-                if len(_pgf_matching_chunks) > 1:
-                    try:
-                        _pgf_embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
-                        _pgf_chunk_vecs = _pgf_embed_model.encode(
-                            _pgf_matching_chunks, normalize_embeddings=True
-                        )
-                    except Exception as _pgf_embed_exc:
-                        logger.debug(
-                            "[ask_stream] PGF chunk embedding failed, falling back to word "
-                            "overlap for evidence ordering: %s", _pgf_embed_exc,
-                        )
-                        _pgf_chunk_vecs = None
-
                 # Confirmed live 2026-08-31: ranking _pgf_matching_chunks by
                 # relevance to a given point and then joining ALL of them
                 # (just reordered) defeats the point of ranking at all — a
@@ -17146,35 +17126,77 @@ class MultiSourceRAG:
                 # yes/no entailment check is far more reliable when shown
                 # just the top few candidates than when asked to find the
                 # right paragraph inside a much larger mixed-relevance
-                # pile. Keeping only the top _PGF_TOP_K_CHUNKS (by whichever
-                # ranking — embedding similarity or the word-overlap
-                # fallback) trusts the ranking instead of hedging against
-                # it, while still allowing a LITTLE headroom (2, not 1) for
-                # a case where the true evidence lands just behind the top
-                # match.
+                # pile. Keeping only the top _PGF_TOP_K_CHUNKS trusts the
+                # ranking instead of hedging against it, while still
+                # allowing a LITTLE headroom (2, not 1) for a case where
+                # the true evidence lands just behind the top match.
                 _PGF_TOP_K_CHUNKS = 2
+
+                # Minimum cross-encoder relevance score a chunk must clear
+                # to count as real evidence for a given unit (2026-09-10).
+                # Without this floor, ranking always hands back its top-K
+                # candidates no matter how weak the actual match is — so a
+                # claim with NO real supporting chunk in the whole pool
+                # still gets matched to "the least-bad chunk available" and
+                # checked against it as if that were genuine evidence.
+                # Confirmed live as the actual mechanism behind a real
+                # hallucination surviving: a fabricated "Term Insurance has
+                # an investment feature, premiums can earn interest" claim
+                # was never actually supported by anything in the pool (the
+                # real Term Insurance chunk didn't even make the retrieval
+                # cutoff — it inherently under-matches an "investment plans"
+                # query, since being NOT an investment product is Term's
+                # whole defining trait), so evidence-selection fell back to
+                # the closest AVAILABLE chunk (Whole of Life — genuinely
+                # about investments, and its source PDF's own confusingly-
+                # worded opening sentence, "a term insurance plan with an
+                # unspecified period is called a whole life plan", reads
+                # like it's describing Term). The small entailment model
+                # got fooled by that coincidental match 3/3 times.
+                #
+                # Calibrated empirically against real content, not guessed:
+                # the exact fabricated claim scored 0.033-0.072 against
+                # every chunk in its real candidate pool (including,
+                # tellingly, the one chunk that actually refutes it —
+                # cross-encoder score reflects whether THIS SPECIFIC claim
+                # is supported, not just topical relevance), while five
+                # separate genuinely-grounded claims from the same real
+                # answer scored 0.963-0.984 against their own true source
+                # chunks. A 10x+ gap with wide headroom on both sides —
+                # unlike the bi-encoder cosine equivalent this replaces,
+                # which gave 0.75 (wrong match) vs 0.78 (right match): no
+                # safe threshold existed there at all. 0.5 sits in the
+                # middle of the measured gap with margin either way.
+                _PGF_RERANK_FLOOR = 0.5
 
                 # Code-computed citation, not model-reported: an earlier
                 # attempt asked the MODEL to end each point with a "[C2]"-
                 # style tag naming its own source chunk — reverted per
                 # explicit direction ("this model doesn't function well
                 # with prompt instructions"), and even at 6/6 compliance on
-                # a later retest, points still mostly got dropped anyway
-                # (see _PGF_TOP_K_CHUNKS's own history above), so citation
-                # tagging alone was never the fix. This instead reuses the
-                # SAME embedding ranking that already picks each point's
-                # top-K evidence chunks, and just also records which
-                # specific chunk (by index into _pgf_matching_chunks) came
-                # out on top — a byproduct of a ranking step that already
-                # runs, not new classification work, so it costs nothing
-                # extra and can never be wrong about what the CODE picked
-                # (it doesn't attempt to verify the model's OWN claim about
-                # its source, only tells you what the ranking's actual
-                # winner was). Every _pgf_context_for_units caller gets
-                # this back as (context_text, cited_chunk_indices) instead
-                # of a bare string, and logs it — a permanent, always-on
-                # log line instead of a one-off [DEBUG-*] block added and
-                # removed by hand every time this needs inspecting again.
+                # a later retest, points still mostly got dropped anyway,
+                # so citation tagging alone was never the fix. This reuses
+                # the SAME cross-encoder already used for retrieval
+                # reranking (turbovec_store.py) — scored here as (unit
+                # text, chunk) pairs instead of (query, chunk) — and
+                # records which specific chunk(s) (by index into
+                # _pgf_matching_chunks) actually cleared the floor. A unit
+                # with no chunk clearing the floor gets ctx=None back,
+                # which callers must treat as an automatic fail (see
+                # _pgf_verify_units below) rather than passing empty
+                # context into _verify_point_faithfulness, which fails
+                # OPEN on empty context — exactly backwards for this case.
+                # Bi-encoder cosine similarity was tried first and dropped
+                # (2026-09-10): it couldn't reliably separate a genuine
+                # match from a coincidental one (see _PGF_RERANK_FLOOR's
+                # own comment for the actual numbers) — the cross-encoder,
+                # which reads both texts jointly instead of encoding them
+                # independently, can. All units for one caller are scored
+                # in a SINGLE batched .predict() call (one call per answer
+                # per branch, not one per unit) — the reranker's per-call
+                # overhead dominates its cost (see _rerank_windows' own
+                # latency notes in turbovec_store.py), so batching across
+                # units instead of looping is what keeps this affordable.
                 def _pgf_word_overlap_order(_unit_text: str) -> tuple:
                     _unit_words = set(re.findall(r"[a-z]{4,}", _unit_text.lower()))
                     if not _unit_words:
@@ -17185,33 +17207,127 @@ class MultiSourceRAG:
                     _top = _order[:_PGF_TOP_K_CHUNKS]
                     return ("\n\n".join(_pgf_matching_chunks[i] for i in _top), _top)
 
+                _pgf_reranker = None
+                if _pgf_matching_chunks:
+                    try:
+                        _pgf_reranker = _get_shared_reranker()
+                    except Exception as _pgf_reranker_exc:
+                        logger.debug(
+                            "[ask_stream] PGF reranker unavailable, falling back to word "
+                            "overlap for evidence ordering: %s", _pgf_reranker_exc,
+                        )
+                        _pgf_reranker = None
+
+                # Cross-encoder pairs cost ~0.22s each regardless of how the
+                # total is split between units and chunks — measured live
+                # (2026-09-10): 5 units x 8 chunks (48 pairs) took ~11s, and
+                # it scales roughly linearly — 10 units x 15 chunks (150
+                # pairs) took 33.6s. Unaffordable unfiltered on a longer
+                # prose answer or a wide retrieved pool. This narrows each
+                # unit's candidates to its top _PGF_PREFILTER_K by a CHEAP
+                # bi-encoder pass first — the exact same two-stage recall-
+                # then-precision shape this file's own top-level retrieval
+                # already uses (dense/BM25 candidates, then cross-encoder
+                # rerank on that shortlist, turbovec_store.py's search()) —
+                # just applied per-sentence instead of per-query. The
+                # bi-encoder isn't reliable enough to make the FINAL
+                # accept/reject call on its own (see _PGF_RERANK_FLOOR's
+                # own comment: 0.75 wrong-match vs 0.78 right-match, no
+                # safe threshold existed), but it doesn't need to be for
+                # this — it only needs to keep the true evidence chunk
+                # somewhere in a small shortlist, which it reliably does
+                # (confirmed: the real supporting chunk ranked #1 by
+                # bi-encoder in every case checked while building this fix).
+                # Only engages when the pool is actually bigger than the
+                # shortlist width — skips the extra bi-encoder pass entirely
+                # for the common small-pool case.
+                _PGF_PREFILTER_K = 5
+
                 def _pgf_context_for_units(_unit_texts: list) -> list:
-                    if len(_pgf_matching_chunks) <= 1 or not _unit_texts:
-                        _only = [0] if len(_pgf_matching_chunks) == 1 else []
-                        return [(_pgf_scoped_context, _only)] * len(_unit_texts)
-                    if _pgf_chunk_vecs is None:
+                    if not _unit_texts:
+                        return []
+                    if not _pgf_matching_chunks:
+                        return [(None, [])] * len(_unit_texts)
+                    if _pgf_reranker is None:
                         return [_pgf_word_overlap_order(u) for u in _unit_texts]
                     try:
-                        _unit_vecs = _pgf_embed_model.encode(_unit_texts, normalize_embeddings=True)
-                    except Exception as _pgf_unit_embed_exc:
+                        if len(_pgf_matching_chunks) > _PGF_PREFILTER_K:
+                            _pgf_pf_embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+                            _pgf_pf_chunk_vecs = _pgf_pf_embed_model.encode(
+                                _pgf_matching_chunks, normalize_embeddings=True
+                            )
+                            _pgf_pf_unit_vecs = _pgf_pf_embed_model.encode(
+                                _unit_texts, normalize_embeddings=True
+                            )
+                            _shortlists = []
+                            for _uv in _pgf_pf_unit_vecs:
+                                _sims = [float(np.dot(_uv, _cv)) for _cv in _pgf_pf_chunk_vecs]
+                                _order = sorted(
+                                    range(len(_pgf_matching_chunks)),
+                                    key=lambda i: _sims[i], reverse=True,
+                                )
+                                _shortlists.append(_order[:_PGF_PREFILTER_K])
+                        else:
+                            _shortlists = [list(range(len(_pgf_matching_chunks)))] * len(_unit_texts)
+
+                        _pairs: list = []
+                        _owner: list = []  # (unit_idx, chunk_idx) per pair
+                        for _ui, _unit in enumerate(_unit_texts):
+                            for _ci in _shortlists[_ui]:
+                                for _window in _rerank_windows(_pgf_matching_chunks[_ci], _unit):
+                                    _pairs.append((_unit, _window))
+                                    _owner.append((_ui, _ci))
+                        _raw_scores = _pgf_reranker.predict(_pairs)
+                    except Exception as _pgf_rerank_exc:
                         logger.debug(
-                            "[ask_stream] PGF sentence embedding failed, falling back to word "
-                            "overlap for evidence ordering: %s", _pgf_unit_embed_exc,
+                            "[ask_stream] PGF cross-encoder scoring failed, falling back to "
+                            "word overlap for evidence ordering: %s", _pgf_rerank_exc,
                         )
                         return [_pgf_word_overlap_order(u) for u in _unit_texts]
+                    _best: dict = {}
+                    for (_ui, _ci), _score in zip(_owner, _raw_scores):
+                        _key = (_ui, _ci)
+                        if _key not in _best or _score > _best[_key]:
+                            _best[_key] = float(_score)
                     _results = []
-                    for _uv in _unit_vecs:
-                        _scores = [float(np.dot(_uv, _cv)) for _cv in _pgf_chunk_vecs]
-                        _order = sorted(range(len(_pgf_matching_chunks)), key=lambda i: _scores[i], reverse=True)
-                        _top = _order[:_PGF_TOP_K_CHUNKS]
-                        _results.append(("\n\n".join(_pgf_matching_chunks[i] for i in _top), _top))
+                    for _ui in range(len(_unit_texts)):
+                        _scored = sorted(
+                            ((_ci, _best[(_ui, _ci)]) for _ci in _shortlists[_ui]),
+                            key=lambda x: x[1], reverse=True,
+                        )
+                        _top = [_ci for _ci, _sc in _scored[:_PGF_TOP_K_CHUNKS] if _sc >= _PGF_RERANK_FLOOR]
+                        if not _top:
+                            _results.append((None, []))
+                        else:
+                            _results.append(("\n\n".join(_pgf_matching_chunks[_ci] for _ci in _top), _top))
+                    return _results
+
+                async def _pgf_verify_units(_units: list, _ctxs: list) -> list:
+                    """Only calls the (LLM) entailment check for units whose
+                    evidence selection actually cleared _PGF_RERANK_FLOOR —
+                    ctx=None means nothing in the whole pool was a real
+                    match, which is an automatic fail, not a coin-flip LLM
+                    call against a weak/irrelevant chunk. Also saves a
+                    round-trip for exactly the units least likely to need
+                    one (see the module-level latency measurement recorded
+                    alongside this fix)."""
+                    _idx = [_j for _j, (_ctx, _cited) in enumerate(_ctxs) if _ctx is not None]
+                    _out = await asyncio.gather(*[
+                        _verify_point_faithfulness(_units[_j], _ctxs[_j][0]) for _j in _idx
+                    ])
+                    _results = [False] * len(_units)
+                    for _j, _ok in zip(_idx, _out):
+                        _results[_j] = _ok
                     return _results
 
                 def _pgf_log_citations(_label: str, _units: list, _ctxs: list, _results: list) -> None:
                     for _u, (_ctx, _cited), _ok in zip(_units, _ctxs, _results):
-                        _cite_desc = ", ".join(
-                            f"#{_i}:{_pgf_matching_chunks[_i][:60]!r}" for _i in _cited
-                        ) or "none (unscoped fallback)"
+                        if _ctx is None:
+                            _cite_desc = "none (no chunk cleared relevance floor)"
+                        else:
+                            _cite_desc = ", ".join(
+                                f"#{_i}:{_pgf_matching_chunks[_i][:60]!r}" for _i in _cited
+                            ) or "none (unscoped fallback)"
                         logger.info(
                             "[ask_stream] PGF citation (%s): unit=%r ok=%s cited_chunk(s)=[%s]",
                             _label, _u[:70], _ok, _cite_desc,
@@ -17228,10 +17344,9 @@ class MultiSourceRAG:
 
                     if _pgf_point_idx:
                         _pgf_point_ctxs = _pgf_context_for_units([_pgf_units[i] for i in _pgf_point_idx])
-                        _pgf_results = await asyncio.gather(*[
-                            _verify_point_faithfulness(_pgf_units[i], _ctx)
-                            for i, (_ctx, _cited) in zip(_pgf_point_idx, _pgf_point_ctxs)
-                        ])
+                        _pgf_results = await _pgf_verify_units(
+                            [_pgf_units[i] for i in _pgf_point_idx], _pgf_point_ctxs,
+                        )
                         _pgf_log_citations(
                             "numbered-list", [_pgf_units[i] for i in _pgf_point_idx],
                             _pgf_point_ctxs, _pgf_results,
@@ -17478,10 +17593,7 @@ class MultiSourceRAG:
 
                     if len(_pgf_sentences) >= 1:
                         _pgf_sent_ctxs = _pgf_context_for_units(_pgf_sentences)
-                        _pgf_sent_results = await asyncio.gather(*[
-                            _verify_point_faithfulness(s, ctx)
-                            for s, (ctx, _cited) in zip(_pgf_sentences, _pgf_sent_ctxs)
-                        ])
+                        _pgf_sent_results = await _pgf_verify_units(_pgf_sentences, _pgf_sent_ctxs)
                         _pgf_log_citations("prose-sentence", _pgf_sentences, _pgf_sent_ctxs, _pgf_sent_results)
                         _pgf_sent_drop = {i for i, ok in enumerate(_pgf_sent_results) if not ok}
 
@@ -17503,10 +17615,7 @@ class MultiSourceRAG:
                             if not _claims:
                                 continue
                             _claim_ctxs = _pgf_context_for_units(_claims)
-                            _claim_results = await asyncio.gather(*[
-                                _verify_point_faithfulness(c, ctx)
-                                for c, (ctx, _cited) in zip(_claims, _claim_ctxs)
-                            ])
+                            _claim_results = await _pgf_verify_units(_claims, _claim_ctxs)
                             _pgf_log_citations("salvage-claim", _claims, _claim_ctxs, _claim_results)
                             _surviving = [c for c, ok in zip(_claims, _claim_results) if ok]
                             logger.info(
