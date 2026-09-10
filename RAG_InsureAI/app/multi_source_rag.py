@@ -883,10 +883,22 @@ policy cover", "how do I file a claim", "what options do I have if my \
 claim is denied" — that asks about the CLAIMS PROCESS, not insurance \
 product types), or any unrelated question.
 
+A phrasing like "what coverage types should I look into" or "what types \
+of coverage does this include" is ALSO a coverage/definition question, \
+not a product-enumeration one, even though it contains the word "types" \
+— here "types" modifies coverage/protection ("what should I know about \
+what's covered"), not distinct insurance PRODUCTS. Answer NO for these. \
+Only answer YES when the question asks for types/kinds/varieties of the \
+INSURANCE PRODUCT or POLICY itself (e.g. "types of motor insurance", \
+"insurance options for a pet") — not types of what a product covers.
+
 Output EXACTLY one word: YES or NO.
 
 Question: "What options do I have when it comes to marine insurance?"
 YES
+
+Question: "What are the coverage types that I should look into for marine insurance?"
+NO
 
 Question: "What options do I have if my claim is denied?"
 NO
@@ -1722,6 +1734,13 @@ category=claims
 Question: "What is No Claim Bonus?"
 category=none
 
+Question: "What are the coverage types that I should look into for marine insurance?"
+category=benefits
+(despite the word "types", this asks what to look into COVERAGE-wise —
+not for a list of named insurance products to choose between; that
+would be "types_of_insurance" instead, e.g. "what types of marine
+insurance policies are there")
+
 Question: {question}
 """
 
@@ -1757,7 +1776,17 @@ _QUERY_SECTION_PROTOTYPES = {
     "flight_delay": "My flight or trip departure was delayed, am I covered for that?",
     "baggage": "My baggage or luggage was lost, delayed, or damaged, what happens?",
     "legislation": "What do the insurance laws, regulations, or IRDAI rules require?",
-    "types_of_insurance": "What are the different types or kinds of this insurance?",
+    # Deliberately product/plan-name-focused, not "coverage"-worded — a
+    # sentence containing "cover(s)" pulls close to real coverage/benefits
+    # queries regardless of any "not" nearby, since this bi-encoder embeds
+    # overall gist rather than logical negation. Confirmed live 2026-09-09:
+    # the earlier phrasing ("What are the different types or kinds of this
+    # insurance?") scored a real "coverage types" query (asking what to
+    # look into, not asking to enumerate named products) at 0.776 — above
+    # floor+margin — purely because both sentences share "types"/"kinds"-
+    # of-insurance framing with no signal distinguishing "kinds of
+    # PRODUCT" from "kinds of COVERAGE".
+    "types_of_insurance": "What named insurance products, plans, or policy variants exist to choose between?",
     "principles": "What insurance principle or doctrine applies here?",
     "history": "What is the history or origin of this kind of insurance?",
     "case_law": "What court case or legal precedent applies to this?",
