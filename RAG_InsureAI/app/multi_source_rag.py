@@ -22,7 +22,7 @@ import numpy as np
 from rapidfuzz import fuzz, process
 from turbovec_store import _rerank_windows, _get_shared_reranker, _get_shared_embed_model, EMBED_MODEL_NAME, _rerank_metadata_prefix
 from metadata_tagger import (
-    classify_query_policy_type, get_active_vocab, _valid_policy_types, _normalize_policy_type,
+    get_active_vocab, _valid_policy_types, _normalize_policy_type,
     _is_duplicate_of_existing_type, _regex_policy_score, classify_chunk_intent,
 )
 import contamination_trace
@@ -4126,8 +4126,14 @@ _POLICY_TYPE_EMBED_MARGIN = 0.06
 
 
 async def _classify_query_policy_type_llm(query: str) -> str:
-    """Fallback for query policy_type, used only when the free regex pass
-    (classify_query_policy_type) can't confidently name one.
+    """THE query policy_type classifier — every call site in this file
+    (2026-09-10). Used to be a fallback, only consulted when a regex pass
+    (classify_query_policy_type, metadata_tagger.py) came up empty; that
+    regex-first gate is gone now, same direction as the ingestion-side
+    fix — a bare keyword match no longer gets to decide the type outright
+    over this function's own embedding+LLM judgment. Not a blind LLM call
+    despite the name: embedding similarity first (fast, deterministic),
+    a real LLM only for the genuinely ambiguous band — see below for why.
 
     Most real queries don't name their type in the exact textbook phrase
     regex looks for — confirmed live: "what's not covered if my car is
@@ -4250,7 +4256,17 @@ async def _classify_query_policy_type_tiebreak_llm(query: str) -> Optional[str]:
         label_list = "\n".join(f"  - {pt}: {info['desc']}" for pt, info in vocab.items())
         prompt = f"""Classify the ONE insurance policy type this question is about, using the
 descriptions below to judge which one actually fits. Reply "general" if the question
-genuinely doesn't match any of them, even if one looks like the closest available option.
+genuinely doesn't match any of them, even if one looks like the closest available option
+on shared vocabulary alone.
+
+Example: "Is my fine art collection covered if it gets damaged in transit?" shares
+surface vocabulary with marine insurance ("damage", "transit") and with jewellery
+insurance ("valuable item"), but the question is genuinely about neither — it names
+fine art specifically, not cargo or jewellery. The correct answer here is "general",
+not whichever label happens to share the most words. Don't feel pressured to pick
+something just because one option sounds closest — a specific label is only correct
+when the question is genuinely, specifically about that exact type; every question
+you're given deserves this same real judgment call, not a forced pick from the list.
 
 {label_list}
   - general: none of the types above genuinely fits this question
@@ -4449,13 +4465,20 @@ async def _classify_query_candidate_type_llm(query: str) -> Optional[str]:
     candidate_policy_type set — the common case has nothing to compare
     against, so this call would otherwise be pure wasted latency on every
     single query.
-    """
-    from candidate_vocab import match_candidate_vocab, normalize_candidate_label, upsert_candidate
 
-    hit = match_candidate_vocab(query)
-    if hit:
-        upsert_candidate(hit, [], query, "query")
-        return hit
+    LLM-only now (2026-09-10) — no longer starts with a cheap keyword-
+    overlap check against the existing candidate vocabulary. Same fix,
+    same reasoning, as metadata_tagger.classify_candidate_type()'s own
+    removal: a keyword match here can just as easily latch onto an
+    existing, unrelated candidate whose stored keywords happen to overlap
+    (confirmed live on the ingestion side — see that function's own
+    docstring for the "jewellery_insurance" case), and this function's own
+    name already promises "_llm" — a query is short enough that the real
+    LLM call costs little, and this only ever runs when there's already a
+    candidate-tagged chunk in the pool to compare against, not on every
+    query.
+    """
+    from candidate_vocab import normalize_candidate_label, upsert_candidate
 
     # Backend failure (timeout, connection error, empty completion) is
     # deliberately allowed to propagate here rather than being swallowed
@@ -4810,6 +4833,13 @@ async def _verify_point_faithfulness(point: str, context: str) -> bool:
         "evidence's own — that alone is not a reason to say no; judge "
         "whether the evidence supports its MEANING, not whether it repeats "
         "the evidence's exact words.\n"
+        "A hypothesis that is broader or less detailed than the evidence — "
+        "one that summarizes rather than listing every specific the "
+        "evidence contains — still counts as entailed, as long as what it "
+        "states is actually supported. Only answer no when the hypothesis "
+        "asserts something the evidence does not support or contradicts, "
+        "never merely because it omits detail the evidence could have "
+        "included.\n"
         "A hypothesis stating that two named things are SEPARATE, not "
         "combined, or not covered by the same product also counts as "
         "entailed when the evidence discusses one of them without ever "
@@ -8470,6 +8500,13 @@ _ENTAILMENT_FIXED_PROMPT_TOKENS_EST = _measure_prompt_tokens(
     "evidence's own — that alone is not a reason to say no; judge "
     "whether the evidence supports its MEANING, not whether it repeats "
     "the evidence's exact words.\n"
+    "A hypothesis that is broader or less detailed than the evidence — "
+    "one that summarizes rather than listing every specific the "
+    "evidence contains — still counts as entailed, as long as what it "
+    "states is actually supported. Only answer no when the hypothesis "
+    "asserts something the evidence does not support or contradicts, "
+    "never merely because it omits detail the evidence could have "
+    "included.\n"
     "A hypothesis stating that two named things are SEPARATE, not "
     "combined, or not covered by the same product also counts as "
     "entailed when the evidence discusses one of them without ever "
@@ -10760,9 +10797,24 @@ class MultiSourceRAG:
         if _force_general_policy_type:
             _query_policy_type = "general"
         else:
-            _query_policy_type = classify_query_policy_type(retrieval_query)
-            if _query_policy_type == "general":
-                _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
+            # No regex-first pass (2026-09-10, same direction as the
+            # ingestion-side fix) — classify_query_policy_type()'s regex
+            # scorer used to decide outright whenever it found a single
+            # confident, untied hit, with the LLM/embedding path
+            # (_classify_query_policy_type_llm) only ever consulted as a
+            # fallback for the "general" case. That let a bare keyword
+            # match win over real understanding on every query where it
+            # fired. _classify_query_policy_type_llm is not a blind LLM
+            # call either way — it's embedding similarity first (fast,
+            # deterministic, not regex) with a real LLM tie-break only for
+            # the genuinely ambiguous band — still vLLM, unchanged; see its
+            # own docstring for why a full one-shot LLM classification over
+            # the whole type list was tried and rejected as unreliable on
+            # this model. _regex_policy_scores above is NOT this decision —
+            # it's a separate, still-used signal for how confidently the
+            # FINAL type is evidenced (see _query_policy_type_weak_evidence
+            # below), not for picking the type itself.
+            _query_policy_type = await _classify_query_policy_type_llm(retrieval_query)
         # Weak-or-absent regex evidence for whichever type we ended up
         # with — computed on the FINAL _query_policy_type (after the LLM
         # fallback just above), not just the pre-fallback regex guess, so
@@ -10857,7 +10909,7 @@ class MultiSourceRAG:
                         _np_name if re.search(r'\binsurance\b', _np_name, re.IGNORECASE)
                         else f"{_np_name} insurance"
                     )
-                    _np_type = classify_query_policy_type(_np_probe)
+                    _np_type = await _classify_query_policy_type_llm(_np_probe)
                     if _np_type != "general":
                         _policy_types_for_filter.add(_np_type)
             _policy_type_filter = {"policy_type": {"$in": sorted(_policy_types_for_filter) + ["general"]}}
@@ -11052,7 +11104,28 @@ class MultiSourceRAG:
         # the block just above), so it must never wait for or adopt anyone
         # else's cached answer. See QueryKVCache.try_acquire_generation_lock
         # / wait_for_generation for the fail-open and self-healing behavior.
-        if _kv_hit is None and not _disable_query_cache and not _bypass_cache_for_chip_click:
+        #
+        # ALSO skipped for _is_retry (2026-09-10, fixed after live
+        # reproduction): _retry_after_full_hallucination below recursively
+        # calls THIS SAME ask_stream with the identical question/history —
+        # _force_general_policy_type only changes retrieval filtering, not
+        # retrieval_query or make_key()'s inputs, so the recursive call
+        # computes the SAME _kv_key as the outer call it's nested inside.
+        # The outer call already holds the lock (never explicitly released
+        # — see try_acquire_generation_lock's own docstring) and is
+        # synchronously awaiting this very recursive call's completion, so
+        # without this guard the retry sees "lock held by another request"
+        # and polls for up to wait_for_generation's full timeout waiting for
+        # a cache write that can only ever land once the retry itself
+        # returns — self-resolving via the timeout rather than a true
+        # deadlock, but a real, reproduced ~150s latency regression on
+        # every full-hallucination retry. A retry call always wants fresh
+        # generation, never a cache hit, so it has no business touching
+        # this coordination at all — same reasoning as the chip-click skip.
+        if (
+            _kv_hit is None and not _disable_query_cache
+            and not _bypass_cache_for_chip_click and not _is_retry
+        ):
             if await asyncio.to_thread(_kv.try_acquire_generation_lock, _kv_key):
                 logger.info("[ask_stream] cache-lock acquired, generating: %r", retrieval_query[:80])
             else:
@@ -11199,8 +11272,8 @@ class MultiSourceRAG:
                 _np_a, _np_b = _np_pair_for_retrieval
                 _np_query_a = _np_a if re.search(r'\binsurance\b', _np_a, re.IGNORECASE) else f"{_np_a} insurance"
                 _np_query_b = _np_b if re.search(r'\binsurance\b', _np_b, re.IGNORECASE) else f"{_np_b} insurance"
-                _np_type_a = classify_query_policy_type(_np_query_a)
-                _np_type_b = classify_query_policy_type(_np_query_b)
+                _np_type_a = await _classify_query_policy_type_llm(_np_query_a)
+                _np_type_b = await _classify_query_policy_type_llm(_np_query_b)
                 if _np_type_a != "general" and _np_type_b != "general" and _np_type_a != _np_type_b:
                     _np_split_types = (_np_type_a, _np_type_b)
                 elif _np_a.strip().lower() in _GENERAL_VOCAB_TERMS and _np_b.strip().lower() in _GENERAL_VOCAB_TERMS:
@@ -12197,10 +12270,10 @@ class MultiSourceRAG:
         _cq_is_split_shape = False
         if _cq_pair:
             _cq_a, _cq_b = _cq_pair
-            _cq_type_a = classify_query_policy_type(
+            _cq_type_a = await _classify_query_policy_type_llm(
                 _cq_a if re.search(r"\binsurance\b", _cq_a, re.IGNORECASE) else f"{_cq_a} insurance"
             )
-            _cq_type_b = classify_query_policy_type(
+            _cq_type_b = await _classify_query_policy_type_llm(
                 _cq_b if re.search(r"\binsurance\b", _cq_b, re.IGNORECASE) else f"{_cq_b} insurance"
             )
             _cq_is_split_shape = (
@@ -12444,9 +12517,9 @@ class MultiSourceRAG:
                     # exactly what this retry just proved is the right
                     # anchor going forward — matches the retrieval_query
                     # reassignment right below.
-                    _query_policy_type = classify_query_policy_type(question)
-                    if _query_policy_type == "general":
-                        _query_policy_type = await _classify_query_policy_type_llm(question)
+                    # No regex-first pass here either (2026-09-10) — same
+                    # fix as the primary call site above.
+                    _query_policy_type = await _classify_query_policy_type_llm(question)
                     all_chunks = _sort_and_truncate(_standalone_chunks)
                     retrieval_query = question
                     ctx_covered = True
@@ -14506,13 +14579,15 @@ class MultiSourceRAG:
                             # that name a real, different type survive
                             # into _confirmed_idx.
                             _confirmed_idx = []
+                            _confirmed_types: dict = {}
                             for _di in _drop_idx:
                                 try:
-                                    _pt_type = classify_query_policy_type(_rel_points[_di])
+                                    _pt_type = await _classify_query_policy_type_llm(_rel_points[_di])
                                 except Exception:
                                     _pt_type = "general"
                                 if _pt_type != "general" and _pt_type != _query_policy_type:
                                     _confirmed_idx.append(_di)
+                                    _confirmed_types[_di] = _pt_type
                             logger.info(
                                 "[ask_stream] point-relevance gate CANDIDATE demote=%d/%d "
                                 "confirmed=%d active=%s (gap=%.2fx, sorted_scores=%s, "
@@ -14527,7 +14602,7 @@ class MultiSourceRAG:
                                 # order; every point the model wrote is
                                 # still in the answer.
                                 _pr_demoted = [
-                                    {"text": _rel_points[i][:200], "confirmed_type": classify_query_policy_type(_rel_points[i])}
+                                    {"text": _rel_points[i][:200], "confirmed_type": _confirmed_types.get(i, "general")}
                                     for i in _confirmed_idx
                                 ]
                                 _demote_set = set(_confirmed_idx)
@@ -17218,6 +17293,64 @@ class MultiSourceRAG:
                         )
                         _pgf_reranker = None
 
+                # Retrieval's own _rerank_windows (turbovec_store.py) caps
+                # windows at 700 chars purely for SPEED and picks only 2
+                # windows heuristically (the opening slice + one keyword-
+                # weighted guess) — confirmed live this can genuinely MISS
+                # real content, not just truncate it: a real "a. Claim bill
+                # in duplicate" list item sat inside the one window the
+                # heuristic picked, but buried behind enough preceding
+                # boilerplate (an unrelated CLAIMS PROCEDURE section ahead
+                # of it in the same chunk) to dilute its cross-encoder
+                # score to 0.33 — below _PGF_RERANK_FLOOR — even though the
+                # fact was genuinely present and correctly retrieved (it
+                # was even the cited evidence for the NEIGHBORING claim in
+                # the same answer).
+                #
+                # First fix attempt used BIGGER windows (2000 chars, close
+                # to the reranker's real ~512-token capacity) on the theory
+                # that more context would help — measured live, it only
+                # improved the same case to 0.44, still under the floor:
+                # a bigger window still buries the one-line list item under
+                # a full paragraph of unrelated procedural text ahead of
+                # it, and a cross-encoder scores the WHOLE pair jointly, so
+                # more surrounding noise still dilutes the match. Swept
+                # window sizes empirically instead of guessing again:
+                # 1000/600/400/300 chars scored 0.59/0.85/0.98/0.65 on the
+                # same real case — 400 chars (not bigger, SMALLER) is what
+                # actually isolates a single list item from its
+                # surrounding boilerplate; going smaller still (300) starts
+                # cutting the target phrase itself across a window
+                # boundary and the score drops again. Re-verified 400/200
+                # against every previously-established pass/fail case
+                # (paraphrase, partial-claim, vague-summary, the original
+                # hallucination) — all held correctly.
+                #
+                # PGF's own candidate count is already bounded by
+                # _PGF_PREFILTER_K (5 chunks/unit, never the whole pool),
+                # so unlike retrieval it can afford FULL coverage at this
+                # smaller size — every character of a candidate chunk gets
+                # seen by at least one window (200-char overlap so a fact
+                # sitting near a boundary is never split across two windows
+                # and missed by both) — rather than retrieval's 2-window
+                # heuristic guess. Deliberately a separate function, not a
+                # change to _rerank_windows itself — retrieval's own
+                # speed-tuned windowing stays exactly as it is.
+                _PGF_RERANK_WINDOW_CHARS = 400
+                _PGF_RERANK_WINDOW_STRIDE = 200
+
+                def _pgf_rerank_windows(_text: str) -> list:
+                    if len(_text) <= _PGF_RERANK_WINDOW_CHARS:
+                        return [_text]
+                    _windows = []
+                    _start = 0
+                    while True:
+                        _windows.append(_text[_start:_start + _PGF_RERANK_WINDOW_CHARS])
+                        if _start + _PGF_RERANK_WINDOW_CHARS >= len(_text):
+                            break
+                        _start += _PGF_RERANK_WINDOW_STRIDE
+                    return _windows
+
                 # Cross-encoder pairs cost ~0.22s each regardless of how the
                 # total is split between units and chunks — measured live
                 # (2026-09-10): 5 units x 8 chunks (48 pairs) took ~11s, and
@@ -17274,7 +17407,7 @@ class MultiSourceRAG:
                         _owner: list = []  # (unit_idx, chunk_idx) per pair
                         for _ui, _unit in enumerate(_unit_texts):
                             for _ci in _shortlists[_ui]:
-                                for _window in _rerank_windows(_pgf_matching_chunks[_ci], _unit):
+                                for _window in _pgf_rerank_windows(_pgf_matching_chunks[_ci]):
                                     _pairs.append((_unit, _window))
                                     _owner.append((_ui, _ci))
                         _raw_scores = _pgf_reranker.predict(_pairs)

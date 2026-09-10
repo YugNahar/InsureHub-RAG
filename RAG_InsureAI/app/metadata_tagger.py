@@ -2676,7 +2676,7 @@ def _extract_candidate_keywords(text: str) -> list[str]:
 
 def classify_candidate_type(
     text: str, llm: Any = None, *, source: str = "", source_type: str = "chunk",
-    skip_cheap_match: bool = False,
+    skip_cheap_match: bool = True,
 ) -> Optional[str]:
     """
     Mode-A handling (open-vocabulary fallback). Called only after the
@@ -2687,39 +2687,41 @@ def classify_candidate_type(
     for the reranking candidate-match bypass and as raw material for a
     future manual promotion review.
 
-    Step 3 (cheap): check the already-discovered candidate vocabulary's
-    keyword hints before paying for another LLM call — catches repeat
-    instances of a novel topic that's already been seen once.
-    Step 4 (LLM, no vocabulary constraint): only if step 3 also misses and
-    an LLM is available. Returns None (no candidate at all) if the model's
-    answer normalizes to a degenerate non-answer ("general", "unclear",
-    etc.) — a real absence of a guess, not an empty-string label, so two
-    unrelated "no idea" cases can never collide in the candidate-match
-    bypass downstream.
-
-    skip_cheap_match: force step 4 unconditionally, bypassing step 3
-    entirely. For a one-time bulk re-classification pass (e.g. backfilling
-    candidate_policy_type across many pre-existing chunks in one run), the
-    normal per-request cost tradeoff that step 3 exists for doesn't apply —
-    confirmed live this backfill scenario is exactly where keyword-overlap
-    matching runs away: one early classification seeds generic domain
-    vocabulary ("risk", "insurable", "interest", "assessment" — all common
-    across broad insurance-law/textbook content, not distinctive to any one
-    topic), which then cheap-matches most of the REST of the same run
-    before the LLM ever gets a chance to independently disagree.
+    LLM-only now (2026-09-10) — the cheap keyword-overlap pre-check this
+    function used to run before ever asking the LLM has been removed
+    entirely, not just made skippable. User's explicit direction: the
+    only thing that decides policy_type (official OR candidate) is the
+    LLM, full stop — a keyword shortcut is exactly the "regex decides
+    over real understanding" pattern already removed from ingestion and
+    every query-side call site. Confirmed live as a real, damaging bug,
+    not just a theoretical risk: uploading a genuinely new "fine art &
+    collectibles insurance" document, 2 of 5 sections cheap-matched an
+    EXISTING unrelated candidate ("jewellery_insurance" — collectibles/
+    valuables vocabulary overlapping its stored keywords) before the LLM
+    ever got a chance to independently guess "fine_art_insurance" like
+    the other 3 sections correctly did. That wrong candidate didn't stay
+    contained either: the in-document anchor-correction pass elsewhere in
+    this pipeline (see api.py's background reclassify) feeds a repeated
+    candidate label back as a doc_prior "anchor" for sibling sections —
+    so the cheap match went on to bias a REAL LLM call's answer for the
+    OFFICIAL policy_type field too, not just the candidate hint. The
+    skip_cheap_match parameter (previously opt-in, used only for bulk
+    backfills — see the module's own history for why keyword-overlap
+    "runs away" at exactly that scale) is now the unconditional default;
+    kept as a parameter rather than deleted outright only so existing
+    call sites don't need touching, not because the non-default value is
+    still expected to be used anywhere.
+    Returns None (no candidate at all) if the model's answer normalizes
+    to a degenerate non-answer ("general", "unclear", etc.) — a real
+    absence of a guess, not an empty-string label, so two unrelated "no
+    idea" cases can never collide in the candidate-match bypass
+    downstream. Returns None immediately, with no keyword fallback of any
+    kind, when no LLM is available (e.g. the synchronous ingest path,
+    llm=None by design) — matches "general" being the safe answer
+    everywhere else in this codebase's policy_type pipeline when the LLM
+    can't be reached, rather than falling back to a guess.
     """
-    from candidate_vocab import match_candidate_vocab, normalize_candidate_label, upsert_candidate
-
-    hit = None if skip_cheap_match else match_candidate_vocab(text)
-    if hit:
-        # Deliberately pass [] here, not _extract_candidate_keywords(text) —
-        # a cheap keyword match was never verified by the LLM, so growing
-        # the label's keyword set from it is how one over-broad match
-        # compounds into an even broader one next time. Only a fresh LLM
-        # classification (below) should ever widen the keyword list;
-        # guess_count/last_seen still update either way.
-        upsert_candidate(hit, [], source, source_type)
-        return hit
+    from candidate_vocab import normalize_candidate_label, upsert_candidate
 
     if llm is None:
         return None

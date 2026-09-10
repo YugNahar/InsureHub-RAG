@@ -1344,6 +1344,68 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
 
             reclass_llm = get_classification_llm(temperature=0)
             tvec = pipeline.vector_store._store
+            # Moved up from its old spot right before the policy_type loop
+            # below — the new doc_type verification block right after this
+            # also needs to count its own corrections into the same total.
+            updated = 0
+
+            # ── doc_type verification (2026-09-10) ─────────────────────────
+            # classify_document_type() (Step 1, synchronous, keyword-
+            # counting only — llm=None by design there, same latency
+            # reasoning as Step 2) decides ONCE, on upload, which of 4
+            # buckets a document goes in, and nothing ever revisited it
+            # before this — unlike policy_type and section (both verified
+            # by a real LLM right here). Confirmed live as a genuine gap,
+            # not hypothetical: a document written as formal policy
+            # WORDING (an insurer's own published terms for a product,
+            # not one customer's administratively-completed certificate)
+            # scores 0-1 on the policy_document checklist, which only
+            # looks for administrative phrases like "policy number" /
+            # "policyholder" / "sum insured" — a real policy wording
+            # document has none of those — while its own formal, legal-
+            # sounding phrasing alone was enough to trip the handbook-
+            # signal fallback. Result: filed as "reference_handbook".
+            # That doesn't retroactively re-chunk the document (the
+            # section-intent fix above no longer depends on doc_type being
+            # right — its own classifier is doc_type-agnostic), but
+            # doc_type is still real, user-facing metadata worth getting
+            # right rather than leaving permanently wrong. One call per
+            # document (not batched — there's only one document type
+            # decision per upload, nothing to batch).
+            try:
+                _doc_type_prompt = f"""Classify this insurance-related document into exactly ONE of these 4 categories:
+  - policy_document: describes what ONE specific insurance product actually covers, excludes, and how to claim on it. This includes BOTH a customer's issued certificate AND a policy wording/terms document an insurer publishes for a product — even one that names no specific policyholder, policy number, or premium amount, as long as it is the actual terms of that one product (insuring clause, what's covered, exclusions, claims procedure).
+  - reference_handbook: a legal textbook, study guide, or general reference material ABOUT insurance principles, law, or concepts — explains insurance as a subject rather than being the terms of one specific product.
+  - regulatory: government/regulator circulars, gazette notifications, acts, or official regulations.
+  - general: none of the above (forms, spreadsheets, unrelated content).
+
+Filename: {filename}
+TEXT:
+{(preview + " " + extra_text)[:2500]}
+
+Reply with ONLY the category name, nothing else."""
+                _doc_type_raw = reclass_llm.invoke(_doc_type_prompt)
+                _doc_type_reply = (
+                    _doc_type_raw.content if hasattr(_doc_type_raw, "content") else str(_doc_type_raw)
+                ).strip().lower()
+                _doc_type_reply = re.split(r"[\s\n,.:;]", _doc_type_reply)[0].strip()
+                _VALID_DOC_TYPES = {"policy_document", "reference_handbook", "regulatory", "general"}
+                if _doc_type_reply in _VALID_DOC_TYPES and _doc_type_reply != doc_type:
+                    logger.info(
+                        "[background reclassify] '%s': doc_type corrected %r -> %r",
+                        filename, doc_type, _doc_type_reply,
+                    )
+                    doc_type = _doc_type_reply
+                    for cid in chunk_ids:
+                        meta = tvec._metadatas.get(cid)
+                        if meta is not None and meta.get("doc_type") != doc_type:
+                            meta["doc_type"] = doc_type
+                            updated += 1
+            except Exception as _doc_type_exc:
+                logger.debug(
+                    "[background reclassify] doc_type verification failed for '%s': %s",
+                    filename, _doc_type_exc,
+                )
 
             sections: dict = {}
             for cid, chunk in zip(chunk_ids, chunks):
@@ -1366,7 +1428,8 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 [c.page_content for c in chunks], filename=filename,
             )
 
-            updated = 0
+            # (updated is initialized earlier now, before the doc_type
+            # verification block, so it can count those corrections too.)
             # The synchronous step above already ran the free heading-first
             # regex pass (SectionChunker.split_documents with llm=None, by
             # design, to keep the upload response fast) — that result is
@@ -1406,11 +1469,54 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 llm=reclass_llm, doc_prior=doc_prior,
             )
 
+            # Section-intent (benefits/exclusions/claims/...) verified for
+            # EVERY section now, not just ones the synchronous regex pass
+            # left as "general" (2026-09-10) — a real gap, not just a
+            # tuning issue: the synchronous ingest step (SectionChunker.
+            # split_documents, llm=None by design) can be CONFIDENTLY
+            # WRONG, not just unconfident, and a confident wrong answer
+            # never reached this rescue before — the old gate only fired
+            # on "general". Confirmed live: a document whose doc_type got
+            # misclassified as "reference_handbook" routes its sections
+            # through a DIFFERENT, older, doc_type-split section-pattern
+            # set (_detect_section/_POLICY_SECTION_PATTERNS vs
+            # _HANDBOOK_SECTION_PATTERNS, rag.py) that has no "exclusions"
+            # category at all on the handbook side — so a real "4.
+            # Exclusions" heading, unable to land on the category that
+            # actually fits, confidently matched "legislation" instead
+            # (its own cross-references to "Section 2"/"Section 3" tripped
+            # that category's \bsection \d\b pattern). That confident-but-
+            # wrong "legislation" tag then skipped this rescue entirely
+            # under the old "only if general" gate — and, compounding it,
+            # fed a WRONG "[Section: Legislation]" hint into the reranker
+            # instead of the correct "[Section: Exclusions]" one, actively
+            # misleading retrieval rather than just failing to help it.
+            #
+            # classify_chunk_intents_batch uses a SINGLE, unified, doc_
+            # type-AGNOSTIC label set (_CHUNK_INTENT_LABELS) that has both
+            # "exclusions" and "legislation" as their own distinct
+            # categories regardless of doc_type — running it
+            # unconditionally, for every section, replaces the older
+            # split system's verdict outright rather than only ever
+            # rescuing sections it had already given up on. This also
+            # means a genuinely correct doc_type is no longer load-bearing
+            # for section-intent to come out right — the unified system
+            # doesn't consult doc_type's category list at all.
+            # Batched the same way as policy_type just above — one call
+            # for the whole document instead of one call per section.
+            _section_headings_list = [
+                section_items[0][1].metadata.get("section_heading", "")
+                for section_items in _section_items_list
+            ]
+            _section_intent_results = classify_chunk_intents_batch(
+                _section_texts, llm=reclass_llm, headings=_section_headings_list,
+            )
+
             _section_pass1 = []
             _section_candidate_sections = []
             _section_llm_fixes = []
-            for section_items, section_text, enriched in zip(
-                _section_items_list, _section_texts, _enriched_list,
+            for section_items, section_text, enriched, _fresh_section in zip(
+                _section_items_list, _section_texts, _enriched_list, _section_intent_results,
             ):
                 fresh = enriched["policy_type"]
                 # Mode-A fallback: the closed vocabulary still can't place
@@ -1433,59 +1539,37 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
                 # One axis over: section (benefits/exclusions/claims/...)
                 # instead of policy_type. A completely separate axis from
                 # Pass 2 below (which only ever revisits policy_type), so
-                # this is computed once here and never needs to participate
-                # in that later rewrite — kept as its own parallel list,
-                # same order/length as _section_items_list, rather than
-                # threaded through _section_pass1's own tuple shape.
+                # this is computed once above (batched, for every section)
+                # and never needs to participate in that later rewrite —
+                # kept as its own parallel list, same order/length as
+                # _section_items_list, rather than threaded through
+                # _section_pass1's own tuple shape.
                 #
-                # 2026-09-09 — real gap, not just a tuning issue: this used
-                # to go STRAIGHT to the open-vocabulary classify_candidate_
-                # section() fallback below, which only ever writes a
-                # separate `candidate_section` hint field, never the real
-                # `section` field itself. That meant the CLOSED 13-category
-                # vocabulary (the field _metadata_scoped_retrieval actually
-                # filters on) had NO LLM correction anywhere in the live
-                # pipeline at all — the synchronous ingest step runs with
-                # llm=None by design (Step 4 above), so "general" from
-                # regex+embedding alone was PERMANENT, with nothing ever
-                # revisiting it, unlike policy_type just above (which this
-                # same background pass already verifies/corrects with a
-                # real LLM). Confirmed live this isn't rare: a real,
-                # correctly-worded "Common Exclusions" heading only scored
-                # 0.58 on the embedding check (below the 0.65 confidence
-                # bar — dilution from ~100 words of dense legal body text
-                # pulling the score down, not the heading being unclear),
-                # and 36 more genuine chunks across this same KB were
-                # caught the same way in one manual audit. Re-running
-                # classify_chunk_intents_batch here — same regex-then-
-                # embedding-then-LLM function the synchronous path already
-                # uses, just with a REAL llm this time instead of None —
-                # gives the closed vocabulary the same rescue policy_type
-                # already gets, instead of only ever attaching an open-
-                # vocabulary hint that a different retrieval path reads.
-                # Single-item list, not batched: matches the existing
-                # classify_candidate_type/classify_candidate_section calls
-                # in this same loop, which are already per-section by
-                # design ("only fires for general sections, a small
-                # minority, so it isn't a rate-limit driver").
+                # _fresh_section is the unified classifier's verdict for
+                # THIS section, already computed for every section above
+                # (not gated on the old regex result) — apply it whenever
+                # it differs from whatever's currently stored, whether that
+                # was "general" or a confident-but-wrong specific label.
+                # Only fall back to the open-vocabulary candidate_section
+                # guess when the unified classifier ALSO lands on
+                # "general" — i.e. even this better system genuinely can't
+                # place it in the fixed 13-category list.
                 _existing_section = section_items[0][1].metadata.get("section", "general")
                 section_llm_fix = None
                 section_candidate_section = None
-                if _existing_section == "general":
-                    _section_heading = section_items[0][1].metadata.get("section_heading", "")
-                    _section_llm_result = classify_chunk_intents_batch(
-                        [section_text], llm=reclass_llm, headings=[_section_heading],
-                    )
-                    if _section_llm_result and _section_llm_result[0] != "general":
-                        section_llm_fix = _section_llm_result[0]
+                if _fresh_section != "general":
+                    if _fresh_section != _existing_section:
+                        section_llm_fix = _fresh_section
                         logger.info(
-                            "[background reclassify] '%s': section corrected general -> %r "
-                            "(heading=%r)", filename, section_llm_fix, _section_heading,
+                            "[background reclassify] '%s': section corrected %r -> %r "
+                            "(heading=%r)", filename, _existing_section, section_llm_fix,
+                            section_items[0][1].metadata.get("section_heading", ""),
                         )
-                    else:
-                        section_candidate_section = classify_candidate_section(
-                            section_text, heading=_section_heading, llm=reclass_llm, source=filename,
-                        )
+                else:
+                    _section_heading = section_items[0][1].metadata.get("section_heading", "")
+                    section_candidate_section = classify_candidate_section(
+                        section_text, heading=_section_heading, llm=reclass_llm, source=filename,
+                    )
                 _section_candidate_sections.append(section_candidate_section)
                 _section_llm_fixes.append(section_llm_fix)
 
