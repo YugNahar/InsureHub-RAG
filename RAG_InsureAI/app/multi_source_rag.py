@@ -16256,6 +16256,31 @@ class MultiSourceRAG:
                 r"not\s+payable|no\s+coverage",
                 _re.IGNORECASE,
             )
+            # A bare structural cross-reference to "exclusions" isn't
+            # exclusion CONTENT — confirmed live 2026-09-11 on a fork
+            # sharing this exact mechanism: a policy's own opening
+            # "Insuring Clause" ("...subject to the terms, conditions,
+            # limits, and exclusions set out below") matched
+            # _EXCLUSION_INDICATOR_RE and, since a rare scenario word from
+            # the question happened to sit right next to it, this made a
+            # totally unrelated denial claim look grounded — the real
+            # exclusion clause elsewhere in the document (naming the
+            # actual excluded scenarios) had ZERO scenario-word overlap
+            # with the question, and would correctly have failed the check
+            # on its own. This near-universal insurance-boilerplate shape
+            # (a coordinate noun list ending in "exclusions set out
+            # below/herein/elsewhere", or "subject to the terms... and
+            # exclusions") names the CONCEPT of exclusions existing
+            # somewhere in the document without stating what's excluded —
+            # a recognizable document-structure pattern, not scenario-
+            # specific whack-a-mole, so skipping it doesn't weaken the
+            # check's ability to catch a genuine mismatch elsewhere.
+            _EXCLUSION_CROSS_REF_RE = _re.compile(
+                r"(?:terms,?\s+)?(?:conditions,?\s+)?(?:limits,?\s+)?and\s+exclu\w*\s+set\s+out|"
+                r"exclu\w*\s+set\s+out\s+(?:below|herein|elsewhere)|"
+                r"subject\s+to\s+the\s+(?:policy'?s?\s+)?terms(?:,?\s+conditions)?(?:,?\s+and)?\s+exclu\w*",
+                _re.IGNORECASE,
+            )
             # Generic insurance vocabulary (already maintained for the
             # hollow-answer detector) plus ordinary English function words —
             # what's left after stripping both is the part of the question
@@ -16338,6 +16363,9 @@ class MultiSourceRAG:
                 _any_compatible_denial_src = False
                 _any_exclusion_context = False
                 for _m in _EXCLUSION_INDICATOR_RE.finditer(_full_context_uncompressed or ''):
+                    _match_local = _full_context_uncompressed[max(0, _m.start() - 40):_m.end() + 40]
+                    if _EXCLUSION_CROSS_REF_RE.search(_match_local):
+                        continue
                     _any_exclusion_context = True
                     _window = _full_context_uncompressed[max(0, _m.start() - 300):_m.end() + 300]
                     _window_words = _denial_scenario_words(_window)
