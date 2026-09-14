@@ -14,15 +14,20 @@ self-growing label store, populated from chunk text at ingestion time
 cheaply at query time (match_candidate_section_vocab(), no LLM call)
 against whatever's already been discovered.
 
-Deliberately simpler than candidate_vocab.py — no "promotion to an
-active/closed vocabulary" step. A policy_type candidate gets promoted
-because retrieval filtering needs a genuine closed list to build
-`$in` clauses from. A section candidate never touches retrieval
-filtering at all (see multi_source_rag.py's guaranteed-inclusion step) —
-it only ever needs to be MATCHABLE via its own candidate_section
-metadata field, which is already true the moment it's first
-discovered. One file, one job: label -> keyword hints, grows
-automatically.
+2026-09-14 update: promotion WAS added after all, mirroring
+candidate_vocab.py's mechanism — not because section needs a closed
+`$in` retrieval filter the way policy_type does (it still doesn't,
+see multi_source_rag.py's guaranteed-inclusion step), but because the
+query-side embedding classifier (_get_query_section_prototype_embeddings
+in multi_source_rag.py) only ever compared a query against the fixed
+12 hand-written prototype sentences — a section category discovered
+repeatedly at ingestion had no way to become recognizable to THAT
+tier at query time, only to the much weaker literal-2-keyword-overlap
+fast path and an LLM call gated behind it. Promotion here means "add
+this label's own generated prototype sentence to the embedding
+comparison set", not "add a hard retrieval filter" — see
+get_active_section_vocab_extra() and multi_source_rag.py's
+get_active_section_vocab().
 """
 import json
 import logging
@@ -38,8 +43,19 @@ _DATA_DIR = os.path.join(
     "candidate_vocab",
 )
 _CANDIDATE_SECTION_PATH = os.path.join(_DATA_DIR, "candidate_section_vocab.json")
+_ACTIVE_SECTION_VOCAB_EXTRA_PATH = os.path.join(_DATA_DIR, "active_section_vocab_extra.json")
 
 _lock = threading.Lock()
+
+# Same two-guard bar candidate_vocab.py uses for policy_type promotion
+# (see that module's own maybe_promote() for the full rationale: raw
+# guess_count alone is gameable by one document re-chunked/re-queried
+# many times, only independently-confirmed source diversity tells real
+# repeat evidence apart from that). Kept at the identical values for
+# consistency, not because section's stakes independently calibrate to
+# the same numbers.
+_PROMOTION_MIN_GUESS_COUNT = 5
+_PROMOTION_MIN_DISTINCT_SOURCES = 2
 
 # Same degenerate-answer guard as candidate_vocab.py's own list, plus a
 # couple of section-specific non-answers an open-ended classifier might
@@ -113,6 +129,63 @@ def match_candidate_section_vocab(text: str) -> Optional[str]:
     return None
 
 
+def get_active_section_vocab_extra() -> Dict[str, Dict]:
+    """Promoted section labels only — multi_source_rag.py's
+    get_active_section_vocab() unions this on top of the hardcoded
+    _QUERY_SECTION_PROTOTYPES categories, the section-side mirror of
+    candidate_vocab.get_active_vocab_extra()."""
+    return _load_json(_ACTIVE_SECTION_VOCAB_EXTRA_PATH, {})
+
+
+def promote_to_active_section_vocab(label: str, desc: str, keywords: List[str]) -> None:
+    with _lock:
+        extra = _load_json(_ACTIVE_SECTION_VOCAB_EXTRA_PATH, {})
+        extra[label] = {"desc": desc, "keywords": keywords}
+        _atomic_write_json(_ACTIVE_SECTION_VOCAB_EXTRA_PATH, extra)
+        candidates = _load_json(_CANDIDATE_SECTION_PATH, {})
+        candidates.pop(label, None)
+        _atomic_write_json(_CANDIDATE_SECTION_PATH, candidates)
+    logger.info("[candidate_section_vocab] promoted %r into active section vocabulary", label)
+
+
+def maybe_promote_section(label: str) -> bool:
+    """Auto-promote `label` into the active/embedded section vocabulary
+    once it crosses the evidence bar above — called after every
+    upsert_candidate_section() so promotion fires the moment a candidate
+    qualifies. Idempotent — an already-promoted label is skipped via the
+    active-vocab check.
+
+    Unlike candidate_vocab.py's maybe_promote(), distinct-source count is
+    read directly off the candidate's own already-deduplicated `sources`
+    list rather than scanning a separate append-only log — this module
+    never needed that log, since a section label's cheap-match field
+    never had policy_type's hard-retrieval-filter stakes to justify the
+    extra audit trail (see the module docstring's 2026-09-14 update)."""
+    if label in get_active_section_vocab_extra():
+        return False
+    entry = get_candidate_section_vocab().get(label)
+    if not entry or entry.get("guess_count", 0) < _PROMOTION_MIN_GUESS_COUNT:
+        return False
+    distinct = len(entry.get("sources", []))
+    if distinct < _PROMOTION_MIN_DISTINCT_SOURCES:
+        return False
+    keywords = entry.get("keywords") or []
+    natural_phrase = label.replace("_", " ")
+    if natural_phrase not in keywords:
+        keywords = keywords + [natural_phrase]
+    desc = (
+        f"Auto-promoted open-vocabulary section: {natural_phrase}. "
+        f"Seen {entry.get('guess_count')} times across {distinct} distinct sources."
+    )
+    promote_to_active_section_vocab(label, desc, keywords)
+    logger.info(
+        "[candidate_section_vocab] AUTO-PROMOTED %r into active section vocabulary "
+        "(guess_count=%d, distinct_sources=%d)",
+        label, entry.get("guess_count"), distinct,
+    )
+    return True
+
+
 def upsert_candidate_section(label: str, keywords: List[str], source: str) -> None:
     with _lock:
         candidates = _load_json(_CANDIDATE_SECTION_PATH, {})
@@ -128,3 +201,11 @@ def upsert_candidate_section(label: str, keywords: List[str], source: str) -> No
         entry["guess_count"] = entry.get("guess_count", 0) + 1
         candidates[label] = entry
         _atomic_write_json(_CANDIDATE_SECTION_PATH, candidates)
+    # Outside the lock above — maybe_promote_section() takes its own lock
+    # via promote_to_active_section_vocab(); nesting would deadlock (plain
+    # threading.Lock, not reentrant) — same discipline as
+    # candidate_vocab.py's upsert_candidate().
+    try:
+        maybe_promote_section(label)
+    except Exception as exc:
+        logger.warning("[candidate_section_vocab] promotion check failed for %r: %s", label, exc)

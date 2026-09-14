@@ -1809,28 +1809,75 @@ _QUERY_SECTION_PROTOTYPES = {
 # seen the specific query shape before.
 _QUERY_SECTION_EMBED_FLOOR = 0.55
 _QUERY_SECTION_EMBED_MARGIN = 0.08
-_query_section_prototype_embeddings: Optional[tuple] = None
+_query_section_prototype_cache: Optional[tuple] = None  # (signature, labels, vecs, is_candidate_flags)
+
+
+def get_active_section_vocab() -> dict:
+    """_QUERY_SECTION_PROTOTYPES unioned with any promoted section labels
+    from candidate_section_vocab.get_active_section_vocab_extra() — the
+    section-side mirror of metadata_tagger.get_active_vocab() (2026-09-14).
+    Makes "a section category discovered repeatedly at ingestion becomes
+    recognizable to the query-side embedding classifier" a data write
+    instead of a code change, the same way a new policy_type already
+    works. A promoted label gets an auto-generated prototype QUESTION
+    (matching the hand-written ones' own shape) rather than the bare
+    "Auto-promoted..." description candidate_vocab.py generates for
+    policy_type — that description reads fine as LLM-prompt context but
+    would be a poor fit for THIS system, since here it's embedded
+    directly and compared against real user questions, not read by a
+    model. Re-read on every call (not itself cached) — promotion is a
+    rare event and the file is tiny; _get_query_section_prototype_embeddings
+    below is what actually caches the expensive part (the embeddings)."""
+    try:
+        from candidate_section_vocab import get_active_section_vocab_extra
+        extra = get_active_section_vocab_extra()
+    except Exception as exc:
+        logger.debug("[SECTION_INTENT] active-section-vocab-extra unavailable (%s)", exc)
+        extra = {}
+    merged = dict(_QUERY_SECTION_PROTOTYPES)
+    for label, info in extra.items():
+        if label in merged:
+            continue
+        natural_phrase = label.replace("_", " ")
+        merged[label] = f"What does this document say about {natural_phrase}?"
+    return merged
 
 
 def _get_query_section_prototype_embeddings():
-    global _query_section_prototype_embeddings
-    if _query_section_prototype_embeddings is None:
+    """Rebuilds from get_active_section_vocab() whenever its signature
+    changes (a new label promoted) — same signature-keyed caching pattern
+    _get_policy_type_prototype_embeddings() already uses for policy_type,
+    so a newly-promoted section label is picked up at the very next call
+    with no separate cache-invalidation step needed anywhere."""
+    global _query_section_prototype_cache
+    _active = get_active_section_vocab()
+    _signature = tuple(sorted(_active.items()))
+    if _query_section_prototype_cache is None or _query_section_prototype_cache[0] != _signature:
         _model = _get_shared_embed_model(EMBED_MODEL_NAME)
-        _labels = list(_QUERY_SECTION_PROTOTYPES.keys())
-        _vecs = _model.encode(list(_QUERY_SECTION_PROTOTYPES.values()), normalize_embeddings=True)
-        _query_section_prototype_embeddings = (_labels, _vecs)
-    return _query_section_prototype_embeddings
+        _labels = list(_active.keys())
+        _vecs = _model.encode(list(_active.values()), normalize_embeddings=True)
+        # A label not in the hardcoded prototype dict is a promoted
+        # candidate — its content only ever lives on chunks' own
+        # candidate_section metadata field, never the real `section`
+        # field (that's ingestion-time-only, see classify_chunk_intent
+        # in metadata_tagger.py), so a match on it must be reported as
+        # is_candidate=True or downstream retrieval would filter on the
+        # wrong metadata field and find nothing.
+        _is_candidate_flags = [lbl not in _QUERY_SECTION_PROTOTYPES for lbl in _labels]
+        _query_section_prototype_cache = (_signature, _labels, _vecs, _is_candidate_flags)
+    return _query_section_prototype_cache[1], _query_section_prototype_cache[2], _query_section_prototype_cache[3]
 
 
 def _classify_query_section_by_embedding(query: str) -> Optional[tuple[str, bool]]:
     """See the _QUERY_SECTION_PROTOTYPES block comment above for the full
-    rationale and calibration evidence. Returns (label, False) — same
-    shape as a fixed-category regex/LLM match, never a candidate/open-
-    vocabulary result — or None if neither the score floor nor the
+    rationale and calibration evidence. Returns (label, is_candidate) —
+    is_candidate is True only for a promoted open-vocabulary label (see
+    _get_query_section_prototype_embeddings), False for one of the
+    original fixed 12 — or None if neither the score floor nor the
     margin bar is cleared, in which case the caller falls through to the
     LLM tier exactly as if this check didn't exist."""
     try:
-        _labels, _proto_vecs = _get_query_section_prototype_embeddings()
+        _labels, _proto_vecs, _is_candidate_flags = _get_query_section_prototype_embeddings()
         _model = _get_shared_embed_model(EMBED_MODEL_NAME)
         _qvec = _model.encode([query], normalize_embeddings=True)[0]
         _sims = np.dot(_proto_vecs, _qvec)
@@ -1838,13 +1885,15 @@ def _classify_query_section_by_embedding(query: str) -> Optional[tuple[str, bool
         _top_score = float(_sims[_order[0]])
         _margin = _top_score - float(_sims[_order[1]])
         if _top_score >= _QUERY_SECTION_EMBED_FLOOR and _margin >= _QUERY_SECTION_EMBED_MARGIN:
-            _label = _labels[_order[0]]
+            _idx = int(_order[0])
+            _label = _labels[_idx]
+            _is_candidate = _is_candidate_flags[_idx]
             logger.info(
                 "[ask_stream] section-intent embedding match: label=%r score=%.3f "
-                "margin=%.3f query=%r",
-                _label, _top_score, _margin, query[:80],
+                "margin=%.3f is_candidate=%s query=%r",
+                _label, _top_score, _margin, _is_candidate, query[:80],
             )
-            return (_label, False)
+            return (_label, _is_candidate)
         return None
     except Exception as exc:
         logger.debug("[ask_stream] section-intent embedding classification failed (%s)", exc)
